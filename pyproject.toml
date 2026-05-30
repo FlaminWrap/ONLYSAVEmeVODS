@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ytdlbot"
+version = "0.1.0"
+description = "Watch YouTube channels and automatically record live streams with yt-dlp."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "yt-dlp[default]>=2024.01.01",
+  "Pillow>=10.0.0",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.9.0",
+]
+
+[project.scripts]
+ytdlbot = "ytdlbot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

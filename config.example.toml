@@ -1,0 +1,116 @@
+# Add YouTube channel URLs or @handles here.
+# Examples:
+# channels = ["@SomeChannel", "https://www.youtube.com/@SomeChannel"]
+channels = []
+
+download_dir = "downloads"
+state_dir = "state"
+
+poll_interval_seconds = 60
+max_concurrent_downloads = 4
+channel_scan_limit = 10
+discovery_probe_concurrency = 4
+live_from_start = true
+
+# Record YouTube live chat as a sidecar .live_chat.json file when available.
+record_live_chat = false
+
+# After a stream ends, create a separate MP4 with the original video on the left
+# and rendered live chat on the right. This implies record_live_chat.
+render_live_chat_video = false
+
+# Worker processes for chat panel frame rendering. 0 uses all CPU cores,
+# 1 forces serial rendering, and higher values use that exact worker count.
+chat_render_panel_workers = 0
+
+# Use NVIDIA NVENC for the FFmpeg chat video encode/merge stages. This speeds
+# encoding when FFmpeg was built with NVENC support and an NVIDIA driver is
+# available. Leave the device list empty for FFmpeg's default GPU, set
+# chat_render_nvenc_devices = ["0"] for one GPU, or set ["0", "1"] to rotate
+# concurrent/segment renders across multiple GPUs. The systemd installer can
+# install NVIDIA/NVENC packages on supported DNF systems when NVIDIA PCI
+# hardware is detected; the running app only detects and logs what is available.
+chat_render_use_nvenc = false
+chat_render_nvenc_devices = []
+
+# Automatically create speech subtitles after a stream is finalized. WhisperX
+# writes .srt, .vtt, .txt, .tsv, and .json sidecars next to the media file.
+transcribe_subtitles = false
+
+# Keep this at 1 for a single GPU. Increase only if the machine can run multiple
+# WhisperX jobs without exhausting VRAM.
+transcription_max_concurrent = 1
+
+# WhisperX settings. Diarization labels speakers as SPEAKER_00, SPEAKER_01, etc.
+# To use diarization with pyannote, set the environment variable named by
+# whisperx_hf_token_env and accept the required Hugging Face model terms.
+whisperx_path = "whisperx"
+whisperx_model = "large-v3"
+whisperx_device = "cuda"
+whisperx_compute_type = "float16"
+whisperx_batch_size = 16
+whisperx_language = ""
+whisperx_diarize = true
+whisperx_hf_token_env = "HF_TOKEN"
+whisperx_min_speakers = 0
+whisperx_max_speakers = 0
+
+# Use "DEBUG" while diagnosing stream detection, resume, and finalize behavior.
+# Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.
+log_level = "INFO"
+
+# Read-only local status page. Use SSH port forwarding or a reverse proxy if you
+# need remote access; there is no built-in authentication.
+web_enabled = true
+web_host = "127.0.0.1"
+web_port = 8080
+
+# Keep downloaded media fragments while a segment is active. This costs extra
+# disk space, but it lets the bot turn an accidentally finalized audio/video
+# format back into a resumable .part file without dropping fragments.
+keep_fragments_for_resume = true
+
+# Planned reconnects are disabled by default. The mixed-format watchdog still
+# reconnects when one format finalizes while another remains partial. Set this
+# above 0 only if you also want periodic forced reconnects after catch-up.
+reconnect_interval_seconds = 0
+
+# After yt-dlp exits, re-check the video at these offsets in seconds.
+# If any check says the stream is still live, the downloader restarts.
+# If all checks complete without seeing live, the stream is marked ended.
+post_exit_check_seconds = [
+  30, 60, 90, 120, 150, 180, 210, 240, 270, 300,
+  330, 360, 390, 420, 450, 480, 510, 540, 570, 600,
+]
+
+retry_backoff_seconds = [30, 60, 120, 300]
+
+# Extra args are passed before the bot's core yt-dlp download args. Do not use
+# metadata-only or download-suppression flags here, such as --skip-download.
+# Example:
+# extra_yt_dlp_args = ["--format", "bestvideo+bestaudio/best"]
+extra_yt_dlp_args = []
+
+# FFmpeg is used to finalize leftover .part format files after a stream ends.
+ffmpeg_path = "ffmpeg"
+
+# Generate private, per-recipient invisible watermark copies from finalized
+# videos. Originals are not modified. Set the environment variable named by
+# watermark_secret_env before queueing or detecting watermark copies. Generate
+# a long random secret with:
+#
+#   export YTDLBOT_WATERMARK_SECRET="$(openssl rand -base64 48)"
+#
+# The systemd installer creates /opt/ytdlbot/secrets.env with a generated value
+# if it does not already exist, and the service loads that file. Back it up with
+# config.toml and state/ytdlbot.sqlite3; old watermarks cannot be detected if
+# the secret is lost. Do not paste the secret itself into this config file.
+watermark_enabled = false
+watermark_secret_env = "YTDLBOT_WATERMARK_SECRET"
+
+# Strength presets: invisible, balanced, robust. The default prioritizes normal
+# viewing quality while still targeting ordinary re-encodes and light edits.
+watermark_strength = "invisible"
+
+# Maximum suspect video upload size accepted by the local dashboard detector.
+watermark_detect_upload_max_bytes = 2147483648
