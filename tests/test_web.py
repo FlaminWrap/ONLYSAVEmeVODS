@@ -759,6 +759,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(file_kind("segment-001.mp4.ytdl"), "state")
         self.assertEqual(file_kind("segment-001.mp4.part-Frag1"), "fragment")
         self.assertEqual(file_kind("segment-001.live_chat.json"), "chat")
+        self.assertEqual(file_kind("segment-001.timing.json"), "state")
         self.assertEqual(format_bytes(1536), "1.5 KiB")
 
     def test_config_summary_redacts_sensitive_extra_args(self) -> None:

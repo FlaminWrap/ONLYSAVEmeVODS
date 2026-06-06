@@ -17,19 +17,19 @@ from .chat_render import (
     parse_live_chat_file,
     probe_video_duration,
 )
+from .chat_timing import (
+    ChatTiming,
+    chat_timing_file_for_chat_file,
+    iso_timestamp_to_us,
+    read_chat_timing,
+    stream_start_timestamp_us,
+)
 from .config import BotConfig
 
 
 LOGGER = logging.getLogger(__name__)
 CHAT_REFRESH_TIMEOUT_SECONDS = 60 * 60
 CHAT_LIVE_BACKUP_SUFFIX = ".raw-live.json.bak"
-YOUTUBE_START_TIMESTAMP_KEYS = (
-    "actual_start_timestamp",
-    "live_start_timestamp",
-    "start_timestamp",
-    "release_timestamp",
-    "timestamp",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,6 +49,7 @@ def refresh_chat_sidecar(
     chat_file: Path,
     last_exit_at: str | None = None,
     stream_metadata: Mapping[str, Any] | None = None,
+    timing_file: Path | None = None,
     logger: logging.Logger = LOGGER,
 ) -> ChatRefreshResult:
     replay = refresh_chat_from_replay(
@@ -71,6 +72,7 @@ def refresh_chat_sidecar(
         chat_file=chat_file,
         last_exit_at=last_exit_at,
         stream_metadata=stream_metadata,
+        timing_file=timing_file,
         logger=logger,
     )
     if synced.ok:
@@ -218,6 +220,7 @@ def sync_recorded_live_chat(
     chat_file: Path,
     last_exit_at: str | None = None,
     stream_metadata: Mapping[str, Any] | None = None,
+    timing_file: Path | None = None,
     logger: logging.Logger = LOGGER,
 ) -> ChatRefreshResult:
     if not live_chat_file_has_live_markers(chat_file):
@@ -228,8 +231,12 @@ def sync_recorded_live_chat(
             message="existing chat does not look like a live capture",
         )
 
-    origin_us = stream_start_timestamp_us(stream_metadata or {})
-    origin_source = "metadata" if origin_us is not None else ""
+    timing = read_chat_timing(timing_file or chat_timing_file_for_chat_file(chat_file))
+    origin_us, origin_source = media_origin_from_timing(
+        timing,
+        stream_metadata=stream_metadata or {},
+        config_live_from_start=config.live_from_start,
+    )
     duration = 0.0
     if origin_us is None:
         try:
@@ -251,6 +258,10 @@ def sync_recorded_live_chat(
             source="sync",
             message="unable to determine media timeline origin for recorded chat",
         )
+
+    chat_delay_message = chat_capture_delay_message(timing, origin_us)
+    if chat_delay_message:
+        logger.info("%s for %s", chat_delay_message, chat_file)
 
     try:
         normalized, changed_count = normalized_live_chat_lines(chat_file, origin_us)
@@ -287,19 +298,58 @@ def sync_recorded_live_chat(
         )
 
     logger.info(
-        "Synced recorded live chat %s using %s; messages=%d backup=%s",
+        "Synced recorded live chat %s using %s; messages=%d backup=%s%s",
         chat_file,
         origin_source,
         changed_count,
         backup_file,
+        f"; {chat_delay_message}" if chat_delay_message else "",
     )
+    message = f"Synced recorded live chat using {origin_source}"
+    if chat_delay_message:
+        message = f"{message}; {chat_delay_message}"
     return ChatRefreshResult(
         ok=True,
         changed=True,
         source="sync",
-        message=f"Synced recorded live chat using {origin_source}",
+        message=message,
         backup_file=backup_file,
     )
+
+
+def media_origin_from_timing(
+    timing: ChatTiming | None,
+    *,
+    stream_metadata: Mapping[str, Any],
+    config_live_from_start: bool,
+) -> tuple[int | None, str]:
+    if timing is not None:
+        if timing.media_live_from_start:
+            stream_origin = iso_timestamp_to_us(timing.stream_started_at)
+            if stream_origin is not None:
+                return stream_origin, "timing stream start"
+        media_started_at = iso_timestamp_to_us(timing.media_started_at)
+        if media_started_at is not None:
+            return media_started_at, "timing media start"
+
+    if config_live_from_start:
+        metadata_origin = stream_start_timestamp_us(stream_metadata)
+        if metadata_origin is not None:
+            return metadata_origin, "metadata stream start"
+
+    return None, ""
+
+
+def chat_capture_delay_message(timing: ChatTiming | None, origin_us: int) -> str:
+    if timing is None:
+        return ""
+    chat_started_at = iso_timestamp_to_us(timing.chat_started_at)
+    if chat_started_at is None:
+        return ""
+    delay_seconds = (chat_started_at - origin_us) / 1_000_000
+    if delay_seconds < 1:
+        return ""
+    return f"chat capture began {delay_seconds:.1f}s after media origin"
 
 
 def normalized_live_chat_lines(path: Path, media_origin_us: int) -> tuple[list[str], int]:
@@ -368,30 +418,6 @@ def apply_video_offset_ms(node: Any, offset_ms: int) -> bool:
     return changed
 
 
-def stream_start_timestamp_us(metadata: Mapping[str, Any]) -> int | None:
-    for key in YOUTUBE_START_TIMESTAMP_KEYS:
-        timestamp = timestamp_value_to_us(metadata.get(key))
-        if timestamp is not None:
-            return timestamp
-    return None
-
-
-def timestamp_value_to_us(value: Any) -> int | None:
-    number = coerce_float(value)
-    if number is not None and number > 0:
-        if number > 10_000_000_000_000:
-            return round(number)
-        if number > 10_000_000_000:
-            return round(number * 1000)
-        return round(number * 1_000_000)
-    if isinstance(value, str) and value:
-        try:
-            return round(datetime.fromisoformat(value).timestamp() * 1_000_000)
-        except ValueError:
-            return None
-    return None
-
-
 def media_origin_from_exit(last_exit_at: str | None, media_duration_seconds: float) -> int | None:
     if not last_exit_at or media_duration_seconds <= 0:
         return None
@@ -440,15 +466,3 @@ def coerce_int(value: Any) -> int | None:
             return None
     return None
 
-
-def coerce_float(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None

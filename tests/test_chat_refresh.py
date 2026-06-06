@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from datetime import datetime, timezone
 import subprocess
 import unittest
 
@@ -11,7 +12,12 @@ from onlysavemevods.chat_refresh import (
     sync_recorded_live_chat,
 )
 from onlysavemevods.chat_render import parse_live_chat_file
+from onlysavemevods.chat_timing import ChatTiming, write_chat_timing
 from onlysavemevods.config import BotConfig
+
+
+def iso_from_us(timestamp_us: int) -> str:
+    return datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc).isoformat()
 
 
 def live_chat_line(offset_ms: int, timestamp_us: int, message: str = "hello") -> str:
@@ -118,6 +124,94 @@ class ChatRefreshTests(unittest.TestCase):
         self.assertEqual(result.source, "sync")
         self.assertEqual(entries[0].offset_seconds, 50.0)
         self.assertEqual(len(backups), 1)
+
+    def test_live_capture_sync_uses_timing_stream_start_for_live_from_start(self) -> None:
+        origin_us = 1_779_054_300_000_000
+        late_by_us = 65_700_000
+
+        with TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "Live [LIVEVIDEO01].mp4"
+            chat_file = Path(tmp) / "Live [LIVEVIDEO01].live_chat.json"
+            timing_file = Path(tmp) / "Live [LIVEVIDEO01].timing.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text(
+                live_chat_line(0, origin_us + late_by_us),
+                encoding="utf-8",
+            )
+            write_chat_timing(
+                timing_file,
+                ChatTiming(
+                    video_id="LIVEVIDEO01",
+                    segment_index=1,
+                    stream_started_at=iso_from_us(origin_us),
+                    media_started_at=iso_from_us(origin_us + 10_000_000),
+                    chat_started_at=iso_from_us(origin_us + late_by_us),
+                    media_live_from_start=True,
+                ),
+            )
+            config = BotConfig(download_dir=Path(tmp))
+
+            with patch(
+                "onlysavemevods.chat_refresh.probe_video_duration",
+                side_effect=AssertionError("duration fallback should not be used"),
+            ):
+                result = sync_recorded_live_chat(
+                    config,
+                    media_file=media_file,
+                    chat_file=chat_file,
+                    timing_file=timing_file,
+                )
+
+            entries = parse_live_chat_file(chat_file)
+
+        self.assertTrue(result.ok)
+        self.assertIn("timing stream start", result.message)
+        self.assertIn("65.7s", result.message)
+        self.assertAlmostEqual(entries[0].offset_seconds, 65.7)
+
+    def test_live_capture_sync_uses_media_start_when_not_live_from_start(self) -> None:
+        stream_origin_us = 1_779_054_300_000_000
+        media_origin_us = stream_origin_us + 20_000_000
+        message_timestamp_us = stream_origin_us + 50_000_000
+
+        with TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "Live [LIVEVIDEO01].mp4"
+            chat_file = Path(tmp) / "Live [LIVEVIDEO01].live_chat.json"
+            timing_file = Path(tmp) / "Live [LIVEVIDEO01].timing.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text(
+                live_chat_line(0, message_timestamp_us),
+                encoding="utf-8",
+            )
+            write_chat_timing(
+                timing_file,
+                ChatTiming(
+                    video_id="LIVEVIDEO01",
+                    segment_index=1,
+                    stream_started_at=iso_from_us(stream_origin_us),
+                    media_started_at=iso_from_us(media_origin_us),
+                    chat_started_at=iso_from_us(message_timestamp_us),
+                    media_live_from_start=False,
+                ),
+            )
+            config = BotConfig(download_dir=Path(tmp), live_from_start=False)
+
+            with patch(
+                "onlysavemevods.chat_refresh.probe_video_duration",
+                side_effect=AssertionError("duration fallback should not be used"),
+            ):
+                result = sync_recorded_live_chat(
+                    config,
+                    media_file=media_file,
+                    chat_file=chat_file,
+                    timing_file=timing_file,
+                )
+
+            entries = parse_live_chat_file(chat_file)
+
+        self.assertTrue(result.ok)
+        self.assertIn("timing media start", result.message)
+        self.assertEqual(entries[0].offset_seconds, 30.0)
 
     def test_replay_failure_falls_back_to_recorded_chat_sync(self) -> None:
         origin_us = 1_779_054_300_000_000

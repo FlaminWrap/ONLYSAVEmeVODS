@@ -7,6 +7,7 @@ import unittest
 
 from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
 from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.chat_timing import read_chat_timing
 from onlysavemevods.downloader import (
     DownloadManager,
     build_chat_download_command,
@@ -18,8 +19,11 @@ from onlysavemevods.downloader import (
     prepare_finalize_plan,
     rename_finalized_segment_file,
     rename_segment_chat_file,
+    rename_segment_timing_file,
     restore_mixed_segment_for_resume,
+    segment_has_final_files,
     segment_part_files,
+    segment_timing_file,
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
@@ -305,6 +309,53 @@ class DownloaderCommandTests(unittest.TestCase):
                 '{"replayChatItemAction":{}}',
             )
 
+    def test_timing_sidecar_is_renamed_to_title_and_video_id(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            source = segment_dir / "segment-001.timing.json"
+            source.write_text('{"video_id":"LIVEVIDEO01","segment_index":1}', encoding="utf-8")
+
+            renamed = rename_segment_timing_file(config, stream, 1, NULL_LOGGER)
+
+            target = segment_dir / "Late Night Stream [LIVEVIDEO01].timing.json"
+            self.assertEqual(renamed, target)
+            self.assertTrue(target.exists())
+            self.assertFalse(source.exists())
+
+    def test_timing_sidecar_does_not_count_as_final_media(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.timing.json").write_text(
+                '{"video_id":"LIVEVIDEO01","segment_index":1}',
+                encoding="utf-8",
+            )
+
+            restart_segment = choose_restart_segment(
+                config,
+                "LIVEVIDEO01",
+                1,
+                "Example Channel",
+            )
+            has_final_files = segment_has_final_files(
+                config,
+                "LIVEVIDEO01",
+                1,
+                "Example Channel",
+            )
+
+        self.assertFalse(has_final_files)
+        self.assertEqual(restart_segment, 1)
+
     def test_existing_legacy_video_folder_is_reused_for_resume(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(download_dir=Path(tmp))
@@ -580,6 +631,49 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_segment_timing_sidecar_records_capture_anchors(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                live_from_start=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+                raw={"actual_start_timestamp": "2026-05-17T21:45:00+00:00"},
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            manager.write_segment_timing_started(
+                stream,
+                1,
+                media_started_at="2026-05-17T21:45:05+00:00",
+            )
+            manager.update_segment_timing(
+                stream,
+                1,
+                chat_started_at="2026-05-17T21:46:05+00:00",
+                last_exit_at="2026-05-17T21:50:00+00:00",
+            )
+            timing = read_chat_timing(
+                segment_timing_file(config, stream.video_id, 1, stream.channel)
+            )
+            state.close()
+
+        self.assertIsNotNone(timing)
+        assert timing is not None
+        self.assertEqual(timing.video_id, stream.video_id)
+        self.assertEqual(timing.segment_index, 1)
+        self.assertEqual(timing.stream_started_at, "2026-05-17T21:45:00+00:00")
+        self.assertEqual(timing.media_started_at, "2026-05-17T21:45:05+00:00")
+        self.assertEqual(timing.chat_started_at, "2026-05-17T21:46:05+00:00")
+        self.assertTrue(timing.media_live_from_start)
+        self.assertEqual(timing.last_exit_at, "2026-05-17T21:50:00+00:00")
+
     async def test_finish_ended_stream_refreshes_chat_before_optional_render(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -597,11 +691,15 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             segment_dir.mkdir(parents=True)
             (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
             (segment_dir / "segment-001.live_chat.json").write_text("chat", encoding="utf-8")
+            (segment_dir / "segment-001.timing.json").write_text(
+                '{"video_id":"LIVEVIDEO01","segment_index":1}',
+                encoding="utf-8",
+            )
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
             state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
-            calls: list[tuple[Path, Path, str | None]] = []
+            calls: list[tuple[Path, Path, str | None, Path | None]] = []
 
             def fake_refresh(
                 _config: BotConfig,
@@ -610,9 +708,10 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                 media_file: Path,
                 chat_file: Path,
                 last_exit_at: str | None,
+                timing_file: Path | None,
                 **_kwargs: object,
             ) -> ChatRefreshResult:
-                calls.append((media_file, chat_file, last_exit_at))
+                calls.append((media_file, chat_file, last_exit_at, timing_file))
                 return ChatRefreshResult(
                     ok=True,
                     changed=True,
@@ -635,11 +734,13 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             media_file = segment_dir / "Late Night Stream [LIVEVIDEO01].mp4"
             chat_file = segment_dir / "Late Night Stream [LIVEVIDEO01].live_chat.json"
+            timing_file = segment_dir / "Late Night Stream [LIVEVIDEO01].timing.json"
 
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], media_file)
         self.assertEqual(calls[0][1], chat_file)
         self.assertIsNotNone(calls[0][2])
+        self.assertEqual(calls[0][3], timing_file)
 
     async def test_finish_ended_stream_transcribes_named_media_file(self) -> None:
         with TemporaryDirectory() as tmp:

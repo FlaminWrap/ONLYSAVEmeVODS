@@ -29,6 +29,14 @@ from .chat_render import (
     write_chat_ass_file,
 )
 from .chat_refresh import refresh_chat_sidecar
+from .chat_timing import (
+    CHAT_TIMING_SUFFIX,
+    chat_timing_file_for_chat_file,
+    is_chat_timing_file,
+    stream_start_iso,
+    update_chat_timing,
+    utc_now_iso,
+)
 from .config import BotConfig
 from .models import LiveStream
 from .state import StateStore
@@ -95,6 +103,7 @@ class FinalizedSegmentFiles:
     segment_index: int
     media_file: Path | None
     chat_file: Path | None
+    timing_file: Path | None
 
 
 class CatchupTracker:
@@ -227,6 +236,7 @@ class DownloadManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
+            media_started_at = utc_now_iso()
         except FileNotFoundError:
             self.logger.exception("Unable to start yt-dlp; binary not found")
             self.state.mark_waiting_retry(stream.video_id)
@@ -238,6 +248,13 @@ class DownloadManager:
             await self._schedule_spawn_retry(stream)
             return False
 
+        record_chat = should_record_chat(self.config)
+        if record_chat:
+            self.write_segment_timing_started(
+                stream,
+                segment_index,
+                media_started_at=media_started_at,
+            )
         task = asyncio.create_task(self._watch_process(stream, process, segment_index))
         output_task = None
         if process.stdout is not None:
@@ -274,7 +291,7 @@ class DownloadManager:
             mixed_segment_task=mixed_segment_task,
         )
         self.active[stream.video_id] = active
-        if should_record_chat(self.config):
+        if record_chat:
             chat_process, chat_task, chat_output_task = await self._start_chat_recorder(
                 stream,
                 segment_index,
@@ -320,6 +337,7 @@ class DownloadManager:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
+            chat_started_at = utc_now_iso()
         except FileNotFoundError:
             self.logger.warning("Unable to start live chat recorder; yt-dlp not found")
             return None, None, None
@@ -334,6 +352,11 @@ class DownloadManager:
             "Started live chat recorder video_id=%s segment=%03d",
             stream.video_id,
             segment_index,
+        )
+        self.update_segment_timing(
+            stream,
+            segment_index,
+            chat_started_at=chat_started_at,
         )
         task = asyncio.create_task(self._watch_chat_process(stream.video_id, process))
         task.add_done_callback(discard_task_exception)
@@ -567,6 +590,12 @@ class DownloadManager:
             exit_code,
         )
         self.state.mark_exited(stream.video_id, int(exit_code))
+        record = self.state.get_stream(stream.video_id)
+        self.update_segment_timing_if_exists(
+            stream,
+            segment_index,
+            last_exit_at=record.last_exit_at if record else utc_now_iso(),
+        )
         if stream.video_id in self._planned_reconnects:
             self._planned_reconnects.discard(stream.video_id)
             task = asyncio.create_task(self.handle_planned_reconnect(stream, segment_index))
@@ -792,11 +821,18 @@ class DownloadManager:
                 index,
                 self.logger,
             )
+            timing_file = rename_segment_timing_file(
+                self.config,
+                stream,
+                index,
+                self.logger,
+            )
             finalized_files.append(
                 FinalizedSegmentFiles(
                     segment_index=index,
                     media_file=media_file,
                     chat_file=chat_file,
+                    timing_file=timing_file,
                 )
             )
         return finalized_files
@@ -832,6 +868,7 @@ class DownloadManager:
                 chat_file=files.chat_file,
                 last_exit_at=last_exit_at,
                 stream_metadata=stream.raw,
+                timing_file=files.timing_file,
                 logger=self.logger,
             )
             if result.ok:
@@ -847,6 +884,62 @@ class DownloadManager:
                     files.segment_index,
                     result.message,
                 )
+
+    def write_segment_timing_started(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        media_started_at: str,
+    ) -> None:
+        self.update_segment_timing(
+            stream,
+            segment_index,
+            stream_started_at=stream_start_iso(stream.raw),
+            media_started_at=media_started_at,
+            media_live_from_start=self.config.live_from_start,
+        )
+
+    def update_segment_timing(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        **changes: object,
+    ) -> None:
+        timing_file = segment_timing_file(
+            self.config,
+            stream.video_id,
+            segment_index,
+            stream.channel,
+        )
+        payload = {
+            "video_id": stream.video_id,
+            "segment_index": segment_index,
+            **changes,
+        }
+        try:
+            update_chat_timing(timing_file, **payload)
+        except OSError:
+            self.logger.warning(
+                "Unable to write live chat timing sidecar %s",
+                timing_file,
+            )
+
+    def update_segment_timing_if_exists(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        **changes: object,
+    ) -> None:
+        timing_file = segment_timing_file(
+            self.config,
+            stream.video_id,
+            segment_index,
+            stream.channel,
+        )
+        if not timing_file.is_file():
+            return
+        self.update_segment_timing(stream, segment_index, **changes)
 
     async def transcribe_finalized_media(
         self,
@@ -1587,6 +1680,7 @@ def segment_has_final_files(
             path.is_file()
             and not is_yt_dlp_temporary_file(path.name)
             and not is_live_chat_file(path.name)
+            and not is_chat_timing_file(path.name)
         ):
             return True
     return False
@@ -1645,6 +1739,16 @@ def is_live_chat_file(name: str) -> bool:
 
 def is_live_chat_related_file(name: str) -> bool:
     return ".live_chat.json" in name
+
+
+def segment_timing_file(
+    config: BotConfig,
+    video_id: str,
+    segment_index: int,
+    channel: str = "",
+) -> Path:
+    directory = segment_directory(config, video_id, channel)
+    return directory / f"{segment_file_stem(segment_index)}{CHAT_TIMING_SUFFIX}"
 
 
 def prepare_finalize_plan(
@@ -1719,6 +1823,7 @@ def segment_final_format_files(
         if path.is_file()
         and not is_yt_dlp_temporary_file(path.name)
         and not is_live_chat_file(path.name)
+        and not is_chat_timing_file(path.name)
         and path.stem != segment_name
     )
 
@@ -1853,6 +1958,34 @@ def rename_segment_chat_file(
     return target
 
 
+def rename_segment_timing_file(
+    config: BotConfig,
+    stream: LiveStream,
+    segment_index: int,
+    logger: logging.Logger,
+) -> Path | None:
+    source = segment_timing_file(config, stream.video_id, segment_index, stream.channel)
+    if not source.is_file():
+        return None
+
+    target = named_segment_timing_file(config, stream, segment_index)
+    if source == target:
+        return target
+    if target.exists():
+        logger.warning(
+            "Final chat timing sidecar already exists; leaving %s in place",
+            source,
+        )
+        return source
+
+    try:
+        source.rename(target)
+    except OSError:
+        logger.warning("Unable to rename chat timing sidecar %s to %s", source, target)
+        return source
+    return target
+
+
 def finalized_segment_chat_file(
     config: BotConfig,
     video_id: str,
@@ -1973,6 +2106,16 @@ def named_segment_chat_file(
     return directory / (
         f"{named_segment_file_stem(stream.title, stream.video_id, segment_index)}"
         ".live_chat.json"
+    )
+
+
+def named_segment_timing_file(
+    config: BotConfig,
+    stream: LiveStream,
+    segment_index: int,
+) -> Path:
+    return chat_timing_file_for_chat_file(
+        named_segment_chat_file(config, stream, segment_index)
     )
 
 

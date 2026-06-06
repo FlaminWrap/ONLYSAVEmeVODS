@@ -31,6 +31,7 @@ from .chat_render import (
     render_chat_video_file,
 )
 from .chat_refresh import refresh_chat_sidecar
+from .chat_timing import is_chat_timing_file
 from .config import BotConfig
 from .downloader import (
     command_for_log,
@@ -2048,6 +2049,8 @@ def file_kind(name: str) -> str:
     if name.endswith(".part"):
         return "part"
     if name.endswith(".ytdl"):
+        return "state"
+    if is_chat_timing_file(name):
         return "state"
     if is_live_chat_file(name):
         return "chat"
