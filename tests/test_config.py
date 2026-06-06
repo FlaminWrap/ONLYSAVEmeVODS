@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from ytdlbot.config import (
+from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     ConfigError,
     append_missing_config_values,
@@ -104,7 +104,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.web_port, 8080)
         self.assertEqual(config.log_level, "INFO")
         self.assertFalse(config.watermark_enabled)
-        self.assertEqual(config.watermark_secret_env, "YTDLBOT_WATERMARK_SECRET")
+        self.assertEqual(config.watermark_secret_env, "ONLYSAVEMEVODS_WATERMARK_SECRET")
         self.assertEqual(config.watermark_strength, "invisible")
         self.assertEqual(config.watermark_detect_upload_max_bytes, 2_147_483_648)
 
@@ -123,6 +123,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.channels, ["@Example"])
         self.assertEqual(config.download_dir, (root / "nested" / "dl").resolve())
         self.assertEqual(config.state_dir, (root / "nested" / "st").resolve())
+
+    def test_db_path_uses_legacy_database_when_new_database_is_absent(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            state_dir = root / "state"
+            state_dir.mkdir()
+            legacy_db = state_dir / "ytdlbot.sqlite3"
+            legacy_db.write_text("", encoding="utf-8")
+            config_path.write_text('state_dir = "state"\n', encoding="utf-8")
+
+            config = load_config(config_path)
+            db_path = config.db_path
+
+        self.assertEqual(db_path, legacy_db)
 
     def test_post_exit_schedule_must_be_increasing(self) -> None:
         with TemporaryDirectory() as tmp:

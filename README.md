@@ -1,6 +1,6 @@
-# YTDLBot
+# ONLYSAVEmeVODS
 
-YTDLBot watches YouTube channel stream pages and starts `yt-dlp` for every live
+ONLYSAVEmeVODS watches YouTube channel stream pages and starts `yt-dlp` for every live
 stream it finds. It supports multiple simultaneous streams from the same
 channel and treats a `yt-dlp` exit as uncertain until YouTube has been checked
 for the configured post-exit window.
@@ -16,13 +16,13 @@ cp config.example.toml config.toml
 Edit `config.toml`, then run a one-shot check:
 
 ```bash
-.venv/bin/ytdlbot check --config config.toml
+.venv/bin/onlysavemevods check --config config.toml
 ```
 
 Run continuously:
 
 ```bash
-.venv/bin/ytdlbot run --config config.toml
+.venv/bin/onlysavemevods run --config config.toml
 ```
 
 The daemon also starts a read-only local dashboard when `web_enabled = true`.
@@ -40,7 +40,7 @@ http://127.0.0.1:8080/status.json
 To run only the status page against an existing state database:
 
 ```bash
-.venv/bin/ytdlbot web --config config.toml
+.venv/bin/onlysavemevods web --config config.toml
 ```
 
 ## Systemd
@@ -51,15 +51,22 @@ Install and enable the system service:
 scripts/install-systemd.sh
 ```
 
-The installer enables and restarts `ytdlbot.service`, so rerunning it after an
+The installer enables and restarts `onlysavemevods.service`, so rerunning it after an
 update makes systemd pick up the newly installed code. It also appends any
 missing top-level settings from the current `config.example.toml` to an existing
 `config.toml` without overwriting your configured values.
 
-By default the systemd installer deploys to `/opt/ytdlbot`, creates a dedicated
-`ytdlbot` system user, and runs the service as that user instead of as root or
+By default the systemd installer deploys to `/opt/onlysavemevods`, creates a dedicated
+`onlysavemevods` system user, and runs the service as that user instead of as root or
 your login account. The application code, venv, and Deno runtime are root-owned;
 only `downloads/`, `state/`, and `.cache/` are writable by the service user.
+If the installer is run with no explicit install dir and detects an existing
+legacy `/opt/ytdlbot` install and `/opt/onlysavemevods` does not already exist,
+it stops/disables/removes `ytdlbot.service`, moves `/opt/ytdlbot` to
+`/opt/onlysavemevods`, fixes writable directory ownership for the new service
+user, and starts `onlysavemevods.service` against the existing config, state,
+downloads, cache, venv, and Deno directories. If both install directories
+already exist, it leaves `/opt/ytdlbot` untouched and uses `/opt/onlysavemevods`.
 
 On AlmaLinux/RHEL-like systems, the installer will use `dnf` to install OS
 dependencies where possible, including Python 3.11+, FFmpeg, DejaVu Sans fonts,
@@ -77,51 +84,58 @@ a system `yt-dlp` package is not required. It also installs a project-local Deno
 runtime under `.deno/` because yt-dlp's current YouTube support uses EJS
 challenge solver scripts with an external JavaScript runtime. If
 `transcribe_subtitles = true` is set in `config.toml`, the installer also
-installs `whisperx` into the project venv. Set `YTDLBOT_INSTALL_WHISPERX=1` to
-force that install or `YTDLBOT_INSTALL_WHISPERX=0` to skip it.
+installs `whisperx` into the project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to
+force that install or `ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it.
 
-To install somewhere other than `/opt/ytdlbot`:
+To install somewhere other than `/opt/onlysavemevods`:
 
 ```bash
-YTDLBOT_INSTALL_DIR=/srv/ytdlbot scripts/install-systemd.sh
+ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods scripts/install-systemd.sh
 ```
 
 To skip OS package installation and only use what is already present:
 
 ```bash
-YTDLBOT_SKIP_OS_DEPS=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_OS_DEPS=1 scripts/install-systemd.sh
 ```
 
 To install OS packages but skip NVIDIA driver/NVENC package installation:
 
 ```bash
-YTDLBOT_SKIP_NVIDIA_DEPS=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1 scripts/install-systemd.sh
 ```
 
 To skip Deno installation because you already provide a supported runtime on
 `PATH`:
 
 ```bash
-YTDLBOT_SKIP_DENO=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_DENO=1 scripts/install-systemd.sh
 ```
 
 To install WhisperX even before transcription is enabled in `config.toml`:
 
 ```bash
-YTDLBOT_INSTALL_WHISPERX=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-systemd.sh
 ```
 
 To update a config file manually without changing existing values:
 
 ```bash
-.venv/bin/ytdlbot update-config --config config.toml --defaults config.example.toml
+.venv/bin/onlysavemevods update-config --config config.toml --defaults config.example.toml
 ```
+
+The old `ytdlbot` command, `python -m ytdlbot`, and `YTDLBOT_*` installer
+environment variables remain available as compatibility aliases. Fresh installs
+use the `onlysavemevods` names by default.
+If installer output still says it installed `ytdlbot.service` or built
+`ytdlbot==0.1.0`, the old installer script was run; run this updated
+`scripts/install-systemd.sh` instead.
 
 Inspect it:
 
 ```bash
-sudo systemctl status ytdlbot.service
-journalctl -u ytdlbot.service -f
+sudo systemctl status onlysavemevods.service
+journalctl -u onlysavemevods.service -f
 ```
 
 Set `log_level = "DEBUG"` in `config.toml` and restart the service when you need
@@ -183,7 +197,7 @@ scripts/uninstall-systemd.sh
   `chat_render_nvenc_devices = ["0", "1"]` to rotate chat renders across
   multiple GPUs. The systemd installer can install NVIDIA/NVENC packages on
   supported DNF systems when NVIDIA PCI hardware is detected. At runtime,
-  YTDLBot only detects NVIDIA GPUs and FFmpeg NVENC support and logs what it
+  ONLYSAVEmeVODS only detects NVIDIA GPUs and FFmpeg NVENC support and logs what it
   finds.
 - Set `transcribe_subtitles = true` to run WhisperX after each stream is
   finalized. It writes speech subtitle/transcript sidecars next to the media
@@ -195,7 +209,7 @@ scripts/uninstall-systemd.sh
   `whisperx_compute_type = "float16"`. Leave
   `transcription_max_concurrent = 1` for a single GPU. The systemd service
   stores Hugging Face, NLTK, and Matplotlib runtime caches under
-  `/opt/ytdlbot/.cache`.
+  `/opt/onlysavemevods/.cache`.
 - `whisperx_diarize = true` asks WhisperX/pyannote to label speakers as
   `SPEAKER_00`, `SPEAKER_01`, and so on. Diarization usually needs a Hugging
   Face token with the relevant pyannote model terms accepted; set the token in
@@ -209,29 +223,31 @@ scripts/uninstall-systemd.sh
 - Set `watermark_enabled = true` to enable private, per-recipient invisible
   video watermark copies from the dashboard. Originals are left untouched.
   Before queueing or detecting copies, set the environment variable named by
-  `watermark_secret_env` (default `YTDLBOT_WATERMARK_SECRET`) to a long random
+  `watermark_secret_env` (default `ONLYSAVEMEVODS_WATERMARK_SECRET`) to a long random
   secret and keep it with your backups; detection requires both the secret and
   the SQLite copy records. One easy way to generate one is:
 
   ```bash
-  export YTDLBOT_WATERMARK_SECRET="$(openssl rand -base64 48)"
+  export ONLYSAVEMEVODS_WATERMARK_SECRET="$(openssl rand -base64 48)"
   ```
 
-  The systemd installer creates `${YTDLBOT_INSTALL_DIR:-/opt/ytdlbot}/secrets.env`
-  with a generated `YTDLBOT_WATERMARK_SECRET` if that file does not already
+  The systemd installer creates `${ONLYSAVEMEVODS_INSTALL_DIR:-/opt/onlysavemevods}/secrets.env`
+  with a generated `ONLYSAVEMEVODS_WATERMARK_SECRET` if that file does not already
   exist, and the service loads it with `EnvironmentFile`. Back up this file with
-  `config.toml` and `state/ytdlbot.sqlite3`; losing the secret means old
-  watermark copies cannot be detected. To create or rotate it manually, put the
-  generated value in that persistent environment file:
+  `config.toml` and `state/onlysavemevods.sqlite3`; losing the secret means old
+  watermark copies cannot be detected. If the new default secret variable is
+  unset, the app also checks the legacy `YTDLBOT_WATERMARK_SECRET` variable. To
+  create or rotate it manually, put the generated value in that persistent
+  environment file:
 
   ```ini
-  YTDLBOT_WATERMARK_SECRET=replace-with-the-generated-secret
+  ONLYSAVEMEVODS_WATERMARK_SECRET=replace-with-the-generated-secret
   ```
 
   Watermarked copies are written below each stream
   folder in `.watermarks/` and are served through a separate dashboard link.
   The detector is available from the dashboard and as
-  `.venv/bin/ytdlbot detect-watermark --config config.toml --media suspect.mp4`.
+  `.venv/bin/onlysavemevods detect-watermark --config config.toml --media suspect.mp4`.
   Use a video slice when possible: 30-120 seconds is best, 10-30 seconds is
   usually enough, and screenshots are not supported for confident attribution.
 - Planned reconnects are disabled by default with `reconnect_interval_seconds =
@@ -260,4 +276,7 @@ scripts/uninstall-systemd.sh
   duplicate active processes without accidentally blocking a false-exit restart.
 - The systemd installer only removes/replaces the root-owned app copy during
   updates; uninstalling the service leaves config, downloads, state, venv, Deno,
-  and the `ytdlbot` user in place.
+  and the `onlysavemevods` user in place.
+- If `state/onlysavemevods.sqlite3` does not exist but the legacy
+  `state/ytdlbot.sqlite3` file does, ONLYSAVEmeVODS uses the legacy database so
+  existing state survives the rename.

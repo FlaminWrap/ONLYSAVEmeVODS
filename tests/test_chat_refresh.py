@@ -4,14 +4,14 @@ from unittest.mock import patch
 import subprocess
 import unittest
 
-from ytdlbot.chat_refresh import (
+from onlysavemevods.chat_refresh import (
     build_chat_replay_download_command,
     refresh_chat_from_replay,
     refresh_chat_sidecar,
     sync_recorded_live_chat,
 )
-from ytdlbot.chat_render import parse_live_chat_file
-from ytdlbot.config import BotConfig
+from onlysavemevods.chat_render import parse_live_chat_file
+from onlysavemevods.config import BotConfig
 
 
 def live_chat_line(offset_ms: int, timestamp_us: int, message: str = "hello") -> str:
@@ -78,7 +78,7 @@ class ChatRefreshTests(unittest.TestCase):
             chat_file.write_text(live_chat_line(0, origin_us + 50_000_000), encoding="utf-8")
             config = BotConfig(download_dir=Path(tmp))
 
-            with patch("ytdlbot.chat_refresh.subprocess.run", side_effect=fake_run):
+            with patch("onlysavemevods.chat_refresh.subprocess.run", side_effect=fake_run):
                 result = refresh_chat_from_replay(
                     config,
                     video_url="https://www.youtube.com/watch?v=LIVEVIDEO01",
@@ -103,7 +103,7 @@ class ChatRefreshTests(unittest.TestCase):
             chat_file.write_text(live_chat_line(0, origin_us + 50_000_000), encoding="utf-8")
             config = BotConfig(download_dir=Path(tmp))
 
-            with patch("ytdlbot.chat_refresh.probe_video_duration", return_value=100.0):
+            with patch("onlysavemevods.chat_refresh.probe_video_duration", return_value=100.0):
                 result = sync_recorded_live_chat(
                     config,
                     media_file=media_file,
@@ -133,8 +133,8 @@ class ChatRefreshTests(unittest.TestCase):
             config = BotConfig(download_dir=Path(tmp))
 
             with (
-                patch("ytdlbot.chat_refresh.subprocess.run", side_effect=fake_run),
-                patch("ytdlbot.chat_refresh.probe_video_duration", return_value=100.0),
+                patch("onlysavemevods.chat_refresh.subprocess.run", side_effect=fake_run),
+                patch("onlysavemevods.chat_refresh.probe_video_duration", return_value=100.0),
             ):
                 result = refresh_chat_sidecar(
                     config,

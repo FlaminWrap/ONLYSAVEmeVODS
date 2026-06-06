@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from ytdlbot.state import StateStore
+from onlysavemevods.state import StateStore
 
 
 class StateWatermarkTests(unittest.TestCase):

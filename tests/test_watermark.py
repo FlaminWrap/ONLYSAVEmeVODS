@@ -1,12 +1,15 @@
 from pathlib import Path
+from unittest.mock import patch
 import unittest
 
-from ytdlbot.state import WatermarkCopyRecord
-from ytdlbot.watermark import (
+from onlysavemevods.config import BotConfig
+from onlysavemevods.state import WatermarkCopyRecord
+from onlysavemevods.watermark import (
     build_audio_mux_command,
     derive_pattern,
     score_watermark_records,
     validate_recipient_label,
+    watermark_secret,
     watermarked_output_name,
 )
 
@@ -61,6 +64,16 @@ class WatermarkTests(unittest.TestCase):
             name,
             ".watermarks/Live [LIVEVIDEO01] - wm-abcdef1234.mp4",
         )
+
+    def test_watermark_secret_falls_back_to_legacy_env_var(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"YTDLBOT_WATERMARK_SECRET": "legacy-secret"},
+            clear=True,
+        ):
+            secret = watermark_secret(BotConfig())
+
+        self.assertEqual(secret, "legacy-secret")
 
     def test_recipient_label_is_required_and_normalized(self) -> None:
         self.assertEqual(validate_recipient_label("  Alice   Example  "), "Alice Example")

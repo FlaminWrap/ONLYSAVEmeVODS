@@ -2,7 +2,7 @@ import unittest
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from ytdlbot.youtube import (
+from onlysavemevods.youtube import (
     TerminalVideoUnavailableError,
     YoutubeProbe,
     YtDlpRunner,

@@ -5,12 +5,12 @@ import json
 import logging
 import unittest
 
-from ytdlbot.config import BotConfig
-from ytdlbot.chat_refresh import ChatRefreshResult
-from ytdlbot.log_buffer import RingBufferLogHandler, clear_log_buffer
-from ytdlbot.models import LiveStream, video_url
-from ytdlbot.state import StateStore
-from ytdlbot.web import (
+from onlysavemevods.config import BotConfig
+from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
+from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.state import StateStore
+from onlysavemevods.web import (
     build_config_summary,
     build_status_snapshot,
     chat_media_file_for_chat_file,
@@ -228,6 +228,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("render_live_chat_video", html)
         self.assertIn("tab-config", html)
         self.assertIn("config-stack", html)
+        self.assertIn("onlysavemevods.dashboardTab", html)
+        self.assertIn("onlysavemevods.collapsedStreams", html)
+        self.assertIn("onlysavemevods.expandedStreams", html)
         self.assertIn("ytdlbot.dashboardTab", html)
         self.assertIn("ytdlbot.collapsedStreams", html)
         self.assertIn("ytdlbot.expandedStreams", html)
@@ -604,7 +607,7 @@ class WebStatusTests(unittest.TestCase):
                 )
 
             try:
-                with patch("ytdlbot.web.refresh_chat_sidecar", fake_refresh):
+                with patch("onlysavemevods.web.refresh_chat_sidecar", fake_refresh):
                     run_refresh_chat_job(config, key, record, media_file, chat_file)
                 chat_text = chat_file.read_text(encoding="utf-8")
                 output_text = output_file.read_text(encoding="utf-8")
@@ -680,7 +683,7 @@ class WebStatusTests(unittest.TestCase):
             transcribe = AsyncMock(return_value=True)
 
             try:
-                with patch("ytdlbot.web.transcribe_media_file", transcribe):
+                with patch("onlysavemevods.web.transcribe_media_file", transcribe):
                     run_transcription_job(config, key, media_file, regenerate=True)
                 with TRANSCRIPTION_JOBS_LOCK:
                     job = TRANSCRIPTION_JOBS[key]
@@ -733,7 +736,7 @@ class WebStatusTests(unittest.TestCase):
             )
             state.close()
 
-            with patch.dict("os.environ", {"YTDLBOT_WATERMARK_SECRET": "secret"}):
+            with patch.dict("os.environ", {"ONLYSAVEMEVODS_WATERMARK_SECRET": "secret"}):
                 snapshot = build_status_snapshot(config)
                 html = render_status_html(snapshot)
             resolved = resolve_watermark_download_file(config, "wm_copy001")
@@ -782,7 +785,7 @@ class WebStatusTests(unittest.TestCase):
         config = BotConfig(chat_render_nvenc_devices=["0", "1", "2"])
 
         with patch(
-            "ytdlbot.web.detect_nvidia_devices",
+            "onlysavemevods.web.detect_nvidia_devices",
             return_value=["0: NVIDIA A2", "1: NVIDIA A2"],
         ):
             summary = build_config_summary(config)

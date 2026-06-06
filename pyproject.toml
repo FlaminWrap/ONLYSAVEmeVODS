@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "ytdlbot"
+name = "onlysavemevods"
 version = "0.1.0"
 description = "Watch YouTube channels and automatically record live streams with yt-dlp."
 readme = "README.md"
@@ -16,7 +16,8 @@ dependencies = [
 ]
 
 [project.scripts]
-ytdlbot = "ytdlbot.cli:main"
+onlysavemevods = "onlysavemevods.cli:main"
+ytdlbot = "onlysavemevods.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

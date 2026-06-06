@@ -4,11 +4,11 @@ import asyncio
 import logging
 import unittest
 
-from ytdlbot.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
-from ytdlbot.downloader import DownloadManager
-from ytdlbot.models import LiveStream, video_url
-from ytdlbot.state import StateStore
-from ytdlbot.youtube import TerminalVideoUnavailableError
+from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
+from onlysavemevods.downloader import DownloadManager
+from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.state import StateStore
+from onlysavemevods.youtube import TerminalVideoUnavailableError
 
 
 NULL_LOGGER = logging.getLogger("tests.null")

@@ -5,9 +5,9 @@ import asyncio
 import json
 import unittest
 
-from ytdlbot.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
-from ytdlbot.chat_refresh import ChatRefreshResult
-from ytdlbot.downloader import (
+from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
+from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.downloader import (
     DownloadManager,
     build_chat_download_command,
     build_download_command,
@@ -21,8 +21,8 @@ from ytdlbot.downloader import (
     restore_mixed_segment_for_resume,
     segment_part_files,
 )
-from ytdlbot.models import LiveStream, video_url
-from ytdlbot.state import StateStore
+from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.state import StateStore
 
 
 class NullLogger:
@@ -626,8 +626,8 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with (
-                    patch("ytdlbot.downloader.refresh_chat_sidecar", fake_refresh),
-                    patch("ytdlbot.downloader.asyncio.to_thread", fake_to_thread),
+                    patch("onlysavemevods.downloader.refresh_chat_sidecar", fake_refresh),
+                    patch("onlysavemevods.downloader.asyncio.to_thread", fake_to_thread),
                 ):
                     await manager.finish_ended_stream(stream, 1)
             finally:
@@ -663,7 +663,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             transcribe = AsyncMock(return_value=True)
 
             try:
-                with patch("ytdlbot.downloader.transcribe_media_file", transcribe):
+                with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
                     await manager.finish_ended_stream(stream, 1)
             finally:
                 state.close()

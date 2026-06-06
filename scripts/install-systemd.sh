@@ -3,7 +3,29 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
-INSTALL_DIR="${YTDLBOT_INSTALL_DIR:-/opt/ytdlbot}"
+STAGED_ROOT_DIR=""
+LEGACY_INSTALL_DIR="/opt/ytdlbot"
+LEGACY_SERVICE_NAME="ytdlbot.service"
+LEGACY_UNIT_FILE="/etc/systemd/system/${LEGACY_SERVICE_NAME}"
+DEFAULT_INSTALL_DIR="/opt/onlysavemevods"
+MIGRATING_LEGACY_INSTALL=0
+MOVING_LEGACY_INSTALL=0
+
+if [[ -n "${ONLYSAVEMEVODS_INSTALL_DIR:-}" ]]; then
+  INSTALL_DIR="${ONLYSAVEMEVODS_INSTALL_DIR}"
+elif [[ -n "${YTDLBOT_INSTALL_DIR:-}" ]]; then
+  INSTALL_DIR="${YTDLBOT_INSTALL_DIR}"
+elif [[ -d "${LEGACY_INSTALL_DIR}" && ! -e "${DEFAULT_INSTALL_DIR}" ]]; then
+  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
+  MIGRATING_LEGACY_INSTALL=1
+  MOVING_LEGACY_INSTALL=1
+elif [[ -d "${LEGACY_INSTALL_DIR}" || -f "${LEGACY_UNIT_FILE}" ]]; then
+  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
+  MIGRATING_LEGACY_INSTALL=1
+else
+  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
+fi
+
 APP_DIR="${INSTALL_DIR}/app"
 VENV_DIR="${INSTALL_DIR}/.venv"
 DENO_INSTALL_DIR="${INSTALL_DIR}/.deno"
@@ -12,18 +34,107 @@ DOWNLOAD_DIR="${INSTALL_DIR}/downloads"
 STATE_DIR="${INSTALL_DIR}/state"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SECRETS_FILE="${INSTALL_DIR}/secrets.env"
-SERVICE_NAME="ytdlbot.service"
+SERVICE_NAME="onlysavemevods.service"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
-SERVICE_USER="${YTDLBOT_USER:-ytdlbot}"
+SERVICE_USER="${ONLYSAVEMEVODS_USER:-${YTDLBOT_USER:-onlysavemevods}}"
 PYTHON_BIN="${PYTHON:-}"
-SKIP_OS_DEPS="${YTDLBOT_SKIP_OS_DEPS:-0}"
-SKIP_DENO="${YTDLBOT_SKIP_DENO:-0}"
-SKIP_NVIDIA_DEPS="${YTDLBOT_SKIP_NVIDIA_DEPS:-0}"
-INSTALL_WHISPERX="${YTDLBOT_INSTALL_WHISPERX:-auto}"
+SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-${YTDLBOT_SKIP_OS_DEPS:-0}}"
+SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-${YTDLBOT_SKIP_DENO:-0}}"
+SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-${YTDLBOT_SKIP_NVIDIA_DEPS:-0}}"
+INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-${YTDLBOT_INSTALL_WHISPERX:-auto}}"
 
 die() {
   echo "$*" >&2
   exit 1
+}
+
+cleanup_staged_source() {
+  if [[ -n "${STAGED_ROOT_DIR}" && -d "${STAGED_ROOT_DIR}" ]]; then
+    rm -rf "${STAGED_ROOT_DIR}"
+  fi
+}
+
+stage_source_if_inside_install_tree() {
+  case "${ROOT_DIR}/" in
+    "${INSTALL_DIR}/"*|"${LEGACY_INSTALL_DIR}/"*)
+      STAGED_ROOT_DIR="$(mktemp -d)"
+      echo "Staging installer source from ${ROOT_DIR} to ${STAGED_ROOT_DIR}"
+      cp -a "${ROOT_DIR}/." "${STAGED_ROOT_DIR}/"
+      ROOT_DIR="${STAGED_ROOT_DIR}"
+      SCRIPT_DIR="${ROOT_DIR}/scripts"
+      trap cleanup_staged_source EXIT
+      ;;
+  esac
+}
+
+prepare_legacy_service_migration() {
+  if [[ "${MIGRATING_LEGACY_INSTALL}" != "1" ]]; then
+    return 0
+  fi
+
+  echo "Detected legacy ${LEGACY_SERVICE_NAME}; migrating service to ${SERVICE_NAME} in ${INSTALL_DIR}"
+  sudo systemctl stop "${LEGACY_SERVICE_NAME}" >/dev/null 2>&1 || true
+  sudo systemctl disable "${LEGACY_SERVICE_NAME}" >/dev/null 2>&1 || true
+  if [[ "${MOVING_LEGACY_INSTALL}" == "1" ]]; then
+    if [[ -e "${DEFAULT_INSTALL_DIR}" ]]; then
+      die "Cannot move ${LEGACY_INSTALL_DIR}: ${DEFAULT_INSTALL_DIR} already exists"
+    fi
+    echo "Moving ${LEGACY_INSTALL_DIR} to ${DEFAULT_INSTALL_DIR}"
+    sudo mv "${LEGACY_INSTALL_DIR}" "${DEFAULT_INSTALL_DIR}"
+  elif [[ -d "${LEGACY_INSTALL_DIR}" && "${INSTALL_DIR}" != "${LEGACY_INSTALL_DIR}" ]]; then
+    echo "Legacy ${LEGACY_INSTALL_DIR} left untouched because ${INSTALL_DIR} already exists or was selected"
+  fi
+  sudo rm -f "${LEGACY_UNIT_FILE}"
+  sudo systemctl daemon-reload
+}
+
+fix_migrated_writable_ownership() {
+  if [[ "${MIGRATING_LEGACY_INSTALL}" != "1" ]]; then
+    return 0
+  fi
+
+  local service_group
+  service_group="$(id -gn "${SERVICE_USER}")"
+  for path in "${CACHE_DIR}" "${DOWNLOAD_DIR}" "${STATE_DIR}"; do
+    if [[ -d "${path}" ]]; then
+      sudo chown -R "${SERVICE_USER}:${service_group}" "${path}"
+    fi
+  done
+}
+
+script_has_missing_shebang_interpreter() {
+  local script="$1"
+  local shebang
+  local interpreter
+
+  if [[ ! -f "${script}" ]]; then
+    return 1
+  fi
+
+  IFS= read -r shebang < "${script}" || return 1
+  if [[ "${shebang}" != '#!'* ]]; then
+    return 1
+  fi
+
+  interpreter="${shebang#\#!}"
+  interpreter="${interpreter%% *}"
+  if [[ "${interpreter}" == "/usr/bin/env" ]]; then
+    return 1
+  fi
+  [[ -n "${interpreter}" && ! -e "${interpreter}" ]]
+}
+
+refresh_console_script_if_stale() {
+  local package_spec="$1"
+  local script="$2"
+  local label="$3"
+
+  if ! script_has_missing_shebang_interpreter "${script}"; then
+    return 0
+  fi
+
+  echo "Refreshing ${label} console script after venv path migration..."
+  sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall --no-deps "${package_spec}"
 }
 
 python_is_supported() {
@@ -77,7 +188,7 @@ ensure_service_user() {
     --system \
     --home-dir "${INSTALL_DIR}" \
     --shell "${nologin_shell}" \
-    --comment "YTDLBot service user" \
+    --comment "ONLYSAVEmeVODS service user" \
     "${SERVICE_USER}"
 }
 
@@ -142,6 +253,12 @@ generate_watermark_secret() {
 install_or_preserve_secrets_file() {
   if [[ -f "${SECRETS_FILE}" ]]; then
     echo "Keeping existing ${SECRETS_FILE}"
+    if [[ "${MIGRATING_LEGACY_INSTALL}" == "1" ]]; then
+      local service_group
+      service_group="$(id -gn "${SERVICE_USER}")"
+      sudo chown root:"${service_group}" "${SECRETS_FILE}"
+      sudo chmod 0640 "${SECRETS_FILE}"
+    fi
     return 0
   fi
 
@@ -152,8 +269,9 @@ install_or_preserve_secrets_file() {
 
   sudo install -m 0640 -o root -g "${service_group}" /dev/null "${SECRETS_FILE}"
   sudo tee "${SECRETS_FILE}" >/dev/null <<EOF
-# YTDLBot service secrets. Back this file up with config.toml and state/.
-# Losing YTDLBOT_WATERMARK_SECRET prevents detecting old watermark copies.
+# ONLYSAVEmeVODS service secrets. Back this file up with config.toml and state/.
+# Losing ONLYSAVEMEVODS_WATERMARK_SECRET prevents detecting old watermark copies.
+ONLYSAVEMEVODS_WATERMARK_SECRET=${secret}
 YTDLBOT_WATERMARK_SECRET=${secret}
 EOF
   sudo chown root:"${service_group}" "${SECRETS_FILE}"
@@ -265,7 +383,7 @@ install_or_refresh_ffmpeg_for_nvenc() {
 
 install_nvidia_dependencies_if_detected() {
   if [[ "${SKIP_NVIDIA_DEPS}" == "1" ]]; then
-    echo "Skipping NVIDIA dependency installation because YTDLBOT_SKIP_NVIDIA_DEPS=1"
+    echo "Skipping NVIDIA dependency installation because ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1"
     return 0
   fi
 
@@ -324,7 +442,7 @@ install_nvidia_dependencies_if_detected() {
 
 install_os_dependencies() {
   if [[ "${SKIP_OS_DEPS}" == "1" ]]; then
-    echo "Skipping OS dependency installation because YTDLBOT_SKIP_OS_DEPS=1"
+    echo "Skipping OS dependency installation because ONLYSAVEMEVODS_SKIP_OS_DEPS=1"
     return 0
   fi
 
@@ -359,7 +477,7 @@ install_os_dependencies() {
 
 install_deno_runtime() {
   if [[ "${SKIP_DENO}" == "1" ]]; then
-    echo "Skipping Deno installation because YTDLBOT_SKIP_DENO=1"
+    echo "Skipping Deno installation because ONLYSAVEMEVODS_SKIP_DENO=1"
     return 0
   fi
 
@@ -368,7 +486,7 @@ install_deno_runtime() {
   fi
 
   if ! command -v curl >/dev/null 2>&1; then
-    die "curl is required to install Deno. Rerun without YTDLBOT_SKIP_OS_DEPS=1 or install curl first."
+    die "curl is required to install Deno. Rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 or install curl first."
   fi
 
   echo "Installing Deno runtime for yt-dlp EJS support..."
@@ -388,7 +506,7 @@ install_deno_runtime() {
 
 config_enables_transcription() {
   sudo "${VENV_DIR}/bin/python" -c '
-from ytdlbot.config import load_config
+from onlysavemevods.config import load_config
 config = load_config("'"${CONFIG_FILE}"'")
 raise SystemExit(0 if config.transcribe_subtitles else 1)
 '
@@ -396,7 +514,7 @@ raise SystemExit(0 if config.transcribe_subtitles else 1)
 
 config_whisperx_path() {
   sudo "${VENV_DIR}/bin/python" -c '
-from ytdlbot.config import load_config
+from onlysavemevods.config import load_config
 print(load_config("'"${CONFIG_FILE}"'").whisperx_path)
 '
 }
@@ -414,7 +532,7 @@ should_install_whisperx() {
       return $?
       ;;
     *)
-      die "YTDLBOT_INSTALL_WHISPERX must be auto, 1, or 0"
+      die "ONLYSAVEMEVODS_INSTALL_WHISPERX must be auto, 1, or 0"
       ;;
   esac
 }
@@ -424,13 +542,14 @@ install_whisperx_if_needed() {
     if [[ "${INSTALL_WHISPERX}" == "auto" || -z "${INSTALL_WHISPERX}" ]]; then
       echo "Transcription disabled; skipping WhisperX installation"
     else
-      echo "Skipping WhisperX installation because YTDLBOT_INSTALL_WHISPERX=${INSTALL_WHISPERX}"
+      echo "Skipping WhisperX installation because ONLYSAVEMEVODS_INSTALL_WHISPERX=${INSTALL_WHISPERX}"
     fi
     return 0
   fi
 
   echo "Installing WhisperX into ${VENV_DIR}..."
   sudo "${VENV_DIR}/bin/python" -m pip install --upgrade whisperx
+  refresh_console_script_if_stale "whisperx" "${VENV_DIR}/bin/whisperx" "WhisperX"
   sudo chown -R root:root "${VENV_DIR}"
   sudo chmod -R a+rX "${VENV_DIR}"
 
@@ -444,34 +563,43 @@ install_whisperx_if_needed() {
   fi
 }
 
+stage_source_if_inside_install_tree
+prepare_legacy_service_migration
 install_os_dependencies
 
 if ! find_python; then
-  die "Python 3.11+ is required. On AlmaLinux, rerun without YTDLBOT_SKIP_OS_DEPS=1 so the installer can install python3.11+."
+  die "Python 3.11+ is required. On AlmaLinux, rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can install python3.11+."
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  die "ffmpeg is required but was not found. On AlmaLinux, rerun without YTDLBOT_SKIP_OS_DEPS=1 so the installer can enable RPM Fusion and install it."
+  die "ffmpeg is required but was not found. On AlmaLinux, rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can enable RPM Fusion and install it."
 fi
 
 install_deno_runtime
 ensure_service_user
 install_application_files
+fix_migrated_writable_ownership
 
 cd "${APP_DIR}"
 sudo "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 
 sudo "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
 sudo "${VENV_DIR}/bin/python" -m pip install --upgrade "yt-dlp[default]"
+refresh_console_script_if_stale "yt-dlp[default]" "${VENV_DIR}/bin/yt-dlp" "yt-dlp"
 
 if ! sudo "${VENV_DIR}/bin/python" -m pip install --editable "${APP_DIR}"; then
   echo "pip editable install failed; falling back to local .pth wrapper install" >&2
   SITE_PACKAGES="$("${VENV_DIR}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-  printf '%s\n' "${APP_DIR}/src" | sudo tee "${SITE_PACKAGES}/ytdlbot-local.pth" >/dev/null
+  printf '%s\n' "${APP_DIR}/src" | sudo tee "${SITE_PACKAGES}/onlysavemevods-local.pth" >/dev/null
+  sudo tee "${VENV_DIR}/bin/onlysavemevods" >/dev/null <<EOF
+#!/usr/bin/env bash
+PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\${PYTHONPATH}}" exec "${VENV_DIR}/bin/python" -m onlysavemevods "\$@"
+EOF
   sudo tee "${VENV_DIR}/bin/ytdlbot" >/dev/null <<EOF
 #!/usr/bin/env bash
 PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\${PYTHONPATH}}" exec "${VENV_DIR}/bin/python" -m ytdlbot "\$@"
 EOF
+  sudo chmod +x "${VENV_DIR}/bin/onlysavemevods"
   sudo chmod +x "${VENV_DIR}/bin/ytdlbot"
 fi
 sudo chown -R root:root "${VENV_DIR}"
@@ -480,19 +608,19 @@ sudo chmod -R a+rX "${VENV_DIR}"
 "${VENV_DIR}/bin/yt-dlp" --version >/dev/null
 ffmpeg -version >/dev/null
 if ! find_deno; then
-  die "Deno 2.0+ is required for yt-dlp EJS support. Remove YTDLBOT_SKIP_DENO=1 or install Deno 2.0+ on PATH."
+  die "Deno 2.0+ is required for yt-dlp EJS support. Remove ONLYSAVEMEVODS_SKIP_DENO=1 or install Deno 2.0+ on PATH."
 fi
 
 install_or_preserve_config
 install_or_preserve_secrets_file
-sudo "${VENV_DIR}/bin/python" -m ytdlbot update-config \
+sudo "${VENV_DIR}/bin/python" -m onlysavemevods update-config \
   --config "${CONFIG_FILE}" \
   --defaults "${APP_DIR}/config.example.toml"
 install_whisperx_if_needed
 
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
 [Unit]
-Description=YTDLBot YouTube live stream downloader
+Description=ONLYSAVEmeVODS YouTube live stream downloader
 After=network-online.target
 Wants=network-online.target
 
@@ -508,7 +636,7 @@ Environment=MPLCONFIGDIR=${CACHE_DIR}/matplotlib
 Environment=NLTK_DATA=${CACHE_DIR}/nltk_data
 Environment=PATH=${VENV_DIR}/bin:${DENO_INSTALL_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
 EnvironmentFile=${SECRETS_FILE}
-ExecStart=${VENV_DIR}/bin/ytdlbot run --config ${CONFIG_FILE}
+ExecStart=${VENV_DIR}/bin/onlysavemevods run --config ${CONFIG_FILE}
 Restart=always
 RestartSec=15
 KillSignal=SIGINT
@@ -530,5 +658,12 @@ sudo systemctl restart "${SERVICE_NAME}"
 echo "Installed and restarted ${SERVICE_NAME}"
 echo "Install dir: ${INSTALL_DIR}"
 echo "Service user: ${SERVICE_USER}"
+if [[ "${MIGRATING_LEGACY_INSTALL}" == "1" ]]; then
+  if [[ "${MOVING_LEGACY_INSTALL}" == "1" ]]; then
+    echo "Migrated legacy ${LEGACY_SERVICE_NAME}; moved ${LEGACY_INSTALL_DIR} to ${DEFAULT_INSTALL_DIR}."
+  else
+    echo "Migrated legacy ${LEGACY_SERVICE_NAME}; old unit removed, legacy data directory left in place."
+  fi
+fi
 echo "Status: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:   journalctl -u ${SERVICE_NAME} -f"

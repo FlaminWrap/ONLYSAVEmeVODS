@@ -6,9 +6,9 @@ from unittest.mock import patch
 import json
 import unittest
 
-from ytdlbot.cli import main
-from ytdlbot.state import StateStore
-from ytdlbot.watermark import DetectionCandidate, DetectionResult
+from onlysavemevods.cli import main
+from onlysavemevods.state import StateStore
+from onlysavemevods.watermark import DetectionCandidate, DetectionResult
 
 
 class CliWatermarkTests(unittest.TestCase):
@@ -39,7 +39,7 @@ class CliWatermarkTests(unittest.TestCase):
             )
             media = root / "suspect.mp4"
             media.write_text("video", encoding="utf-8")
-            state = StateStore(root / "state" / "ytdlbot.sqlite3")
+            state = StateStore(root / "state" / "onlysavemevods.sqlite3")
             state.create_watermark_copy(
                 copy_id="wm_copy001",
                 video_id="LIVEVIDEO01",
@@ -77,7 +77,7 @@ class CliWatermarkTests(unittest.TestCase):
             output = StringIO()
             with (
                 patch.dict("os.environ", {"TEST_WATERMARK_SECRET": "secret"}),
-                patch("ytdlbot.cli.detect_watermark", return_value=detection),
+                patch("onlysavemevods.cli.detect_watermark", return_value=detection),
                 redirect_stdout(output),
             ):
                 result = main(

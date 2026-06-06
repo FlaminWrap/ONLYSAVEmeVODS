@@ -3,8 +3,8 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from ytdlbot.config import BotConfig
-from ytdlbot.transcription import (
+from onlysavemevods.config import BotConfig
+from onlysavemevods.transcription import (
     build_whisperx_command,
     command_for_log,
     existing_transcription_outputs,
@@ -68,21 +68,21 @@ class TranscriptionTests(unittest.TestCase):
     def test_whisperx_process_env_passes_tokens_without_command_line(self) -> None:
         with patch.dict(
             "os.environ",
-            {"XDG_CACHE_HOME": "/tmp/ytdlbot-cache"},
+            {"XDG_CACHE_HOME": "/tmp/onlysavemevods-cache"},
             clear=True,
         ):
             env = whisperx_process_env("hf_secret_token_value")
 
         self.assertEqual(env["HF_TOKEN"], "hf_secret_token_value")
         self.assertEqual(env["HUGGINGFACE_HUB_TOKEN"], "hf_secret_token_value")
-        self.assertEqual(env["MPLCONFIGDIR"], "/tmp/ytdlbot-cache/matplotlib")
-        self.assertEqual(env["NLTK_DATA"], "/tmp/ytdlbot-cache/nltk_data")
+        self.assertEqual(env["MPLCONFIGDIR"], "/tmp/onlysavemevods-cache/matplotlib")
+        self.assertEqual(env["NLTK_DATA"], "/tmp/onlysavemevods-cache/nltk_data")
 
     def test_whisperx_process_env_keeps_existing_cache_env_values(self) -> None:
         with patch.dict(
             "os.environ",
             {
-                "XDG_CACHE_HOME": "/tmp/ytdlbot-cache",
+                "XDG_CACHE_HOME": "/tmp/onlysavemevods-cache",
                 "MPLCONFIGDIR": "/tmp/custom-matplotlib",
                 "NLTK_DATA": "/tmp/custom-nltk",
             },

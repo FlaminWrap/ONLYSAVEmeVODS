@@ -7,7 +7,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from ytdlbot.chat_render import (
+from onlysavemevods.chat_render import (
     ASS_CHAT_TEXT_COLOR,
     ASS_EMOJI_COLORS,
     build_chat_panel_merge_command,
@@ -80,7 +80,7 @@ class ChatRenderTests(unittest.TestCase):
             stdout = "0, NVIDIA RTX 4090\n1, NVIDIA RTX 3090\n"
             stderr = ""
 
-        with patch("ytdlbot.chat_render.subprocess.run", return_value=Result()):
+        with patch("onlysavemevods.chat_render.subprocess.run", return_value=Result()):
             devices = detect_nvidia_devices()
 
         self.assertEqual(devices, ["0: NVIDIA RTX 4090", "1: NVIDIA RTX 3090"])
@@ -91,7 +91,7 @@ class ChatRenderTests(unittest.TestCase):
             stdout = " V..... h264_nvenc NVIDIA NVENC H.264 encoder\n"
             stderr = ""
 
-        with patch("ytdlbot.chat_render.subprocess.run", return_value=Result()):
+        with patch("onlysavemevods.chat_render.subprocess.run", return_value=Result()):
             self.assertTrue(ffmpeg_supports_h264_nvenc("ffmpeg"))
 
     def test_parse_live_chat_json_lines(self) -> None:
@@ -435,8 +435,8 @@ class ChatRenderTests(unittest.TestCase):
             ]
 
             with (
-                patch("ytdlbot.chat_render.ProcessPoolExecutor", InlineProcessPoolExecutor),
-                patch("ytdlbot.chat_render.subprocess.run", side_effect=fake_run),
+                patch("onlysavemevods.chat_render.ProcessPoolExecutor", InlineProcessPoolExecutor),
+                patch("onlysavemevods.chat_render.subprocess.run", side_effect=fake_run),
             ):
                 render_chat_panel_video(
                     entries,
@@ -674,11 +674,11 @@ class ChatRenderTests(unittest.TestCase):
 
             with (
                 patch(
-                    "ytdlbot.chat_render.probe_video_dimensions",
+                    "onlysavemevods.chat_render.probe_video_dimensions",
                     side_effect=VideoProbeError("no probe"),
                 ),
-                patch("ytdlbot.chat_render.LOGGER.exception"),
-                patch("ytdlbot.chat_render.subprocess.run", side_effect=fake_run),
+                patch("onlysavemevods.chat_render.LOGGER.exception"),
+                patch("onlysavemevods.chat_render.subprocess.run", side_effect=fake_run),
             ):
                 result = render_chat_video_file(
                     media_file,
