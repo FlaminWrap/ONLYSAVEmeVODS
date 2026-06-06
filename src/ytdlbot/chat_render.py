@@ -163,6 +163,7 @@ CHAT_AUTHOR_COLORS = (
 CHAT_PANEL_FPS = 30
 DEFAULT_CHAT_RENDER_TIMEOUT_SECONDS = 60 * 60
 KIRKLAND_TIME_ZONE = "America/Los_Angeles"
+CHAT_SYNC_WARNING_THRESHOLD_SECONDS = 10.0
 
 
 LOGGER = logging.getLogger(__name__)
@@ -913,6 +914,44 @@ def render_chat_panel_video(
         )
 
     return True
+
+
+def log_chat_media_sync_diagnostics(
+    entries: Sequence[ChatEntry],
+    duration_seconds: float,
+    *,
+    media_file: Path,
+    chat_file: Path,
+    logger: logging.Logger = LOGGER,
+) -> None:
+    if not entries or duration_seconds <= 0:
+        return
+
+    first_offset = entries[0].offset_seconds
+    last_offset = entries[-1].offset_seconds
+    tail_gap = duration_seconds - last_offset
+    logger.info(
+        "Chat/media timing media=%s chat=%s duration=%.2fs "
+        "first_chat=%.2fs last_chat=%.2fs tail_gap=%.2fs",
+        media_file,
+        chat_file,
+        duration_seconds,
+        first_offset,
+        last_offset,
+        tail_gap,
+    )
+    if first_offset > CHAT_SYNC_WARNING_THRESHOLD_SECONDS:
+        logger.warning(
+            "Chat starts %.2fs after media start for %s; messages may be missing or delayed",
+            first_offset,
+            chat_file,
+        )
+    if tail_gap > CHAT_SYNC_WARNING_THRESHOLD_SECONDS:
+        logger.warning(
+            "Chat ends %.2fs before media end for %s; live chat may need refresh or sync",
+            tail_gap,
+            chat_file,
+        )
 
 
 def resolve_chat_render_panel_workers(
@@ -2148,6 +2187,12 @@ def render_chat_video_file(
             layout.output_width,
             layout.output_height,
             layout.panel_width,
+        )
+        log_chat_media_sync_diagnostics(
+            entries,
+            duration,
+            media_file=media_file,
+            chat_file=chat_file,
         )
     except VideoProbeError:
         LOGGER.exception(

@@ -31,6 +31,7 @@ from ytdlbot.chat_render import (
     ass_color_from_rgb,
     format_ass_time,
     load_chat_panel_fonts,
+    log_chat_media_sync_diagnostics,
     panel_emoji_size,
     panel_emoji_y,
     panel_line_height,
@@ -208,6 +209,35 @@ class ChatRenderTests(unittest.TestCase):
         self.assertTrue(entries[0].tokens[1].is_emoji)
         self.assertEqual(entries[0].tokens[1].image_url, "")
         self.assertTrue(entries[0].tokens[3].is_emoji)
+
+    def test_chat_media_sync_diagnostics_warn_when_chat_ends_early(self) -> None:
+        class Logger:
+            def __init__(self) -> None:
+                self.infos: list[tuple[object, ...]] = []
+                self.warnings: list[tuple[object, ...]] = []
+
+            def info(self, *args: object) -> None:
+                self.infos.append(args)
+
+            def warning(self, *args: object) -> None:
+                self.warnings.append(args)
+
+        logger = Logger()
+
+        log_chat_media_sync_diagnostics(
+            [
+                ChatEntry(offset_seconds=0.0, author="Alice", message="first"),
+                ChatEntry(offset_seconds=50.0, author="Bob", message="last"),
+            ],
+            100.0,
+            media_file=Path("/tmp/live.mp4"),
+            chat_file=Path("/tmp/live.live_chat.json"),
+            logger=logger,  # type: ignore[arg-type]
+        )
+
+        self.assertTrue(logger.infos)
+        self.assertTrue(logger.warnings)
+        self.assertIn("Chat ends", str(logger.warnings[0][0]))
 
     def test_render_chat_ass_places_messages_in_right_panel(self) -> None:
         layout = chat_layout_for_video(1280, 720)

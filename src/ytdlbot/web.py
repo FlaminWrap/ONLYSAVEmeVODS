@@ -30,6 +30,7 @@ from .chat_render import (
     detect_nvidia_devices,
     render_chat_video_file,
 )
+from .chat_refresh import refresh_chat_sidecar
 from .config import BotConfig
 from .downloader import (
     command_for_log,
@@ -87,6 +88,8 @@ STATUS_LABELS = {
 }
 CHAT_RENDER_JOBS: dict[str, RenderChatJob] = {}
 CHAT_RENDER_JOBS_LOCK = Lock()
+CHAT_REFRESH_JOBS: dict[str, RefreshChatJob] = {}
+CHAT_REFRESH_JOBS_LOCK = Lock()
 TRANSCRIPTION_JOBS: dict[str, TranscriptionJob] = {}
 TRANSCRIPTION_JOBS_LOCK = Lock()
 WATERMARK_JOB_STATUSES = {
@@ -120,6 +123,9 @@ class FileStatus:
     render_chat_output_url: str | None
     render_chat_status: str | None
     render_chat_message: str | None
+    refresh_chat_url: str | None
+    refresh_chat_status: str | None
+    refresh_chat_message: str | None
     transcription_url: str | None
     transcription_status: str | None
     transcription_message: str | None
@@ -149,6 +155,17 @@ class RenderChatJob:
     chat_name: str
     media_name: str
     output_name: str
+    status: str
+    message: str
+    started_at: float
+    finished_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RefreshChatJob:
+    video_id: str
+    chat_name: str
+    media_name: str
     status: str
     message: str
     started_at: float
@@ -339,6 +356,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if parts.path == "/render-chat":
                 self._start_render_chat(parts.query)
                 return
+            if parts.path == "/refresh-chat":
+                self._start_refresh_chat(parts.query)
+                return
             if parts.path == "/transcribe":
                 self._start_transcription(parts.query)
                 return
@@ -423,6 +443,22 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 chat_name,
                 regenerate=regenerate,
             )
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streams")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _start_refresh_chat(self, query: str) -> None:
+            self._discard_request_body()
+            params = parse_qs(query)
+            video_id = first_query_value(params, "video_id")
+            chat_name = first_query_value(params, "chat")
+            ok, message = start_refresh_chat_job(config, video_id, chat_name)
             if not ok:
                 self.send_error(HTTPStatus.BAD_REQUEST, message)
                 return
@@ -832,6 +868,7 @@ def stream_status_from_record(
 ) -> StreamStatus:
     directory = segment_directory(config, record.video_id, record.channel)
     files = summarize_files(
+        config,
         directory,
         record.video_id,
         config.watermark_enabled and bool(watermark_secret(config)),
@@ -883,6 +920,7 @@ def stream_status_from_record(
 
 
 def summarize_files(
+    config: BotConfig,
     directory: Path,
     video_id: str,
     watermark_enabled: bool = False,
@@ -906,6 +944,9 @@ def summarize_files(
         details = file_details(path.name)
         render_chat_url, render_chat_output_url, render_chat_status, render_chat_message = (
             chat_render_action_for_file(directory, video_id, path.name)
+        )
+        refresh_chat_url, refresh_chat_status, refresh_chat_message = (
+            chat_refresh_action_for_file(config, directory, video_id, path.name)
         )
         transcription_url, transcription_status, transcription_message = (
             transcription_action_for_file(directory, video_id, path.name)
@@ -931,6 +972,9 @@ def summarize_files(
                 render_chat_output_url=render_chat_output_url,
                 render_chat_status=render_chat_status,
                 render_chat_message=render_chat_message,
+                refresh_chat_url=refresh_chat_url,
+                refresh_chat_status=refresh_chat_status,
+                refresh_chat_message=refresh_chat_message,
                 transcription_url=transcription_url,
                 transcription_status=transcription_status,
                 transcription_message=transcription_message,
@@ -957,6 +1001,10 @@ def render_chat_url_for(
     if regenerate:
         params["regenerate"] = "1"
     return "/render-chat?" + urlencode(params)
+
+
+def refresh_chat_url_for(video_id: str, chat_filename: str) -> str:
+    return "/refresh-chat?" + urlencode({"video_id": video_id, "chat": chat_filename})
 
 
 def transcription_url_for(
@@ -1169,6 +1217,40 @@ def resolve_render_chat_files(
     video_id: str,
     chat_filename: str,
 ) -> tuple[Path, Path, Path] | None:
+    resolved = resolve_chat_sidecar_files(config, video_id, chat_filename)
+    if resolved is None:
+        return None
+    _record, media_file, chat_path = resolved
+    output_file = chat_video_output_file(media_file)
+    return media_file, chat_path, output_file
+
+
+def resolve_refresh_chat_files(
+    config: BotConfig,
+    video_id: str,
+    chat_filename: str,
+) -> tuple[StreamRecord, Path, Path] | None:
+    resolved = resolve_chat_sidecar_files(
+        config,
+        video_id,
+        chat_filename,
+        strict_media_match=True,
+    )
+    if resolved is None:
+        return None
+    record, media_file, chat_path = resolved
+    if record.status != "ended":
+        return None
+    return record, media_file, chat_path
+
+
+def resolve_chat_sidecar_files(
+    config: BotConfig,
+    video_id: str,
+    chat_filename: str,
+    *,
+    strict_media_match: bool = False,
+) -> tuple[StreamRecord, Path, Path] | None:
     if not video_id or not chat_filename:
         return None
     if Path(chat_filename).name != chat_filename or "/" in chat_filename or "\\" in chat_filename:
@@ -1195,14 +1277,22 @@ def resolve_render_chat_files(
     if chat_path.parent != directory_path or not chat_path.is_file():
         return None
 
-    media_file = chat_media_file_for_chat_file(directory_path, chat_path.name)
+    media_file = chat_media_file_for_chat_file(
+        directory_path,
+        chat_path.name,
+        allow_single_media_fallback=not strict_media_match,
+    )
     if media_file is None:
         return None
-    output_file = chat_video_output_file(media_file)
-    return media_file, chat_path, output_file
+    return record, media_file, chat_path
 
 
-def chat_media_file_for_chat_file(directory: Path, chat_filename: str) -> Path | None:
+def chat_media_file_for_chat_file(
+    directory: Path,
+    chat_filename: str,
+    *,
+    allow_single_media_fallback: bool = True,
+) -> Path | None:
     if not is_live_chat_file(chat_filename):
         return None
     if not (directory / chat_filename).is_file():
@@ -1212,13 +1302,14 @@ def chat_media_file_for_chat_file(directory: Path, chat_filename: str) -> Path |
         candidate = directory / f"{stem}{suffix}"
         if candidate.is_file() and is_renderable_media_file(candidate.name):
             return candidate
-    candidates = sorted(
-        path
-        for path in directory.iterdir()
-        if path.is_file() and is_renderable_media_file(path.name)
-    )
-    if len(candidates) == 1:
-        return candidates[0]
+    if allow_single_media_fallback:
+        candidates = sorted(
+            path
+            for path in directory.iterdir()
+            if path.is_file() and is_renderable_media_file(path.name)
+        )
+        if len(candidates) == 1:
+            return candidates[0]
     return None
 
 
@@ -1269,6 +1360,27 @@ def chat_render_action_for_file(
     if job is not None and job.status == "failed":
         return render_chat_url_for(video_id, filename), None, "failed", job.message
     return render_chat_url_for(video_id, filename), None, "ready", None
+
+
+def chat_refresh_action_for_file(
+    config: BotConfig,
+    directory: Path,
+    video_id: str,
+    filename: str,
+) -> tuple[str | None, str | None, str | None]:
+    if not is_live_chat_file(filename):
+        return None, None, None
+    if chat_media_file_for_chat_file(directory, filename) is None:
+        return None, None, None
+    if resolve_refresh_chat_files(config, video_id, filename) is None:
+        return None, None, None
+
+    job = refresh_chat_job_for(video_id, filename)
+    if job is not None and job.status == "running":
+        return None, "running", job.message
+    if job is not None and job.status == "failed":
+        return refresh_chat_url_for(video_id, filename), "failed", job.message
+    return refresh_chat_url_for(video_id, filename), "ready", None
 
 
 def transcription_action_for_file(
@@ -1349,6 +1461,100 @@ def start_render_chat_job(
         chat_file.name,
     )
     return True, "Chat regeneration queued" if regenerate else "Chat render queued"
+
+
+def start_refresh_chat_job(
+    config: BotConfig,
+    video_id: str,
+    chat_filename: str,
+) -> tuple[bool, str]:
+    resolved = resolve_refresh_chat_files(config, video_id, chat_filename)
+    if resolved is None:
+        return False, "No matching finalized video and live chat file found"
+
+    record, media_file, chat_file = resolved
+    key = refresh_chat_job_key(video_id, chat_file.name)
+    now = time.time()
+    with CHAT_REFRESH_JOBS_LOCK:
+        existing = CHAT_REFRESH_JOBS.get(key)
+        if existing is not None and existing.status == "running":
+            return True, "Chat refresh is already running"
+        CHAT_REFRESH_JOBS[key] = RefreshChatJob(
+            video_id=video_id,
+            chat_name=chat_file.name,
+            media_name=media_file.name,
+            status="running",
+            message="Refreshing chat",
+            started_at=now,
+        )
+
+    thread = Thread(
+        target=run_refresh_chat_job,
+        args=(config, key, record, media_file, chat_file),
+        name=f"ytdlbot-chat-refresh-{video_id}",
+        daemon=True,
+    )
+    thread.start()
+    LOGGER.info(
+        "Queued manual chat refresh for %s using media=%s chat=%s",
+        video_id,
+        media_file.name,
+        chat_file.name,
+    )
+    return True, "Chat refresh queued"
+
+
+def run_refresh_chat_job(
+    config: BotConfig,
+    key: str,
+    record: StreamRecord,
+    media_file: Path,
+    chat_file: Path,
+) -> None:
+    try:
+        result = refresh_chat_sidecar(
+            config,
+            video_url=record.url,
+            media_file=media_file,
+            chat_file=chat_file,
+            last_exit_at=record.last_exit_at,
+            logger=LOGGER,
+        )
+    except Exception as exc:  # noqa: BLE001 - web job should capture refresh failures.
+        LOGGER.exception(
+            "Manual chat refresh failed for media=%s chat=%s",
+            media_file,
+            chat_file,
+        )
+        update_refresh_chat_job(
+            key,
+            status="failed",
+            message=str(exc) or exc.__class__.__name__,
+            finished_at=time.time(),
+        )
+        return
+
+    if not result.ok:
+        update_refresh_chat_job(
+            key,
+            status="failed",
+            message=result.message,
+            finished_at=time.time(),
+        )
+        return
+
+    LOGGER.info(
+        "Manual chat refresh completed chat=%s source=%s message=%s",
+        chat_file,
+        result.source,
+        result.message,
+    )
+    update_refresh_chat_job(
+        key,
+        status="done",
+        message=result.message,
+        finished_at=time.time(),
+    )
 
 
 def run_render_chat_job(
@@ -1515,6 +1721,15 @@ def chat_render_job_for(video_id: str, chat_filename: str) -> RenderChatJob | No
         return CHAT_RENDER_JOBS.get(chat_render_job_key(video_id, chat_filename))
 
 
+def refresh_chat_job_key(video_id: str, chat_filename: str) -> str:
+    return f"{video_id}\0{chat_filename}"
+
+
+def refresh_chat_job_for(video_id: str, chat_filename: str) -> RefreshChatJob | None:
+    with CHAT_REFRESH_JOBS_LOCK:
+        return CHAT_REFRESH_JOBS.get(refresh_chat_job_key(video_id, chat_filename))
+
+
 def update_render_chat_job(key: str, **changes: Any) -> None:
     with CHAT_RENDER_JOBS_LOCK:
         job = CHAT_RENDER_JOBS.get(key)
@@ -1525,6 +1740,22 @@ def update_render_chat_job(key: str, **changes: Any) -> None:
             chat_name=changes.get("chat_name", job.chat_name),
             media_name=changes.get("media_name", job.media_name),
             output_name=changes.get("output_name", job.output_name),
+            status=changes.get("status", job.status),
+            message=changes.get("message", job.message),
+            started_at=changes.get("started_at", job.started_at),
+            finished_at=changes.get("finished_at", job.finished_at),
+        )
+
+
+def update_refresh_chat_job(key: str, **changes: Any) -> None:
+    with CHAT_REFRESH_JOBS_LOCK:
+        job = CHAT_REFRESH_JOBS.get(key)
+        if job is None:
+            return
+        CHAT_REFRESH_JOBS[key] = RefreshChatJob(
+            video_id=changes.get("video_id", job.video_id),
+            chat_name=changes.get("chat_name", job.chat_name),
+            media_name=changes.get("media_name", job.media_name),
             status=changes.get("status", job.status),
             message=changes.get("message", job.message),
             started_at=changes.get("started_at", job.started_at),
@@ -2400,6 +2631,15 @@ def dashboard_script() -> str:
     if (file.download_url) {
       actions.push(`<a class="download" href="${escapeAttr(file.download_url)}">Download</a>`);
     }
+    if (file.refresh_chat_status === "running") {
+      actions.push('<span class="action-note">Refreshing chat</span>');
+    } else if (file.refresh_chat_url) {
+      const label = file.refresh_chat_status === "failed" ? "Retry refresh" : "Refresh chat";
+      actions.push(`<form class="inline-form" method="post" action="${escapeAttr(file.refresh_chat_url)}"><button class="download action-button" type="submit" title="Redownload chat replay or sync the recorded chat sidecar">${label}</button></form>`);
+      if (file.refresh_chat_status === "failed" && file.refresh_chat_message) {
+        actions.push(`<span class="action-note" title="${escapeAttr(file.refresh_chat_message)}">Refresh failed</span>`);
+      }
+    }
     if (file.render_chat_output_url) {
       actions.push(`<a class="download" href="${escapeAttr(file.render_chat_output_url)}">Chat video</a>`);
     } else if (file.render_chat_status === "rendering") {
@@ -2815,6 +3055,24 @@ def render_file_action(file: FileStatus) -> str:
             f'<a class="download" href="{escape(file.download_url, quote=True)}">'
             "Download</a>"
         )
+    if file.refresh_chat_status == "running":
+        actions.append('<span class="action-note">Refreshing chat</span>')
+    elif file.refresh_chat_url:
+        label = "Retry refresh" if file.refresh_chat_status == "failed" else "Refresh chat"
+        title = ' title="Redownload chat replay or sync the recorded chat sidecar"'
+        actions.append(
+            '<form class="inline-form" method="post" '
+            f'action="{escape(file.refresh_chat_url, quote=True)}">'
+            f'<button class="download action-button" type="submit"{title}>'
+            f"{escape(label)}</button>"
+            "</form>"
+        )
+        if file.refresh_chat_status == "failed" and file.refresh_chat_message:
+            actions.append(
+                '<span class="action-note" '
+                f'title="{escape(file.refresh_chat_message, quote=True)}">'
+                "Refresh failed</span>"
+            )
     if file.render_chat_output_url:
         actions.append(
             '<a class="download" '

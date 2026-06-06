@@ -6,6 +6,7 @@ import logging
 import unittest
 
 from ytdlbot.config import BotConfig
+from ytdlbot.chat_refresh import ChatRefreshResult
 from ytdlbot.log_buffer import RingBufferLogHandler, clear_log_buffer
 from ytdlbot.models import LiveStream, video_url
 from ytdlbot.state import StateStore
@@ -18,11 +19,17 @@ from ytdlbot.web import (
     is_watermarkable_media_file,
     render_file_action,
     render_status_html,
+    resolve_refresh_chat_files,
     resolve_watermark_download_file,
     resolve_transcription_source_file,
     resolve_render_chat_files,
     resolve_download_file,
+    run_refresh_chat_job,
     run_transcription_job,
+    refresh_chat_job_key,
+    RefreshChatJob,
+    CHAT_REFRESH_JOBS,
+    CHAT_REFRESH_JOBS_LOCK,
     snapshot_to_dict,
     transcription_job_key,
     TranscriptionJob,
@@ -410,6 +417,203 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Regenerate chat video", action)
         self.assertIn("Re-render and replace the existing chat video", action)
         self.assertNotIn("Chat video", action)
+
+    def test_chat_refresh_action_is_available_for_finalized_chat(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            output_file = segment_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+            output_file.write_text("rendered", encoding="utf-8")
+
+            snapshot = build_status_snapshot(config)
+            resolved_bad = resolve_refresh_chat_files(
+                config,
+                "LIVEVIDEO01",
+                "../Live Status [LIVEVIDEO01].live_chat.json",
+            )
+            unmatched_chat = segment_dir / "Different [LIVEVIDEO01].live_chat.json"
+            unmatched_chat.write_text("chat", encoding="utf-8")
+            resolved_unmatched = resolve_refresh_chat_files(
+                config,
+                "LIVEVIDEO01",
+                unmatched_chat.name,
+            )
+            rendered_text = output_file.read_text(encoding="utf-8")
+
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertIsNone(resolved_bad)
+        self.assertIsNone(resolved_unmatched)
+        self.assertIsNotNone(chat_status.refresh_chat_url)
+        self.assertIn("/refresh-chat?", chat_status.refresh_chat_url or "")
+        action = render_file_action(chat_status)
+        self.assertIn("Refresh chat", action)
+        self.assertIn("Regenerate chat video", action)
+        self.assertEqual(rendered_text, "rendered")
+
+    def test_chat_refresh_action_is_hidden_until_stream_is_ended(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+
+            snapshot = build_status_snapshot(config)
+            resolved = resolve_refresh_chat_files(config, "LIVEVIDEO01", chat_file.name)
+
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertIsNone(resolved)
+        self.assertIsNone(chat_status.refresh_chat_url)
+
+    def test_chat_refresh_action_shows_running_state(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+            key = refresh_chat_job_key("LIVEVIDEO01", chat_file.name)
+            with CHAT_REFRESH_JOBS_LOCK:
+                CHAT_REFRESH_JOBS[key] = RefreshChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name=chat_file.name,
+                    media_name=media_file.name,
+                    status="running",
+                    message="Refreshing chat",
+                    started_at=0,
+                )
+
+            try:
+                snapshot = build_status_snapshot(config)
+            finally:
+                with CHAT_REFRESH_JOBS_LOCK:
+                    CHAT_REFRESH_JOBS.pop(key, None)
+
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertEqual(chat_status.refresh_chat_status, "running")
+        self.assertIn("Refreshing chat", render_file_action(chat_status))
+
+    def test_manual_chat_refresh_does_not_overwrite_rendered_chat_video(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
+            state.mark_ended(stream.video_id)
+            record = state.get_stream(stream.video_id)
+            state.close()
+            assert record is not None
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            output_file = segment_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("old chat", encoding="utf-8")
+            output_file.write_text("rendered", encoding="utf-8")
+            key = refresh_chat_job_key(stream.video_id, chat_file.name)
+            with CHAT_REFRESH_JOBS_LOCK:
+                CHAT_REFRESH_JOBS[key] = RefreshChatJob(
+                    video_id=stream.video_id,
+                    chat_name=chat_file.name,
+                    media_name=media_file.name,
+                    status="running",
+                    message="Refreshing chat",
+                    started_at=0,
+                )
+
+            def fake_refresh(*_args: object, **_kwargs: object) -> ChatRefreshResult:
+                chat_file.write_text("new chat", encoding="utf-8")
+                return ChatRefreshResult(
+                    ok=True,
+                    changed=True,
+                    source="replay",
+                    message="Refreshed",
+                )
+
+            try:
+                with patch("ytdlbot.web.refresh_chat_sidecar", fake_refresh):
+                    run_refresh_chat_job(config, key, record, media_file, chat_file)
+                chat_text = chat_file.read_text(encoding="utf-8")
+                output_text = output_file.read_text(encoding="utf-8")
+            finally:
+                with CHAT_REFRESH_JOBS_LOCK:
+                    CHAT_REFRESH_JOBS.pop(key, None)
+
+        self.assertEqual(chat_text, "new chat")
+        self.assertEqual(output_text, "rendered")
 
     def test_transcription_action_can_retranscribe_existing_sidecars(self) -> None:
         with TemporaryDirectory() as tmp:

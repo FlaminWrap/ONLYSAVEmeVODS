@@ -21,12 +21,14 @@ from .chat_render import (
     chat_video_output_file,
     choose_chat_render_nvenc_device,
     ffprobe_path_for,
+    log_chat_media_sync_diagnostics,
     parse_live_chat_file,
     probe_video_dimensions,
     probe_video_duration,
     render_chat_panel_video,
     write_chat_ass_file,
 )
+from .chat_refresh import refresh_chat_sidecar
 from .config import BotConfig
 from .models import LiveStream
 from .state import StateStore
@@ -763,6 +765,8 @@ class DownloadManager:
             stream.channel,
         )
         finalized_files = self.rename_finalized_segments(stream, segment_index)
+        if should_record_chat(self.config):
+            await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
         if self.config.transcribe_subtitles:
             await self.transcribe_finalized_media(finalized_files)
@@ -809,6 +813,40 @@ class DownloadManager:
                 files.chat_file,
                 files.segment_index,
             )
+
+    async def refresh_finalized_chat_files(
+        self,
+        stream: LiveStream,
+        finalized_files: list[FinalizedSegmentFiles],
+    ) -> None:
+        record = self.state.get_stream(stream.video_id)
+        last_exit_at = record.last_exit_at if record else None
+        for files in finalized_files:
+            if files.media_file is None or files.chat_file is None:
+                continue
+            result = await asyncio.to_thread(
+                refresh_chat_sidecar,
+                self.config,
+                video_url=stream.url,
+                media_file=files.media_file,
+                chat_file=files.chat_file,
+                last_exit_at=last_exit_at,
+                stream_metadata=stream.raw,
+                logger=self.logger,
+            )
+            if result.ok:
+                self.logger.info(
+                    "Chat refresh completed segment=%03d source=%s message=%s",
+                    files.segment_index,
+                    result.source,
+                    result.message,
+                )
+            else:
+                self.logger.warning(
+                    "Chat refresh unavailable segment=%03d message=%s",
+                    files.segment_index,
+                    result.message,
+                )
 
     async def transcribe_finalized_media(
         self,
@@ -908,6 +946,13 @@ class DownloadManager:
                 layout.output_width,
                 layout.output_height,
                 layout.panel_width,
+            )
+            log_chat_media_sync_diagnostics(
+                entries,
+                duration,
+                media_file=media_file,
+                chat_file=chat_file,
+                logger=self.logger,
             )
         except VideoProbeError:
             layout = None

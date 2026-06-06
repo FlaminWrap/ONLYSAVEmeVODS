@@ -6,6 +6,7 @@ import json
 import unittest
 
 from ytdlbot.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
+from ytdlbot.chat_refresh import ChatRefreshResult
 from ytdlbot.downloader import (
     DownloadManager,
     build_chat_download_command,
@@ -579,6 +580,67 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finish_ended_stream_refreshes_chat_before_optional_render(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
+            (segment_dir / "segment-001.live_chat.json").write_text("chat", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            calls: list[tuple[Path, Path, str | None]] = []
+
+            def fake_refresh(
+                _config: BotConfig,
+                *,
+                video_url: str,
+                media_file: Path,
+                chat_file: Path,
+                last_exit_at: str | None,
+                **_kwargs: object,
+            ) -> ChatRefreshResult:
+                calls.append((media_file, chat_file, last_exit_at))
+                return ChatRefreshResult(
+                    ok=True,
+                    changed=True,
+                    source="replay",
+                    message="Refreshed",
+                )
+
+            async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
+                assert callable(func)
+                return func(*args, **kwargs)
+
+            try:
+                with (
+                    patch("ytdlbot.downloader.refresh_chat_sidecar", fake_refresh),
+                    patch("ytdlbot.downloader.asyncio.to_thread", fake_to_thread),
+                ):
+                    await manager.finish_ended_stream(stream, 1)
+            finally:
+                state.close()
+
+            media_file = segment_dir / "Late Night Stream [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "Late Night Stream [LIVEVIDEO01].live_chat.json"
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], media_file)
+        self.assertEqual(calls[0][1], chat_file)
+        self.assertIsNotNone(calls[0][2])
+
     async def test_finish_ended_stream_transcribes_named_media_file(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
