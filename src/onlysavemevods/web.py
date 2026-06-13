@@ -1801,9 +1801,18 @@ def is_renderable_media_file(name: str) -> bool:
         return False
     if name.endswith(CHAT_RENDER_OUTPUT_SUFFIX):
         return False
+    if is_rendering_temporary_file(name):
+        return False
     if Path(name).suffix.lower() not in CHAT_RENDER_MEDIA_SUFFIXES:
         return False
     return is_downloadable_file(name)
+
+
+def is_rendering_temporary_file(name: str) -> bool:
+    path = Path(name)
+    return path.suffix.lower() in CHAT_RENDER_MEDIA_SUFFIXES and path.stem.endswith(
+        ".rendering"
+    )
 
 
 def is_watermarkable_media_file(name: str) -> bool:
@@ -3017,7 +3026,7 @@ def file_kind(name: str) -> str:
         return "state"
     if is_live_chat_file(name):
         return "chat"
-    if is_yt_dlp_temporary_file(name):
+    if is_yt_dlp_temporary_file(name) or is_rendering_temporary_file(name):
         return "temporary"
     return "final"
 

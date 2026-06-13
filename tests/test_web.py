@@ -1363,6 +1363,7 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertTrue(is_watermarkable_media_file(media_file.name))
         self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01].live_chat.json"))
+        self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01] - chat.rendering.mp4"))
         stream_status = snapshot.streams[0]
         final_file = next(file for file in stream_status.files if file.name == media_file.name)
         self.assertIsNotNone(final_file.watermark_url)
@@ -1380,6 +1381,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(file_kind("segment-001.mp4.part-Frag1"), "fragment")
         self.assertEqual(file_kind("segment-001.live_chat.json"), "chat")
         self.assertEqual(file_kind("segment-001.timing.json"), "state")
+        self.assertEqual(file_kind("Live Status [LIVEVIDEO01] - chat.rendering.mp4"), "temporary")
         self.assertEqual(format_bytes(1536), "1.5 KiB")
 
     def test_config_summary_redacts_sensitive_extra_args(self) -> None:
