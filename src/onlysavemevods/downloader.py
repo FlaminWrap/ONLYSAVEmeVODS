@@ -40,7 +40,6 @@ from .chat_timing import (
 from .config import BotConfig
 from .models import LiveStream
 from .state import StateStore
-from .shot_audit import maybe_run_auto_shot_audit
 from .transcription import transcribe_media_file
 from .youtube import TerminalVideoUnavailableError, YoutubeProbe
 
@@ -802,7 +801,6 @@ class DownloadManager:
             await self.transcribe_finalized_media(finalized_files)
         if self.config.render_live_chat_video:
             await self.render_finalized_chat_videos(finalized_files)
-        await self.run_auto_shot_audits(stream, finalized_files)
 
     def rename_finalized_segments(
         self,
@@ -955,43 +953,6 @@ class DownloadManager:
                     self.config,
                     files.media_file,
                     logger=self.logger,
-                )
-
-    async def run_auto_shot_audits(
-        self,
-        stream: LiveStream,
-        finalized_files: list[FinalizedSegmentFiles],
-    ) -> None:
-        if not self.config.shot_audit_enabled or not self.config.shot_audit_auto_run:
-            return
-        for files in finalized_files:
-            if files.media_file is None:
-                continue
-            chat_video_file = chat_video_output_file(files.media_file)
-            result = await asyncio.to_thread(
-                maybe_run_auto_shot_audit,
-                self.config,
-                video_id=stream.video_id,
-                media_file=files.media_file,
-                chat_file=files.chat_file,
-                chat_video_file=chat_video_file,
-                title=stream.title,
-                channel=stream.channel,
-                logger=self.logger,
-            )
-            if result.ran:
-                self.logger.info(
-                    "Auto shot audit completed video_id=%s project=%s message=%s",
-                    stream.video_id,
-                    result.project_id,
-                    result.message,
-                )
-            else:
-                self.logger.info(
-                    "Auto shot audit skipped video_id=%s media=%s message=%s",
-                    stream.video_id,
-                    files.media_file.name,
-                    result.message,
                 )
 
     async def render_live_chat_video(

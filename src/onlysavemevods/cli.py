@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import __version__ as APP_VERSION
 from .chat_render import (
     choose_chat_render_nvenc_device,
     log_nvenc_environment,
@@ -73,6 +74,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="count",
         default=0,
         help="Increase log verbosity.",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {APP_VERSION}",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)

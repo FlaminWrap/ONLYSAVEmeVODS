@@ -6,9 +6,20 @@ from unittest.mock import patch
 import json
 import unittest
 
+from onlysavemevods import __version__
 from onlysavemevods.cli import main
 from onlysavemevods.state import StateStore
 from onlysavemevods.watermark import DetectionCandidate, DetectionResult
+
+
+class CliVersionTests(unittest.TestCase):
+    def test_version_flag_prints_app_version(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaises(SystemExit) as raised:
+            main(["--version"])
+
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn(__version__, output.getvalue())
 
 
 class CliWatermarkTests(unittest.TestCase):

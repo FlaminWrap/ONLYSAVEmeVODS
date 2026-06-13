@@ -116,26 +116,3 @@ watermark_strength = "invisible"
 
 # Maximum suspect video upload size accepted by the local dashboard detector.
 watermark_detect_upload_max_bytes = 2147483648
-
-# Automatically estimate donation-triggered shots after streams are finalized.
-# This is a machine-estimated audit aid, not legal proof of fraud. OCR reads
-# on-screen donation alert/message overlays from the video, not chat messages.
-# Configurable rules turn donations into owed shots, and transcript/video
-# heuristics estimate likely consumed shots.
-shot_audit_enabled = false
-shot_audit_auto_run = false
-shot_audit_require_transcription = true
-shot_audit_require_chat_video = true
-shot_audit_ocr_backend = "tesseract" # tesseract or paddleocr
-shot_audit_ocr_device = "auto"       # auto, cpu, gpu, gpu:0, etc. for paddleocr
-shot_audit_tesseract_path = "tesseract"
-shot_audit_frame_interval_seconds = 0.5
-shot_audit_max_ocr_frames = 900
-shot_audit_visual_detection_enabled = true
-shot_audit_vision_backend = "motion" # motion or yolo_pose
-shot_audit_vision_device = "auto"    # auto, cpu, cuda, 0, etc. for yolo_pose
-shot_audit_yolo_pose_model = "yolo11n-pose.pt"
-shot_audit_visual_frame_interval_seconds = 2.0
-shot_audit_max_visual_frames = 1800
-shot_audit_visual_motion_threshold = 0.035
-shot_audit_rules_file = ""

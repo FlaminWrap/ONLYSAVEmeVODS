@@ -42,6 +42,7 @@ SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-${YTDLBOT_SKIP_OS_DEPS:-0}}"
 SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-${YTDLBOT_SKIP_DENO:-0}}"
 SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-${YTDLBOT_SKIP_NVIDIA_DEPS:-0}}"
 INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-${YTDLBOT_INSTALL_WHISPERX:-auto}}"
+APT_UPDATED=0
 
 die() {
   echo "$*" >&2
@@ -213,6 +214,10 @@ python_is_supported() {
   "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1
 }
 
+python_has_venv() {
+  "$1" -m venv --help >/dev/null 2>&1
+}
+
 deno_is_supported() {
   "$1" eval 'const version = Deno.version.deno.split(".").map(Number); Deno.exit(version[0] >= 2 ? 0 : 1)' >/dev/null 2>&1
 }
@@ -357,6 +362,40 @@ dnf_install() {
 
 try_dnf_install() {
   sudo dnf install -y "$@" >/dev/null 2>&1
+}
+
+apt_update_once() {
+  if [[ "${APT_UPDATED}" == "1" ]]; then
+    return 0
+  fi
+  sudo apt-get update
+  APT_UPDATED=1
+}
+
+apt_install() {
+  apt_update_once
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+}
+
+try_apt_install() {
+  apt_update_once
+  sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" >/dev/null 2>&1
+}
+
+is_ubuntu() {
+  [[ -r /etc/os-release ]] && . /etc/os-release && [[ "${ID:-}" == "ubuntu" ]]
+}
+
+enable_ubuntu_universe_if_available() {
+  if ! is_ubuntu; then
+    return 0
+  fi
+
+  echo "Ensuring Ubuntu universe repository is enabled for FFmpeg..."
+  apt_install software-properties-common
+  sudo add-apt-repository -y universe >/dev/null 2>&1 || true
+  APT_UPDATED=0
+  apt_update_once
 }
 
 enable_almalinux_extra_repos() {
@@ -512,14 +551,32 @@ install_nvidia_dependencies_if_detected() {
   fi
 }
 
-install_os_dependencies() {
-  if [[ "${SKIP_OS_DEPS}" == "1" ]]; then
-    echo "Skipping OS dependency installation because ONLYSAVEMEVODS_SKIP_OS_DEPS=1"
+install_nvidia_dependencies_if_detected_apt() {
+  if [[ "${SKIP_NVIDIA_DEPS}" == "1" ]]; then
+    echo "Skipping NVIDIA dependency checks because ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1"
     return 0
   fi
 
+  if ! has_nvidia_pci_device; then
+    echo "No NVIDIA PCI devices detected; skipping NVIDIA/NVENC dependency notes"
+    return 0
+  fi
+
+  echo "NVIDIA PCI device detected."
+  if ffmpeg_has_any_nvenc; then
+    echo "FFmpeg already advertises NVENC encoders; leaving NVIDIA driver packages unchanged"
+    if ! ffmpeg_has_h264_nvenc; then
+      echo "WARNING: FFmpeg advertises NVENC, but not h264_nvenc required by chat rendering" >&2
+    fi
+    return 0
+  fi
+
+  echo "WARNING: apt-based installer does not install NVIDIA drivers automatically." >&2
+  echo "Install the distro-recommended NVIDIA driver/CUDA encode packages if you want NVENC chat rendering." >&2
+}
+
+install_dnf_os_dependencies() {
   if ! command -v dnf >/dev/null 2>&1; then
-    echo "dnf not found; skipping OS dependency installation"
     return 0
   fi
 
@@ -545,6 +602,83 @@ install_os_dependencies() {
   fi
 
   install_nvidia_dependencies_if_detected
+}
+
+ensure_apt_python_with_venv() {
+  if find_python && python_has_venv "${PYTHON_BIN}"; then
+    return 0
+  fi
+
+  local version
+  for version in 3.13 3.12 3.11; do
+    if try_apt_install "python${version}" "python${version}-venv"; then
+      if command -v "python${version}" >/dev/null 2>&1 && \
+        python_is_supported "python${version}" && \
+        python_has_venv "python${version}"; then
+        PYTHON_BIN="python${version}"
+        return 0
+      fi
+    fi
+  done
+
+  if [[ -n "${PYTHON_BIN}" ]]; then
+    local python_name
+    python_name="${PYTHON_BIN##*/}"
+    case "${python_name}" in
+      python3.13|python3.12|python3.11)
+        try_apt_install "${python_name}-venv" || true
+        ;;
+      python3)
+        try_apt_install python3-venv || true
+        ;;
+    esac
+    if python_is_supported "${PYTHON_BIN}" && python_has_venv "${PYTHON_BIN}"; then
+      return 0
+    fi
+  fi
+
+  apt_install python3 python3-venv python3-pip
+  if command -v python3 >/dev/null 2>&1 && python_is_supported python3 && python_has_venv python3; then
+    PYTHON_BIN="python3"
+    return 0
+  fi
+
+  return 1
+}
+
+install_apt_os_dependencies() {
+  if ! command -v apt-get >/dev/null 2>&1; then
+    return 0
+  fi
+
+  echo "Installing OS dependencies with apt..."
+  apt_install systemd curl ca-certificates unzip fonts-dejavu-core
+
+  if ! ensure_apt_python_with_venv; then
+    echo "WARNING: Could not install or find Python 3.11+ with venv support via apt" >&2
+  fi
+
+  if ! command -v ffmpeg >/dev/null 2>&1; then
+    enable_ubuntu_universe_if_available
+    apt_install ffmpeg
+  fi
+
+  install_nvidia_dependencies_if_detected_apt
+}
+
+install_os_dependencies() {
+  if [[ "${SKIP_OS_DEPS}" == "1" ]]; then
+    echo "Skipping OS dependency installation because ONLYSAVEMEVODS_SKIP_OS_DEPS=1"
+    return 0
+  fi
+
+  if command -v dnf >/dev/null 2>&1; then
+    install_dnf_os_dependencies
+  elif command -v apt-get >/dev/null 2>&1; then
+    install_apt_os_dependencies
+  else
+    echo "No supported OS package manager found; skipping OS dependency installation"
+  fi
 }
 
 install_deno_runtime() {
@@ -640,11 +774,11 @@ prepare_legacy_service_migration
 install_os_dependencies
 
 if ! find_python; then
-  die "Python 3.11+ is required. On AlmaLinux, rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can install python3.11+."
+  die "Python 3.11+ is required. Rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can install Python with dnf/apt, or install Python 3.11+ with venv support manually."
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  die "ffmpeg is required but was not found. On AlmaLinux, rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can enable RPM Fusion and install it."
+  die "ffmpeg is required but was not found. Rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can install it with dnf/apt, or install FFmpeg manually."
 fi
 
 install_deno_runtime

@@ -27,7 +27,6 @@ class ConfigTests(unittest.TestCase):
                 "web_port = 8080\n"
                 "record_live_chat = false\n"
                 "post_exit_check_seconds = [30, 60]\n"
-                "shot_audit_frame_interval_seconds = 0.5\n"
                 'ffmpeg_path = "ffmpeg"\n',
                 encoding="utf-8",
             )
@@ -41,7 +40,6 @@ class ConfigTests(unittest.TestCase):
             [
                 "record_live_chat",
                 "post_exit_check_seconds",
-                "shot_audit_frame_interval_seconds",
                 "ffmpeg_path",
             ],
         )
@@ -51,7 +49,6 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("web_port = 8080", text)
         self.assertIn("record_live_chat = false", text)
         self.assertIn("post_exit_check_seconds = [30, 60]", text)
-        self.assertIn("shot_audit_frame_interval_seconds = 0.5", text)
         self.assertIn('ffmpeg_path = "ffmpeg"', text)
         self.assertEqual(config.channels, ["@Existing"])
         self.assertEqual(config.web_port, 9090)
@@ -114,23 +111,6 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.watermark_secret_env, "ONLYSAVEMEVODS_WATERMARK_SECRET")
         self.assertEqual(config.watermark_strength, "invisible")
         self.assertEqual(config.watermark_detect_upload_max_bytes, 2_147_483_648)
-        self.assertFalse(config.shot_audit_enabled)
-        self.assertFalse(config.shot_audit_auto_run)
-        self.assertTrue(config.shot_audit_require_transcription)
-        self.assertTrue(config.shot_audit_require_chat_video)
-        self.assertEqual(config.shot_audit_ocr_backend, "tesseract")
-        self.assertEqual(config.shot_audit_ocr_device, "auto")
-        self.assertEqual(config.shot_audit_tesseract_path, "tesseract")
-        self.assertEqual(config.shot_audit_frame_interval_seconds, 0.5)
-        self.assertEqual(config.shot_audit_max_ocr_frames, 900)
-        self.assertTrue(config.shot_audit_visual_detection_enabled)
-        self.assertEqual(config.shot_audit_vision_backend, "motion")
-        self.assertEqual(config.shot_audit_vision_device, "auto")
-        self.assertEqual(config.shot_audit_yolo_pose_model, "yolo11n-pose.pt")
-        self.assertEqual(config.shot_audit_visual_frame_interval_seconds, 2.0)
-        self.assertEqual(config.shot_audit_max_visual_frames, 1800)
-        self.assertEqual(config.shot_audit_visual_motion_threshold, 0.035)
-        self.assertIsNone(config.shot_audit_rules_file)
 
     def test_relative_paths_resolve_next_to_config(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -432,34 +412,6 @@ class ConfigTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text('watermark_strength = "loud"\n', encoding="utf-8")
-
-            with self.assertRaises(ConfigError):
-                load_config(config_path)
-
-    def test_shot_audit_gpu_backends_can_be_configured(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
-            config_path.write_text(
-                'shot_audit_ocr_backend = "paddleocr"\n'
-                'shot_audit_ocr_device = "gpu:0"\n'
-                'shot_audit_vision_backend = "yolo_pose"\n'
-                'shot_audit_vision_device = "cuda"\n'
-                'shot_audit_yolo_pose_model = "custom-pose.pt"\n',
-                encoding="utf-8",
-            )
-
-            config = load_config(config_path)
-
-        self.assertEqual(config.shot_audit_ocr_backend, "paddleocr")
-        self.assertEqual(config.shot_audit_ocr_device, "gpu:0")
-        self.assertEqual(config.shot_audit_vision_backend, "yolo_pose")
-        self.assertEqual(config.shot_audit_vision_device, "cuda")
-        self.assertEqual(config.shot_audit_yolo_pose_model, "custom-pose.pt")
-
-    def test_shot_audit_backend_names_must_be_valid(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config_path = Path(tmp) / "config.toml"
-            config_path.write_text('shot_audit_ocr_backend = "cuda"\n', encoding="utf-8")
 
             with self.assertRaises(ConfigError):
                 load_config(config_path)

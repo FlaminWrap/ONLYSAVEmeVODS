@@ -28,9 +28,10 @@ Run continuously:
 The daemon also starts a read-only local dashboard when `web_enabled = true`.
 It shows stream status, storage totals, attention signals, and current segment
 files. Channel and log tabs summarize the configured channels being archived
-and recent in-process service logs, and the config tab shows the currently
-loaded settings with sensitive yt-dlp arguments redacted. Finalized media files
-and sidecars such as live chat and subtitles can be downloaded from the dashboard:
+and recent in-process service logs, the About tab shows the app version and
+runtime details, and the config tab shows the currently loaded settings with
+sensitive yt-dlp arguments redacted. Finalized media files and sidecars such as
+live chat and subtitles can be downloaded from the dashboard:
 
 ```text
 http://127.0.0.1:8080/
@@ -51,6 +52,13 @@ Install and enable the system service:
 scripts/install-systemd.sh
 ```
 
+On Debian or Ubuntu, you can use the distro-named entrypoints instead:
+
+```bash
+scripts/install-debian.sh
+scripts/install-ubuntu.sh
+```
+
 The installer enables and restarts `onlysavemevods.service`, so rerunning it after an
 update makes systemd pick up the newly installed code. It also appends any
 missing top-level settings from the current `config.example.toml` to an existing
@@ -68,24 +76,27 @@ user, and starts `onlysavemevods.service` against the existing config, state,
 downloads, cache, venv, and Deno directories. If both install directories
 already exist, it leaves `/opt/ytdlbot` untouched and uses `/opt/onlysavemevods`.
 
-On AlmaLinux/RHEL-like systems, the installer will use `dnf` to install OS
-dependencies where possible, including Python 3.11+, FFmpeg, DejaVu Sans fonts,
-EPEL, and RPM Fusion. If NVIDIA PCI hardware is detected, it also enables RPM
-Fusion nonfree and attempts to install the NVIDIA driver/CUDA runtime packages
-needed for FFmpeg NVENC (`akmod-nvidia` and `xorg-x11-drv-nvidia-cuda`) only
-when FFmpeg does not already advertise NVENC encoders and `nvidia-smi` is not
-already installed. If FFmpeg already lists NVENC or `nvidia-smi` exists, the
-installer treats the driver stack as user-managed and leaves NVIDIA driver
-packages unchanged. When `nvidia-smi` exists but FFmpeg lacks `h264_nvenc`, the
-installer may refresh FFmpeg and swap `ffmpeg-free` for the full RPM Fusion
-`ffmpeg` package. DejaVu Sans is used by the rendered live chat panel for
-consistent text layout. It installs `yt-dlp[default]` into the project venv, so
-a system `yt-dlp` package is not required. It also installs a project-local Deno
-runtime under `.deno/` because yt-dlp's current YouTube support uses EJS
-challenge solver scripts with an external JavaScript runtime. If
-`transcribe_subtitles = true` is set in `config.toml`, the installer also
-installs `whisperx` into the project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to
-force that install or `ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it.
+The generic installer auto-detects `dnf` or `apt-get` for OS dependencies. On
+Debian/Ubuntu systems, it uses `apt-get` to install systemd, curl, certificates,
+unzip, DejaVu fonts, Python 3.11+ with venv support, and FFmpeg; the Ubuntu
+script also enables the `universe` repository when available for FFmpeg. On
+AlmaLinux/RHEL-like systems, the installer uses `dnf` where possible, including
+Python 3.11+, FFmpeg, DejaVu Sans fonts, EPEL, and RPM Fusion.
+
+For NVIDIA/NVENC, the AlmaLinux/RHEL path can install RPM Fusion NVIDIA
+driver/CUDA runtime packages (`akmod-nvidia` and
+`xorg-x11-drv-nvidia-cuda`) when needed. The Debian/Ubuntu path does not install
+NVIDIA drivers automatically; install the distro-recommended NVIDIA driver and
+encode packages yourself if you want NVENC chat rendering. If FFmpeg already
+advertises NVENC encoders, the installer leaves the driver stack unchanged.
+
+The installer installs `yt-dlp[default]` into the project venv, so a system
+`yt-dlp` package is not required. It also installs a project-local Deno runtime
+under `.deno/` because yt-dlp's current YouTube support uses EJS challenge
+solver scripts with an external JavaScript runtime. If `transcribe_subtitles =
+true` is set in `config.toml`, the installer also installs `whisperx` into the
+project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to force that install or
+`ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it.
 
 To install somewhere other than `/opt/onlysavemevods`:
 
@@ -220,26 +231,6 @@ scripts/uninstall-systemd.sh
 - The dashboard shows `Transcribe` for finalized media without subtitles and
   `Retranscribe` when `.srt`/`.vtt` sidecars already exist. Retranscription
   replaces only the WhisperX subtitle/transcript sidecars for that media file.
-- Set `shot_audit_enabled = true` and `shot_audit_auto_run = true` to create
-  machine-estimated donation/shot audit projects after a stream is finalized,
-  chat is refreshed/rendered, and transcription is complete. The audit samples
-  video frames, uses OCR to read on-screen donation alert/message overlays, not
-  live chat messages, applies configurable shot rules, uses transcript
-  heuristics for likely consumed shots, and can flag visual candidates in
-  donation-following review windows for possible pouring/drinking. Tesseract is
-  the default OCR backend; `shot_audit_ocr_backend = "paddleocr"` can use a
-  PaddleOCR GPU install. The default visual backend is lightweight motion
-  scoring; `shot_audit_vision_backend = "yolo_pose"` can use Ultralytics pose
-  models on a configured CPU/CUDA device. The Python-side optional packages are
-  exposed as extras: `.[shot-audit-ocr]`, `.[shot-audit-vision]`, or
-  `.[shot-audit-gpu]`; install the matching PaddlePaddle CUDA wheel separately
-  if your OCR backend needs GPU acceleration. Projects are saved under
-  `state/shot-audits/` and appear in the dashboard's Shot Audit workspace,
-  where you can attach multiple finalized media files to one project, jump from
-  donation or consumed rows to the matching video timestamp, add or remove
-  visible-shot corrections per media file, delete saved audit projects without
-  deleting downloaded media, and download Markdown, JSON, review CSV, or parody
-  reports. These reports are review aids, not legal proof.
 - Set `watermark_enabled = true` to enable private, per-recipient invisible
   video watermark copies from the dashboard. Originals are left untouched.
   Before queueing or detecting copies, set the environment variable named by

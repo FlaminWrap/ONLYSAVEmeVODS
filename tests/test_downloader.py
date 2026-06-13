@@ -26,7 +26,6 @@ from onlysavemevods.downloader import (
     segment_timing_file,
 )
 from onlysavemevods.models import LiveStream, video_url
-from onlysavemevods.shot_audit import AutoAuditResult
 from onlysavemevods.state import StateStore
 
 
@@ -775,51 +774,3 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             transcribe.assert_awaited_once()
             self.assertEqual(transcribe.await_args.args[0], config)
             self.assertEqual(transcribe.await_args.args[1], target)
-
-    async def test_finish_ended_stream_runs_auto_shot_audit_after_finalize(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-                shot_audit_enabled=True,
-                shot_audit_auto_run=True,
-                shot_audit_require_transcription=False,
-                shot_audit_require_chat_video=False,
-            )
-            stream = LiveStream(
-                video_id="LIVEVIDEO01",
-                url=video_url("LIVEVIDEO01"),
-                title="Late Night Stream",
-                channel="Example Channel",
-            )
-            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
-            segment_dir.mkdir(parents=True)
-            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
-            state = StateStore(config.db_path)
-            state.mark_downloading(stream, 1)
-            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
-            calls: list[dict[str, object]] = []
-
-            def fake_audit(*_args: object, **kwargs: object) -> AutoAuditResult:
-                calls.append(kwargs)
-                return AutoAuditResult(True, "audit-project", "ok")
-
-            async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
-                assert callable(func)
-                return func(*args, **kwargs)
-
-            try:
-                with (
-                    patch("onlysavemevods.downloader.maybe_run_auto_shot_audit", fake_audit),
-                    patch("onlysavemevods.downloader.asyncio.to_thread", fake_to_thread),
-                ):
-                    await manager.finish_ended_stream(stream, 1)
-            finally:
-                state.close()
-
-            target = segment_dir / "Late Night Stream [LIVEVIDEO01].mp4"
-
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0]["video_id"], "LIVEVIDEO01")
-        self.assertEqual(calls[0]["media_file"], target)
-        self.assertEqual(calls[0]["title"], "Late Night Stream")
