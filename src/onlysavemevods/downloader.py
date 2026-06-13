@@ -1340,6 +1340,35 @@ class DownloadManager:
             )
             return segment_index + 1
 
+        if segment_final_format_files(
+            self.config,
+            stream.video_id,
+            segment_index,
+            channel,
+        ):
+            try:
+                restored = restore_mixed_segment_for_resume(
+                    self.config,
+                    stream.video_id,
+                    segment_index,
+                    channel,
+                )
+            except OSError:
+                restored = False
+                self.logger.exception(
+                    "Unable to restore finalized segment for %s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+
+            if restored:
+                self.logger.info(
+                    "Prepared finalized segment for resumed live download of %s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+                return segment_index
+
         next_segment = choose_restart_segment(
             self.config,
             stream.video_id,

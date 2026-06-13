@@ -317,10 +317,12 @@ scripts/uninstall-systemd.sh
   marks the stream ended immediately.
 - If one format, such as audio, reaches the live edge and finalizes before the
   other format, a watchdog cuts that mixed segment quickly. When kept fragments
-  are available, the bot turns the finalized format back into a resumable
-  `.part` file and restarts the same segment with `--live-from-start` instead
-  of jumping to the live edge. Once the stream is truly ended, mixed leftovers
-  are muxed to the shortest track.
+  are available, the bot turns finalized format files back into resumable
+  `.part` files and restarts the same segment with `--live-from-start` instead
+  of jumping to the live edge. If exact restore is not possible, continuation
+  segments also use `--live-from-start` to prefer duplicates over missing
+  content. Once the stream is truly ended, mixed leftovers are muxed to the
+  shortest track.
 - `-k` is not used by default. Add it to `extra_yt_dlp_args` only if you want
   to debug or keep post-processing intermediates.
 - `extra_yt_dlp_args` cannot include metadata-only or download-suppression flags

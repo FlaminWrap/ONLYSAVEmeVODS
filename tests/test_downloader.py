@@ -630,6 +630,65 @@ class DownloaderCommandTests(unittest.TestCase):
         self.assertTrue(event.is_set())
 
 
+class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_restart_restores_finalized_formats_with_kept_fragments(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            audio_file = segment_dir / "segment-001.f140.mp4"
+            video_file = segment_dir / "segment-001.f137.mp4"
+            audio_file.write_text("audio", encoding="utf-8")
+            video_file.write_text("video", encoding="utf-8")
+            (segment_dir / "segment-001.f140.mp4.part-Frag2").write_text(
+                "audio fragment",
+                encoding="utf-8",
+            )
+            (segment_dir / "segment-001.f137.mp4.part-Frag5").write_text(
+                "video fragment",
+                encoding="utf-8",
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            try:
+                next_segment = await manager.choose_live_restart_segment(stream, 1)
+            finally:
+                state.close()
+
+            audio_state = json.loads(
+                (segment_dir / "segment-001.f140.mp4.ytdl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            video_state = json.loads(
+                (segment_dir / "segment-001.f137.mp4.ytdl").read_text(
+                    encoding="utf-8"
+                )
+            )
+            audio_file_exists = audio_file.exists()
+            video_file_exists = video_file.exists()
+            audio_part_exists = (segment_dir / "segment-001.f140.mp4.part").exists()
+            video_part_exists = (segment_dir / "segment-001.f137.mp4.part").exists()
+
+        self.assertEqual(next_segment, 1)
+        self.assertFalse(audio_file_exists)
+        self.assertFalse(video_file_exists)
+        self.assertTrue(audio_part_exists)
+        self.assertTrue(video_part_exists)
+        self.assertEqual(audio_state["downloader"]["current_fragment"]["index"], 2)
+        self.assertEqual(video_state["downloader"]["current_fragment"]["index"], 5)
+
+
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
     async def test_segment_timing_sidecar_records_capture_anchors(self) -> None:
         with TemporaryDirectory() as tmp:
