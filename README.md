@@ -68,13 +68,6 @@ By default the systemd installer deploys to `/opt/onlysavemevods`, creates a ded
 `onlysavemevods` system user, and runs the service as that user instead of as root or
 your login account. The application code, venv, and Deno runtime are root-owned;
 only `downloads/`, `state/`, and `.cache/` are writable by the service user.
-If the installer is run with no explicit install dir and detects an existing
-legacy `/opt/ytdlbot` install and `/opt/onlysavemevods` does not already exist,
-it stops/disables/removes `ytdlbot.service`, moves `/opt/ytdlbot` to
-`/opt/onlysavemevods`, fixes writable directory ownership for the new service
-user, and starts `onlysavemevods.service` against the existing config, state,
-downloads, cache, venv, and Deno directories. If both install directories
-already exist, it leaves `/opt/ytdlbot` untouched and uses `/opt/onlysavemevods`.
 
 The generic installer auto-detects `dnf` or `apt-get` for OS dependencies. On
 Debian/Ubuntu systems, it uses `apt-get` to install systemd, curl, certificates,
@@ -134,13 +127,6 @@ To update a config file manually without changing existing values:
 ```bash
 .venv/bin/onlysavemevods update-config --config config.toml --defaults config.example.toml
 ```
-
-The old `ytdlbot` command, `python -m ytdlbot`, and `YTDLBOT_*` installer
-environment variables remain available as compatibility aliases. Fresh installs
-use the `onlysavemevods` names by default.
-If installer output still says it installed `ytdlbot.service` or built
-`ytdlbot==0.1.0`, the old installer script was run; run this updated
-`scripts/install-systemd.sh` instead.
 
 Inspect it:
 
@@ -246,10 +232,8 @@ scripts/uninstall-systemd.sh
   with a generated `ONLYSAVEMEVODS_WATERMARK_SECRET` if that file does not already
   exist, and the service loads it with `EnvironmentFile`. Back up this file with
   `config.toml` and `state/onlysavemevods.sqlite3`; losing the secret means old
-  watermark copies cannot be detected. If the new default secret variable is
-  unset, the app also checks the legacy `YTDLBOT_WATERMARK_SECRET` variable. To
-  create or rotate it manually, put the generated value in that persistent
-  environment file:
+  watermark copies cannot be detected. To create or rotate it manually, put the
+  generated value in that persistent environment file:
 
   ```ini
   ONLYSAVEMEVODS_WATERMARK_SECRET=replace-with-the-generated-secret
@@ -288,6 +272,3 @@ scripts/uninstall-systemd.sh
 - The systemd installer only removes/replaces the root-owned app copy during
   updates; uninstalling the service leaves config, downloads, state, venv, Deno,
   and the `onlysavemevods` user in place.
-- If `state/onlysavemevods.sqlite3` does not exist but the legacy
-  `state/ytdlbot.sqlite3` file does, ONLYSAVEmeVODS uses the legacy database so
-  existing state survives the rename.

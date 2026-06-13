@@ -160,6 +160,3 @@ class OnlySaveMeVodsDaemon:
     async def _start_stream(self, stream: LiveStream) -> None:
         self.state.upsert_detected(stream)
         await self.downloads.start_stream(stream)
-
-
-YTDLBotDaemon = OnlySaveMeVodsDaemon

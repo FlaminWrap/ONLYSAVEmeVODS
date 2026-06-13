@@ -65,15 +65,15 @@ class WatermarkTests(unittest.TestCase):
             ".watermarks/Live [LIVEVIDEO01] - wm-abcdef1234.mp4",
         )
 
-    def test_watermark_secret_falls_back_to_legacy_env_var(self) -> None:
+    def test_watermark_secret_reads_configured_env_var(self) -> None:
         with patch.dict(
             "os.environ",
-            {"YTDLBOT_WATERMARK_SECRET": "legacy-secret"},
+            {"ONLYSAVEMEVODS_WATERMARK_SECRET": "current-secret"},
             clear=True,
         ):
             secret = watermark_secret(BotConfig())
 
-        self.assertEqual(secret, "legacy-secret")
+        self.assertEqual(secret, "current-secret")
 
     def test_recipient_label_is_required_and_normalized(self) -> None:
         self.assertEqual(validate_recipient_label("  Alice   Example  "), "Alice Example")

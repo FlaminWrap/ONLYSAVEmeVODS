@@ -2478,9 +2478,6 @@ def dashboard_script() -> str:
   const tabKey = "onlysavemevods.dashboardTab";
   const collapsedKey = "onlysavemevods.collapsedStreams";
   const expandedKey = "onlysavemevods.expandedStreams";
-  const legacyTabKey = "ytdlbot.dashboardTab";
-  const legacyCollapsedKey = "ytdlbot.collapsedStreams";
-  const legacyExpandedKey = "ytdlbot.expandedStreams";
   const tabs = ["tab-streams", "tab-channels", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
@@ -2561,28 +2558,23 @@ def dashboard_script() -> str:
     return String(value);
   };
   const streamNeedsAttention = (stream) => attentionStatuses.has(stream.status) || Boolean(stream.has_mixed_formats);
-  const readLocalStorageValue = (key, legacyKey) => {
+  const readLocalStorageValue = (key) => {
     try {
       const value = localStorage.getItem(key);
       if (value !== null) return value;
-      const legacyValue = localStorage.getItem(legacyKey);
-      if (legacyValue !== null) {
-        try { localStorage.setItem(key, legacyValue); } catch (_) {}
-        return legacyValue;
-      }
     } catch (_) {}
     return "";
   };
-  const readStreamSet = (key, legacyKey) => {
+  const readStreamSet = (key) => {
     try {
-      const parsed = JSON.parse(readLocalStorageValue(key, legacyKey) || "[]");
+      const parsed = JSON.parse(readLocalStorageValue(key) || "[]");
       return new Set(Array.isArray(parsed) ? parsed.map(String) : []);
     } catch (_) {
       return new Set();
     }
   };
-  const collapsedStreams = readStreamSet(collapsedKey, legacyCollapsedKey);
-  const expandedStreams = readStreamSet(expandedKey, legacyExpandedKey);
+  const collapsedStreams = readStreamSet(collapsedKey);
+  const expandedStreams = readStreamSet(expandedKey);
   const writeCollapsedStreams = () => {
     try { localStorage.setItem(collapsedKey, JSON.stringify([...collapsedStreams])); } catch (_) {}
   };
@@ -2605,7 +2597,7 @@ def dashboard_script() -> str:
   };
 
   let stored = "";
-  stored = readLocalStorageValue(tabKey, legacyTabKey);
+  stored = readLocalStorageValue(tabKey);
   const hashTab = location.hash ? "tab-" + location.hash.slice(1) : "";
   selectTab(tabs.includes(hashTab) ? hashTab : stored, false);
 

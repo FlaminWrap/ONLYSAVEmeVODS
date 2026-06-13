@@ -102,11 +102,9 @@ ffmpeg_path = "ffmpeg"
 #   export ONLYSAVEMEVODS_WATERMARK_SECRET="$(openssl rand -base64 48)"
 #
 # The systemd installer creates /opt/onlysavemevods/secrets.env with a generated value
-# if it does not already exist, and the service loads that file. If the default
-# variable is unset, the app also checks legacy YTDLBOT_WATERMARK_SECRET. Back
-# it up with config.toml and state/onlysavemevods.sqlite3; old watermarks cannot
-# be detected if the secret is lost. Do not paste the secret itself into this
-# config file.
+# if it does not already exist, and the service loads that file. Back it up with
+# config.toml and state/onlysavemevods.sqlite3; old watermarks cannot be detected
+# if the secret is lost. Do not paste the secret itself into this config file.
 watermark_enabled = false
 watermark_secret_env = "ONLYSAVEMEVODS_WATERMARK_SECRET"
 

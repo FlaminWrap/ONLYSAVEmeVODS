@@ -44,9 +44,7 @@ DISALLOWED_EXTRA_YT_DLP_ARGS = {
     "-s",
 }
 DEFAULT_DB_FILENAME = "onlysavemevods.sqlite3"
-LEGACY_DB_FILENAME = "ytdlbot.sqlite3"
 DEFAULT_WATERMARK_SECRET_ENV = "ONLYSAVEMEVODS_WATERMARK_SECRET"
-LEGACY_WATERMARK_SECRET_ENV = "YTDLBOT_WATERMARK_SECRET"
 
 
 class ConfigError(ValueError):
@@ -103,11 +101,7 @@ class BotConfig:
 
     @property
     def db_path(self) -> Path:
-        db_path = self.state_dir / DEFAULT_DB_FILENAME
-        legacy_db_path = self.state_dir / LEGACY_DB_FILENAME
-        if not db_path.exists() and legacy_db_path.exists():
-            return legacy_db_path
-        return db_path
+        return self.state_dir / DEFAULT_DB_FILENAME
 
 
 def load_config(path: str | Path) -> BotConfig:

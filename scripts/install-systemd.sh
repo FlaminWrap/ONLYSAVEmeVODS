@@ -4,27 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 ROOT_DIR="$(cd -- "${SCRIPT_DIR}/.." >/dev/null 2>&1 && pwd)"
 STAGED_ROOT_DIR=""
-LEGACY_INSTALL_DIR="/opt/ytdlbot"
-LEGACY_SERVICE_NAME="ytdlbot.service"
-LEGACY_UNIT_FILE="/etc/systemd/system/${LEGACY_SERVICE_NAME}"
 DEFAULT_INSTALL_DIR="/opt/onlysavemevods"
-MIGRATING_LEGACY_INSTALL=0
-MOVING_LEGACY_INSTALL=0
-
-if [[ -n "${ONLYSAVEMEVODS_INSTALL_DIR:-}" ]]; then
-  INSTALL_DIR="${ONLYSAVEMEVODS_INSTALL_DIR}"
-elif [[ -n "${YTDLBOT_INSTALL_DIR:-}" ]]; then
-  INSTALL_DIR="${YTDLBOT_INSTALL_DIR}"
-elif [[ -d "${LEGACY_INSTALL_DIR}" && ! -e "${DEFAULT_INSTALL_DIR}" ]]; then
-  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
-  MIGRATING_LEGACY_INSTALL=1
-  MOVING_LEGACY_INSTALL=1
-elif [[ -d "${LEGACY_INSTALL_DIR}" || -f "${LEGACY_UNIT_FILE}" ]]; then
-  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
-  MIGRATING_LEGACY_INSTALL=1
-else
-  INSTALL_DIR="${DEFAULT_INSTALL_DIR}"
-fi
+INSTALL_DIR="${ONLYSAVEMEVODS_INSTALL_DIR:-${DEFAULT_INSTALL_DIR}}"
 
 APP_DIR="${INSTALL_DIR}/app"
 VENV_DIR="${INSTALL_DIR}/.venv"
@@ -36,12 +17,12 @@ CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SECRETS_FILE="${INSTALL_DIR}/secrets.env"
 SERVICE_NAME="onlysavemevods.service"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
-SERVICE_USER="${ONLYSAVEMEVODS_USER:-${YTDLBOT_USER:-onlysavemevods}}"
+SERVICE_USER="${ONLYSAVEMEVODS_USER:-onlysavemevods}"
 PYTHON_BIN="${PYTHON:-}"
-SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-${YTDLBOT_SKIP_OS_DEPS:-0}}"
-SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-${YTDLBOT_SKIP_DENO:-0}}"
-SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-${YTDLBOT_SKIP_NVIDIA_DEPS:-0}}"
-INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-${YTDLBOT_INSTALL_WHISPERX:-auto}}"
+SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-0}"
+SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-0}"
+SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-0}"
+INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-auto}"
 APT_UPDATED=0
 
 die() {
@@ -57,7 +38,7 @@ cleanup_staged_source() {
 
 stage_source_if_inside_install_tree() {
   case "${ROOT_DIR}/" in
-    "${INSTALL_DIR}/"*|"${LEGACY_INSTALL_DIR}/"*)
+    "${INSTALL_DIR}/"*)
       STAGED_ROOT_DIR="$(mktemp -d)"
       echo "Staging installer source from ${ROOT_DIR} to ${STAGED_ROOT_DIR}"
       cp -a "${ROOT_DIR}/." "${STAGED_ROOT_DIR}/"
@@ -66,41 +47,6 @@ stage_source_if_inside_install_tree() {
       trap cleanup_staged_source EXIT
       ;;
   esac
-}
-
-prepare_legacy_service_migration() {
-  if [[ "${MIGRATING_LEGACY_INSTALL}" != "1" ]]; then
-    return 0
-  fi
-
-  echo "Detected legacy ${LEGACY_SERVICE_NAME}; migrating service to ${SERVICE_NAME} in ${INSTALL_DIR}"
-  sudo systemctl stop "${LEGACY_SERVICE_NAME}" >/dev/null 2>&1 || true
-  sudo systemctl disable "${LEGACY_SERVICE_NAME}" >/dev/null 2>&1 || true
-  if [[ "${MOVING_LEGACY_INSTALL}" == "1" ]]; then
-    if [[ -e "${DEFAULT_INSTALL_DIR}" ]]; then
-      die "Cannot move ${LEGACY_INSTALL_DIR}: ${DEFAULT_INSTALL_DIR} already exists"
-    fi
-    echo "Moving ${LEGACY_INSTALL_DIR} to ${DEFAULT_INSTALL_DIR}"
-    sudo mv "${LEGACY_INSTALL_DIR}" "${DEFAULT_INSTALL_DIR}"
-  elif [[ -d "${LEGACY_INSTALL_DIR}" && "${INSTALL_DIR}" != "${LEGACY_INSTALL_DIR}" ]]; then
-    echo "Legacy ${LEGACY_INSTALL_DIR} left untouched because ${INSTALL_DIR} already exists or was selected"
-  fi
-  sudo rm -f "${LEGACY_UNIT_FILE}"
-  sudo systemctl daemon-reload
-}
-
-fix_migrated_writable_ownership() {
-  if [[ "${MIGRATING_LEGACY_INSTALL}" != "1" ]]; then
-    return 0
-  fi
-
-  local service_group
-  service_group="$(id -gn "${SERVICE_USER}")"
-  for path in "${CACHE_DIR}" "${DOWNLOAD_DIR}" "${STATE_DIR}"; do
-    if [[ -d "${path}" ]]; then
-      sudo chown -R "${SERVICE_USER}:${service_group}" "${path}"
-    fi
-  done
 }
 
 script_has_missing_shebang_interpreter() {
@@ -136,78 +82,6 @@ refresh_console_script_if_stale() {
 
   echo "Refreshing ${label} console script after venv path migration..."
   sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --force-reinstall --no-deps "${package_spec}"
-}
-
-fix_legacy_deno_shell_startup_references() {
-  sudo "${PYTHON_BIN}" - "${LEGACY_INSTALL_DIR}" "${INSTALL_DIR}" <<'PY'
-from __future__ import annotations
-
-import os
-import pwd
-import sys
-from pathlib import Path
-
-legacy_install = sys.argv[1]
-new_install = sys.argv[2]
-new_deno_env = Path(new_install) / ".deno" / "env"
-replacements = {
-    f"{legacy_install}/.deno": f"{new_install}/.deno",
-    f"{legacy_install}/.demo": f"{new_install}/.deno",
-}
-legacy_env_files = (
-    f"{legacy_install}/.deno/env",
-    f"{legacy_install}/.demo/env",
-)
-
-
-def shell_profiles_for_home(home: Path) -> list[Path]:
-    return [
-        home / ".bashrc",
-        home / ".bash_profile",
-        home / ".profile",
-        home / ".zshrc",
-    ]
-
-
-profiles: list[Path] = shell_profiles_for_home(Path("/root"))
-sudo_user = os.environ.get("SUDO_USER")
-if sudo_user and sudo_user != "root":
-    try:
-        user_home = Path(pwd.getpwnam(sudo_user).pw_dir)
-    except KeyError:
-        user_home = None
-    if user_home is not None:
-        profiles.extend(shell_profiles_for_home(user_home))
-
-seen: set[Path] = set()
-for profile in profiles:
-    if profile in seen or not profile.is_file():
-        continue
-    seen.add(profile)
-    try:
-        original = profile.read_text(encoding="utf-8")
-    except OSError:
-        continue
-    updated_lines: list[str] = []
-    for line in original.splitlines(keepends=True):
-        has_legacy_env_source = any(old in line for old in legacy_env_files)
-        if has_legacy_env_source and not new_deno_env.exists():
-            stripped = line.lstrip()
-            prefix = line[: len(line) - len(stripped)]
-            if not stripped.startswith("#"):
-                line = f"{prefix}# Disabled by ONLYSAVEmeVODS migration: {stripped}"
-            updated_lines.append(line)
-            continue
-
-        for old, new in replacements.items():
-            line = line.replace(old, new)
-        updated_lines.append(line)
-    updated = "".join(updated_lines)
-    if updated == original:
-        continue
-    profile.write_text(updated, encoding="utf-8")
-    print(f"Updated legacy Deno shell startup references in {profile}")
-PY
 }
 
 python_is_supported() {
@@ -330,12 +204,6 @@ generate_watermark_secret() {
 install_or_preserve_secrets_file() {
   if [[ -f "${SECRETS_FILE}" ]]; then
     echo "Keeping existing ${SECRETS_FILE}"
-    if [[ "${MIGRATING_LEGACY_INSTALL}" == "1" ]]; then
-      local service_group
-      service_group="$(id -gn "${SERVICE_USER}")"
-      sudo chown root:"${service_group}" "${SECRETS_FILE}"
-      sudo chmod 0640 "${SECRETS_FILE}"
-    fi
     return 0
   fi
 
@@ -349,7 +217,6 @@ install_or_preserve_secrets_file() {
 # ONLYSAVEmeVODS service secrets. Back this file up with config.toml and state/.
 # Losing ONLYSAVEMEVODS_WATERMARK_SECRET prevents detecting old watermark copies.
 ONLYSAVEMEVODS_WATERMARK_SECRET=${secret}
-YTDLBOT_WATERMARK_SECRET=${secret}
 EOF
   sudo chown root:"${service_group}" "${SECRETS_FILE}"
   sudo chmod 0640 "${SECRETS_FILE}"
@@ -770,7 +637,6 @@ install_whisperx_if_needed() {
 }
 
 stage_source_if_inside_install_tree
-prepare_legacy_service_migration
 install_os_dependencies
 
 if ! find_python; then
@@ -782,10 +648,8 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
 fi
 
 install_deno_runtime
-fix_legacy_deno_shell_startup_references
 ensure_service_user
 install_application_files
-fix_migrated_writable_ownership
 
 cd "${APP_DIR}"
 sudo "${PYTHON_BIN}" -m venv "${VENV_DIR}"
@@ -802,12 +666,7 @@ if ! sudo "${VENV_DIR}/bin/python" -m pip install --editable "${APP_DIR}"; then
 #!/usr/bin/env bash
 PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\${PYTHONPATH}}" exec "${VENV_DIR}/bin/python" -m onlysavemevods "\$@"
 EOF
-  sudo tee "${VENV_DIR}/bin/ytdlbot" >/dev/null <<EOF
-#!/usr/bin/env bash
-PYTHONPATH="${APP_DIR}/src\${PYTHONPATH:+:\${PYTHONPATH}}" exec "${VENV_DIR}/bin/python" -m ytdlbot "\$@"
-EOF
   sudo chmod +x "${VENV_DIR}/bin/onlysavemevods"
-  sudo chmod +x "${VENV_DIR}/bin/ytdlbot"
 fi
 sudo chown -R root:root "${VENV_DIR}"
 sudo chmod -R a+rX "${VENV_DIR}"
@@ -865,12 +724,5 @@ sudo systemctl restart "${SERVICE_NAME}"
 echo "Installed and restarted ${SERVICE_NAME}"
 echo "Install dir: ${INSTALL_DIR}"
 echo "Service user: ${SERVICE_USER}"
-if [[ "${MIGRATING_LEGACY_INSTALL}" == "1" ]]; then
-  if [[ "${MOVING_LEGACY_INSTALL}" == "1" ]]; then
-    echo "Migrated legacy ${LEGACY_SERVICE_NAME}; moved ${LEGACY_INSTALL_DIR} to ${DEFAULT_INSTALL_DIR}."
-  else
-    echo "Migrated legacy ${LEGACY_SERVICE_NAME}; old unit removed, legacy data directory left in place."
-  fi
-fi
 echo "Status: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:   journalctl -u ${SERVICE_NAME} -f"

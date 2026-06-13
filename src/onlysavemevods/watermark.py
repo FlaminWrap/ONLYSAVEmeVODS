@@ -10,11 +10,7 @@ import secrets
 import subprocess
 import time
 
-from .config import (
-    DEFAULT_WATERMARK_SECRET_ENV,
-    LEGACY_WATERMARK_SECRET_ENV,
-    BotConfig,
-)
+from .config import BotConfig
 from .downloader import command_for_log
 from .state import WatermarkCopyRecord
 
@@ -67,12 +63,7 @@ class DetectionResult:
 
 def watermark_secret(config: BotConfig) -> str:
     secret = os.environ.get(config.watermark_secret_env, "")
-    secret = secret.strip()
-    if secret:
-        return secret
-    if config.watermark_secret_env == DEFAULT_WATERMARK_SECRET_ENV:
-        return os.environ.get(LEGACY_WATERMARK_SECRET_ENV, "").strip()
-    return ""
+    return secret.strip()
 
 
 def require_watermark_secret(config: BotConfig) -> str:
