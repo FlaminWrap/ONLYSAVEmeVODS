@@ -25,6 +25,16 @@ class StreamRecord:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamEventRecord:
+    event_id: int
+    video_id: str
+    level: str
+    message: str
+    segment_index: int | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class WatermarkCopyRecord:
     copy_id: str
     video_id: str
@@ -48,7 +58,11 @@ class StateStore:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
-        self._migrate()
+        try:
+            self._migrate()
+        except Exception:
+            self.conn.close()
+            raise
 
     def close(self) -> None:
         self.conn.close()
@@ -68,6 +82,18 @@ class StateStore:
                 last_started_at TEXT,
                 last_exit_at TEXT,
                 exit_code INTEGER
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS stream_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                video_id TEXT NOT NULL,
+                level TEXT NOT NULL DEFAULT 'info',
+                message TEXT NOT NULL,
+                segment_index INTEGER,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -94,6 +120,12 @@ class StateStore:
         self._ensure_watermark_progress_columns()
         self.conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_stream_events_video_created
+            ON stream_events (video_id, created_at DESC, event_id DESC)
+            """
+        )
+        self.conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_watermark_copies_video_source
             ON watermark_copies (video_id, source_name, created_at)
             """
@@ -116,6 +148,13 @@ class StateStore:
 
     def mark_stale_downloads_interrupted(self) -> None:
         now = utc_now()
+        rows = self.conn.execute(
+            """
+            SELECT video_id, segment_index
+            FROM streams
+            WHERE status = 'downloading'
+            """
+        ).fetchall()
         self.conn.execute(
             """
             UPDATE streams
@@ -124,6 +163,14 @@ class StateStore:
             """,
             (now,),
         )
+        for row in rows:
+            self._insert_stream_event(
+                row["video_id"],
+                "Interrupted active download after service restart",
+                level="warning",
+                segment_index=int(row["segment_index"]),
+                created_at=now,
+            )
         self.conn.commit()
 
     def mark_stale_watermarks_interrupted(self) -> None:
@@ -163,6 +210,12 @@ class StateStore:
                     now,
                 ),
             )
+            self._insert_stream_event(
+                stream.video_id,
+                "Detected live stream",
+                segment_index=1,
+                created_at=now,
+            )
         else:
             status = "detected" if existing.status == "ended" and stream.is_live else existing.status
             self.conn.execute(
@@ -180,6 +233,13 @@ class StateStore:
                     stream.video_id,
                 ),
             )
+            if existing.status == "ended" and stream.is_live:
+                self._insert_stream_event(
+                    stream.video_id,
+                    "Detected stream live again",
+                    segment_index=existing.segment_index,
+                    created_at=now,
+                )
         self.conn.commit()
         record = self.get_stream(stream.video_id)
         assert record is not None
@@ -200,6 +260,12 @@ class StateStore:
             """,
             (segment_index, now, now, stream.video_id),
         )
+        self._insert_stream_event(
+            stream.video_id,
+            f"Started download segment={segment_index:03d}",
+            segment_index=segment_index,
+            created_at=now,
+        )
         self.conn.commit()
 
     def mark_waiting_retry(self, video_id: str, exit_code: int | None = None) -> None:
@@ -212,10 +278,18 @@ class StateStore:
             """,
             (now, exit_code, video_id),
         )
+        self._insert_stream_event(
+            video_id,
+            "Waiting to retry"
+            + (f" after exit code {exit_code}" if exit_code is not None else ""),
+            level="warning",
+            created_at=now,
+        )
         self.conn.commit()
 
     def mark_exited(self, video_id: str, exit_code: int) -> None:
         now = utc_now()
+        record = self.get_stream(video_id)
         self.conn.execute(
             """
             UPDATE streams
@@ -227,10 +301,18 @@ class StateStore:
             """,
             (now, now, exit_code, video_id),
         )
+        self._insert_stream_event(
+            video_id,
+            f"yt-dlp exited with code {exit_code}; running post-exit checks",
+            level="warning" if exit_code else "info",
+            segment_index=record.segment_index if record is not None else None,
+            created_at=now,
+        )
         self.conn.commit()
 
     def mark_ended(self, video_id: str) -> None:
         now = utc_now()
+        record = self.get_stream(video_id)
         self.conn.execute(
             """
             UPDATE streams
@@ -238,6 +320,12 @@ class StateStore:
             WHERE video_id = ?
             """,
             (now, video_id),
+        )
+        self._insert_stream_event(
+            video_id,
+            "Marked stream ended",
+            segment_index=record.segment_index if record is not None else None,
+            created_at=now,
         )
         self.conn.commit()
 
@@ -251,6 +339,12 @@ class StateStore:
             """,
             (segment_index, now, video_id),
         )
+        self._insert_stream_event(
+            video_id,
+            f"Switched to segment={segment_index:03d}",
+            segment_index=segment_index,
+            created_at=now,
+        )
         self.conn.commit()
 
     def bump_segment_index(self, video_id: str) -> int:
@@ -258,6 +352,82 @@ class StateStore:
         next_segment = (record.segment_index if record else 1) + 1
         self.set_segment_index(video_id, next_segment)
         return next_segment
+
+    def add_stream_event(
+        self,
+        video_id: str,
+        message: str,
+        *,
+        level: str = "info",
+        segment_index: int | None = None,
+    ) -> None:
+        if not video_id or not message.strip():
+            return
+        self._insert_stream_event(
+            video_id,
+            message.strip(),
+            level=level,
+            segment_index=segment_index,
+            created_at=utc_now(),
+        )
+        self.conn.commit()
+
+    def list_stream_events(
+        self,
+        video_ids: list[str],
+        *,
+        limit_per_stream: int = 8,
+    ) -> dict[str, list[StreamEventRecord]]:
+        events: dict[str, list[StreamEventRecord]] = {}
+        if limit_per_stream <= 0:
+            return {video_id: [] for video_id in video_ids}
+        for video_id in video_ids:
+            rows = self.conn.execute(
+                """
+                SELECT event_id, video_id, level, message, segment_index, created_at
+                FROM stream_events
+                WHERE video_id = ?
+                ORDER BY event_id DESC
+                LIMIT ?
+                """,
+                (video_id, limit_per_stream),
+            ).fetchall()
+            records = [_event_record_from_row(row) for row in rows]
+            events[video_id] = list(reversed(records))
+        return events
+
+    def _insert_stream_event(
+        self,
+        video_id: str,
+        message: str,
+        *,
+        level: str = "info",
+        segment_index: int | None = None,
+        created_at: str,
+    ) -> None:
+        normalized_level = level if level in {"debug", "info", "warning", "error"} else "info"
+        self.conn.execute(
+            """
+            INSERT INTO stream_events (
+                video_id, level, message, segment_index, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (video_id, normalized_level, message, segment_index, created_at),
+        )
+        self.conn.execute(
+            """
+            DELETE FROM stream_events
+            WHERE video_id = ?
+              AND event_id NOT IN (
+                  SELECT event_id
+                  FROM stream_events
+                  WHERE video_id = ?
+                  ORDER BY event_id DESC
+                  LIMIT 200
+              )
+            """,
+            (video_id, video_id),
+        )
 
     def get_stream(self, video_id: str) -> StreamRecord | None:
         row = self.conn.execute(
@@ -422,6 +592,11 @@ def utc_now() -> str:
 def _record_from_row(row: sqlite3.Row) -> StreamRecord:
     values: dict[str, Any] = dict(row)
     return StreamRecord(**values)
+
+
+def _event_record_from_row(row: sqlite3.Row) -> StreamEventRecord:
+    values: dict[str, Any] = dict(row)
+    return StreamEventRecord(**values)
 
 
 def _watermark_record_from_row(row: sqlite3.Row) -> WatermarkCopyRecord:

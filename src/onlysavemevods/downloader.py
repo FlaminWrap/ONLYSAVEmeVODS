@@ -1319,6 +1319,11 @@ class DownloadManager:
                     stream.video_id,
                     segment_index,
                 )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Restored mixed segment={segment_index:03d} from kept fragments",
+                    segment_index=segment_index,
+                )
                 return segment_index
 
             self.logger.warning(
@@ -1366,6 +1371,11 @@ class DownloadManager:
                     "Prepared finalized segment for resumed live download of %s segment=%03d",
                     stream.video_id,
                     segment_index,
+                )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Restored finalized segment={segment_index:03d} from kept fragments",
+                    segment_index=segment_index,
                 )
                 return segment_index
 

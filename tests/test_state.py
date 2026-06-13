@@ -51,6 +51,43 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertIsNotNone(fetched.finished_at)
         self.assertEqual([record.copy_id for record in listed], ["wm_copy001"])
 
+    def test_stream_events_are_listed_oldest_first_and_capped(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            for index in range(205):
+                state.add_stream_event(
+                    "LIVEVIDEO01",
+                    f"event {index:03d}",
+                    level="warning" if index == 204 else "info",
+                    segment_index=index if index == 204 else None,
+                )
+
+            events = state.list_stream_events(
+                ["LIVEVIDEO01", "MISSING"],
+                limit_per_stream=5,
+            )
+            retained_count = state.conn.execute(
+                "SELECT COUNT(*) FROM stream_events WHERE video_id = ?",
+                ("LIVEVIDEO01",),
+            ).fetchone()[0]
+            state.close()
+
+        self.assertEqual(retained_count, 200)
+        self.assertEqual(events["MISSING"], [])
+        self.assertEqual(
+            [event.message for event in events["LIVEVIDEO01"]],
+            [
+                "event 200",
+                "event 201",
+                "event 202",
+                "event 203",
+                "event 204",
+            ],
+        )
+        self.assertEqual(events["LIVEVIDEO01"][-1].level, "warning")
+        self.assertEqual(events["LIVEVIDEO01"][-1].segment_index, 204)
+
+
     def test_stale_watermark_jobs_are_marked_interrupted(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")

@@ -107,6 +107,11 @@ class WebStatusTests(unittest.TestCase):
             )
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.add_stream_event(
+                stream.video_id,
+                "Post-exit check saw stream live",
+                segment_index=1,
+            )
             state.close()
 
             segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
@@ -270,6 +275,11 @@ class WebStatusTests(unittest.TestCase):
             )
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.add_stream_event(
+                stream.video_id,
+                "Post-exit check saw stream live",
+                segment_index=1,
+            )
             state.close()
             segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
             segment_dir.mkdir(parents=True)
@@ -329,6 +339,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("onlysavemevods.dashboardTab", html)
         self.assertIn("onlysavemevods.collapsedStreams", html)
         self.assertIn("onlysavemevods.expandedStreams", html)
+        self.assertIn("Stream log", html)
+        self.assertIn("Post-exit check saw stream live", html)
+        self.assertIn("seg 001", html)
         self.assertIn("data-stream-toggle", html)
         self.assertIn("stream-body", html)
         self.assertIn("Collapse", html)
@@ -340,6 +353,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("#\" + id.replace(\"tab-\", \"\")", html)
         self.assertIn("dashboard warning line", html)
         self.assertEqual(payload["streams"][0]["video_id"], "LIVEVIDEO01")
+        self.assertEqual(
+            payload["streams"][0]["events"][-1]["message"],
+            "Post-exit check saw stream live",
+        )
+        self.assertEqual(payload["streams"][0]["events"][-1]["segment_index"], 1)
         self.assertIn("file_kind_counts", payload["streams"][0])
         self.assertIn("total_bytes", payload)
         self.assertIn("chat_bytes", payload)
@@ -1287,7 +1305,10 @@ class WebStatusTests(unittest.TestCase):
 
     def test_manual_transcription_job_passes_overwrite_for_retranscribe(self) -> None:
         with TemporaryDirectory() as tmp:
-            config = BotConfig(download_dir=Path(tmp) / "downloads")
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
             media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
             media_file.parent.mkdir(parents=True)
             media_file.write_text("media", encoding="utf-8")

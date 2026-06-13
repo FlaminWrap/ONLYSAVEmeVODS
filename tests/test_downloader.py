@@ -662,6 +662,9 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 next_segment = await manager.choose_live_restart_segment(stream, 1)
+                events = state.list_stream_events([stream.video_id], limit_per_stream=4)[
+                    stream.video_id
+                ]
             finally:
                 state.close()
 
@@ -687,6 +690,10 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(video_part_exists)
         self.assertEqual(audio_state["downloader"]["current_fragment"]["index"], 2)
         self.assertEqual(video_state["downloader"]["current_fragment"]["index"], 5)
+        self.assertIn(
+            "Restored finalized segment=001 from kept fragments",
+            [event.message for event in events],
+        )
 
 
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):

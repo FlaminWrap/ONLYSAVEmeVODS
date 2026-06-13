@@ -59,7 +59,7 @@ from .downloader import (
     segment_part_files,
 )
 from .log_buffer import LogEntry, get_recent_log_entries
-from .state import StateStore, StreamRecord, WatermarkCopyRecord
+from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
 from .transcription import (
     load_whisperx_subtitle_segments,
     rewrite_speaker_labels_for_media,
@@ -93,6 +93,7 @@ from .watermark import (
 LOGGER = logging.getLogger(__name__)
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
+STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
 SEGMENT_NAME_RE = re.compile(
@@ -234,6 +235,15 @@ class JobStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamEventStatus:
+    event_id: int
+    level: str
+    message: str
+    segment_index: int | None
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class StreamStatus:
     video_id: str
     title: str
@@ -259,6 +269,7 @@ class StreamStatus:
     latest_file_modified_at: float | None
     has_part_files: bool
     has_mixed_formats: bool
+    events: list[StreamEventStatus]
     files: list[FileStatus]
 
 
@@ -838,6 +849,10 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
     try:
         records = state.list_streams(STREAM_LIMIT)
         watermark_records = state.list_watermark_copies(limit=1000)
+        stream_events = state.list_stream_events(
+            [record.video_id for record in records],
+            limit_per_stream=STREAM_EVENT_LIMIT,
+        )
     finally:
         state.close()
 
@@ -852,6 +867,7 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
             config,
             record,
             watermarks_by_video.get(record.video_id, []),
+            stream_events.get(record.video_id, []),
         )
         for record in records
     ]
@@ -1346,6 +1362,7 @@ def stream_status_from_record(
     config: BotConfig,
     record: StreamRecord,
     watermark_records: list[WatermarkCopyRecord] | None = None,
+    event_records: list[StreamEventRecord] | None = None,
 ) -> StreamStatus:
     directory = segment_directory(config, record.video_id, record.channel)
     files = summarize_files(
@@ -1396,7 +1413,18 @@ def stream_status_from_record(
             record.segment_index,
             record.channel,
         ),
+        events=[stream_event_status(event) for event in event_records or []],
         files=files[:FILE_LIMIT_PER_STREAM],
+    )
+
+
+def stream_event_status(event: StreamEventRecord) -> StreamEventStatus:
+    return StreamEventStatus(
+        event_id=event.event_id,
+        level=event.level,
+        message=event.message,
+        segment_index=event.segment_index,
+        created_at=event.created_at,
     )
 
 
@@ -1907,6 +1935,38 @@ def transcription_action_for_file(
     return transcription_url_for(video_id, filename), "ready", None
 
 
+def record_stream_event(
+    config: BotConfig,
+    video_id: str,
+    message: str,
+    *,
+    level: str = "info",
+    segment_index: int | None = None,
+) -> None:
+    state: StateStore | None = None
+    try:
+        state = StateStore(config.db_path)
+        state.add_stream_event(
+            video_id,
+            message,
+            level=level,
+            segment_index=segment_index,
+        )
+    except Exception as exc:  # noqa: BLE001 - stream logging must not break jobs.
+        LOGGER.warning(
+            "Unable to record stream event for %s: %s",
+            video_id,
+            str(exc) or exc.__class__.__name__,
+        )
+    finally:
+        if state is not None:
+            state.close()
+
+
+def video_id_from_job_key(key: str) -> str:
+    return key.partition("\0")[0]
+
+
 def start_render_chat_job(
     config: BotConfig,
     video_id: str,
@@ -1941,6 +2001,12 @@ def start_render_chat_job(
             updated_at=now,
         )
 
+    record_stream_event(
+        config,
+        video_id,
+        ("Queued chat video regeneration" if regenerate else "Queued chat video render")
+        + f" for {chat_file.name}",
+    )
     thread = Thread(
         target=run_render_chat_job,
         args=(config, key, media_file, chat_file, output_file, regenerate),
@@ -1986,6 +2052,12 @@ def start_refresh_chat_job(
             updated_at=now,
         )
 
+    record_stream_event(
+        config,
+        video_id,
+        f"Queued chat refresh for {chat_file.name}",
+        segment_index=record.segment_index,
+    )
     thread = Thread(
         target=run_refresh_chat_job,
         args=(config, key, record, media_file, chat_file),
@@ -2032,13 +2104,21 @@ def run_refresh_chat_job(
             chat_file,
         )
         finished = time.time()
+        message = str(exc) or exc.__class__.__name__
         update_refresh_chat_job(
             key,
             status="failed",
-            message=str(exc) or exc.__class__.__name__,
+            message=message,
             phase="Failed",
             finished_at=finished,
             updated_at=finished,
+        )
+        record_stream_event(
+            config,
+            record.video_id,
+            f"Chat refresh failed for {chat_file.name}: {message}",
+            level="error",
+            segment_index=record.segment_index,
         )
         return
 
@@ -2051,6 +2131,13 @@ def run_refresh_chat_job(
             phase="Failed",
             finished_at=finished,
             updated_at=finished,
+        )
+        record_stream_event(
+            config,
+            record.video_id,
+            f"Chat refresh failed for {chat_file.name}: {result.message}",
+            level="error",
+            segment_index=record.segment_index,
         )
         return
 
@@ -2069,6 +2156,12 @@ def run_refresh_chat_job(
         progress=1.0,
         finished_at=finished,
         updated_at=finished,
+    )
+    record_stream_event(
+        config,
+        record.video_id,
+        f"Chat refresh completed for {chat_file.name}: {result.message}",
+        segment_index=record.segment_index,
     )
 
 
@@ -2135,13 +2228,20 @@ def run_render_chat_process_job(
         )
     except OSError as exc:
         LOGGER.exception("Unable to start isolated manual chat render process")
+        message = str(exc) or exc.__class__.__name__
         update_render_chat_job(
             key,
             status="failed",
-            message=str(exc) or exc.__class__.__name__,
+            message=message,
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Chat video render failed for {chat_file.name}: {message}",
+            level="error",
         )
         return
 
@@ -2154,13 +2254,20 @@ def run_render_chat_process_job(
     )
     if result.returncode != 0:
         message = process_failure_message(result.stdout or b"", result.stderr or b"")
+        failure_message = message or f"Chat render exited with code {result.returncode}"
         update_render_chat_job(
             key,
             status="failed",
-            message=message or f"Chat render exited with code {result.returncode}",
+            message=failure_message,
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Chat video render failed for {chat_file.name}: {failure_message}",
+            level="error",
         )
         return
 
@@ -2173,6 +2280,11 @@ def run_render_chat_process_job(
         progress=1.0,
         finished_at=time.time(),
         updated_at=time.time(),
+    )
+    record_stream_event(
+        config,
+        video_id_from_job_key(key),
+        f"Chat video rendered: {output_file.name}",
     )
 
 
@@ -2225,13 +2337,20 @@ def run_render_chat_in_process_job(
             media_file,
             chat_file,
         )
+        message = str(exc) or exc.__class__.__name__
         update_render_chat_job(
             key,
             status="failed",
-            message=str(exc) or exc.__class__.__name__,
+            message=message,
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Chat video render failed for {chat_file.name}: {message}",
+            level="error",
         )
         return
 
@@ -2244,6 +2363,11 @@ def run_render_chat_in_process_job(
         progress=1.0,
         finished_at=time.time(),
         updated_at=time.time(),
+    )
+    record_stream_event(
+        config,
+        video_id_from_job_key(key),
+        f"Chat video rendered: {output_file.name}",
     )
 
 
@@ -2735,6 +2859,13 @@ def start_transcription_job(
             updated_at=now,
         )
 
+    record_stream_event(
+        config,
+        video_id,
+        ("Queued subtitle retranscription" if regenerate else "Queued subtitle transcription")
+        + f" for {media_file.name}",
+        segment_index=record.segment_index,
+    )
     thread = Thread(
         target=run_transcription_job,
         args=(config, key, media_file, regenerate, record.channel),
@@ -2781,24 +2912,38 @@ def run_transcription_job(
         )
     except Exception as exc:  # noqa: BLE001 - background job must capture failures.
         LOGGER.exception("Manual transcription failed for media=%s", media_file)
+        message = str(exc) or exc.__class__.__name__
         update_transcription_job(
             key,
             status="failed",
-            message=str(exc) or exc.__class__.__name__,
+            message=message,
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
         )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Subtitle transcription failed for {media_file.name}: {message}",
+            level="error",
+        )
         return
 
     if not ok:
+        message = "WhisperX did not produce both .srt and .vtt outputs"
         update_transcription_job(
             key,
             status="failed",
-            message="WhisperX did not produce both .srt and .vtt outputs",
+            message=message,
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Subtitle transcription failed for {media_file.name}: {message}",
+            level="error",
         )
         return
 
@@ -2812,6 +2957,11 @@ def run_transcription_job(
         progress=1.0,
         finished_at=finished,
         updated_at=finished,
+    )
+    record_stream_event(
+        config,
+        video_id_from_job_key(key),
+        f"Subtitle transcription completed for {media_file.name}",
     )
 
 
@@ -2873,6 +3023,10 @@ def start_watermark_job(
             recipient_label=label,
             message="Queued watermark render",
         )
+        state.add_stream_event(
+            video_id,
+            f"Queued watermark copy for {source_file.name} recipient={label!r}",
+        )
     finally:
         state.close()
 
@@ -2896,6 +3050,7 @@ def start_watermark_job(
 def run_watermark_job(config: BotConfig, copy_id: str) -> None:
     state = StateStore(config.db_path)
     started_at = time.monotonic()
+    copy: WatermarkCopyRecord | None = None
     try:
         copy = state.get_watermark_copy(copy_id)
         if copy is None:
@@ -2909,6 +3064,11 @@ def run_watermark_job(config: BotConfig, copy_id: str) -> None:
                 message="Stream record not found",
                 error="Stream record not found",
                 finished=True,
+            )
+            state.add_stream_event(
+                copy.video_id,
+                f"Watermark copy failed copy_id={copy_id}: stream record not found",
+                level="error",
             )
             state.close()
             return
@@ -2950,13 +3110,20 @@ def run_watermark_job(config: BotConfig, copy_id: str) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - background job must capture failures.
         LOGGER.exception("Watermark render failed copy_id=%s", copy_id)
+        message = str(exc) or exc.__class__.__name__
         state.update_watermark_copy(
             copy_id,
             status=WATERMARK_STATUS_FAILED,
             message="Watermark render failed",
-            error=str(exc) or exc.__class__.__name__,
+            error=message,
             finished=True,
         )
+        if copy is not None:
+            state.add_stream_event(
+                copy.video_id,
+                f"Watermark copy failed copy_id={copy_id}: {message}",
+                level="error",
+            )
         state.close()
         return
 
@@ -2966,6 +3133,10 @@ def run_watermark_job(config: BotConfig, copy_id: str) -> None:
         message=elapsed_message(started_at),
         error="",
         finished=True,
+    )
+    state.add_stream_event(
+        copy.video_id,
+        f"Watermark copy completed copy_id={copy_id} output={copy.output_name}",
     )
     state.close()
     LOGGER.info("Watermark render completed copy_id=%s", copy_id)
@@ -3780,6 +3951,20 @@ def dashboard_script() -> str:
     return signals.length ? `<div class="signals">${escapeHtml(signals.join(" / "))}</div>` : "";
   };
 
+  const renderStreamEvents = (events) => {
+    if (!events || !events.length) return "";
+    const rows = events.map((event) => {
+      const segment = event.segment_index ? `seg ${String(event.segment_index).padStart(3, "0")}` : "-";
+      const level = event.level || "info";
+      return `<div class="stream-event ${escapeAttr(level)}">
+        <div class="stream-event-time">${escapeHtml(formatIso(event.created_at))}</div>
+        <div class="stream-event-segment">${escapeHtml(segment)}</div>
+        <div class="stream-event-message">${escapeHtml(event.message || "")}</div>
+      </div>`;
+    }).join("");
+    return `<div class="stream-events"><div class="stream-events-title">Stream log</div>${rows}</div>`;
+  };
+
   const renderFileAction = (file) => {
     const actions = [];
     if (file.download_url) {
@@ -3881,6 +4066,7 @@ def dashboard_script() -> str:
   </div>
   <div class="stream-body">
     ${renderStreamSignals(stream)}
+    ${renderStreamEvents(stream.events || [])}
     <div class="meta">
       <div>Segment: ${String(stream.segment_index).padStart(3, "0")}</div>
       <div>Files: ${escapeHtml(stream.file_count)}</div>
@@ -4585,6 +4771,7 @@ def render_stream_card(stream: StreamStatus) -> str:
     files = "\n".join(render_file_row(file) for file in stream.files[:20])
     if not files:
         files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
+    events = render_stream_event_timeline(stream.events)
 
     return f"""<section class="stream{collapsed_class}" data-video-id="{escape(stream.video_id, quote=True)}" data-stream-status="{escape(stream.status, quote=True)}">
   <div class="stream-head">
@@ -4599,6 +4786,7 @@ def render_stream_card(stream: StreamStatus) -> str:
   </div>
   <div class="stream-body">
     {signals}
+    {events}
     <div class="meta">
       <div>Segment: {stream.segment_index:03d}</div>
       <div>Files: {stream.file_count}</div>
@@ -4624,6 +4812,30 @@ def render_stream_card(stream: StreamStatus) -> str:
     </div>
   </div>
 </section>"""
+
+
+def render_stream_event_timeline(events: list[StreamEventStatus]) -> str:
+    if not events:
+        return ""
+    rows = "".join(render_stream_event(event) for event in events)
+    return (
+        '<div class="stream-events">'
+        '<div class="stream-events-title">Stream log</div>'
+        f"{rows}"
+        "</div>"
+    )
+
+
+def render_stream_event(event: StreamEventStatus) -> str:
+    segment = f"seg {event.segment_index:03d}" if event.segment_index else "-"
+    level = event.level if event.level in {"debug", "info", "warning", "error"} else "info"
+    return (
+        f'<div class="stream-event {escape(level, quote=True)}">'
+        f'<div class="stream-event-time">{escape(format_optional_iso(event.created_at))}</div>'
+        f'<div class="stream-event-segment">{escape(segment)}</div>'
+        f'<div class="stream-event-message">{escape(event.message)}</div>'
+        "</div>"
+    )
 
 
 def render_file_row(file: FileStatus) -> str:
