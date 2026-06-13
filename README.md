@@ -220,6 +220,26 @@ scripts/uninstall-systemd.sh
 - The dashboard shows `Transcribe` for finalized media without subtitles and
   `Retranscribe` when `.srt`/`.vtt` sidecars already exist. Retranscription
   replaces only the WhisperX subtitle/transcript sidecars for that media file.
+- Set `shot_audit_enabled = true` and `shot_audit_auto_run = true` to create
+  machine-estimated donation/shot audit projects after a stream is finalized,
+  chat is refreshed/rendered, and transcription is complete. The audit samples
+  video frames, uses OCR to read on-screen donation alert/message overlays, not
+  live chat messages, applies configurable shot rules, uses transcript
+  heuristics for likely consumed shots, and can flag visual candidates in
+  donation-following review windows for possible pouring/drinking. Tesseract is
+  the default OCR backend; `shot_audit_ocr_backend = "paddleocr"` can use a
+  PaddleOCR GPU install. The default visual backend is lightweight motion
+  scoring; `shot_audit_vision_backend = "yolo_pose"` can use Ultralytics pose
+  models on a configured CPU/CUDA device. The Python-side optional packages are
+  exposed as extras: `.[shot-audit-ocr]`, `.[shot-audit-vision]`, or
+  `.[shot-audit-gpu]`; install the matching PaddlePaddle CUDA wheel separately
+  if your OCR backend needs GPU acceleration. Projects are saved under
+  `state/shot-audits/` and appear in the dashboard's Shot Audit workspace,
+  where you can attach multiple finalized media files to one project, jump from
+  donation or consumed rows to the matching video timestamp, add or remove
+  visible-shot corrections per media file, delete saved audit projects without
+  deleting downloaded media, and download Markdown, JSON, review CSV, or parody
+  reports. These reports are review aids, not legal proof.
 - Set `watermark_enabled = true` to enable private, per-recipient invisible
   video watermark copies from the dashboard. Originals are left untouched.
   Before queueing or detecting copies, set the environment variable named by

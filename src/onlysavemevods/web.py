@@ -44,6 +44,26 @@ from .downloader import (
 )
 from .log_buffer import LogEntry, get_recent_log_entries
 from .state import StateStore, StreamRecord, WatermarkCopyRecord
+from .shot_audit import (
+    ShotAuditError,
+    add_manual_visible_shot,
+    add_media_to_project,
+    create_project as create_shot_audit_project,
+    delete_consumed_event,
+    delete_project as delete_shot_audit_project,
+    list_projects as list_shot_audit_projects,
+    load_project as load_shot_audit_project,
+    maybe_run_auto_shot_audit,
+    project_media_file,
+    project_media_files,
+    project_media_items,
+    project_to_dict as shot_audit_project_to_dict,
+    project_totals,
+    render_funny_report,
+    render_markdown_report,
+    render_review_csv,
+    run_shot_audit,
+)
 from .transcription import (
     transcribe_media_file,
     transcription_outputs_exist,
@@ -251,6 +271,7 @@ class StatusSnapshot:
     channel_stats: list[ChannelStatus]
     recent_logs: list[LogEntry]
     log_limit: int
+    shot_audit_projects: list[dict[str, Any]]
     streams: list[StreamStatus]
 
 
@@ -344,6 +365,24 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if path == "/healthz":
                 self._send_text("ok\n", "text/plain; charset=utf-8")
                 return
+            if path == "/shot-audit":
+                params = parse_qs(parts.query)
+                self._send_html(
+                    render_shot_audit_html(
+                        config,
+                        first_query_value(params, "project_id"),
+                    )
+                )
+                return
+            if path == "/shot-audit.json":
+                self._send_shot_audit_json(parts.query)
+                return
+            if path == "/shot-audit/report":
+                self._send_shot_audit_report(parts.query)
+                return
+            if path == "/shot-audit/media":
+                self._send_shot_audit_media(parts.query)
+                return
             if path == "/download":
                 self._send_download(parts.query)
                 return
@@ -368,6 +407,24 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
             if parts.path == "/detect-watermark":
                 self._detect_watermark_upload()
+                return
+            if parts.path == "/shot-audit/create":
+                self._create_shot_audit()
+                return
+            if parts.path == "/shot-audit/add-media":
+                self._add_shot_audit_media()
+                return
+            if parts.path == "/shot-audit/run":
+                self._run_shot_audit()
+                return
+            if parts.path == "/shot-audit/delete":
+                self._delete_shot_audit()
+                return
+            if parts.path == "/shot-audit/visible-shot":
+                self._add_shot_audit_visible_shot()
+                return
+            if parts.path == "/shot-audit/delete-visible-shot":
+                self._delete_shot_audit_visible_shot()
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -424,6 +481,83 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 "Content-Disposition",
                 f"attachment; filename*=UTF-8''{quote(path.name)}",
             )
+            self.end_headers()
+            with path.open("rb") as file:
+                shutil.copyfileobj(file, self.wfile)
+
+        def _send_shot_audit_json(self, query: str) -> None:
+            params = parse_qs(query)
+            project_id = first_query_value(params, "project_id")
+            if project_id:
+                project = load_shot_audit_project(config, project_id)
+                if project is None:
+                    self.send_error(HTTPStatus.NOT_FOUND)
+                    return
+                self._send_json(shot_audit_project_to_dict(project))
+                return
+            self._send_json(
+                {
+                    "projects": [
+                        shot_audit_project_to_dict(project)
+                        for project in list_shot_audit_projects(config)
+                    ]
+                }
+            )
+
+        def _send_shot_audit_report(self, query: str) -> None:
+            params = parse_qs(query)
+            project_id = first_query_value(params, "project_id")
+            kind = first_query_value(params, "kind") or "markdown"
+            project = load_shot_audit_project(config, project_id)
+            if project is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            if kind == "json":
+                body = json.dumps(
+                    shot_audit_project_to_dict(project),
+                    indent=2,
+                    sort_keys=True,
+                ) + "\n"
+                filename = f"{project.project_id}.json"
+                content_type = "application/json; charset=utf-8"
+            elif kind == "funny":
+                body = render_funny_report(project)
+                filename = f"{project.project_id}-funny.md"
+                content_type = "text/markdown; charset=utf-8"
+            elif kind == "review_csv":
+                body = render_review_csv(project)
+                filename = f"{project.project_id}-review.csv"
+                content_type = "text/csv; charset=utf-8"
+            else:
+                body = render_markdown_report(project)
+                filename = f"{project.project_id}.md"
+                content_type = "text/markdown; charset=utf-8"
+            self._send_attachment(body, content_type, filename)
+
+        def _send_shot_audit_media(self, query: str) -> None:
+            params = parse_qs(query)
+            project_id = first_query_value(params, "project_id")
+            project = load_shot_audit_project(config, project_id)
+            if project is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                media_index = int(first_query_value(params, "media_index") or "0")
+            except ValueError:
+                media_index = 0
+            path = project_media_file(config, project, media_index)
+            if path is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            stat = path.stat()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(stat.st_size))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Disposition", "inline")
             self.end_headers()
             with path.open("rb") as file:
                 shutil.copyfileobj(file, self.wfile)
@@ -578,6 +712,140 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
 
             self._send_html(render_watermark_detection_result(result))
 
+        def _create_shot_audit(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            video_id = first_query_value(params, "video_id")
+            filename = first_query_value(params, "name")
+            resolved = resolve_transcription_source_file(config, video_id, filename)
+            if resolved is None:
+                self.send_error(HTTPStatus.BAD_REQUEST, "No matching finalized media file found")
+                return
+            record, media_file = resolved
+            chat_file = matching_chat_file_for_media(media_file)
+            project = create_shot_audit_project(
+                config,
+                video_id=record.video_id,
+                media_file=media_file,
+                chat_file=chat_file,
+                chat_video_file=chat_video_output_file(media_file),
+                title=record.title,
+                channel=record.channel,
+                message="Project created from dashboard",
+            )
+            self._redirect(f"/shot-audit?project_id={quote(project.project_id)}")
+
+        def _add_shot_audit_media(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            project_id = first_query_value(params, "project_id")
+            video_id = first_query_value(params, "video_id")
+            filename = first_query_value(params, "name")
+            resolved = resolve_transcription_source_file(config, video_id, filename)
+            if resolved is None:
+                self.send_error(HTTPStatus.BAD_REQUEST, "No matching finalized media file found")
+                return
+            record, media_file = resolved
+            chat_file = matching_chat_file_for_media(media_file)
+            try:
+                project = add_media_to_project(
+                    config,
+                    project_id,
+                    video_id=record.video_id,
+                    media_file=media_file,
+                    chat_file=chat_file,
+                    chat_video_file=chat_video_output_file(media_file),
+                    title=record.title,
+                    channel=record.channel,
+                )
+            except ShotAuditError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._redirect(f"/shot-audit?project_id={quote(project.project_id)}")
+
+        def _run_shot_audit(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            project_id = first_query_value(params, "project_id")
+            project = load_shot_audit_project(config, project_id)
+            if project is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            media_file = project_media_file(config, project)
+            if media_file is None:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Project media file is unavailable")
+                return
+            chat_file = Path(project.chat_file) if project.chat_file else None
+            chat_video_file = Path(project.chat_video_file) if project.chat_video_file else None
+            run_shot_audit(
+                config,
+                video_id=project.video_id,
+                media_file=media_file,
+                chat_file=chat_file if chat_file and chat_file.is_file() else None,
+                chat_video_file=chat_video_file if chat_video_file and chat_video_file.is_file() else None,
+                title=project.title,
+                channel=project.channel,
+                force=True,
+                logger=LOGGER,
+            )
+            self._redirect(f"/shot-audit?project_id={quote(project.project_id)}")
+
+        def _delete_shot_audit(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            project_id = first_query_value(params, "project_id")
+            try:
+                delete_shot_audit_project(config, project_id)
+            except ShotAuditError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._redirect("/shot-audit")
+
+        def _add_shot_audit_visible_shot(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            project_id = first_query_value(params, "project_id")
+            try:
+                offset_seconds = float(first_query_value(params, "offset_seconds") or "0")
+                count = int(first_query_value(params, "count") or "1")
+                note = first_query_value(params, "note")
+                project = add_manual_visible_shot(
+                    config,
+                    project_id,
+                    offset_seconds=offset_seconds,
+                    count=count,
+                    note=note,
+                    media_name=first_query_value(params, "media_name"),
+                )
+            except (ValueError, ShotAuditError) as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._redirect(f"/shot-audit?project_id={quote(project.project_id)}")
+
+        def _delete_shot_audit_visible_shot(self) -> None:
+            body = self._read_request_body(1024 * 64)
+            if body is None:
+                return
+            params = parse_qs(body.decode("utf-8", "replace"))
+            project_id = first_query_value(params, "project_id")
+            event_id = first_query_value(params, "event_id")
+            try:
+                project = delete_consumed_event(config, project_id, event_id)
+            except ShotAuditError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._redirect(f"/shot-audit?project_id={quote(project.project_id)}")
+
         def _read_request_body(self, max_bytes: int) -> bytes | None:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
@@ -607,6 +875,32 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             self.wfile.write(encoded)
+
+        def _send_attachment(
+            self,
+            body: str,
+            content_type: str,
+            filename: str,
+        ) -> None:
+            encoded = body.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Disposition",
+                f"attachment; filename*=UTF-8''{quote(filename)}",
+            )
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def _redirect(self, location: str) -> None:
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", location)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
 
     return StatusRequestHandler
 
@@ -656,6 +950,10 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         channel_stats=channel_stats,
         recent_logs=get_recent_log_entries(LOG_LIMIT),
         log_limit=LOG_LIMIT,
+        shot_audit_projects=[
+            shot_audit_project_to_dict(project)
+            for project in list_shot_audit_projects(config)[:20]
+        ],
         streams=streams,
     )
 
@@ -717,6 +1015,29 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "watermark_strength": config.watermark_strength,
             "watermark_secret_configured": bool(watermark_secret(config)),
             "watermark_detect_upload_max_bytes": config.watermark_detect_upload_max_bytes,
+        },
+        "Shot Audit": {
+            "shot_audit_enabled": config.shot_audit_enabled,
+            "shot_audit_auto_run": config.shot_audit_auto_run,
+            "shot_audit_require_transcription": config.shot_audit_require_transcription,
+            "shot_audit_require_chat_video": config.shot_audit_require_chat_video,
+            "shot_audit_ocr_backend": config.shot_audit_ocr_backend,
+            "shot_audit_ocr_device": config.shot_audit_ocr_device,
+            "shot_audit_tesseract_path": config.shot_audit_tesseract_path,
+            "shot_audit_frame_interval_seconds": config.shot_audit_frame_interval_seconds,
+            "shot_audit_max_ocr_frames": config.shot_audit_max_ocr_frames,
+            "shot_audit_visual_detection_enabled": config.shot_audit_visual_detection_enabled,
+            "shot_audit_vision_backend": config.shot_audit_vision_backend,
+            "shot_audit_vision_device": config.shot_audit_vision_device,
+            "shot_audit_yolo_pose_model": config.shot_audit_yolo_pose_model,
+            "shot_audit_visual_frame_interval_seconds": (
+                config.shot_audit_visual_frame_interval_seconds
+            ),
+            "shot_audit_max_visual_frames": config.shot_audit_max_visual_frames,
+            "shot_audit_visual_motion_threshold": config.shot_audit_visual_motion_threshold,
+            "shot_audit_rules_file": str(config.shot_audit_rules_file)
+            if config.shot_audit_rules_file
+            else "-",
         },
         "Web": {
             "web_enabled": config.web_enabled,
@@ -1314,6 +1635,51 @@ def chat_media_file_for_chat_file(
     return None
 
 
+def matching_chat_file_for_media(media_file: Path) -> Path | None:
+    candidate = media_file.with_name(f"{media_file.stem}{LIVE_CHAT_SUFFIX}")
+    return candidate if candidate.is_file() else None
+
+
+def shot_audit_media_options(config: BotConfig) -> list[tuple[StreamRecord, Path]]:
+    state = StateStore(config.db_path)
+    try:
+        records = state.list_streams(STREAM_LIMIT)
+    finally:
+        state.close()
+    options: list[tuple[StreamRecord, Path]] = []
+    for record in records:
+        directory = segment_directory(config, record.video_id, record.channel)
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir(), key=lambda item: item.name):
+            if path.is_file() and is_transcribable_media_file(path.name):
+                options.append((record, path))
+    return options
+
+
+def unattached_shot_audit_media_options(
+    config: BotConfig,
+    project: Any,
+) -> list[tuple[StreamRecord, Path]]:
+    attached = {
+        normalized_path_identity(Path(item.media_file))
+        for item in project_media_items(project)
+        if item.media_file
+    }
+    return [
+        (record, path)
+        for record, path in shot_audit_media_options(config)
+        if normalized_path_identity(path) not in attached
+    ]
+
+
+def normalized_path_identity(path: Path) -> str:
+    try:
+        return str(path.resolve())
+    except OSError:
+        return str(path.absolute())
+
+
 def is_renderable_media_file(name: str) -> bool:
     if is_live_chat_file(name):
         return False
@@ -1652,6 +2018,13 @@ def run_render_chat_process_job(
         message="Rendered chat video",
         finished_at=time.time(),
     )
+    maybe_run_auto_shot_audit_for_web_job(
+        config,
+        video_id_from_job_key(key),
+        media_file,
+        chat_file=chat_file,
+        chat_video_file=output_file,
+    )
 
 
 def process_failure_message(stdout: bytes, stderr: bytes) -> str:
@@ -1710,6 +2083,13 @@ def run_render_chat_in_process_job(
         status="done",
         message="Rendered chat video",
         finished_at=time.time(),
+    )
+    maybe_run_auto_shot_audit_for_web_job(
+        config,
+        video_id_from_job_key(key),
+        media_file,
+        chat_file=chat_file,
+        chat_video_file=output_file,
     )
 
 
@@ -1852,10 +2232,59 @@ def run_transcription_job(
         message="Transcribed subtitles",
         finished_at=time.time(),
     )
+    maybe_run_auto_shot_audit_for_web_job(
+        config,
+        video_id_from_job_key(key),
+        media_file,
+        chat_file=matching_chat_file_for_media(media_file),
+        chat_video_file=chat_video_output_file(media_file),
+    )
 
 
 def transcription_job_key(video_id: str, filename: str) -> str:
     return f"{video_id}\0{filename}"
+
+
+def video_id_from_job_key(key: str) -> str:
+    return key.split("\0", 1)[0]
+
+
+def maybe_run_auto_shot_audit_for_web_job(
+    config: BotConfig,
+    video_id: str,
+    media_file: Path,
+    *,
+    chat_file: Path | None = None,
+    chat_video_file: Path | None = None,
+) -> None:
+    title = ""
+    channel = ""
+    if video_id:
+        state = StateStore(config.db_path)
+        try:
+            record = state.get_stream(video_id)
+        finally:
+            state.close()
+        if record is not None:
+            title = record.title
+            channel = record.channel
+    result = maybe_run_auto_shot_audit(
+        config,
+        video_id=video_id,
+        media_file=media_file,
+        chat_file=chat_file,
+        chat_video_file=chat_video_file,
+        title=title,
+        channel=channel,
+        logger=LOGGER,
+    )
+    if result.ran:
+        LOGGER.info(
+            "Auto shot audit completed after manual job video_id=%s project=%s message=%s",
+            video_id,
+            result.project_id,
+            result.message,
+        )
 
 
 def transcription_job_for(video_id: str, filename: str) -> TranscriptionJob | None:
@@ -2084,6 +2513,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     config_sections = render_config_sections(snapshot.configuration)
     log_rows = render_log_rows(snapshot.recent_logs)
     watermark_detection = render_watermark_detection_panel(snapshot.configuration)
+    shot_audit_panel = render_shot_audit_panel(snapshot.shot_audit_projects)
     script = dashboard_script()
 
     return f"""<!doctype html>
@@ -2176,6 +2606,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     #tab-streams:checked ~ .tabs label[for="tab-streams"],
     #tab-channels:checked ~ .tabs label[for="tab-channels"],
     #tab-logs:checked ~ .tabs label[for="tab-logs"],
+    #tab-shot-audit:checked ~ .tabs label[for="tab-shot-audit"],
     #tab-config:checked ~ .tabs label[for="tab-config"] {{
       color: var(--text);
       background: var(--panel-strong);
@@ -2184,6 +2615,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     #tab-streams:checked ~ .streams-panel,
     #tab-channels:checked ~ .channels-panel,
     #tab-logs:checked ~ .logs-panel,
+    #tab-shot-audit:checked ~ .shot-audit-panel,
     #tab-config:checked ~ .config-panel {{ display: block; }}
     .dashboard-grid {{
       display: grid;
@@ -2371,11 +2803,13 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     <input class="tab-radio" type="radio" id="tab-streams" name="dashboard-tab" checked>
     <input class="tab-radio" type="radio" id="tab-channels" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-logs" name="dashboard-tab">
+    <input class="tab-radio" type="radio" id="tab-shot-audit" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-config" name="dashboard-tab">
     <div class="tabs">
       <label for="tab-streams">Streams</label>
       <label for="tab-channels">Channels</label>
       <label for="tab-logs">Logs</label>
+      <label for="tab-shot-audit">Shot Audit</label>
       <label for="tab-config">Config</label>
     </div>
     <section class="tab-panel streams-panel">
@@ -2427,6 +2861,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         </div>
       </section>
     </section>
+    <section class="tab-panel shot-audit-panel">
+      {shot_audit_panel}
+    </section>
     <section class="tab-panel config-panel">
       <h2>Current Configuration</h2>
       <div class="file-meta">Sensitive yt-dlp arguments are redacted before display.</div>
@@ -2450,7 +2887,7 @@ def dashboard_script() -> str:
   const legacyTabKey = "ytdlbot.dashboardTab";
   const legacyCollapsedKey = "ytdlbot.collapsedStreams";
   const legacyExpandedKey = "ytdlbot.expandedStreams";
-  const tabs = ["tab-streams", "tab-channels", "tab-logs", "tab-config"];
+  const tabs = ["tab-streams", "tab-channels", "tab-logs", "tab-shot-audit", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
     detected: "detected",
@@ -2971,6 +3408,476 @@ def render_watermark_detection_error(message: str) -> str:
 </body>
 </html>
 """
+
+
+def render_shot_audit_panel(projects: list[dict[str, Any]]) -> str:
+    if not projects:
+        rows = '<tr><td colspan="7" class="file-meta">No shot audits have been created yet.</td></tr>'
+    else:
+        rows = "\n".join(render_shot_audit_summary_row(project) for project in projects[:10])
+    return f"""<section class="panel">
+        <h2>Shot Audit</h2>
+        <div class="file-meta">Machine-estimated donation/shot tallies. Treat results as review aids, not legal proof.</div>
+        <p><a class="download" href="/shot-audit">Open Shot Audit workspace</a></p>
+        <div class="table-wrap">
+          <table class="channels">
+            <thead><tr><th>Project</th><th>Status</th><th>Owed</th><th>Counted</th><th>Unconfirmed</th><th>Donations</th><th>Updated</th></tr></thead>
+            <tbody>{rows}</tbody>
+          </table>
+        </div>
+      </section>"""
+
+
+def render_shot_audit_summary_row(project: dict[str, Any]) -> str:
+    totals = project.get("totals") or {}
+    project_id = str(project.get("project_id") or "")
+    title = str(project.get("title") or project.get("video_id") or project_id)
+    href = "/shot-audit?" + urlencode({"project_id": project_id})
+    return (
+        "<tr>"
+        f'<td class="file-name"><a href="{escape(href, quote=True)}">{escape(title)}</a></td>'
+        f"<td>{escape(str(project.get('status') or '-'))}</td>"
+        f"<td>{escape(str(totals.get('owed_shots', 0)))}</td>"
+        f"<td>{escape(str(totals.get('counted_consumed_shots', 0)))}</td>"
+        f"<td>{escape(str(totals.get('unconfirmed_owed_shots', 0)))}</td>"
+        f"<td>{escape(str(totals.get('donation_count', 0)))}</td>"
+        f"<td>{escape(format_optional_iso(str(project.get('updated_at') or '')))}</td>"
+        "</tr>"
+    )
+
+
+def render_shot_audit_html(config: BotConfig, project_id: str = "") -> str:
+    projects = list_shot_audit_projects(config)
+    selected = load_shot_audit_project(config, project_id) if project_id else None
+    media_options = shot_audit_media_options(config)
+    project_rows = render_shot_audit_project_rows(projects)
+    option_rows = render_shot_audit_media_options(media_options)
+    detail = render_shot_audit_detail(config, selected) if selected else render_no_shot_audit_detail()
+    enabled = "enabled" if config.shot_audit_enabled else "disabled"
+    auto = "auto-run on" if config.shot_audit_auto_run else "auto-run off"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Shot Audit</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-strong: #eef2f6;
+      --text: #18202a;
+      --muted: #647184;
+      --line: #d7dde5;
+      --active: #0f7b44;
+      --warn: #ad5f00;
+      --bad: #a4262c;
+    }}
+    @media (prefers-color-scheme: dark) {{
+      :root {{
+        --bg: #11161d;
+        --panel: #171e27;
+        --panel-strong: #202a35;
+        --text: #eef3f8;
+        --muted: #9da9b8;
+        --line: #2c3745;
+      }}
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    header, main {{ padding: 18px clamp(16px, 4vw, 42px); }}
+    header {{ border-bottom: 1px solid var(--line); background: var(--panel); }}
+    h1 {{ margin: 0 0 8px; font-size: 24px; }}
+    h2 {{ margin: 0 0 10px; font-size: 16px; }}
+    a {{ color: inherit; }}
+    .grid {{ display: grid; grid-template-columns: minmax(280px, 420px) minmax(0, 1fr); gap: 14px; align-items: start; }}
+    .panel {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      margin-bottom: 14px;
+    }}
+    .muted, .file-meta {{ color: var(--muted); }}
+    .download, button {{
+      display: inline-block;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 8px;
+      text-decoration: none;
+      background: var(--panel-strong);
+      color: inherit;
+      font: inherit;
+      cursor: pointer;
+    }}
+    form {{ margin: 0; }}
+    .form-grid {{ display: grid; gap: 8px; }}
+    input, select, textarea {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    .actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .metrics {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; margin-bottom: 12px; }}
+    .metric {{ border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: var(--panel-strong); }}
+    .metric strong {{ display: block; font-size: 20px; }}
+    .table-wrap {{ overflow-x: auto; }}
+    table {{ width: 100%; border-collapse: collapse; min-width: 760px; }}
+    th, td {{ border-top: 1px solid var(--line); padding: 7px 6px; text-align: left; vertical-align: top; }}
+    .file-name {{ overflow-wrap: anywhere; }}
+    video {{ width: 100%; max-height: 62vh; background: #000; border-radius: 8px; }}
+    .badge {{ border: 1px solid var(--line); border-radius: 6px; padding: 2px 7px; background: var(--panel-strong); }}
+    .media-player {{ border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }}
+    .media-player:first-child {{ border-top: 0; padding-top: 0; margin-top: 0; }}
+    @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shot Audit</h1>
+    <div class="muted">Machine estimate workspace, {escape(enabled)}, {escape(auto)}. <a href="/#shot-audit">Back to dashboard</a></div>
+  </header>
+  <main class="grid">
+    <aside>
+      <section class="panel">
+        <h2>Create Project</h2>
+        <form class="form-grid" method="post" action="/shot-audit/create">
+          <select name="selection" onchange="const parts=JSON.parse(this.value || '[&quot;&quot;,&quot;&quot;]'); this.form.video_id.value=parts[0]||''; this.form.name.value=parts[1]||'';">
+            <option value="">Select finalized media...</option>
+            {option_rows}
+          </select>
+          <input type="hidden" name="video_id">
+          <input type="hidden" name="name">
+          <button type="submit">Create audit</button>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Projects</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Project</th><th>Status</th><th>Unconfirmed</th><th>Action</th></tr></thead>
+            <tbody>{project_rows}</tbody>
+          </table>
+        </div>
+      </section>
+    </aside>
+    <section>
+      {detail}
+    </section>
+  </main>
+  <script>
+    const videos = Array.from(document.querySelectorAll("video[data-media-name]"));
+    let activeVideo = videos[0] || null;
+    const offsetInput = document.querySelector("[data-current-time-target]");
+    const mediaInput = document.querySelector("[data-current-media-target]");
+    const useCurrent = document.querySelector("[data-use-current-time]");
+    const setActiveVideo = (video) => {{
+      activeVideo = video;
+      if (mediaInput && video.dataset.mediaName) {{
+        mediaInput.value = video.dataset.mediaName;
+      }}
+    }};
+    videos.forEach((video) => {{
+      video.addEventListener("click", () => setActiveVideo(video));
+      video.addEventListener("play", () => setActiveVideo(video));
+      video.addEventListener("seeking", () => setActiveVideo(video));
+    }});
+    document.querySelectorAll("[data-jump-offset]").forEach((button) => {{
+      button.addEventListener("click", () => {{
+        const mediaName = button.dataset.jumpMedia || "";
+        const offset = Number.parseFloat(button.dataset.jumpOffset || "0") || 0;
+        const video = videos.find((item) => item.dataset.mediaName === mediaName) || activeVideo || videos[0];
+        if (!video) {{
+          return;
+        }}
+        setActiveVideo(video);
+        const seek = () => {{
+          video.currentTime = Math.max(0, offset);
+          video.focus({{ preventScroll: true }});
+        }};
+        if (video.readyState >= 1) {{
+          seek();
+        }} else {{
+          video.addEventListener("loadedmetadata", seek, {{ once: true }});
+          video.load();
+        }}
+        video.scrollIntoView({{ behavior: "smooth", block: "center" }});
+        const playRequest = video.play();
+        if (playRequest && typeof playRequest.catch === "function") {{
+          playRequest.catch(() => {{}});
+        }}
+      }});
+    }});
+    if (activeVideo && offsetInput && useCurrent) {{
+      useCurrent.addEventListener("click", () => {{
+        const video = activeVideo || videos[0];
+        if (!video) {{
+          return;
+        }}
+        offsetInput.value = String(Math.max(0, video.currentTime || 0).toFixed(3));
+        setActiveVideo(video);
+      }});
+    }}
+  </script>
+</body>
+</html>
+"""
+
+
+def render_shot_audit_media_options(options: list[tuple[StreamRecord, Path]]) -> str:
+    rows: list[str] = []
+    for record, path in options:
+        label = f"{record.title or record.video_id} - {path.name}"
+        value = json.dumps([record.video_id, path.name])
+        rows.append(f'<option value="{escape(value, quote=True)}">{escape(label)}</option>')
+    return "\n".join(rows)
+
+
+def render_shot_audit_project_rows(projects: list[Any]) -> str:
+    if not projects:
+        return '<tr><td colspan="4" class="file-meta">No projects yet</td></tr>'
+    rows: list[str] = []
+    for project in projects:
+        totals = project_totals(project)
+        href = "/shot-audit?" + urlencode({"project_id": project.project_id})
+        title = project.title or project.video_id or project.project_id
+        delete_form = render_shot_audit_delete_form(project.project_id)
+        rows.append(
+            "<tr>"
+            f'<td class="file-name"><a href="{escape(href, quote=True)}">{escape(title)}</a></td>'
+            f"<td>{escape(project.status)}</td>"
+            f"<td>{totals.unconfirmed_owed_shots}</td>"
+            f"<td>{delete_form}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def render_no_shot_audit_detail() -> str:
+    return """<section class="panel">
+        <h2>No Project Selected</h2>
+        <div class="file-meta">Create or choose a shot audit project to review donation alerts and counted shots.</div>
+      </section>"""
+
+
+def render_shot_audit_media_players(config: BotConfig, project: Any) -> str:
+    media_files = project_media_files(config, project)
+    if not media_files:
+        return '<div class="file-meta">No attached media files are currently available.</div>'
+    players: list[str] = []
+    for index, media_file in enumerate(media_files):
+        query = urlencode({"project_id": project.project_id, "media_index": str(index)})
+        players.append(
+            f"""<div class="media-player">
+          <h2>{escape(media_file.name)}</h2>
+          <video controls data-media-name="{escape(media_file.name, quote=True)}" data-media-index="{index}" src="/shot-audit/media?{escape(query, quote=True)}"></video>
+        </div>"""
+        )
+    return "\n".join(players)
+
+
+def render_shot_audit_project_media_select_options(project: Any) -> str:
+    items = project_media_items(project)
+    if not items:
+        return '<option value="">Default media</option>'
+    rows = []
+    for item in items:
+        name = Path(item.media_file).name
+        rows.append(f'<option value="{escape(name, quote=True)}">{escape(name)}</option>')
+    return "\n".join(rows)
+
+
+def render_shot_audit_project_media_rows(config: BotConfig, project: Any) -> str:
+    items = project_media_items(project)
+    if not items:
+        return '<tr><td colspan="4" class="file-meta">No finalized media attached</td></tr>'
+    rows: list[str] = []
+    for index, item in enumerate(items):
+        media_file = project_media_file(config, project, index)
+        name = Path(item.media_file).name
+        chat_name = Path(item.chat_file).name if item.chat_file else "-"
+        chat_video_name = Path(item.chat_video_file).name if item.chat_video_file else "-"
+        available = "" if media_file is not None else " (missing)"
+        rows.append(
+            "<tr>"
+            f'<td class="file-name">{escape(name + available)}</td>'
+            f"<td>{escape(item.video_id or '-')}</td>"
+            f'<td class="file-name">{escape(chat_name)}</td>'
+            f'<td class="file-name">{escape(chat_video_name)}</td>'
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def render_shot_audit_detail(config: BotConfig, project: Any) -> str:
+    totals = project_totals(project)
+    media = render_shot_audit_media_players(config, project)
+    media_options = render_shot_audit_media_options(
+        unattached_shot_audit_media_options(config, project)
+    )
+    correction_media_options = render_shot_audit_project_media_select_options(project)
+    media_rows = render_shot_audit_project_media_rows(config, project)
+    report_query = urlencode({"project_id": project.project_id})
+    donation_rows = render_shot_audit_donation_rows(project.donations)
+    consumed_rows = render_shot_audit_consumed_rows(project)
+    run_form = f"""<form method="post" action="/shot-audit/run">
+          <input type="hidden" name="project_id" value="{escape(project.project_id, quote=True)}">
+          <button type="submit">Run audit now</button>
+        </form>"""
+    delete_form = render_shot_audit_delete_form(project.project_id)
+    return f"""<section class="panel">
+        <h2>{escape(project.title or project.video_id or project.project_id)}</h2>
+        <div class="file-meta">Status: <span class="badge">{escape(project.status)}</span> {escape(project.message)}</div>
+        <div class="metrics">
+          <div class="metric"><strong>{totals.owed_shots}</strong><span>Owed</span></div>
+          <div class="metric"><strong>{totals.machine_high_confidence_shots}</strong><span>Machine high confidence</span></div>
+          <div class="metric"><strong>{totals.manual_shots}</strong><span>Manual corrections</span></div>
+          <div class="metric"><strong>{totals.unconfirmed_owed_shots}</strong><span>Unconfirmed owed</span></div>
+        </div>
+        <div class="actions">
+          {run_form}
+          <a class="download" href="/shot-audit/report?{escape(report_query, quote=True)}&kind=markdown">Markdown</a>
+          <a class="download" href="/shot-audit/report?{escape(report_query, quote=True)}&kind=json">JSON</a>
+          <a class="download" href="/shot-audit/report?{escape(report_query, quote=True)}&kind=review_csv">Review CSV</a>
+          <a class="download" href="/shot-audit/report?{escape(report_query, quote=True)}&kind=funny">Funny report</a>
+          {delete_form}
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Finalized Media</h2>
+        <form class="form-grid" method="post" action="/shot-audit/add-media">
+          <input type="hidden" name="project_id" value="{escape(project.project_id, quote=True)}">
+          <select name="selection" onchange="const parts=JSON.parse(this.value || '[&quot;&quot;,&quot;&quot;]'); this.form.video_id.value=parts[0]||''; this.form.name.value=parts[1]||'';">
+            <option value="">Select finalized media to add...</option>
+            {media_options}
+          </select>
+          <input type="hidden" name="video_id">
+          <input type="hidden" name="name">
+          <button type="submit">Add media</button>
+        </form>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Media</th><th>Video ID</th><th>Chat</th><th>Chat Video</th></tr></thead>
+            <tbody>{media_rows}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Review Videos</h2>
+        {media}
+      </section>
+      <section class="panel">
+        <h2>Add Visible Shot Correction</h2>
+        <form class="form-grid" method="post" action="/shot-audit/visible-shot">
+          <input type="hidden" name="project_id" value="{escape(project.project_id, quote=True)}">
+          <label>Media<select name="media_name" data-current-media-target>{correction_media_options}</select></label>
+          <label>Offset seconds<input data-current-time-target name="offset_seconds" inputmode="decimal" value="0"></label>
+          <div class="actions"><button type="button" data-use-current-time>Use current video time</button></div>
+          <label>Count<input name="count" type="number" min="1" value="1"></label>
+          <label>Note<textarea name="note" rows="2" placeholder="Visible on camera, clear drink, etc."></textarea></label>
+          <button type="submit">Add visible shot</button>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>On-Screen Donation Alerts</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Media</th><th>Time</th><th>Amount</th><th>Owed</th><th>Rule</th><th>Confidence</th><th>Evidence</th><th>Action</th></tr></thead>
+            <tbody>{donation_rows}</tbody>
+          </table>
+        </div>
+      </section>
+      <section class="panel">
+        <h2>Consumed Shot Estimates</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Media</th><th>Time</th><th>Count</th><th>Confidence</th><th>Source</th><th>Evidence</th><th>Action</th></tr></thead>
+            <tbody>{consumed_rows}</tbody>
+          </table>
+        </div>
+      </section>"""
+
+
+def render_shot_audit_donation_rows(donations: list[Any]) -> str:
+    if not donations:
+        return '<tr><td colspan="8" class="file-meta">No donation alerts detected yet</td></tr>'
+    rows: list[str] = []
+    for donation in donations:
+        rows.append(
+            "<tr>"
+            f'<td class="file-name">{escape(donation.media_name or "-")}</td>'
+            f"<td>{escape(format_duration(int(donation.offset_seconds)))}</td>"
+            f"<td>{escape(donation.currency)} {donation.amount:.2f}</td>"
+            f"<td>{donation.owed_shots}</td>"
+            f"<td>{escape(donation.rule_label)}</td>"
+            f"<td>{escape(donation.confidence)}</td>"
+            f'<td class="file-name">{escape(donation.raw_text[:240])}</td>'
+            f"<td>{render_shot_audit_jump_button(donation.media_name, donation.offset_seconds)}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def render_shot_audit_consumed_rows(project: Any) -> str:
+    if not project.consumed:
+        return '<tr><td colspan="7" class="file-meta">No consumed-shot estimates or corrections yet</td></tr>'
+    rows: list[str] = []
+    for event in project.consumed:
+        delete_form = (
+            '<form method="post" action="/shot-audit/delete-visible-shot">'
+            f'<input type="hidden" name="project_id" value="{escape(project.project_id, quote=True)}">'
+            f'<input type="hidden" name="event_id" value="{escape(event.event_id, quote=True)}">'
+            '<button type="submit">Delete</button>'
+            "</form>"
+        )
+        actions = (
+            '<div class="actions">'
+            f"{render_shot_audit_jump_button(event.media_name, event.offset_seconds)}"
+            f"{delete_form}"
+            "</div>"
+        )
+        rows.append(
+            "<tr>"
+            f'<td class="file-name">{escape(event.media_name or "-")}</td>'
+            f"<td>{escape(format_duration(int(event.offset_seconds)))}</td>"
+            f"<td>{event.count}</td>"
+            f"<td>{escape(event.confidence)}</td>"
+            f"<td>{escape(event.source)}</td>"
+            f'<td class="file-name">{escape((event.note or event.evidence)[:240])}</td>'
+            f"<td>{actions}</td>"
+            "</tr>"
+        )
+    return "\n".join(rows)
+
+
+def render_shot_audit_jump_button(media_name: str, offset_seconds: float) -> str:
+    return (
+        '<button type="button" '
+        f'data-jump-media="{escape(media_name or "", quote=True)}" '
+        f'data-jump-offset="{max(0.0, offset_seconds):.3f}">'
+        "Jump"
+        "</button>"
+    )
+
+
+def render_shot_audit_delete_form(project_id: str) -> str:
+    return (
+        '<form method="post" action="/shot-audit/delete" '
+        'onsubmit="return confirm(&quot;Delete this audit project? Downloaded media files are not deleted.&quot;);">'
+        f'<input type="hidden" name="project_id" value="{escape(project_id, quote=True)}">'
+        '<button type="submit">Delete audit</button>'
+        "</form>"
+    )
 
 
 def render_config_row(name: str, value: Any) -> str:

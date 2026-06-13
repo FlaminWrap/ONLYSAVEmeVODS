@@ -1,6 +1,7 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
+from html import escape as html_escape
 import json
 import logging
 import unittest
@@ -18,6 +19,8 @@ from onlysavemevods.web import (
     format_bytes,
     is_watermarkable_media_file,
     render_file_action,
+    render_shot_audit_detail,
+    render_shot_audit_html,
     render_status_html,
     resolve_refresh_chat_files,
     resolve_watermark_download_file,
@@ -36,6 +39,15 @@ from onlysavemevods.web import (
     TRANSCRIPTION_JOBS,
     TRANSCRIPTION_JOBS_LOCK,
     StatusWebServer,
+)
+from onlysavemevods.shot_audit import (
+    AutoAuditResult,
+    ConsumedShotEvent,
+    DonationEvent,
+    add_media_to_project,
+    create_project as create_shot_audit_project,
+    replace_project as replace_shot_audit_project,
+    save_project as save_shot_audit_project,
 )
 
 
@@ -223,9 +235,12 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Channels", html)
         self.assertIn("Configured As", html)
         self.assertIn("Recent Logs", html)
+        self.assertIn("Shot Audit", html)
+        self.assertIn("/shot-audit", html)
         self.assertIn("Current Configuration", html)
         self.assertIn("record_live_chat", html)
         self.assertIn("render_live_chat_video", html)
+        self.assertIn("shot_audit_enabled", html)
         self.assertIn("tab-config", html)
         self.assertIn("config-stack", html)
         self.assertIn("onlysavemevods.dashboardTab", html)
@@ -258,6 +273,15 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Transcription", payload["configuration"])
         self.assertFalse(payload["configuration"]["Transcription"]["transcribe_subtitles"])
         self.assertEqual(payload["configuration"]["Transcription"]["whisperx_model"], "large-v3")
+        self.assertIn("Shot Audit", payload["configuration"])
+        self.assertEqual(
+            payload["configuration"]["Shot Audit"]["shot_audit_ocr_backend"],
+            "tesseract",
+        )
+        self.assertTrue(
+            payload["configuration"]["Shot Audit"]["shot_audit_visual_detection_enabled"]
+        )
+        self.assertIn("shot_audit_projects", payload)
         self.assertIn("channel_stats", payload)
         self.assertIn("recent_logs", payload)
         self.assertEqual(payload["recent_logs"][0]["level"], "WARNING")
@@ -270,6 +294,96 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/render-chat?", chat_payload["render_chat_url"])
         self.assertEqual(chat_payload["render_chat_status"], "ready")
         json.dumps(payload)
+
+    def test_shot_audit_workspace_renders_saved_project(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            second_media_file = segment_dir / "Live Status [LIVEVIDEO01] - part 002.mp4"
+            third_media_file = segment_dir / "Live Status [LIVEVIDEO01] - part 003.mp4"
+            media_file.write_text("media", encoding="utf-8")
+            second_media_file.write_text("media2", encoding="utf-8")
+            third_media_file.write_text("media3", encoding="utf-8")
+            project = create_shot_audit_project(
+                config,
+                video_id=stream.video_id,
+                media_file=media_file,
+                title=stream.title,
+                channel=stream.channel,
+            )
+            project = add_media_to_project(
+                config,
+                project.project_id,
+                video_id=stream.video_id,
+                media_file=second_media_file,
+                title=stream.title,
+                channel=stream.channel,
+            )
+            project = replace_shot_audit_project(
+                project,
+                donations=[
+                    DonationEvent(
+                        "d1",
+                        30.0,
+                        21.0,
+                        "USD",
+                        2,
+                        "$21 double",
+                        media_name=media_file.name,
+                    )
+                ],
+                consumed=[
+                    ConsumedShotEvent(
+                        "s1",
+                        90.0,
+                        2,
+                        "medium",
+                        "visual",
+                        "visual motion candidate",
+                        media_name=media_file.name,
+                    )
+                ],
+            )
+            save_shot_audit_project(config, project)
+
+            html = render_shot_audit_html(config, project.project_id)
+            detail = render_shot_audit_detail(config, project)
+
+        self.assertIn("Live Status", html)
+        self.assertIn("Run audit now", html)
+        self.assertIn("Add media", html)
+        self.assertIn("Delete audit", html)
+        self.assertIn("/shot-audit/delete", html)
+        self.assertIn("On-Screen Donation Alerts", html)
+        self.assertIn("Use current video time", html)
+        self.assertIn("data-current-media-target", html)
+        self.assertIn("data-jump-offset", html)
+        self.assertIn("data-jump-media", html)
+        self.assertIn("visual motion candidate", html)
+        self.assertIn("Unconfirmed owed", html)
+        self.assertIn("Live Status [LIVEVIDEO01] - part 002.mp4", html)
+        self.assertIn("kind=funny", html)
+        first_value = html_escape(json.dumps([stream.video_id, media_file.name]), quote=True)
+        second_value = html_escape(json.dumps([stream.video_id, second_media_file.name]), quote=True)
+        third_value = html_escape(json.dumps([stream.video_id, third_media_file.name]), quote=True)
+        self.assertNotIn(f'value="{first_value}"', detail)
+        self.assertNotIn(f'value="{second_value}"', detail)
+        self.assertIn(f'value="{third_value}"', detail)
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -696,6 +810,49 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(transcribe.await_args.args[0], config)
         self.assertEqual(transcribe.await_args.args[1], media_file)
         self.assertTrue(transcribe.await_args.kwargs["overwrite"])
+
+    def test_manual_transcription_job_checks_auto_shot_audit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                shot_audit_enabled=True,
+                shot_audit_auto_run=True,
+                shot_audit_require_transcription=False,
+                shot_audit_require_chat_video=False,
+            )
+            media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.parent.mkdir(parents=True)
+            media_file.write_text("media", encoding="utf-8")
+            key = transcription_job_key("LIVEVIDEO01", media_file.name)
+            with TRANSCRIPTION_JOBS_LOCK:
+                TRANSCRIPTION_JOBS[key] = TranscriptionJob(
+                    video_id="LIVEVIDEO01",
+                    media_name=media_file.name,
+                    status="running",
+                    message="Transcribing subtitles",
+                    started_at=0.0,
+                )
+            transcribe = AsyncMock(return_value=True)
+            audit_calls: list[dict[str, object]] = []
+
+            def fake_audit(*_args: object, **kwargs: object) -> AutoAuditResult:
+                audit_calls.append(kwargs)
+                return AutoAuditResult(True, "audit-project", "ok")
+
+            try:
+                with (
+                    patch("onlysavemevods.web.transcribe_media_file", transcribe),
+                    patch("onlysavemevods.web.maybe_run_auto_shot_audit", fake_audit),
+                ):
+                    run_transcription_job(config, key, media_file)
+            finally:
+                with TRANSCRIPTION_JOBS_LOCK:
+                    TRANSCRIPTION_JOBS.pop(key, None)
+
+        self.assertEqual(len(audit_calls), 1)
+        self.assertEqual(audit_calls[0]["video_id"], "LIVEVIDEO01")
+        self.assertEqual(audit_calls[0]["media_file"], media_file)
 
     def test_watermark_status_and_downloads_are_separate_from_originals(self) -> None:
         with TemporaryDirectory() as tmp:

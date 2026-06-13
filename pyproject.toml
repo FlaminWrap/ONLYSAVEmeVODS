@@ -15,6 +15,18 @@ dependencies = [
   "opencv-python-headless>=4.9.0",
 ]
 
+[project.optional-dependencies]
+shot-audit-ocr = [
+  "paddleocr>=3.0.0",
+]
+shot-audit-vision = [
+  "ultralytics>=8.0.0",
+]
+shot-audit-gpu = [
+  "paddleocr>=3.0.0",
+  "ultralytics>=8.0.0",
+]
+
 [project.scripts]
 onlysavemevods = "onlysavemevods.cli:main"
 ytdlbot = "onlysavemevods.cli:main"

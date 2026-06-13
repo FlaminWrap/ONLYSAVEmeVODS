@@ -33,6 +33,8 @@ DEFAULT_POST_EXIT_CHECK_SECONDS = [
 DEFAULT_RETRY_BACKOFF_SECONDS = [30, 60, 120, 300]
 LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 WATERMARK_STRENGTHS = {"invisible", "balanced", "robust"}
+SHOT_AUDIT_OCR_BACKENDS = {"tesseract", "paddleocr"}
+SHOT_AUDIT_VISION_BACKENDS = {"motion", "yolo_pose"}
 HUGGINGFACE_TOKEN_PREFIX = "hf_"
 DISALLOWED_EXTRA_YT_DLP_ARGS = {
     "--dump-json",
@@ -99,6 +101,23 @@ class BotConfig:
     watermark_secret_env: str = DEFAULT_WATERMARK_SECRET_ENV
     watermark_strength: str = "invisible"
     watermark_detect_upload_max_bytes: int = 2_147_483_648
+    shot_audit_enabled: bool = False
+    shot_audit_auto_run: bool = False
+    shot_audit_require_transcription: bool = True
+    shot_audit_require_chat_video: bool = True
+    shot_audit_ocr_backend: str = "tesseract"
+    shot_audit_ocr_device: str = "auto"
+    shot_audit_tesseract_path: str = "tesseract"
+    shot_audit_frame_interval_seconds: float = 0.5
+    shot_audit_max_ocr_frames: int = 900
+    shot_audit_visual_detection_enabled: bool = True
+    shot_audit_vision_backend: str = "motion"
+    shot_audit_vision_device: str = "auto"
+    shot_audit_yolo_pose_model: str = "yolo11n-pose.pt"
+    shot_audit_visual_frame_interval_seconds: float = 2.0
+    shot_audit_max_visual_frames: int = 1800
+    shot_audit_visual_motion_threshold: float = 0.035
+    shot_audit_rules_file: Path | None = None
     config_path: Path | None = None
 
     @property
@@ -257,6 +276,77 @@ def load_config(path: str | Path) -> BotConfig:
             raw.get("watermark_detect_upload_max_bytes", 2_147_483_648),
             "watermark_detect_upload_max_bytes",
         ),
+        shot_audit_enabled=_as_bool(
+            raw.get("shot_audit_enabled", False),
+            "shot_audit_enabled",
+        ),
+        shot_audit_auto_run=_as_bool(
+            raw.get("shot_audit_auto_run", False),
+            "shot_audit_auto_run",
+        ),
+        shot_audit_require_transcription=_as_bool(
+            raw.get("shot_audit_require_transcription", True),
+            "shot_audit_require_transcription",
+        ),
+        shot_audit_require_chat_video=_as_bool(
+            raw.get("shot_audit_require_chat_video", True),
+            "shot_audit_require_chat_video",
+        ),
+        shot_audit_ocr_backend=_as_choice(
+            raw.get("shot_audit_ocr_backend", "tesseract"),
+            "shot_audit_ocr_backend",
+            SHOT_AUDIT_OCR_BACKENDS,
+        ),
+        shot_audit_ocr_device=_as_optional_str(
+            raw.get("shot_audit_ocr_device", "auto"),
+            "shot_audit_ocr_device",
+        ) or "auto",
+        shot_audit_tesseract_path=_as_str(
+            raw.get("shot_audit_tesseract_path", "tesseract"),
+            "shot_audit_tesseract_path",
+        ),
+        shot_audit_frame_interval_seconds=_as_positive_float(
+            raw.get("shot_audit_frame_interval_seconds", 0.5),
+            "shot_audit_frame_interval_seconds",
+        ),
+        shot_audit_max_ocr_frames=_as_positive_int(
+            raw.get("shot_audit_max_ocr_frames", 900),
+            "shot_audit_max_ocr_frames",
+        ),
+        shot_audit_visual_detection_enabled=_as_bool(
+            raw.get("shot_audit_visual_detection_enabled", True),
+            "shot_audit_visual_detection_enabled",
+        ),
+        shot_audit_vision_backend=_as_choice(
+            raw.get("shot_audit_vision_backend", "motion"),
+            "shot_audit_vision_backend",
+            SHOT_AUDIT_VISION_BACKENDS,
+        ),
+        shot_audit_vision_device=_as_optional_str(
+            raw.get("shot_audit_vision_device", "auto"),
+            "shot_audit_vision_device",
+        ) or "auto",
+        shot_audit_yolo_pose_model=_as_str(
+            raw.get("shot_audit_yolo_pose_model", "yolo11n-pose.pt"),
+            "shot_audit_yolo_pose_model",
+        ),
+        shot_audit_visual_frame_interval_seconds=_as_positive_float(
+            raw.get("shot_audit_visual_frame_interval_seconds", 2.0),
+            "shot_audit_visual_frame_interval_seconds",
+        ),
+        shot_audit_max_visual_frames=_as_positive_int(
+            raw.get("shot_audit_max_visual_frames", 1800),
+            "shot_audit_max_visual_frames",
+        ),
+        shot_audit_visual_motion_threshold=_as_positive_float(
+            raw.get("shot_audit_visual_motion_threshold", 0.035),
+            "shot_audit_visual_motion_threshold",
+        ),
+        shot_audit_rules_file=_resolve_optional_path(
+            raw.get("shot_audit_rules_file", ""),
+            base_dir,
+            "shot_audit_rules_file",
+        ),
         config_path=config_path.resolve(),
     )
 
@@ -325,6 +415,8 @@ def _toml_value(value: Any, name: str) -> str:
         return "true" if value else "false"
     if isinstance(value, int) and not isinstance(value, bool):
         return str(value)
+    if isinstance(value, float):
+        return repr(value)
     if isinstance(value, str):
         return json.dumps(value)
     if isinstance(value, list):
@@ -334,6 +426,16 @@ def _toml_value(value: Any, name: str) -> str:
 
 def _resolve_path(value: Any, base_dir: Path) -> Path:
     path = Path(_as_str(value, "path")).expanduser()
+    if not path.is_absolute():
+        path = base_dir / path
+    return path.resolve()
+
+
+def _resolve_optional_path(value: Any, base_dir: Path, name: str) -> Path | None:
+    raw = _as_optional_str(value, name)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
@@ -374,6 +476,16 @@ def _as_positive_int(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ConfigError(f"{name} must be a positive integer")
     return value
+
+
+def _as_positive_float(value: Any, name: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or float(value) <= 0
+    ):
+        raise ConfigError(f"{name} must be a positive number")
+    return float(value)
 
 
 def _as_non_negative_int(value: Any, name: str) -> int:
@@ -429,6 +541,13 @@ def _as_log_level(value: Any, name: str) -> str:
     if level not in LOG_LEVELS:
         raise ConfigError(f"{name} must be one of: {', '.join(sorted(LOG_LEVELS))}")
     return level
+
+
+def _as_choice(value: Any, name: str, allowed: set[str]) -> str:
+    choice = _as_str(value, name).casefold()
+    if choice not in allowed:
+        raise ConfigError(f"{name} must be one of: {', '.join(sorted(allowed))}")
+    return choice
 
 
 def _as_watermark_strength(value: Any, name: str) -> str:
