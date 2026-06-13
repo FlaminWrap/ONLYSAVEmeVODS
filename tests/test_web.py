@@ -888,6 +888,8 @@ class WebStatusTests(unittest.TestCase):
             html = render_status_html(build_status_snapshot(config))
 
         self.assertIn('action="/voice-detection"', html)
+        self.assertIn('class="voice-table"', html)
+        self.assertNotIn('config-table voice-table', html)
         self.assertIn('name="scope" value="global"', html)
         self.assertIn('name="scope" value="channel"', html)
         self.assertIn("fixed, exactly 2", html)

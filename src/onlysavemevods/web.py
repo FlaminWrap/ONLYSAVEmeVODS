@@ -2904,7 +2904,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .meta div {{ min-width: 0; overflow-wrap: anywhere; }}
     .wide {{ grid-column: 1 / -1; }}
     .table-wrap {{ overflow-x: auto; }}
-    .files, .channels, .jobs, .logs, .config-table {{
+    .files, .channels, .jobs, .logs, .config-table, .voice-table {{
       width: 100%;
       border-collapse: collapse;
       margin-top: 8px;
@@ -2917,7 +2917,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .config-table th:first-child, .config-table td:first-child {{ width: 32%; }}
     .config-table th:last-child, .config-table td:last-child {{ width: 68%; }}
     .files th, .files td, .channels th, .channels td, .jobs th, .jobs td, .logs th, .logs td,
-    .config-table th, .config-table td {{
+    .config-table th, .config-table td, .voice-table th, .voice-table td {{
       border-top: 1px solid var(--line);
       padding: 7px 6px;
       text-align: left;
@@ -3011,7 +3011,22 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .small-input {{ width: 74px; }}
     .env-input {{ width: 150px; }}
-    .voice-table {{ min-width: 980px; }}
+    .voice-table {{ min-width: 1040px; table-layout: fixed; }}
+    .voice-table th {{ white-space: nowrap; }}
+    .voice-table th:nth-child(1), .voice-table td:nth-child(1) {{ width: 22%; }}
+    .voice-table th:nth-child(2), .voice-table td:nth-child(2) {{ width: 20%; }}
+    .voice-table th:nth-child(3), .voice-table td:nth-child(3) {{ width: 18%; }}
+    .voice-table th:nth-child(4), .voice-table td:nth-child(4) {{ width: 40%; }}
+    .voice-channel-form {{
+      flex-wrap: nowrap;
+      align-items: center;
+      margin: 0;
+      gap: 6px;
+    }}
+    .voice-channel-form select {{ flex: 0 0 118px; width: 118px; }}
+    .voice-channel-form .small-input {{ flex: 0 0 70px; width: 70px; }}
+    .voice-channel-form .env-input {{ flex: 1 0 140px; min-width: 140px; }}
+    .voice-channel-form .action-button {{ flex: 0 0 auto; }}
     .settings-form {{
       display: grid;
       gap: 14px;
@@ -3863,10 +3878,10 @@ def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
         for channel in snapshot.channel_stats
     )
     if not rows:
-        rows = '<tr><td colspan="5" class="file-meta">No configured channels or stream history found</td></tr>'
+        rows = '<tr><td colspan="4" class="file-meta">No configured channels or stream history found</td></tr>'
     return f"""<section class="panel voice-detection-panel">
   <h2>Voice Detection</h2>
-  <form class="voice-form" method="post" action="/voice-detection">
+  <form class="voice-form voice-default-form" method="post" action="/voice-detection">
     <input type="hidden" name="scope" value="global">
     <label>Default mode {render_voice_detection_mode_select("mode", str(transcription.get("voice_detection", "auto")), include_inherit=False)}</label>
     <label>Speakers <input class="small-input" name="speakers" type="number" min="1" value="{escape(fixed_value, quote=True)}" placeholder="fixed"></label>
@@ -3876,8 +3891,8 @@ def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
     <button class="download action-button" type="submit">Save Default</button>
   </form>
   <div class="table-wrap">
-    <table class="config-table voice-table">
-      <thead><tr><th>Channel</th><th>Configured As</th><th>Override</th><th>Speaker Bounds</th><th>Action</th></tr></thead>
+    <table class="voice-table">
+      <thead><tr><th>Channel</th><th>Configured As</th><th>Current Override</th><th>Update Override</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
   </div>
@@ -3895,8 +3910,8 @@ def render_voice_detection_channel_row(
   <td class="file-name">{escape(channel.name)}</td>
   <td class="file-name">{escape(configured_as)}</td>
   <td>{escape(summary)}</td>
-  <td colspan="2">
-    <form class="voice-form" method="post" action="/voice-detection">
+  <td>
+    <form class="voice-form voice-channel-form" method="post" action="/voice-detection">
       <input type="hidden" name="scope" value="channel">
       <input type="hidden" name="channel" value="{escape(key, quote=True)}">
       {render_voice_detection_mode_select("mode", "inherit", include_inherit=True)}
