@@ -17,12 +17,19 @@ CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SECRETS_FILE="${INSTALL_DIR}/secrets.env"
 SERVICE_NAME="onlysavemevods.service"
 UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}"
+PYTHON_UPDATE_SERVICE_NAME="onlysavemevods-python-update.service"
+PYTHON_UPDATE_TIMER_NAME="onlysavemevods-python-update.timer"
+PYTHON_UPDATE_SERVICE_UNIT="/etc/systemd/system/${PYTHON_UPDATE_SERVICE_NAME}"
+PYTHON_UPDATE_TIMER_UNIT="/etc/systemd/system/${PYTHON_UPDATE_TIMER_NAME}"
 SERVICE_USER="${ONLYSAVEMEVODS_USER:-onlysavemevods}"
 PYTHON_BIN="${PYTHON:-}"
 SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-0}"
 SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-0}"
 SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-0}"
 INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-auto}"
+ENABLE_PYTHON_UPDATER="${ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER:-1}"
+PYTHON_UPDATE_CALENDAR="${ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR:-*-*-* 04:15:00}"
+PYTHON_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY:-45m}"
 APT_UPDATED=0
 
 die() {
@@ -175,6 +182,9 @@ install_application_files() {
 
   sudo chown -R root:root "${APP_DIR}"
   sudo chmod -R go-w "${APP_DIR}"
+  if [[ -f "${APP_DIR}/scripts/update-python-deps.sh" ]]; then
+    sudo chmod 0755 "${APP_DIR}/scripts/update-python-deps.sh"
+  fi
 }
 
 install_or_preserve_config() {
@@ -636,6 +646,42 @@ install_whisperx_if_needed() {
   fi
 }
 
+python_updater_enabled() {
+  case "${ENABLE_PYTHON_UPDATER}" in
+    0|false|False|FALSE|no|No|NO)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+install_or_disable_python_update_units() {
+  if ! python_updater_enabled; then
+    echo "Disabling nightly Python dependency updater..."
+    sudo systemctl disable --now "${PYTHON_UPDATE_TIMER_NAME}" >/dev/null 2>&1 || true
+    sudo systemctl stop "${PYTHON_UPDATE_SERVICE_NAME}" >/dev/null 2>&1 || true
+    sudo rm -f "${PYTHON_UPDATE_SERVICE_UNIT}" "${PYTHON_UPDATE_TIMER_UNIT}"
+    return 0
+  fi
+
+  echo "Installing nightly Python dependency updater..."
+  sudo "${VENV_DIR}/bin/python" -m onlysavemevods.python_update write-systemd-units \
+    --service-unit "${PYTHON_UPDATE_SERVICE_UNIT}" \
+    --timer-unit "${PYTHON_UPDATE_TIMER_UNIT}" \
+    --install-dir "${INSTALL_DIR}" \
+    --app-dir "${APP_DIR}" \
+    --venv-dir "${VENV_DIR}" \
+    --config "${CONFIG_FILE}" \
+    --main-service-name "${SERVICE_NAME}" \
+    --update-service-name "${PYTHON_UPDATE_SERVICE_NAME}" \
+    --calendar "${PYTHON_UPDATE_CALENDAR}" \
+    --random-delay "${PYTHON_UPDATE_RANDOM_DELAY}"
+  sudo chown root:root "${PYTHON_UPDATE_SERVICE_UNIT}" "${PYTHON_UPDATE_TIMER_UNIT}"
+  sudo chmod 0644 "${PYTHON_UPDATE_SERVICE_UNIT}" "${PYTHON_UPDATE_TIMER_UNIT}"
+}
+
 stage_source_if_inside_install_tree
 install_os_dependencies
 
@@ -717,12 +763,21 @@ ReadWritePaths=${CACHE_DIR} ${DOWNLOAD_DIR} ${STATE_DIR}
 WantedBy=multi-user.target
 EOF
 
+install_or_disable_python_update_units
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}" --now
 sudo systemctl restart "${SERVICE_NAME}"
+if python_updater_enabled; then
+  sudo systemctl enable "${PYTHON_UPDATE_TIMER_NAME}" --now
+fi
 
 echo "Installed and restarted ${SERVICE_NAME}"
 echo "Install dir: ${INSTALL_DIR}"
 echo "Service user: ${SERVICE_USER}"
+if python_updater_enabled; then
+  echo "Python updater: ${PYTHON_UPDATE_TIMER_NAME} (${PYTHON_UPDATE_CALENDAR}, randomized delay ${PYTHON_UPDATE_RANDOM_DELAY})"
+else
+  echo "Python updater: disabled"
+fi
 echo "Status: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:   journalctl -u ${SERVICE_NAME} -f"

@@ -73,7 +73,7 @@ To run only the status page against an existing state database:
 Install and enable the system service:
 
 ```bash
-scripts/install-systemd.sh
+scripts/install-almalinux.sh
 ```
 
 On Debian or Ubuntu, you can use the distro-named entrypoints instead:
@@ -115,35 +115,49 @@ true` is set in `config.toml`, the installer also installs `whisperx` into the
 project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to force that install or
 `ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it.
 
+The installer also enables a nightly root-run Python dependency updater. It
+refreshes the project venv, `yt-dlp[default]`, and installed/enabled WhisperX,
+but skips the run if the service is recording, checking a recent exit, waiting
+to retry, or running queued dashboard/watermark jobs. By default it runs at
+`04:15` with up to `45m` randomized delay. If the service is active but the
+local status endpoint cannot be read, the updater skips that run rather than
+guessing. Disable or reschedule it at install time with:
+
+```bash
+ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER=0 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR='*-*-* 03:30:00' scripts/install-almalinux.sh
+ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY=20m scripts/install-almalinux.sh
+```
+
 To install somewhere other than `/opt/onlysavemevods`:
 
 ```bash
-ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods scripts/install-systemd.sh
+ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods scripts/install-almalinux.sh
 ```
 
 To skip OS package installation and only use what is already present:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_OS_DEPS=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_OS_DEPS=1 scripts/install-almalinux.sh
 ```
 
 To install OS packages but skip NVIDIA driver/NVENC package installation:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1 scripts/install-almalinux.sh
 ```
 
 To skip Deno installation because you already provide a supported runtime on
 `PATH`:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_DENO=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_SKIP_DENO=1 scripts/install-almalinux.sh
 ```
 
 To install WhisperX even before transcription is enabled in `config.toml`:
 
 ```bash
-ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-systemd.sh
+ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-almalinux.sh
 ```
 
 To update a config file manually without changing existing values:
@@ -156,7 +170,9 @@ Inspect it:
 
 ```bash
 sudo systemctl status onlysavemevods.service
+systemctl list-timers onlysavemevods-python-update.timer
 journalctl -u onlysavemevods.service -f
+journalctl -u onlysavemevods-python-update.service
 ```
 
 Set `log_level = "DEBUG"` in `config.toml` and restart the service when you need
