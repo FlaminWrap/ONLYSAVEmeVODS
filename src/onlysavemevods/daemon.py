@@ -4,7 +4,7 @@ import asyncio
 import logging
 
 from .chat_render import log_nvenc_environment
-from .config import BotConfig, ensure_config_dirs
+from .config import BotConfig, ensure_config_dirs, monitored_sources
 from .downloader import DownloadManager
 from .models import LiveStream
 from .state import StateStore
@@ -32,9 +32,10 @@ class OnlySaveMeVodsDaemon:
     async def run(self) -> None:
         self.state.mark_stale_downloads_interrupted()
         self.state.mark_stale_watermarks_interrupted()
+        sources = monitored_sources(self.config)
         LOGGER.info(
-            "ONLYSAVEmeVODS daemon started channels=%s poll_interval=%ss download_dir=%s",
-            len(self.config.channels),
+            "ONLYSAVEmeVODS daemon started sources=%s poll_interval=%ss download_dir=%s",
+            len(sources),
             self.config.poll_interval_seconds,
             self.config.download_dir,
         )
@@ -82,8 +83,8 @@ class OnlySaveMeVodsDaemon:
                 )
         else:
             LOGGER.info("Status web interface disabled by config")
-        if not self.config.channels:
-            LOGGER.warning("No channels configured; edit config.toml to add channels")
+        if not monitored_sources(self.config):
+            LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
 
         try:
             while not self._stop_event.is_set():
@@ -106,7 +107,7 @@ class OnlySaveMeVodsDaemon:
         self._stop_event.set()
 
     async def poll_once(self) -> None:
-        for channel in self.config.channels:
+        for channel in monitored_sources(self.config):
             LOGGER.info("Checking channel %s", channel)
             skip_video_ids: set[str] = set()
             try:

@@ -6,7 +6,7 @@ import logging
 import unittest
 
 from onlysavemevods import __version__
-from onlysavemevods.config import BotConfig, ConfigError, VoiceDetectionConfig, load_config
+from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
@@ -21,6 +21,8 @@ from onlysavemevods.web import (
     render_file_action,
     render_status_html,
     update_app_config_from_form,
+    update_speaker_labels_from_form,
+    update_streamer_from_form,
     update_voice_detection_from_form,
     resolve_refresh_chat_files,
     resolve_watermark_download_file,
@@ -211,6 +213,46 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(unused_channel.configured_sources, ["@Unused"])
         self.assertEqual(unused_channel.stream_count, 0)
+
+    def test_status_snapshot_groups_streamer_sources(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                streamers={
+                    "OUMB3rd": StreamerConfig(
+                        sources=["@OUMB3rd", "@OUMB3rdVODS"],
+                    )
+                },
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="OUMB3rd VODS",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            segment_dir = config.download_dir / "OUMB3rd" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "Live Status [LIVEVIDEO01].mp4").write_text(
+                "final",
+                encoding="utf-8",
+            )
+
+            snapshot = build_status_snapshot(config)
+
+        streamer = next(
+            channel
+            for channel in snapshot.channel_stats
+            if channel.name == "OUMB3rd"
+        )
+        self.assertEqual(streamer.configured_sources, ["@OUMB3rd", "@OUMB3rdVODS"])
+        self.assertEqual(streamer.stream_count, 1)
+        self.assertEqual(streamer.active_count, 1)
+        self.assertEqual(snapshot.configuration["Streamers"]["count"], 1)
+        self.assertEqual(snapshot.configuration["Channels"]["monitored_source_count"], 2)
 
     def test_status_html_and_json_are_renderable(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -760,6 +802,39 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("&lt;redacted&gt;", html)
         self.assertNotIn("/secret/cookies.txt", html)
 
+    def test_streamer_group_form_updates_file_and_running_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("channels = []\n", encoding="utf-8")
+            config = load_config(config_path)
+
+            update_streamer_from_form(
+                config,
+                {
+                    "action": ["save"],
+                    "streamer_name": ["OUMB3rd"],
+                    "sources": ["@OUMB3rd\n@OUMB3rdVODS"],
+                    "download_dir_name": ["OUMB3rd Shared"],
+                },
+            )
+            created = load_config(config_path)
+            html = render_status_html(build_status_snapshot(config))
+            update_streamer_from_form(
+                config,
+                {
+                    "action": ["delete"],
+                    "streamer_name": ["OUMB3rd"],
+                },
+            )
+            removed = load_config(config_path)
+
+        self.assertEqual(created.streamers["OUMB3rd"].sources, ["@OUMB3rd", "@OUMB3rdVODS"])
+        self.assertEqual(created.streamers["OUMB3rd"].download_dir_name, "OUMB3rd Shared")
+        self.assertEqual(config.streamers, {})
+        self.assertEqual(removed.streamers, {})
+        self.assertIn('action="/streamers"', html)
+        self.assertIn("Streamer Groups", html)
+
     def test_app_config_form_updates_file_and_running_config(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -922,6 +997,33 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(config.whisperx_max_speakers, 2)
         self.assertEqual(config.channel_voice_detection["Example Channel"].mode, "off")
 
+    def test_voice_detection_form_updates_streamer_shared_override(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@ExampleChannel"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_voice_detection_from_form(
+                config,
+                {
+                    "scope": ["channel"],
+                    "channel": ["OUMB3rd"],
+                    "mode": ["fixed"],
+                    "speakers": ["2"],
+                },
+            )
+            updated = load_config(config_path)
+
+        self.assertEqual(updated.channel_voice_detection, {})
+        self.assertIsNotNone(updated.streamers["OUMB3rd"].voice_detection)
+        assert updated.streamers["OUMB3rd"].voice_detection is not None
+        self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.mode, "fixed")
+        self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.min_speakers, 2)
+
     def test_voice_detection_form_ignores_irrelevant_prefilled_values(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -970,6 +1072,171 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(override.mode, "range")
         self.assertEqual(override.min_speakers, 2)
         self.assertEqual(override.max_speakers, 4)
+
+    def test_speaker_labels_panel_detects_transcript_speakers(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["@ExampleChannel"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                channel_speaker_labels={"Example Channel": {"SPEAKER_00": "OUMB3rd"}},
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "Live Status [LIVEVIDEO01].json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "speaker": "SPEAKER_00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('action="/speaker-labels"', html)
+        self.assertIn("Speaker Names", html)
+        self.assertIn("SPEAKER_00", html)
+        self.assertIn("OUMB3rd", html)
+
+    def test_speaker_labels_form_updates_config_and_existing_subtitles(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'channels = ["@ExampleChannel"]\n'
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "speaker": "SPEAKER_00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".srt").write_text("old", encoding="utf-8")
+            media_file.with_suffix(".vtt").write_text("old", encoding="utf-8")
+
+            update_speaker_labels_from_form(
+                config,
+                {
+                    "channel": ["Example Channel"],
+                    "speaker_label": ["SPEAKER_00", ""],
+                    "speaker_name": ["OUMB3rd", ""],
+                },
+            )
+            updated = load_config(config_path)
+            srt_text = media_file.with_suffix(".srt").read_text(encoding="utf-8")
+
+        self.assertEqual(
+            updated.channel_speaker_labels["Example Channel"],
+            {"SPEAKER_00": "OUMB3rd"},
+        )
+        self.assertIn("OUMB3rd: hello", srt_text)
+
+    def test_speaker_labels_form_updates_streamer_shared_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@ExampleChannel"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "OUMB3rd" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "speaker": "SPEAKER_00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".srt").write_text("old", encoding="utf-8")
+            media_file.with_suffix(".vtt").write_text("old", encoding="utf-8")
+
+            update_speaker_labels_from_form(
+                config,
+                {
+                    "channel": ["OUMB3rd"],
+                    "speaker_label": ["SPEAKER_00"],
+                    "speaker_name": ["OUMB3rd"],
+                },
+            )
+            updated = load_config(config_path)
+            srt_text = media_file.with_suffix(".srt").read_text(encoding="utf-8")
+
+        self.assertEqual(updated.channel_speaker_labels, {})
+        self.assertEqual(
+            updated.streamers["OUMB3rd"].speaker_labels,
+            {"SPEAKER_00": "OUMB3rd"},
+        )
+        self.assertIn("OUMB3rd: hello", srt_text)
 
     def test_transcription_action_can_retranscribe_existing_sidecars(self) -> None:
         with TemporaryDirectory() as tmp:

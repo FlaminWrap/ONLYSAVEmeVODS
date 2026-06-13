@@ -37,7 +37,7 @@ from .chat_timing import (
     update_chat_timing,
     utc_now_iso,
 )
-from .config import BotConfig
+from .config import BotConfig, download_group_name_for_channel
 from .models import LiveStream
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
@@ -955,6 +955,7 @@ class DownloadManager:
                     transcription_config_for_channel(self.config, files.channel),
                     files.media_file,
                     logger=self.logger,
+                    channel=files.channel,
                 )
 
     async def render_live_chat_video(
@@ -2184,12 +2185,13 @@ def discard_task_exception(task: asyncio.Task[None]) -> None:
 
 def segment_directory(config: BotConfig, video_id: str, channel: str = "") -> Path:
     legacy_directory = config.download_dir / safe_path_component(video_id)
-    if not channel.strip():
+    group_name = download_group_name_for_channel(config, channel)
+    if not group_name:
         return legacy_directory
 
     channel_directory = (
         config.download_dir
-        / safe_path_component(channel)
+        / safe_path_component(group_name)
         / safe_path_component(video_id)
     )
     if legacy_directory.exists() and not channel_directory.exists():

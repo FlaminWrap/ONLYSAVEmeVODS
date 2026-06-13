@@ -1,8 +1,23 @@
-# Add YouTube channel URLs or @handles here. The dashboard Config tab can
-# edit this file after the first run.
+# Add simple YouTube channel URLs or @handles here. The dashboard Config tab
+# can edit this top-level list after the first run.
 # Examples:
 # channels = ["@SomeChannel", "https://www.youtube.com/@SomeChannel"]
 channels = []
+
+# For one streamer with several channels, use a streamer object instead. The
+# daemon monitors every source, stores downloads under the streamer name, and
+# shares voice detection and speaker-name settings across those sources.
+# [streamers."Some Streamer"]
+# sources = ["@SomeStreamer", "https://www.youtube.com/@SomeStreamerVODS"]
+# download_dir_name = "Some Streamer"
+#
+# [streamers."Some Streamer".voice_detection]
+# mode = "fixed"
+# speakers = 2
+#
+# [streamers."Some Streamer".speaker_labels]
+# SPEAKER_00 = "Host"
+# SPEAKER_01 = "Guest"
 
 download_dir = "downloads"
 state_dir = "state"
@@ -48,7 +63,7 @@ transcription_max_concurrent = 1
 #   onlysavemevods voice-detection set --config config.toml --mode auto
 # Modes: off disables labels, auto lets WhisperX infer the count, range uses
 # whisperx_min_speakers/whisperx_max_speakers, and fixed sets both to one count.
-# The dashboard Config tab can manage the default and per-channel overrides.
+# The dashboard Config tab can manage the default, streamer, and per-channel overrides.
 # To use diarization with pyannote, set the environment variable named by
 # whisperx_hf_token_env and accept the required Hugging Face model terms.
 whisperx_path = "whisperx"
@@ -62,10 +77,18 @@ whisperx_hf_token_env = "HF_TOKEN"
 whisperx_min_speakers = 0
 whisperx_max_speakers = 0
 
-# Optional per-channel override. Use the channel name shown in the dashboard.
+# Optional source-specific override. Use the channel name shown in the dashboard.
+# If a streamer also has voice_detection settings, this source-specific table wins.
 # [channel_voice_detection."Example Channel"]
 # mode = "fixed"
 # speakers = 2
+
+# Optional speaker-name mapping for diarized subtitles. WhisperX emits labels
+# such as SPEAKER_00 and SPEAKER_01 in each transcript JSON. The dashboard
+# Config tab can show detected labels and save mappings per streamer or channel.
+# [channel_speaker_labels."Example Channel"]
+# SPEAKER_00 = "Host"
+# SPEAKER_01 = "Guest"
 
 # Use "DEBUG" while diagnosing stream detection, resume, and finalize behavior.
 # Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.

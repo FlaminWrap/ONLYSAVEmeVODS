@@ -39,8 +39,15 @@ from .config import (
     ConfigError,
     VoiceDetectionConfig,
     load_config,
+    monitored_sources,
+    remove_streamer_config,
+    streamer_display_name_for_channel,
+    update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
     update_config_values,
+    update_streamer_config,
+    update_streamer_speaker_labels_config,
+    update_streamer_voice_detection_config,
 )
 from .downloader import (
     command_for_log,
@@ -54,6 +61,9 @@ from .downloader import (
 from .log_buffer import LogEntry, get_recent_log_entries
 from .state import StateStore, StreamRecord, WatermarkCopyRecord
 from .transcription import (
+    load_whisperx_subtitle_segments,
+    rewrite_speaker_labels_for_media,
+    speaker_labels_for_channel,
     transcribe_media_file,
     transcription_config_for_channel,
     transcription_outputs_exist,
@@ -273,6 +283,24 @@ class ChannelStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeakerLabelStatus:
+    channel: str
+    configured_sources: list[str]
+    detected_labels: list[str]
+    labels: dict[str, str]
+    transcript_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class StreamerStatus:
+    name: str
+    sources: list[str]
+    download_dir_name: str
+    voice_detection: str
+    speaker_label_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class AppInfo:
     name: str
     version: str
@@ -307,8 +335,10 @@ class StatusSnapshot:
     temporary_bytes: int
     stream_limit: int
     configured_channels: list[str]
+    streamer_groups: list[StreamerStatus]
     configuration: dict[str, dict[str, Any]]
     channel_stats: list[ChannelStatus]
+    speaker_labels: list[SpeakerLabelStatus]
     recent_logs: list[LogEntry]
     log_limit: int
     jobs: list[JobStatus]
@@ -469,6 +499,12 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if parts.path == "/voice-detection":
                 self._update_voice_detection()
                 return
+            if parts.path == "/speaker-labels":
+                self._update_speaker_labels()
+                return
+            if parts.path == "/streamers":
+                self._update_streamers()
+                return
             if parts.path == "/config":
                 self._update_config()
                 return
@@ -622,6 +658,26 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
+        def _update_speaker_labels(self) -> None:
+            body = self._read_request_body(64 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_speaker_labels_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#config")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
         def _update_config(self) -> None:
             body = self._read_request_body(256 * 1024)
             if body is None:
@@ -632,6 +688,26 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     keep_blank_values=True,
                 )
                 update_app_config_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#config")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_streamers(self) -> None:
+            body = self._read_request_body(64 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_streamer_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -783,7 +859,8 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
     for stream in streams:
         counts[stream.status] = counts.get(stream.status, 0) + 1
 
-    channel_stats = build_channel_stats(streams, config.channels)
+    channel_stats = build_channel_stats(streams, config)
+    speaker_labels = build_speaker_label_statuses(config, streams, channel_stats)
     jobs = build_job_statuses(watermark_records)
     return StatusSnapshot(
         generated_at=time.time(),
@@ -800,8 +877,10 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         temporary_bytes=sum(stream.temporary_bytes for stream in streams),
         stream_limit=STREAM_LIMIT,
         configured_channels=list(config.channels),
+        streamer_groups=build_streamer_statuses(config),
         configuration=build_config_summary(config),
         channel_stats=channel_stats,
+        speaker_labels=speaker_labels,
         recent_logs=get_recent_log_entries(LOG_LIMIT),
         log_limit=LOG_LIMIT,
         jobs=jobs,
@@ -931,7 +1010,10 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
         "Channels": {
             "count": len(config.channels),
             "channels": list(config.channels),
+            "monitored_source_count": len(monitored_sources(config)),
+            "monitored_sources": monitored_sources(config),
         },
+        "Streamers": streamer_summary_for_config(config),
         "Discovery": {
             "poll_interval_seconds": config.poll_interval_seconds,
             "channel_scan_limit": config.channel_scan_limit,
@@ -999,6 +1081,23 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
     }
 
 
+def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
+    return [
+        StreamerStatus(
+            name=name,
+            sources=list(streamer.sources),
+            download_dir_name=streamer.download_dir_name,
+            voice_detection=(
+                voice_detection_config_summary(streamer.voice_detection)
+                if streamer.voice_detection is not None
+                else "default"
+            ),
+            speaker_label_count=len(streamer.speaker_labels),
+        )
+        for name, streamer in sorted(config.streamers.items())
+    ]
+
+
 def nvenc_devices_for_config_summary(devices: list[str]) -> list[str]:
     if not devices:
         return []
@@ -1032,21 +1131,22 @@ def redacted_extra_args(args: list[str]) -> str:
 
 def build_channel_stats(
     streams: list[StreamStatus],
-    configured_channels: list[str],
+    config: BotConfig,
 ) -> list[ChannelStatus]:
     groups: dict[str, list[StreamStatus]] = {}
     configured: dict[str, list[str]] = {}
     display_names: dict[str, str] = {}
 
-    for channel in configured_channels:
-        name = channel_display_name(channel)
+    for channel in monitored_sources(config):
+        name = streamer_display_name_for_channel(config, channel) or channel_display_name(channel)
         key = channel_group_key(name)
         configured.setdefault(key, []).append(channel)
         groups.setdefault(key, [])
         display_names.setdefault(key, name)
 
     for stream in streams:
-        name = stream.channel or "unknown channel"
+        raw_name = stream.channel or "unknown channel"
+        name = streamer_display_name_for_channel(config, raw_name) or raw_name
         key = channel_group_key(name)
         groups.setdefault(key, []).append(stream)
         if name != "unknown channel" or key not in display_names:
@@ -1128,6 +1228,118 @@ def channel_group_key(channel: str) -> str:
     folded = target.casefold()
     compact = re.sub(r"[^a-z0-9]+", "", folded)
     return compact or folded or "unknown channel"
+
+
+def build_speaker_label_statuses(
+    config: BotConfig,
+    streams: list[StreamStatus],
+    channel_stats: list[ChannelStatus],
+) -> list[SpeakerLabelStatus]:
+    streams_by_key: dict[str, list[StreamStatus]] = {}
+    for stream in streams:
+        name = streamer_display_name_for_channel(config, stream.channel) or stream.channel
+        streams_by_key.setdefault(channel_group_key(name), []).append(stream)
+
+    statuses_by_key: dict[str, ChannelStatus] = {
+        channel_group_key(status.name): status for status in channel_stats
+    }
+    for channel in config.channel_speaker_labels:
+        key = channel_group_key(channel)
+        statuses_by_key.setdefault(
+            key,
+            ChannelStatus(
+                name=channel,
+                configured_sources=[],
+                stream_count=0,
+                active_count=0,
+                checking_count=0,
+                ended_count=0,
+                attention_count=0,
+                file_count=0,
+                downloadable_count=0,
+                total_bytes=0,
+                part_bytes=0,
+                final_bytes=0,
+                chat_bytes=0,
+                fragment_bytes=0,
+                latest_updated_at=None,
+                latest_file_modified_at=None,
+            ),
+        )
+    for streamer_name, streamer in config.streamers.items():
+        if not streamer.speaker_labels:
+            continue
+        key = channel_group_key(streamer_name)
+        statuses_by_key.setdefault(
+            key,
+            ChannelStatus(
+                name=streamer_name,
+                configured_sources=list(streamer.sources),
+                stream_count=0,
+                active_count=0,
+                checking_count=0,
+                ended_count=0,
+                attention_count=0,
+                file_count=0,
+                downloadable_count=0,
+                total_bytes=0,
+                part_bytes=0,
+                final_bytes=0,
+                chat_bytes=0,
+                fragment_bytes=0,
+                latest_updated_at=None,
+                latest_file_modified_at=None,
+            ),
+        )
+
+    speaker_statuses: list[SpeakerLabelStatus] = []
+    for key, status in statuses_by_key.items():
+        detected: set[str] = set()
+        transcript_count = 0
+        for stream in streams_by_key.get(key, []):
+            labels, count = detected_speaker_labels_for_directory(Path(stream.directory))
+            detected.update(labels)
+            transcript_count += count
+        configured = speaker_labels_for_channel(config, status.name)
+        if detected or configured or status.configured_sources:
+            speaker_statuses.append(
+                SpeakerLabelStatus(
+                    channel=status.name,
+                    configured_sources=status.configured_sources,
+                    detected_labels=sorted(detected),
+                    labels=configured,
+                    transcript_count=transcript_count,
+                )
+            )
+    return sorted(speaker_statuses, key=lambda item: item.channel.lower())
+
+
+def detected_speaker_labels_for_directory(directory: Path) -> tuple[set[str], int]:
+    labels: set[str] = set()
+    transcript_count = 0
+    for json_file in transcript_json_files(directory):
+        segments = load_whisperx_subtitle_segments(json_file, logger=LOGGER)
+        segment_labels = {
+            str(segment.get("speaker") or "").strip()
+            for segment in segments
+            if str(segment.get("speaker") or "").strip()
+        }
+        if segment_labels:
+            transcript_count += 1
+            labels.update(segment_labels)
+    return labels, transcript_count
+
+
+def transcript_json_files(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(
+        path
+        for path in directory.glob("*.json")
+        if path.is_file()
+        and not is_live_chat_file(path.name)
+        and not is_chat_timing_file(path.name)
+    )
 
 
 def stream_status_from_record(
@@ -2247,6 +2459,34 @@ def reload_running_config(config: BotConfig) -> None:
             continue
         setattr(config, name, getattr(loaded, name))
 
+def update_streamer_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    action = (first_query_value(params, "action") or "save").strip().lower()
+    streamer_name = first_query_value(params, "streamer_name").strip()
+    if action == "delete":
+        remove_streamer_config(config.config_path, streamer_name)
+        reload_running_config(config)
+        return
+    if action != "save":
+        raise ConfigError("Unknown streamer action")
+    sources = form_string_list(
+        first_query_value(params, "sources"),
+        "sources",
+    )
+    download_dir_name = first_query_value(params, "download_dir_name").strip()
+    update_streamer_config(
+        config.config_path,
+        streamer_name,
+        sources,
+        download_dir_name,
+    )
+    reload_running_config(config)
+
+
 def update_voice_detection_from_form(
     config: BotConfig,
     params: dict[str, list[str]],
@@ -2266,6 +2506,17 @@ def update_voice_detection_from_form(
         return
     if scope == "channel":
         channel = first_query_value(params, "channel").strip()
+        if channel in config.streamers:
+            if mode == "inherit":
+                update_streamer_voice_detection_config(config.config_path, channel, None)
+            else:
+                update_streamer_voice_detection_config(
+                    config.config_path,
+                    channel,
+                    voice_detection_override_from_form(params, mode),
+                )
+            reload_running_config(config)
+            return
         if mode == "inherit":
             update_channel_voice_detection_config(config.config_path, channel, None)
             config.channel_voice_detection.pop(channel, None)
@@ -2279,6 +2530,80 @@ def update_voice_detection_from_form(
         config.channel_voice_detection[channel] = override
         return
     raise ConfigError("Unknown voice detection scope")
+
+
+def update_speaker_labels_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    channel = first_query_value(params, "channel").strip()
+    if not channel:
+        raise ConfigError("speaker labels require a channel")
+    labels = speaker_labels_from_form(params)
+    if channel in config.streamers:
+        update_streamer_speaker_labels_config(config.config_path, channel, labels)
+    else:
+        update_channel_speaker_labels_config(config.config_path, channel, labels)
+    reload_running_config(config)
+    rewritten = rewrite_speaker_subtitles_for_channel(config, channel)
+    LOGGER.info(
+        "Updated speaker labels channel=%s labels=%d subtitles_rewritten=%d",
+        channel,
+        len(labels),
+        rewritten,
+    )
+
+
+def speaker_labels_from_form(params: dict[str, list[str]]) -> dict[str, str]:
+    raw_labels = params.get("speaker_label") or []
+    raw_names = params.get("speaker_name") or []
+    labels: dict[str, str] = {}
+    for index, raw_label in enumerate(raw_labels):
+        label = raw_label.strip()
+        name = raw_names[index].strip() if index < len(raw_names) else ""
+        if not label and not name:
+            continue
+        if not label:
+            raise ConfigError("speaker label is required when a speaker name is set")
+        if any(char.isspace() for char in label):
+            raise ConfigError("speaker labels must not contain whitespace")
+        if name:
+            labels[label] = name
+    return labels
+
+
+def rewrite_speaker_subtitles_for_channel(config: BotConfig, channel: str) -> int:
+    target_key = channel_group_key(channel)
+    state = StateStore(config.db_path)
+    try:
+        records = state.list_streams(limit=5000)
+    finally:
+        state.close()
+
+    rewritten = 0
+    for record in records:
+        record_name = streamer_display_name_for_channel(config, record.channel) or record.channel
+        if channel_group_key(record_name) != target_key:
+            continue
+        directory = segment_directory(config, record.video_id, record.channel)
+        if not directory.is_dir():
+            continue
+        for media_file in sorted(directory.iterdir(), key=lambda item: item.name):
+            if (
+                not media_file.is_file()
+                or not is_transcribable_media_file(media_file.name)
+            ):
+                continue
+            if rewrite_speaker_labels_for_media(
+                transcription_config_for_channel(config, record.channel),
+                media_file,
+                channel=record.channel,
+                logger=LOGGER,
+            ):
+                rewritten += 1
+    return rewritten
 
 
 def voice_detection_root_updates(
@@ -2442,6 +2767,7 @@ def run_transcription_job(
                 overwrite=regenerate,
                 logger=LOGGER,
                 progress_callback=progress,
+                channel=channel,
             )
         )
     except Exception as exc:  # noqa: BLE001 - background job must capture failures.
@@ -2721,7 +3047,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     job_rows = render_job_rows(snapshot.jobs)
     config_sections = render_config_sections(snapshot.configuration)
     voice_detection_panel = render_voice_detection_panel(snapshot)
+    speaker_labels_panel = render_speaker_labels_panel(snapshot)
     app_config_form = render_app_config_form(snapshot)
+    streamer_groups_panel = render_streamer_groups_panel(snapshot)
     log_rows = render_log_rows(snapshot.recent_logs)
     watermark_detection = render_watermark_detection_panel(snapshot.configuration)
     about_panel = render_about_panel(snapshot)
@@ -2904,7 +3232,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .meta div {{ min-width: 0; overflow-wrap: anywhere; }}
     .wide {{ grid-column: 1 / -1; }}
     .table-wrap {{ overflow-x: auto; }}
-    .files, .channels, .jobs, .logs, .config-table, .voice-table {{
+    .files, .channels, .jobs, .logs, .config-table, .voice-table, .speaker-table {{
       width: 100%;
       border-collapse: collapse;
       margin-top: 8px;
@@ -2917,7 +3245,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .config-table th:first-child, .config-table td:first-child {{ width: 32%; }}
     .config-table th:last-child, .config-table td:last-child {{ width: 68%; }}
     .files th, .files td, .channels th, .channels td, .jobs th, .jobs td, .logs th, .logs td,
-    .config-table th, .config-table td, .voice-table th, .voice-table td {{
+    .config-table th, .config-table td, .voice-table th, .voice-table td,
+    .speaker-table th, .speaker-table td {{
       border-top: 1px solid var(--line);
       padding: 7px 6px;
       text-align: left;
@@ -3027,6 +3356,30 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .voice-channel-form .small-input {{ flex: 0 0 70px; width: 70px; }}
     .voice-channel-form .env-input {{ flex: 1 0 140px; min-width: 140px; }}
     .voice-channel-form .action-button {{ flex: 0 0 auto; }}
+    .speaker-table {{ min-width: 1040px; table-layout: fixed; }}
+    .speaker-table th {{ white-space: nowrap; }}
+    .speaker-table th:nth-child(1), .speaker-table td:nth-child(1) {{ width: 18%; }}
+    .speaker-table th:nth-child(2), .speaker-table td:nth-child(2) {{ width: 18%; }}
+    .speaker-table th:nth-child(3), .speaker-table td:nth-child(3) {{ width: 20%; }}
+    .speaker-table th:nth-child(4), .speaker-table td:nth-child(4) {{ width: 44%; }}
+    .speaker-label-form {{ display: grid; gap: 7px; margin: 0; }}
+    .speaker-label-pair {{
+      display: grid;
+      grid-template-columns: 130px minmax(170px, 1fr);
+      gap: 6px;
+      align-items: center;
+    }}
+    .speaker-label-pair input {{
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 6px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    .speaker-label-pair input[readonly] {{ background: var(--panel-strong); }}
+    .speaker-label-actions {{ display: flex; justify-content: flex-end; }}
     .settings-form {{
       display: grid;
       gap: 14px;
@@ -3076,6 +3429,21 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       align-items: center;
       gap: 10px;
     }}
+    .streamer-groups {{
+      display: grid;
+      gap: 12px;
+      margin-top: 8px;
+    }}
+    .streamer-form {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px 12px;
+    }}
+    .streamer-form .wide, .streamer-form .settings-actions {{ grid-column: 1 / -1; }}
+    .streamer-meta {{ color: var(--muted); align-self: end; }}
     .upload-form {{
       display: grid;
       gap: 8px;
@@ -3194,7 +3562,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <h2>Current Configuration</h2>
       <div class="file-meta">Sensitive yt-dlp arguments are redacted before display.</div>
       {app_config_form}
+      {streamer_groups_panel}
       {voice_detection_panel}
+      {speaker_labels_panel}
       <div class="config-stack" id="config-sections">
         {config_sections}
       </div>
@@ -3531,7 +3901,7 @@ def dashboard_script() -> str:
 
   const renderChannelRows = (channels) => {
     if (!channels || !channels.length) {
-      return '<tr><td colspan="15" class="file-meta">No configured channels or stream history found</td></tr>';
+      return '<tr><td colspan="15" class="file-meta">No configured channels, streamers, or stream history found</td></tr>';
     }
     return channels.map((channel) => {
       const configuredAs = (channel.configured_sources || []).join(", ") || "-";
@@ -3708,9 +4078,39 @@ def render_about_panel(snapshot: StatusSnapshot) -> str:
 
 
 def voice_detection_overrides_for_summary(config: BotConfig) -> dict[str, str]:
-    return {
+    overrides = {
         channel: voice_detection_config_summary(override)
         for channel, override in sorted(config.channel_voice_detection.items())
+    }
+    for streamer_name, streamer in sorted(config.streamers.items()):
+        if streamer.voice_detection is not None and streamer_name not in overrides:
+            overrides[streamer_name] = (
+                "streamer default: "
+                f"{voice_detection_config_summary(streamer.voice_detection)}"
+            )
+    return overrides
+
+
+def streamer_summary_for_config(config: BotConfig) -> dict[str, Any]:
+    streamers = [
+        f"{name}: {', '.join(streamer.sources)}"
+        for name, streamer in sorted(config.streamers.items())
+    ]
+    voice_detection = [
+        f"{name}: {voice_detection_config_summary(streamer.voice_detection)}"
+        for name, streamer in sorted(config.streamers.items())
+        if streamer.voice_detection is not None
+    ]
+    speaker_labels = [
+        f"{name}: {len(streamer.speaker_labels)} labels"
+        for name, streamer in sorted(config.streamers.items())
+        if streamer.speaker_labels
+    ]
+    return {
+        "count": len(config.streamers),
+        "streamers": streamers,
+        "shared_voice_detection": voice_detection,
+        "shared_speaker_labels": speaker_labels,
     }
 
 
@@ -3729,6 +4129,61 @@ def voice_detection_config_summary(override: VoiceDetectionConfig) -> str:
         speakers = f"up to {override.max_speakers}"
     return f"range, {speakers}"
 
+
+
+def render_streamer_groups_panel(snapshot: StatusSnapshot) -> str:
+    config_path = str(
+        snapshot.configuration.get("Paths", {}).get("config_path", "-")
+    )
+    if config_path == "-":
+        return ""
+    forms = "".join(
+        render_streamer_group_form(streamer)
+        for streamer in snapshot.streamer_groups
+    )
+    forms += render_streamer_group_form(None)
+    return f"""<section class="panel streamer-groups-panel">
+  <h2>Streamer Groups</h2>
+  <div class="streamer-groups">{forms}</div>
+</section>"""
+
+
+def render_streamer_group_form(streamer: StreamerStatus | None) -> str:
+    is_existing = streamer is not None
+    name = streamer.name if streamer is not None else ""
+    sources = "\n".join(streamer.sources) if streamer is not None else ""
+    download_dir_name = streamer.download_dir_name if streamer is not None else ""
+    voice_detection = streamer.voice_detection if streamer is not None else "default"
+    speaker_label_count = streamer.speaker_label_count if streamer is not None else 0
+    readonly = " readonly" if is_existing else ""
+    delete_button = (
+        '<button class="download action-button" name="action" value="delete" type="submit">Delete</button>'
+        if is_existing
+        else ""
+    )
+    save_label = "Save Streamer" if is_existing else "Add Streamer"
+    meta = (
+        f'<span class="streamer-meta">Voice {escape(voice_detection)}; '
+        f'labels {speaker_label_count}</span>'
+        if is_existing
+        else '<span class="streamer-meta">&nbsp;</span>'
+    )
+    return f"""<form class="streamer-form" method="post" action="/streamers">
+  <label class="settings-field">Name
+    <input name="streamer_name" value="{escape(name, quote=True)}"{readonly}>
+  </label>
+  <label class="settings-field">Download Dir Name
+    <input name="download_dir_name" value="{escape(download_dir_name, quote=True)}">
+  </label>
+  {meta}
+  <label class="settings-field wide">Sources
+    <textarea name="sources" rows="3">{escape(sources)}</textarea>
+  </label>
+  <div class="settings-actions">
+    <button class="download action-button" name="action" value="save" type="submit">{save_label}</button>
+    {delete_button}
+  </div>
+</form>"""
 
 
 def render_app_config_form(snapshot: StatusSnapshot) -> str:
@@ -3839,7 +4294,7 @@ def render_form_select(name: str, selected: str, options: tuple[str, ...]) -> st
 
 def app_config_field_value(snapshot: StatusSnapshot, field: ConfigFormField) -> Any:
     if field.key == "channels":
-        return list(snapshot.configured_channels)
+        return list(snapshot.configuration.get("Channels", {}).get("channels", []))
     if field.key == "extra_yt_dlp_args":
         return snapshot.configuration.get("Download", {}).get(
             "extra_yt_dlp_args_configured",
@@ -3878,7 +4333,7 @@ def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
         for channel in snapshot.channel_stats
     )
     if not rows:
-        rows = '<tr><td colspan="4" class="file-meta">No configured channels or stream history found</td></tr>'
+        rows = '<tr><td colspan="4" class="file-meta">No configured channels, streamers, or stream history found</td></tr>'
     return f"""<section class="panel voice-detection-panel">
   <h2>Voice Detection</h2>
   <form class="voice-form voice-default-form" method="post" action="/voice-detection">
@@ -3923,6 +4378,58 @@ def render_voice_detection_channel_row(
     </form>
   </td>
 </tr>"""
+
+
+def render_speaker_labels_panel(snapshot: StatusSnapshot) -> str:
+    rows = "\n".join(
+        render_speaker_label_row(status)
+        for status in snapshot.speaker_labels
+    )
+    if not rows:
+        rows = '<tr><td colspan="4" class="file-meta">No configured channels, streamers, or diarized transcripts found</td></tr>'
+    return f"""<section class="panel speaker-labels-panel">
+  <h2>Speaker Names</h2>
+  <div class="table-wrap">
+    <table class="speaker-table">
+      <thead><tr><th>Channel</th><th>Configured As</th><th>Detected Labels</th><th>Speaker Names</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>"""
+
+
+def render_speaker_label_row(status: SpeakerLabelStatus) -> str:
+    sources = ", ".join(status.configured_sources) or "-"
+    detected = ", ".join(status.detected_labels) or "-"
+    return f"""<tr>
+  <td class="file-name">{escape(status.channel)}</td>
+  <td class="file-name">{escape(sources)}</td>
+  <td class="file-name">{escape(detected)}</td>
+  <td>{render_speaker_label_form(status)}</td>
+</tr>"""
+
+
+def render_speaker_label_form(status: SpeakerLabelStatus) -> str:
+    labels = sorted(set(status.detected_labels) | set(status.labels))
+    fields = "".join(
+        render_speaker_label_pair(label, status.labels.get(label, ""), readonly=True)
+        for label in labels
+    )
+    fields += render_speaker_label_pair("", "", readonly=False)
+    return f"""<form class="speaker-label-form" method="post" action="/speaker-labels">
+      <input type="hidden" name="channel" value="{escape(status.channel, quote=True)}">
+      {fields}
+      <div class="speaker-label-actions"><button class="download action-button" type="submit">Save Names</button></div>
+    </form>"""
+
+
+def render_speaker_label_pair(label: str, name: str, *, readonly: bool) -> str:
+    readonly_attr = " readonly" if readonly else ""
+    label_placeholder = "SPEAKER_00" if not label else ""
+    return f"""<div class="speaker-label-pair">
+        <input name="speaker_label" value="{escape(label, quote=True)}" placeholder="{label_placeholder}"{readonly_attr}>
+        <input name="speaker_name" value="{escape(name, quote=True)}" placeholder="Name">
+      </div>"""
 
 
 def render_voice_detection_mode_select(
@@ -4241,7 +4748,7 @@ def render_file_action(file: FileStatus) -> str:
 
 def render_channel_rows(channels: list[ChannelStatus]) -> str:
     if not channels:
-        return '<tr><td colspan="15" class="file-meta">No configured channels or stream history found</td></tr>'
+        return '<tr><td colspan="15" class="file-meta">No configured channels, streamers, or stream history found</td></tr>'
     return "\n".join(render_channel_row(channel) for channel in channels)
 
 

@@ -7,9 +7,17 @@ from onlysavemevods.config import (
     ConfigError,
     VoiceDetectionConfig,
     append_missing_config_values,
+    download_group_name_for_channel,
     load_config,
+    monitored_sources,
+    streamer_display_name_for_channel,
+    update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
+    remove_streamer_config,
     update_config_values,
+    update_streamer_config,
+    update_streamer_speaker_labels_config,
+    update_streamer_voice_detection_config,
 )
 
 
@@ -308,6 +316,123 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.whisperx_min_speakers, 2)
         self.assertEqual(config.whisperx_max_speakers, 4)
 
+    def test_streamers_group_sources_and_shared_settings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'channels = ["@Legacy"]\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd", "https://www.youtube.com/@OUMB3rdVODS"]\n'
+                'download_dir_name = "OUMB3rd Shared"\n'
+                '[streamers."OUMB3rd".voice_detection]\n'
+                'mode = "fixed"\n'
+                'speakers = 2\n'
+                'hf_token_env = "PYANNOTE_TOKEN"\n'
+                '[streamers."OUMB3rd".speaker_labels]\n'
+                'SPEAKER_00 = "OUMB3rd"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(
+            monitored_sources(config),
+            ["@Legacy", "@OUMB3rd", "https://www.youtube.com/@OUMB3rdVODS"],
+        )
+        self.assertEqual(streamer_display_name_for_channel(config, "OUMB3rd VODS"), "OUMB3rd")
+        self.assertEqual(
+            download_group_name_for_channel(config, "OUMB3rd VODS"),
+            "OUMB3rd Shared",
+        )
+        streamer = config.streamers["OUMB3rd"]
+        self.assertEqual(streamer.sources, ["@OUMB3rd", "https://www.youtube.com/@OUMB3rdVODS"])
+        self.assertIsNotNone(streamer.voice_detection)
+        assert streamer.voice_detection is not None
+        self.assertEqual(streamer.voice_detection.mode, "fixed")
+        self.assertEqual(streamer.voice_detection.min_speakers, 2)
+        self.assertEqual(streamer.voice_detection.hf_token_env, "PYANNOTE_TOKEN")
+        self.assertEqual(streamer.speaker_labels, {"SPEAKER_00": "OUMB3rd"})
+
+    def test_streamer_config_update_writes_updates_and_removes_group(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("channels = []\n", encoding="utf-8")
+
+            created = update_streamer_config(
+                config_path,
+                "OUMB3rd",
+                ["@OUMB3rd", "@OUMB3rdVODS"],
+                "OUMB3rd Shared",
+            )
+            update_streamer_voice_detection_config(
+                config_path,
+                "OUMB3rd",
+                VoiceDetectionConfig(mode="fixed", min_speakers=2, max_speakers=2),
+            )
+            updated = update_streamer_config(
+                config_path,
+                "OUMB3rd",
+                ["@OUMB3rd"],
+                "",
+            )
+            config = load_config(config_path)
+            removed = remove_streamer_config(config_path, "OUMB3rd")
+            config_after_remove = load_config(config_path)
+            text_after_remove = config_path.read_text(encoding="utf-8")
+
+        self.assertTrue(created)
+        self.assertTrue(updated)
+        self.assertEqual(config.streamers["OUMB3rd"].sources, ["@OUMB3rd"])
+        self.assertEqual(config.streamers["OUMB3rd"].download_dir_name, "")
+        self.assertIsNotNone(config.streamers["OUMB3rd"].voice_detection)
+        self.assertTrue(removed)
+        self.assertEqual(config_after_remove.streamers, {})
+        self.assertNotIn("OUMB3rd", text_after_remove)
+
+    def test_streamer_shared_settings_update_writes_and_removes_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+
+            voice_changed = update_streamer_voice_detection_config(
+                config_path,
+                "OUMB3rd",
+                VoiceDetectionConfig(mode="range", min_speakers=2, max_speakers=4),
+            )
+            labels_changed = update_streamer_speaker_labels_config(
+                config_path,
+                "OUMB3rd",
+                {"SPEAKER_00": "OUMB3rd", "SPEAKER_01": ""},
+            )
+            config = load_config(config_path)
+            voice_removed = update_streamer_voice_detection_config(
+                config_path,
+                "OUMB3rd",
+                None,
+            )
+            labels_removed = update_streamer_speaker_labels_config(
+                config_path,
+                "OUMB3rd",
+                {},
+            )
+            config_after_remove = load_config(config_path)
+
+        self.assertTrue(voice_changed)
+        self.assertTrue(labels_changed)
+        self.assertIsNotNone(config.streamers["OUMB3rd"].voice_detection)
+        assert config.streamers["OUMB3rd"].voice_detection is not None
+        self.assertEqual(config.streamers["OUMB3rd"].voice_detection.mode, "range")
+        self.assertEqual(config.streamers["OUMB3rd"].voice_detection.max_speakers, 4)
+        self.assertEqual(config.streamers["OUMB3rd"].speaker_labels, {"SPEAKER_00": "OUMB3rd"})
+        self.assertTrue(voice_removed)
+        self.assertTrue(labels_removed)
+        self.assertIsNone(config_after_remove.streamers["OUMB3rd"].voice_detection)
+        self.assertEqual(config_after_remove.streamers["OUMB3rd"].speaker_labels, {})
+
     def test_channel_voice_detection_overrides_can_be_configured(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -377,6 +502,49 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.channel_voice_detection["Example Channel"].mode, "fixed")
         self.assertTrue(removed)
         self.assertEqual(config_after_remove.channel_voice_detection, {})
+
+    def test_channel_speaker_labels_can_be_configured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[channel_speaker_labels."Example Channel"]\n'
+                'SPEAKER_00 = "OUMB3rd"\n'
+                'SPEAKER_01 = "Guest"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(
+            config.channel_speaker_labels["Example Channel"],
+            {"SPEAKER_00": "OUMB3rd", "SPEAKER_01": "Guest"},
+        )
+
+    def test_channel_speaker_labels_update_writes_and_removes_table(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('channels = ["@Example"]\n', encoding="utf-8")
+
+            changed = update_channel_speaker_labels_config(
+                config_path,
+                "Example Channel",
+                {"SPEAKER_00": "OUMB3rd", "SPEAKER_01": ""},
+            )
+            config = load_config(config_path)
+            removed = update_channel_speaker_labels_config(
+                config_path,
+                "Example Channel",
+                {},
+            )
+            config_after_remove = load_config(config_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(
+            config.channel_speaker_labels["Example Channel"],
+            {"SPEAKER_00": "OUMB3rd"},
+        )
+        self.assertTrue(removed)
+        self.assertEqual(config_after_remove.channel_speaker_labels, {})
 
     def test_transcription_speaker_bounds_must_be_ordered(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -19,6 +19,27 @@ Edit `config.toml`, then run a one-shot check:
 .venv/bin/onlysavemevods check --config config.toml
 ```
 
+For a streamer with multiple channels, group them in `config.toml` so shared
+settings only need to be maintained once:
+
+```toml
+[streamers."OUMB3rd"]
+sources = ["@OUMB3rd", "https://www.youtube.com/@OUMB3rdVODS"]
+download_dir_name = "OUMB3rd"
+
+[streamers."OUMB3rd".voice_detection]
+mode = "fixed"
+speakers = 2
+
+[streamers."OUMB3rd".speaker_labels]
+SPEAKER_00 = "OUMB3rd"
+SPEAKER_01 = "Guest"
+```
+
+The top-level `channels = [...]` list still works for simple setups. Streamer
+`sources` currently use the same YouTube channel URL or `@handle` inputs as
+`channels`.
+
 Run continuously:
 
 ```bash
@@ -27,9 +48,10 @@ Run continuously:
 
 The daemon also starts a local dashboard when `web_enabled = true`. It shows
 stream status, storage totals, attention signals, and current segment files.
-Channel, Jobs, and Log tabs summarize the configured channels being archived,
-dashboard-triggered processing work with phase and progress, and recent in-process service logs. The
-About tab shows the app version and runtime details, and the Config tab can save
+Channel, Jobs, and Log tabs summarize the configured channels or streamer
+sources being archived, dashboard-triggered processing work with phase and
+progress, and recent in-process service logs. The About tab shows the app
+version and runtime details, and the Config tab can save
 app settings back to `config.toml` while keeping sensitive yt-dlp arguments
 redacted. Bind address and port changes are saved for the next restart.
 Finalized media files and sidecars such as live chat and subtitles can be
@@ -210,21 +232,31 @@ scripts/uninstall-systemd.sh
   stores Hugging Face, NLTK, and Matplotlib runtime caches under
   `/opt/onlysavemevods/.cache`.
 - Most app settings can be changed from the dashboard Config tab and are
-  written back to `config.toml`. The running process reloads the saved values
-  where possible; web bind address and port changes apply after restart.
+  written back to `config.toml`. The Streamer Groups panel can add, update, or
+  delete grouped sources. The running process reloads the saved values where
+  possible; web bind address and port changes apply after restart.
 - Voice detection for transcription is managed with WhisperX/pyannote
   diarization. Use the dashboard Config tab to update the default mode or add a
-  per-channel override, or use `onlysavemevods voice-detection show --config
+  shared streamer/source override, or use `onlysavemevods voice-detection show --config
   config.toml` and `onlysavemevods voice-detection set --config config.toml
   --mode auto` from the CLI. Modes are `off` for no speaker labels, `auto` to
   let WhisperX infer the count, `range` with `--min-speakers` and/or
-  `--max-speakers`, and `fixed` with `--speakers N`. Per-channel overrides are
-  stored as `[channel_voice_detection."Channel Name"]` tables keyed by the
-  channel name shown in the dashboard. Diarization usually needs a Hugging Face
+  `--max-speakers`, and `fixed` with `--speakers N`. Streamer defaults are
+  stored under `[streamers."Name".voice_detection]`; source-specific overrides
+  can still be stored as `[channel_voice_detection."Channel Name"]` tables and
+  take precedence. Diarization usually needs a Hugging Face
   token with the relevant pyannote model terms accepted; set the token in the
   environment variable named by `whisperx_hf_token_env` (`HF_TOKEN` by default).
   These labels identify recurring voices within a stream, but they do not prove
   real names.
+- The dashboard Config tab also has a Speaker Names section. After WhisperX has
+  produced a diarized `.json` sidecar, the dashboard lists detected labels such
+  as `SPEAKER_00` and `SPEAKER_01` per channel or streamer group. Save names
+  there to write `[streamers."Name".speaker_labels]` or
+  `[channel_speaker_labels."Channel Name"]` mappings into `config.toml`; existing
+  `.srt` and `.vtt` subtitles for that group are rewritten with names such as
+  `Host: ...` or `Guest: ...`. The mapping is manual because WhisperX speaker
+  numbers can change between videos.
 - The dashboard shows `Transcribe` for finalized media without subtitles and
   `Retranscribe` when `.srt`/`.vtt` sidecars already exist. Retranscription
   replaces only the WhisperX subtitle/transcript sidecars for that media file.

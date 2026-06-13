@@ -1,15 +1,18 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import json
 import unittest
 from unittest.mock import patch
 
-from onlysavemevods.config import BotConfig, VoiceDetectionConfig
+from onlysavemevods.config import BotConfig, StreamerConfig, VoiceDetectionConfig
 from onlysavemevods.transcription import (
     build_whisperx_command,
     command_for_log,
     existing_transcription_outputs,
     handle_process_output_line,
     redact_sensitive_text,
+    rewrite_speaker_labels_for_media,
+    speaker_labels_for_channel,
     transcription_config_for_channel,
     transcription_outputs_exist,
     voice_detection_mode,
@@ -124,6 +127,118 @@ class TranscriptionTests(unittest.TestCase):
         self.assertEqual(effective.whisperx_min_speakers, 2)
         self.assertEqual(effective.whisperx_max_speakers, 2)
         self.assertEqual(effective.whisperx_hf_token_env, "PYANNOTE_TOKEN")
+
+    def test_transcription_config_for_channel_applies_streamer_override(self) -> None:
+        config = BotConfig(
+            whisperx_diarize=True,
+            whisperx_min_speakers=0,
+            whisperx_max_speakers=0,
+            whisperx_hf_token_env="HF_TOKEN",
+            streamers={
+                "OUMB3rd": StreamerConfig(
+                    sources=["@OUMB3rdVODS"],
+                    voice_detection=VoiceDetectionConfig(
+                        mode="range",
+                        min_speakers=2,
+                        max_speakers=4,
+                    ),
+                )
+            },
+        )
+
+        effective = transcription_config_for_channel(config, "OUMB3rd VODS")
+
+        self.assertIsNot(effective, config)
+        self.assertTrue(effective.whisperx_diarize)
+        self.assertEqual(effective.whisperx_min_speakers, 2)
+        self.assertEqual(effective.whisperx_max_speakers, 4)
+        self.assertEqual(effective.whisperx_hf_token_env, "HF_TOKEN")
+
+    def test_speaker_labels_for_channel_merges_streamer_and_channel_labels(self) -> None:
+        config = BotConfig(
+            streamers={
+                "OUMB3rd": StreamerConfig(
+                    sources=["@OUMB3rdVODS"],
+                    speaker_labels={
+                        "SPEAKER_00": "OUMB3rd",
+                        "SPEAKER_01": "Guest",
+                    },
+                )
+            },
+            channel_speaker_labels={
+                "OUMB3rd VODS": {
+                    "SPEAKER_01": "Co-host",
+                    "SPEAKER_02": "Caller",
+                }
+            },
+        )
+
+        self.assertEqual(
+            speaker_labels_for_channel(config, "OUMB3rd VODS"),
+            {
+                "SPEAKER_00": "OUMB3rd",
+                "SPEAKER_01": "Co-host",
+                "SPEAKER_02": "Caller",
+            },
+        )
+
+    def test_speaker_labels_for_channel_matches_handle_or_display_name(self) -> None:
+        config = BotConfig(
+            channel_speaker_labels={"@ExampleChannel": {"SPEAKER_00": "OUMB3rd"}}
+        )
+
+        self.assertEqual(
+            speaker_labels_for_channel(config, "Example Channel"),
+            {"SPEAKER_00": "OUMB3rd"},
+        )
+
+    def test_rewrite_speaker_labels_for_media_uses_whisperx_json(self) -> None:
+        with TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 1.2,
+                                "end": 2.4,
+                                "text": "hello there",
+                                "speaker": "SPEAKER_00",
+                            },
+                            {
+                                "start": 2.5,
+                                "end": 3.0,
+                                "text": "good answer",
+                                "speaker": "SPEAKER_01",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = BotConfig(
+                channel_speaker_labels={
+                    "Example Channel": {"SPEAKER_00": "OUMB3rd", "SPEAKER_01": "Guest"}
+                }
+            )
+
+            rewritten = rewrite_speaker_labels_for_media(
+                config,
+                media_file,
+                channel="Example Channel",
+            )
+
+            srt_text = media_file.with_suffix(".srt").read_text(encoding="utf-8")
+            vtt_text = media_file.with_suffix(".vtt").read_text(encoding="utf-8")
+
+        self.assertTrue(rewritten)
+        self.assertIn("00:00:01,200 --> 00:00:02,400", srt_text)
+        self.assertIn("OUMB3rd: hello there", srt_text)
+        self.assertIn("Guest: good answer", srt_text)
+        self.assertTrue(vtt_text.startswith("WEBVTT"))
+        self.assertIn("00:00:01.200 --> 00:00:02.400", vtt_text)
+        self.assertIn("OUMB3rd: hello there", vtt_text)
 
     def test_whisperx_process_env_passes_tokens_without_command_line(self) -> None:
         with patch.dict(

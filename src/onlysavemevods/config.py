@@ -63,9 +63,18 @@ class VoiceDetectionConfig:
     hf_token_env: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class StreamerConfig:
+    sources: list[str] = field(default_factory=list)
+    download_dir_name: str = ""
+    voice_detection: VoiceDetectionConfig | None = None
+    speaker_labels: dict[str, str] = field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class BotConfig:
     channels: list[str] = field(default_factory=list)
+    streamers: dict[str, StreamerConfig] = field(default_factory=dict)
     download_dir: Path = Path("downloads")
     state_dir: Path = Path("state")
     poll_interval_seconds: int = 60
@@ -89,6 +98,7 @@ class BotConfig:
     whisperx_min_speakers: int = 0
     whisperx_max_speakers: int = 0
     channel_voice_detection: dict[str, VoiceDetectionConfig] = field(default_factory=dict)
+    channel_speaker_labels: dict[str, dict[str, str]] = field(default_factory=dict)
     keep_fragments_for_resume: bool = True
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
@@ -156,9 +166,15 @@ def load_config(path: str | Path) -> BotConfig:
         raw.get("channel_voice_detection", {}),
         "channel_voice_detection",
     )
+    channel_speaker_labels = _as_channel_speaker_labels(
+        raw.get("channel_speaker_labels", {}),
+        "channel_speaker_labels",
+    )
+    streamers = _as_streamers(raw.get("streamers", {}), "streamers")
 
     return BotConfig(
         channels=_as_str_list(raw.get("channels", []), "channels"),
+        streamers=streamers,
         download_dir=_resolve_path(raw.get("download_dir", "downloads"), base_dir),
         state_dir=_resolve_path(raw.get("state_dir", "state"), base_dir),
         poll_interval_seconds=_as_positive_int(
@@ -222,6 +238,7 @@ def load_config(path: str | Path) -> BotConfig:
         whisperx_min_speakers=whisperx_min_speakers,
         whisperx_max_speakers=whisperx_max_speakers,
         channel_voice_detection=channel_voice_detection,
+        channel_speaker_labels=channel_speaker_labels,
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),
             "keep_fragments_for_resume",
@@ -276,6 +293,71 @@ def load_config(path: str | Path) -> BotConfig:
 def ensure_config_dirs(config: BotConfig) -> None:
     config.download_dir.mkdir(parents=True, exist_ok=True)
     config.state_dir.mkdir(parents=True, exist_ok=True)
+
+
+def monitored_sources(config: BotConfig) -> list[str]:
+    sources: list[str] = []
+    seen: set[str] = set()
+    for source in [*config.channels, *streamer_sources(config)]:
+        key = source.strip().rstrip("/").casefold()
+        if key and key not in seen:
+            sources.append(source)
+            seen.add(key)
+    return sources
+
+
+def streamer_sources(config: BotConfig) -> list[str]:
+    sources: list[str] = []
+    for streamer in config.streamers.values():
+        sources.extend(streamer.sources)
+    return sources
+
+
+def streamer_for_channel(
+    config: BotConfig,
+    channel: str,
+) -> tuple[str, StreamerConfig] | None:
+    target = source_lookup_key(channel)
+    if not target:
+        return None
+    for name, streamer in config.streamers.items():
+        if source_lookup_key(name) == target:
+            return name, streamer
+        for source in streamer.sources:
+            if source_lookup_key(source) == target:
+                return name, streamer
+    return None
+
+
+def streamer_display_name_for_channel(config: BotConfig, channel: str) -> str:
+    match = streamer_for_channel(config, channel)
+    return match[0] if match is not None else ""
+
+
+def download_group_name_for_channel(config: BotConfig, channel: str) -> str:
+    match = streamer_for_channel(config, channel)
+    if match is None:
+        return channel.strip()
+    name, streamer = match
+    return streamer.download_dir_name or name
+
+
+def source_display_name(source: str) -> str:
+    target = source.strip().rstrip("/")
+    if not target:
+        return ""
+    if "/" in target:
+        target = target.rsplit("/", 1)[-1]
+    return target or source.strip()
+
+
+def source_lookup_key(source: str) -> str:
+    target = source_display_name(source)
+    if target.startswith("@"):
+        target = target[1:]
+    folded = target.casefold()
+    compact = re.sub(r"[^a-z0-9]+", "", folded)
+    return compact or folded
 
 
 def append_missing_config_values(
@@ -398,6 +480,172 @@ def update_config_values(
     return changed
 
 
+def update_streamer_config(
+    config_path: str | Path,
+    streamer_name: str,
+    sources: list[str],
+    download_dir_name: str = "",
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("streamer name is required")
+    normalized_sources = _as_str_list(sources, f"streamers.{streamer_name}.sources")
+    if not normalized_sources:
+        raise ConfigError(f"streamers.{streamer_name}.sources must not be empty")
+    normalized_download_dir_name = _as_optional_str(
+        download_dir_name,
+        f"streamers.{streamer_name}.download_dir_name",
+    )
+
+    table_name = f"streamers.{_toml_key(streamer_name)}"
+    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
+    block = _streamer_block(
+        streamer_name,
+        normalized_sources,
+        normalized_download_dir_name,
+    )
+    if pattern.search(current_text):
+        updated_text = pattern.sub(block + "\n", current_text, count=1)
+    else:
+        prefix = current_text.rstrip()
+        updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def remove_streamer_config(
+    config_path: str | Path,
+    streamer_name: str,
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("streamer name is required")
+    _require_configured_streamer(current_text, streamer_name, target)
+
+    table_key = re.escape(_toml_key(streamer_name))
+    pattern = re.compile(rf"(?ms)^\[streamers\.{table_key}(?:\.[^\]]+)?\]\n.*?(?=^\[|\Z)")
+    updated_text, count = pattern.subn("", current_text)
+    updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+    if count == 0:
+        return False
+
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_streamer_voice_detection_config(
+    config_path: str | Path,
+    streamer_name: str,
+    voice_config: VoiceDetectionConfig | None,
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("streamer voice detection override requires a streamer")
+    _require_configured_streamer(current_text, streamer_name, target)
+
+    table_name = f"streamers.{_toml_key(streamer_name)}.voice_detection"
+    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
+    if voice_config is None:
+        updated_text, count = pattern.subn("", current_text, count=1)
+        updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+        if count == 0:
+            return False
+    else:
+        block = _streamer_voice_detection_block(streamer_name, voice_config)
+        if pattern.search(current_text):
+            updated_text = pattern.sub(block + "\n", current_text, count=1)
+        else:
+            prefix = current_text.rstrip()
+            updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    _validate_generated_config(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_streamer_speaker_labels_config(
+    config_path: str | Path,
+    streamer_name: str,
+    labels: dict[str, str],
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("speaker labels require a streamer")
+    _require_configured_streamer(current_text, streamer_name, target)
+
+    normalized = _normalize_speaker_labels(
+        labels,
+        f"streamers.{streamer_name}.speaker_labels",
+    )
+    table_name = f"streamers.{_toml_key(streamer_name)}.speaker_labels"
+    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
+    if not normalized:
+        updated_text, count = pattern.subn("", current_text, count=1)
+        updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+        if count == 0:
+            return False
+    else:
+        block = _streamer_speaker_labels_block(streamer_name, normalized)
+        if pattern.search(current_text):
+            updated_text = pattern.sub(block + "\n", current_text, count=1)
+        else:
+            prefix = current_text.rstrip()
+            updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    _validate_generated_config(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
 def update_channel_voice_detection_config(
     config_path: str | Path,
     channel: str,
@@ -432,6 +680,62 @@ def update_channel_voice_detection_config(
             prefix = current_text.rstrip()
             updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
 
+    _validate_generated_config(target, updated_text)
+
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_channel_speaker_labels_config(
+    config_path: str | Path,
+    channel: str,
+    labels: dict[str, str],
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    channel = channel.strip()
+    if not channel:
+        raise ConfigError("speaker labels require a channel")
+
+    normalized = _normalize_speaker_labels(
+        labels,
+        f"channel_speaker_labels.{channel}",
+    )
+    pattern = re.compile(
+        rf"(?ms)^\[channel_speaker_labels\.{re.escape(_toml_key(channel))}\]\n.*?(?=^\[|\Z)"
+    )
+    if not normalized:
+        updated_text, count = pattern.subn("", current_text, count=1)
+        updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+        if count == 0:
+            return False
+    else:
+        block = _channel_speaker_labels_block(channel, normalized)
+        if pattern.search(current_text):
+            updated_text = pattern.sub(block + "\n", current_text, count=1)
+        else:
+            prefix = current_text.rstrip()
+            updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    _validate_generated_config(target, updated_text)
+
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def _validate_generated_config(target: Path, updated_text: str) -> None:
     try:
         parsed = tomllib.loads(updated_text)
     except tomllib.TOMLDecodeError as exc:
@@ -439,11 +743,67 @@ def update_channel_voice_detection_config(
     if not isinstance(parsed, dict):
         raise ConfigError("Generated config must have a TOML table at the root")
 
+
+def _validate_generated_streamers(target: Path, updated_text: str) -> None:
     try:
-        target.write_text(updated_text, encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
-    return updated_text != current_text
+        parsed = tomllib.loads(updated_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Generated invalid TOML for {target}: {exc}") from exc
+    if isinstance(parsed, dict):
+        _as_streamers(parsed.get("streamers", {}), "streamers")
+
+
+def _require_configured_streamer(
+    current_text: str,
+    streamer_name: str,
+    target: Path,
+) -> None:
+    try:
+        parsed = tomllib.loads(current_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+    streamers = parsed.get("streamers", {}) if isinstance(parsed, dict) else {}
+    if not isinstance(streamers, dict) or streamer_name not in streamers:
+        raise ConfigError(f"streamer is not configured: {streamer_name}")
+
+
+def _streamer_block(
+    streamer_name: str,
+    sources: list[str],
+    download_dir_name: str,
+) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}]"]
+    lines.append(f"sources = {_toml_value(sources, 'sources')}")
+    if download_dir_name:
+        lines.append(
+            f"download_dir_name = {_toml_value(download_dir_name, 'download_dir_name')}"
+        )
+    return "\n".join(lines)
+
+
+def _streamer_voice_detection_block(
+    streamer_name: str,
+    voice_config: VoiceDetectionConfig,
+) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}.voice_detection]"]
+    lines.append(f"mode = {_toml_value(voice_config.mode, 'mode')}")
+    if voice_config.mode == "fixed":
+        lines.append(f"speakers = {voice_config.min_speakers}")
+    elif voice_config.mode == "range":
+        if voice_config.min_speakers:
+            lines.append(f"min_speakers = {voice_config.min_speakers}")
+        if voice_config.max_speakers:
+            lines.append(f"max_speakers = {voice_config.max_speakers}")
+    if voice_config.hf_token_env:
+        lines.append(f"hf_token_env = {_toml_value(voice_config.hf_token_env, 'hf_token_env')}")
+    return "\n".join(lines)
+
+
+def _streamer_speaker_labels_block(streamer_name: str, labels: dict[str, str]) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}.speaker_labels]"]
+    for label, name in sorted(labels.items()):
+        lines.append(f"{_toml_key(label)} = {_toml_value(name, label)}")
+    return "\n".join(lines)
 
 
 def _channel_voice_detection_block(
@@ -461,6 +821,13 @@ def _channel_voice_detection_block(
             lines.append(f"max_speakers = {voice_config.max_speakers}")
     if voice_config.hf_token_env:
         lines.append(f"hf_token_env = {_toml_value(voice_config.hf_token_env, 'hf_token_env')}")
+    return "\n".join(lines)
+
+
+def _channel_speaker_labels_block(channel: str, labels: dict[str, str]) -> str:
+    lines = [f"[channel_speaker_labels.{_toml_key(channel)}]"]
+    for label, name in sorted(labels.items()):
+        lines.append(f"{_toml_key(label)} = {_toml_value(name, label)}")
     return "\n".join(lines)
 
 
@@ -499,6 +866,71 @@ def _resolve_optional_path(value: Any, base_dir: Path, name: str) -> Path | None
     return path.resolve()
 
 
+def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a TOML table")
+    streamers: dict[str, StreamerConfig] = {}
+    seen_sources: dict[str, str] = {}
+    for raw_streamer_name, raw_config in value.items():
+        if not isinstance(raw_streamer_name, str) or not raw_streamer_name.strip():
+            raise ConfigError(f"{name} keys must be non-empty streamer names")
+        streamer_name = raw_streamer_name.strip()
+        if not isinstance(raw_config, dict):
+            raise ConfigError(f"{name}.{streamer_name} must be a TOML table")
+        if "sources" in raw_config and "channels" in raw_config:
+            raise ConfigError(
+                f"{name}.{streamer_name} must use either sources or channels, not both"
+            )
+        source_field = "sources" if "sources" in raw_config else "channels"
+        sources = _as_str_list(
+            raw_config.get(source_field, []),
+            f"{name}.{streamer_name}.{source_field}",
+        )
+        if not sources:
+            raise ConfigError(f"{name}.{streamer_name}.{source_field} must not be empty")
+        for source in sources:
+            dedupe_key = source.strip().rstrip("/").casefold()
+            if dedupe_key in seen_sources:
+                raise ConfigError(
+                    f"{name}.{streamer_name}.{source_field} duplicates source "
+                    f"from {seen_sources[dedupe_key]}"
+                )
+            seen_sources[dedupe_key] = streamer_name
+
+        raw_voice_detection = raw_config.get("voice_detection")
+        voice_detection = None
+        if raw_voice_detection is not None:
+            if not isinstance(raw_voice_detection, dict):
+                raise ConfigError(
+                    f"{name}.{streamer_name}.voice_detection must be a TOML table"
+                )
+            voice_detection = _as_voice_detection_config(
+                raw_voice_detection,
+                f"{name}.{streamer_name}.voice_detection",
+            )
+
+        raw_speaker_labels = raw_config.get("speaker_labels", {})
+        if not isinstance(raw_speaker_labels, dict):
+            raise ConfigError(
+                f"{name}.{streamer_name}.speaker_labels must be a TOML table"
+            )
+        speaker_labels = _normalize_speaker_labels(
+            raw_speaker_labels,
+            f"{name}.{streamer_name}.speaker_labels",
+        )
+
+        streamers[streamer_name] = StreamerConfig(
+            sources=sources,
+            download_dir_name=_as_optional_str(
+                raw_config.get("download_dir_name", ""),
+                f"{name}.{streamer_name}.download_dir_name",
+            ),
+            voice_detection=voice_detection,
+            speaker_labels=speaker_labels,
+        )
+    return streamers
+
+
 def _as_channel_voice_detection(
     value: Any,
     name: str,
@@ -516,6 +948,43 @@ def _as_channel_voice_detection(
             f"{name}.{channel}",
         )
     return overrides
+
+
+def _as_channel_speaker_labels(
+    value: Any,
+    name: str,
+) -> dict[str, dict[str, str]]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a TOML table")
+    channels: dict[str, dict[str, str]] = {}
+    for channel, raw_labels in value.items():
+        if not isinstance(channel, str) or not channel.strip():
+            raise ConfigError(f"{name} keys must be non-empty channel names")
+        if not isinstance(raw_labels, dict):
+            raise ConfigError(f"{name}.{channel} must be a TOML table")
+        labels = _normalize_speaker_labels(raw_labels, f"{name}.{channel}")
+        if labels:
+            channels[channel.strip()] = labels
+    return channels
+
+
+def _normalize_speaker_labels(value: dict[str, Any], name: str) -> dict[str, str]:
+    labels: dict[str, str] = {}
+    for raw_label, raw_name in value.items():
+        label = _as_speaker_label(raw_label, f"{name} speaker label")
+        speaker_name = _as_optional_str(raw_name, f"{name}.{label}")
+        if speaker_name:
+            labels[label] = speaker_name
+    return labels
+
+
+def _as_speaker_label(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{name} must be a non-empty speaker label")
+    label = value.strip()
+    if any(char.isspace() for char in label):
+        raise ConfigError(f"{name} must not contain whitespace")
+    return label
 
 
 def _as_voice_detection_config(raw: dict[str, Any], name: str) -> VoiceDetectionConfig:

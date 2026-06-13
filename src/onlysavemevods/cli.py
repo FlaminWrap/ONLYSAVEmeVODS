@@ -20,6 +20,7 @@ from .config import (
     ConfigError,
     append_missing_config_values,
     load_config,
+    monitored_sources,
     update_config_values,
 )
 from .daemon import OnlySaveMeVodsDaemon
@@ -91,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    check = subparsers.add_parser("check", help="Check configured channels once.")
+    check = subparsers.add_parser("check", help="Check configured channels and streamer sources once.")
     check.add_argument("--config", default="config.toml", help="Path to config TOML.")
 
     update_config = subparsers.add_parser(
@@ -245,11 +246,12 @@ def check_command(args: argparse.Namespace) -> int:
     found = 0
     failures = 0
 
-    if not config.channels:
-        print("No channels configured.")
+    sources = monitored_sources(config)
+    if not sources:
+        print("No channels or streamers configured.")
         return 0
 
-    for channel in config.channels:
+    for channel in sources:
         print(f"Checking {channel}")
         try:
             streams = probe.discover_channel_live_streams(channel)
