@@ -22,12 +22,16 @@ class StateWatermarkTests(unittest.TestCase):
                 status="running",
                 message="Rendering",
                 started=True,
+                phase="Rendering frames",
+                progress=0.5,
             )
             state.update_watermark_copy(
                 "wm_copy001",
                 status="done",
                 message="Completed",
                 finished=True,
+                phase="Complete",
+                progress=1.0,
             )
             fetched = state.get_watermark_copy("wm_copy001")
             listed = state.list_watermark_copies(
@@ -41,6 +45,8 @@ class StateWatermarkTests(unittest.TestCase):
         assert fetched is not None
         self.assertEqual(fetched.status, "done")
         self.assertEqual(fetched.message, "Completed")
+        self.assertEqual(fetched.phase, "Complete")
+        self.assertEqual(fetched.progress, 1.0)
         self.assertIsNotNone(fetched.started_at)
         self.assertIsNotNone(fetched.finished_at)
         self.assertEqual([record.copy_id for record in listed], ["wm_copy001"])

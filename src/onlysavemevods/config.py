@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import json
+import re
 import tomllib
 
 
@@ -51,6 +52,17 @@ class ConfigError(ValueError):
     """Raised when a config file cannot be parsed into a usable bot config."""
 
 
+VOICE_DETECTION_MODES = {"off", "auto", "range", "fixed"}
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceDetectionConfig:
+    mode: str = "auto"
+    min_speakers: int = 0
+    max_speakers: int = 0
+    hf_token_env: str = ""
+
+
 @dataclass(slots=True)
 class BotConfig:
     channels: list[str] = field(default_factory=list)
@@ -76,6 +88,7 @@ class BotConfig:
     whisperx_hf_token_env: str = "HF_TOKEN"
     whisperx_min_speakers: int = 0
     whisperx_max_speakers: int = 0
+    channel_voice_detection: dict[str, VoiceDetectionConfig] = field(default_factory=dict)
     keep_fragments_for_resume: bool = True
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
@@ -139,6 +152,10 @@ def load_config(path: str | Path) -> BotConfig:
         raise ConfigError(
             "whisperx_min_speakers must be less than or equal to whisperx_max_speakers"
         )
+    channel_voice_detection = _as_channel_voice_detection(
+        raw.get("channel_voice_detection", {}),
+        "channel_voice_detection",
+    )
 
     return BotConfig(
         channels=_as_str_list(raw.get("channels", []), "channels"),
@@ -204,6 +221,7 @@ def load_config(path: str | Path) -> BotConfig:
         ),
         whisperx_min_speakers=whisperx_min_speakers,
         whisperx_max_speakers=whisperx_max_speakers,
+        channel_voice_detection=channel_voice_detection,
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),
             "keep_fragments_for_resume",
@@ -314,6 +332,142 @@ def append_missing_config_values(
     return missing
 
 
+def update_config_values(
+    config_path: str | Path,
+    updates: dict[str, Any],
+) -> list[str]:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    try:
+        current = tomllib.loads(current_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+    if not isinstance(current, dict):
+        raise ConfigError("Config files must have TOML tables at the root")
+
+    changed: list[str] = []
+    updated_text = current_text
+    missing: list[str] = []
+    for key, value in updates.items():
+        line = f"{key} = {_toml_value(value, key)}"
+        if key in current:
+            if current[key] == value:
+                continue
+            pattern = re.compile(rf"(?m)^{re.escape(key)}\s*=.*$")
+            updated_text, count = pattern.subn(line, updated_text, count=1)
+            if count == 0:
+                missing.append(key)
+            else:
+                changed.append(key)
+        else:
+            missing.append(key)
+
+    if missing:
+        lines = [
+            "",
+            "# Added by ONLYSAVEmeVODS config update. Existing settings above were left unchanged.",
+        ]
+        for key in missing:
+            lines.append(f"{key} = {_toml_value(updates[key], key)}")
+        addition = "\n".join(lines) + "\n"
+        table_match = re.search(r"(?m)^\[", updated_text)
+        if table_match is None:
+            prefix = updated_text
+            if prefix and not prefix.endswith("\n"):
+                prefix += "\n"
+            updated_text = prefix + addition
+        else:
+            prefix = updated_text[: table_match.start()].rstrip()
+            suffix = updated_text[table_match.start() :].lstrip("\n")
+            updated_text = (prefix + addition + "\n" if prefix else addition + "\n") + suffix
+        changed.extend(missing)
+
+    if not changed:
+        return []
+
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return changed
+
+
+def update_channel_voice_detection_config(
+    config_path: str | Path,
+    channel: str,
+    voice_config: VoiceDetectionConfig | None,
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    channel = channel.strip()
+    if not channel:
+        raise ConfigError("channel voice detection override requires a channel")
+
+    header = f"[channel_voice_detection.{_toml_key(channel)}]"
+    pattern = re.compile(
+        rf"(?ms)^\[channel_voice_detection\.{re.escape(_toml_key(channel))}\]\n.*?(?=^\[|\Z)"
+    )
+    if voice_config is None:
+        updated_text, count = pattern.subn("", current_text, count=1)
+        updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+        if count == 0:
+            return False
+    else:
+        block = _channel_voice_detection_block(channel, voice_config)
+        if pattern.search(current_text):
+            updated_text = pattern.sub(block + "\n", current_text, count=1)
+        else:
+            prefix = current_text.rstrip()
+            updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    try:
+        parsed = tomllib.loads(updated_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Generated invalid TOML for {target}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ConfigError("Generated config must have a TOML table at the root")
+
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def _channel_voice_detection_block(
+    channel: str,
+    voice_config: VoiceDetectionConfig,
+) -> str:
+    lines = [f"[channel_voice_detection.{_toml_key(channel)}]"]
+    lines.append(f"mode = {_toml_value(voice_config.mode, 'mode')}")
+    if voice_config.mode == "fixed":
+        lines.append(f"speakers = {voice_config.min_speakers}")
+    elif voice_config.mode == "range":
+        if voice_config.min_speakers:
+            lines.append(f"min_speakers = {voice_config.min_speakers}")
+        if voice_config.max_speakers:
+            lines.append(f"max_speakers = {voice_config.max_speakers}")
+    if voice_config.hf_token_env:
+        lines.append(f"hf_token_env = {_toml_value(voice_config.hf_token_env, 'hf_token_env')}")
+    return "\n".join(lines)
+
+
+def _toml_key(value: str) -> str:
+    return json.dumps(value)
+
+
 def _toml_value(value: Any, name: str) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -343,6 +497,77 @@ def _resolve_optional_path(value: Any, base_dir: Path, name: str) -> Path | None
     if not path.is_absolute():
         path = base_dir / path
     return path.resolve()
+
+
+def _as_channel_voice_detection(
+    value: Any,
+    name: str,
+) -> dict[str, VoiceDetectionConfig]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a TOML table")
+    overrides: dict[str, VoiceDetectionConfig] = {}
+    for channel, raw_config in value.items():
+        if not isinstance(channel, str) or not channel.strip():
+            raise ConfigError(f"{name} keys must be non-empty channel names")
+        if not isinstance(raw_config, dict):
+            raise ConfigError(f"{name}.{channel} must be a TOML table")
+        overrides[channel.strip()] = _as_voice_detection_config(
+            raw_config,
+            f"{name}.{channel}",
+        )
+    return overrides
+
+
+def _as_voice_detection_config(raw: dict[str, Any], name: str) -> VoiceDetectionConfig:
+    mode = _as_voice_detection_mode(raw.get("mode", "auto"), f"{name}.mode")
+    speakers = _as_non_negative_int(raw.get("speakers", 0), f"{name}.speakers")
+    min_speakers = _as_non_negative_int(
+        raw.get("min_speakers", 0),
+        f"{name}.min_speakers",
+    )
+    max_speakers = _as_non_negative_int(
+        raw.get("max_speakers", 0),
+        f"{name}.max_speakers",
+    )
+    hf_token_env = _as_optional_str(raw.get("hf_token_env", ""), f"{name}.hf_token_env")
+    if hf_token_env:
+        hf_token_env = _as_env_var_name(hf_token_env, f"{name}.hf_token_env")
+
+    if mode == "fixed":
+        if speakers:
+            min_speakers = speakers
+            max_speakers = speakers
+        elif not (min_speakers and max_speakers and min_speakers == max_speakers):
+            raise ConfigError(f"{name} fixed voice detection requires speakers")
+    elif mode == "range":
+        if speakers:
+            raise ConfigError(f"{name} range voice detection uses min_speakers/max_speakers")
+        if not min_speakers and not max_speakers:
+            raise ConfigError(f"{name} range voice detection requires a speaker bound")
+        if min_speakers and max_speakers and min_speakers > max_speakers:
+            raise ConfigError(f"{name}.min_speakers must be less than or equal to max_speakers")
+    elif mode in {"off", "auto"}:
+        if speakers or min_speakers or max_speakers:
+            raise ConfigError(f"{name} {mode} voice detection does not accept speaker counts")
+        min_speakers = 0
+        max_speakers = 0
+
+    return VoiceDetectionConfig(
+        mode=mode,
+        min_speakers=min_speakers,
+        max_speakers=max_speakers,
+        hf_token_env=hf_token_env,
+    )
+
+
+def _as_voice_detection_mode(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be a string")
+    mode = value.strip().lower()
+    if mode not in VOICE_DETECTION_MODES:
+        allowed = ", ".join(sorted(VOICE_DETECTION_MODES))
+        raise ConfigError(f"{name} must be one of: {allowed}")
+    return mode
 
 
 def _as_str(value: Any, name: str) -> str:

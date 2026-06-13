@@ -24,6 +24,8 @@ def copy_record(copy_id: str, label: str) -> WatermarkCopyRecord:
         status="done",
         message="Completed",
         error="",
+        phase="Complete",
+        progress=1.0,
         created_at="2026-01-01T00:00:00+00:00",
         updated_at="2026-01-01T00:00:00+00:00",
         started_at="2026-01-01T00:00:00+00:00",

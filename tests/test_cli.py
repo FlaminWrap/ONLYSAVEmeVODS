@@ -8,6 +8,7 @@ import unittest
 
 from onlysavemevods import __version__
 from onlysavemevods.cli import main
+from onlysavemevods.config import load_config
 from onlysavemevods.state import StateStore
 from onlysavemevods.watermark import DetectionCandidate, DetectionResult
 
@@ -20,6 +21,87 @@ class CliVersionTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 0)
         self.assertIn(__version__, output.getvalue())
+
+
+class CliVoiceDetectionTests(unittest.TestCase):
+    def test_voice_detection_set_fixed_updates_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "whisperx_diarize = true\n"
+                "whisperx_min_speakers = 0\n"
+                "whisperx_max_speakers = 0\n",
+                encoding="utf-8",
+            )
+
+            output = StringIO()
+            with redirect_stdout(output):
+                result = main(
+                    [
+                        "voice-detection",
+                        "set",
+                        "--config",
+                        str(config_path),
+                        "--mode",
+                        "fixed",
+                        "--speakers",
+                        "3",
+                        "--hf-token-env",
+                        "PYANNOTE_TOKEN",
+                    ]
+                )
+
+            config = load_config(config_path)
+
+        self.assertEqual(result, 0)
+        self.assertTrue(config.whisperx_diarize)
+        self.assertEqual(config.whisperx_min_speakers, 3)
+        self.assertEqual(config.whisperx_max_speakers, 3)
+        self.assertEqual(config.whisperx_hf_token_env, "PYANNOTE_TOKEN")
+        self.assertIn("Voice detection: fixed", output.getvalue())
+        self.assertIn("Speaker count: exactly 3", output.getvalue())
+
+    def test_voice_detection_set_range_requires_a_bound(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+
+            result = main(
+                [
+                    "voice-detection",
+                    "set",
+                    "--config",
+                    str(config_path),
+                    "--mode",
+                    "range",
+                ]
+            )
+
+        self.assertEqual(result, 2)
+
+    def test_voice_detection_show_reports_token_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'whisperx_hf_token_env = "PYANNOTE_TOKEN"\n',
+                encoding="utf-8",
+            )
+
+            output = StringIO()
+            with patch.dict("os.environ", {"PYANNOTE_TOKEN": "secret"}, clear=True):
+                with redirect_stdout(output):
+                    result = main(
+                        [
+                            "voice-detection",
+                            "show",
+                            "--config",
+                            str(config_path),
+                        ]
+                    )
+
+        self.assertEqual(result, 0)
+        self.assertIn("Voice detection: auto", output.getvalue())
+        self.assertIn("Hugging Face token env: PYANNOTE_TOKEN (set)", output.getvalue())
 
 
 class CliWatermarkTests(unittest.TestCase):

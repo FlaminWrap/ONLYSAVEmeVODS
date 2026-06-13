@@ -5,8 +5,11 @@ import unittest
 from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     ConfigError,
+    VoiceDetectionConfig,
     append_missing_config_values,
     load_config,
+    update_channel_voice_detection_config,
+    update_config_values,
 )
 
 
@@ -304,6 +307,76 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.whisperx_hf_token_env, "HUGGINGFACE_TOKEN")
         self.assertEqual(config.whisperx_min_speakers, 2)
         self.assertEqual(config.whisperx_max_speakers, 4)
+
+    def test_channel_voice_detection_overrides_can_be_configured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[channel_voice_detection."Example Channel"]\n'
+                'mode = "fixed"\n'
+                'speakers = 3\n'
+                'hf_token_env = "PYANNOTE_TOKEN"\n'
+                '[channel_voice_detection."@Other"]\n'
+                'mode = "range"\n'
+                'min_speakers = 2\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        fixed = config.channel_voice_detection["Example Channel"]
+        ranged = config.channel_voice_detection["@Other"]
+        self.assertEqual(fixed.mode, "fixed")
+        self.assertEqual(fixed.min_speakers, 3)
+        self.assertEqual(fixed.max_speakers, 3)
+        self.assertEqual(fixed.hf_token_env, "PYANNOTE_TOKEN")
+        self.assertEqual(ranged.mode, "range")
+        self.assertEqual(ranged.min_speakers, 2)
+        self.assertEqual(ranged.max_speakers, 0)
+
+    def test_root_config_update_inserts_missing_keys_before_channel_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[channel_voice_detection."Example Channel"]\n'
+                'mode = "fixed"\n'
+                'speakers = 2\n',
+                encoding="utf-8",
+            )
+
+            update_config_values(config_path, {"whisperx_diarize": False})
+            text = config_path.read_text(encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertLess(
+            text.index("whisperx_diarize"),
+            text.index('[channel_voice_detection."Example Channel"]'),
+        )
+        self.assertFalse(config.whisperx_diarize)
+        self.assertIn("Example Channel", config.channel_voice_detection)
+
+    def test_channel_voice_detection_update_writes_and_removes_table(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('channels = ["@Example"]\n', encoding="utf-8")
+
+            changed = update_channel_voice_detection_config(
+                config_path,
+                "Example Channel",
+                VoiceDetectionConfig(mode="fixed", min_speakers=2, max_speakers=2),
+            )
+            config = load_config(config_path)
+            removed = update_channel_voice_detection_config(
+                config_path,
+                "Example Channel",
+                None,
+            )
+            config_after_remove = load_config(config_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(config.channel_voice_detection["Example Channel"].mode, "fixed")
+        self.assertTrue(removed)
+        self.assertEqual(config_after_remove.channel_voice_detection, {})
 
     def test_transcription_speaker_bounds_must_be_ordered(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -34,7 +34,14 @@ from .chat_render import (
 )
 from .chat_refresh import refresh_chat_sidecar
 from .chat_timing import is_chat_timing_file
-from .config import BotConfig
+from .config import (
+    BotConfig,
+    ConfigError,
+    VoiceDetectionConfig,
+    load_config,
+    update_channel_voice_detection_config,
+    update_config_values,
+)
 from .downloader import (
     command_for_log,
     is_live_chat_file,
@@ -48,7 +55,10 @@ from .log_buffer import LogEntry, get_recent_log_entries
 from .state import StateStore, StreamRecord, WatermarkCopyRecord
 from .transcription import (
     transcribe_media_file,
+    transcription_config_for_channel,
     transcription_outputs_exist,
+    voice_detection_mode,
+    voice_detection_speaker_summary,
 )
 from .watermark import (
     WATERMARK_STATUS_DONE,
@@ -74,6 +84,7 @@ LOGGER = logging.getLogger(__name__)
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
 LOG_LIMIT = 200
+JOB_LIMIT = 200
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
 )
@@ -145,6 +156,8 @@ class WatermarkCopyStatus:
     status: str
     message: str
     error: str
+    phase: str
+    progress: float | None
     created_at: str
     updated_at: str
     started_at: str | None
@@ -162,6 +175,9 @@ class RenderChatJob:
     message: str
     started_at: float
     finished_at: float | None = None
+    phase: str = ""
+    progress: float | None = None
+    updated_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +189,9 @@ class RefreshChatJob:
     message: str
     started_at: float
     finished_at: float | None = None
+    phase: str = ""
+    progress: float | None = None
+    updated_at: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +202,25 @@ class TranscriptionJob:
     message: str
     started_at: float
     finished_at: float | None = None
+    phase: str = ""
+    progress: float | None = None
+    updated_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class JobStatus:
+    job_id: str
+    kind: str
+    status: str
+    phase: str
+    progress: float | None
+    video_id: str
+    item: str
+    detail: str
+    message: str
+    started_at: float | None
+    updated_at: float | None
+    finished_at: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +282,16 @@ class AppInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ConfigFormField:
+    key: str
+    section: str
+    kind: str
+    options: tuple[str, ...] = ()
+    minimum: int | None = None
+    rows: int = 1
+
+
+@dataclass(frozen=True, slots=True)
 class StatusSnapshot:
     generated_at: float
     app: AppInfo
@@ -263,7 +311,50 @@ class StatusSnapshot:
     channel_stats: list[ChannelStatus]
     recent_logs: list[LogEntry]
     log_limit: int
+    jobs: list[JobStatus]
+    job_limit: int
     streams: list[StreamStatus]
+
+
+CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
+    ConfigFormField("channels", "Channels", "str_list", rows=5),
+    ConfigFormField("download_dir", "Paths", "text"),
+    ConfigFormField("state_dir", "Paths", "text"),
+    ConfigFormField("poll_interval_seconds", "Discovery", "int", minimum=1),
+    ConfigFormField("channel_scan_limit", "Discovery", "int", minimum=1),
+    ConfigFormField("discovery_probe_concurrency", "Discovery", "int", minimum=1),
+    ConfigFormField("max_concurrent_downloads", "Discovery", "int", minimum=1),
+    ConfigFormField("live_from_start", "Download", "bool"),
+    ConfigFormField("keep_fragments_for_resume", "Download", "bool"),
+    ConfigFormField("reconnect_interval_seconds", "Download", "int", minimum=0),
+    ConfigFormField("post_exit_check_seconds", "Download", "int_list", rows=3),
+    ConfigFormField("retry_backoff_seconds", "Download", "int_list", rows=2),
+    ConfigFormField("extra_yt_dlp_args", "Download", "extra_args", rows=4),
+    ConfigFormField("record_live_chat", "Live Chat", "bool"),
+    ConfigFormField("render_live_chat_video", "Live Chat", "bool"),
+    ConfigFormField("chat_render_panel_workers", "Live Chat", "int", minimum=0),
+    ConfigFormField("chat_render_use_nvenc", "Live Chat", "bool"),
+    ConfigFormField("chat_render_nvenc_devices", "Live Chat", "str_list", rows=2),
+    ConfigFormField("transcribe_subtitles", "Transcription", "bool"),
+    ConfigFormField("transcription_max_concurrent", "Transcription", "int", minimum=1),
+    ConfigFormField("whisperx_path", "Transcription", "text"),
+    ConfigFormField("whisperx_model", "Transcription", "text"),
+    ConfigFormField("whisperx_device", "Transcription", "text"),
+    ConfigFormField("whisperx_compute_type", "Transcription", "text"),
+    ConfigFormField("whisperx_batch_size", "Transcription", "int", minimum=1),
+    ConfigFormField("whisperx_language", "Transcription", "optional_text"),
+    ConfigFormField("web_enabled", "Web", "bool"),
+    ConfigFormField("web_host", "Web", "text"),
+    ConfigFormField("web_port", "Web", "int", minimum=1),
+    ConfigFormField("log_level", "Tools", "choice", options=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")),
+    ConfigFormField("yt_dlp_path", "Tools", "text"),
+    ConfigFormField("ffmpeg_path", "Tools", "text"),
+    ConfigFormField("watermark_enabled", "Watermark", "bool"),
+    ConfigFormField("watermark_secret_env", "Watermark", "text"),
+    ConfigFormField("watermark_strength", "Watermark", "choice", options=("invisible", "balanced", "robust")),
+    ConfigFormField("watermark_detect_upload_max_bytes", "Watermark", "int", minimum=1),
+)
+CONFIG_FORM_SECTIONS = tuple(dict.fromkeys(field.section for field in CONFIG_FORM_FIELDS))
 
 
 class StatusWebServer:
@@ -374,6 +465,12 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
             if parts.path == "/transcribe":
                 self._start_transcription(parts.query)
+                return
+            if parts.path == "/voice-detection":
+                self._update_voice_detection()
+                return
+            if parts.path == "/config":
+                self._update_config()
                 return
             if parts.path == "/watermark":
                 self._start_watermark()
@@ -504,6 +601,43 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
 
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/#streams")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_voice_detection(self) -> None:
+            body = self._read_request_body(32 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(body.decode("utf-8", "replace"))
+                update_voice_detection_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#config")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_config(self) -> None:
+            body = self._read_request_body(256 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_app_config_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#config")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -650,6 +784,7 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         counts[stream.status] = counts.get(stream.status, 0) + 1
 
     channel_stats = build_channel_stats(streams, config.channels)
+    jobs = build_job_statuses(watermark_records)
     return StatusSnapshot(
         generated_at=time.time(),
         app=build_app_info(),
@@ -669,8 +804,110 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         channel_stats=channel_stats,
         recent_logs=get_recent_log_entries(LOG_LIMIT),
         log_limit=LOG_LIMIT,
+        jobs=jobs,
+        job_limit=JOB_LIMIT,
         streams=streams,
     )
+
+
+
+def build_job_statuses(
+    watermark_records: list[WatermarkCopyRecord],
+) -> list[JobStatus]:
+    jobs: list[JobStatus] = []
+    with CHAT_RENDER_JOBS_LOCK:
+        render_jobs = list(CHAT_RENDER_JOBS.values())
+    with CHAT_REFRESH_JOBS_LOCK:
+        refresh_jobs = list(CHAT_REFRESH_JOBS.values())
+    with TRANSCRIPTION_JOBS_LOCK:
+        transcription_jobs = list(TRANSCRIPTION_JOBS.values())
+
+    for job in render_jobs:
+        jobs.append(
+            JobStatus(
+                job_id=f"chat-render:{job.video_id}:{job.chat_name}",
+                kind="Chat render",
+                status=job.status,
+                phase=job.phase or job.message,
+                progress=job.progress,
+                video_id=job.video_id,
+                item=job.output_name,
+                detail=f"{job.media_name} + {job.chat_name}",
+                message=job.message,
+                started_at=job.started_at,
+                updated_at=job.updated_at or job.finished_at or job.started_at,
+                finished_at=job.finished_at,
+            )
+        )
+    for job in refresh_jobs:
+        jobs.append(
+            JobStatus(
+                job_id=f"chat-refresh:{job.video_id}:{job.chat_name}",
+                kind="Chat refresh",
+                status=job.status,
+                phase=job.phase or job.message,
+                progress=job.progress,
+                video_id=job.video_id,
+                item=job.chat_name,
+                detail=job.media_name,
+                message=job.message,
+                started_at=job.started_at,
+                updated_at=job.updated_at or job.finished_at or job.started_at,
+                finished_at=job.finished_at,
+            )
+        )
+    for job in transcription_jobs:
+        jobs.append(
+            JobStatus(
+                job_id=f"transcription:{job.video_id}:{job.media_name}",
+                kind="Transcription",
+                status=job.status,
+                phase=job.phase or job.message,
+                progress=job.progress,
+                video_id=job.video_id,
+                item=job.media_name,
+                detail="WhisperX subtitles",
+                message=job.message,
+                started_at=job.started_at,
+                updated_at=job.updated_at or job.finished_at or job.started_at,
+                finished_at=job.finished_at,
+            )
+        )
+    for record in watermark_records:
+        started_at = iso_to_epoch(record.started_at) or iso_to_epoch(record.created_at)
+        updated_at = iso_to_epoch(record.updated_at)
+        finished_at = iso_to_epoch(record.finished_at)
+        jobs.append(
+            JobStatus(
+                job_id=f"watermark:{record.copy_id}",
+                kind="Watermark",
+                status=record.status,
+                phase=record.phase or record.message,
+                progress=record.progress,
+                video_id=record.video_id,
+                item=record.output_name,
+                detail=record.recipient_label,
+                message=record.error or record.message,
+                started_at=started_at,
+                updated_at=updated_at,
+                finished_at=finished_at,
+            )
+        )
+
+    return sorted(
+        jobs,
+        key=lambda job: job.updated_at or job.started_at or 0.0,
+        reverse=True,
+    )[:JOB_LIMIT]
+
+
+def iso_to_epoch(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return None
 
 
 def build_app_info() -> AppInfo:
@@ -708,6 +945,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "post_exit_check_seconds": list(config.post_exit_check_seconds),
             "retry_backoff_seconds": list(config.retry_backoff_seconds),
             "extra_yt_dlp_args": redacted_extra_args(config.extra_yt_dlp_args),
+            "extra_yt_dlp_args_configured": bool(config.extra_yt_dlp_args),
         },
         "Live Chat": {
             "record_live_chat": config.record_live_chat,
@@ -717,17 +955,23 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "chat_render_nvenc_devices": nvenc_devices_for_config_summary(
                 config.chat_render_nvenc_devices
             ),
+            "chat_render_nvenc_device_values": list(config.chat_render_nvenc_devices),
         },
         "Transcription": {
             "transcribe_subtitles": config.transcribe_subtitles,
             "transcription_max_concurrent": config.transcription_max_concurrent,
+            "voice_detection": voice_detection_mode(config),
+            "voice_detection_speakers": voice_detection_speaker_summary(config),
+            "channel_overrides": voice_detection_overrides_for_summary(config),
             "whisperx_path": config.whisperx_path,
             "whisperx_model": config.whisperx_model,
             "whisperx_device": config.whisperx_device,
             "whisperx_compute_type": config.whisperx_compute_type,
             "whisperx_batch_size": config.whisperx_batch_size,
             "whisperx_language": config.whisperx_language or "auto",
+            "whisperx_language_value": config.whisperx_language,
             "whisperx_diarize": config.whisperx_diarize,
+            "whisperx_hf_token_env": config.whisperx_hf_token_env or "-",
             "whisperx_hf_token_configured": bool(
                 config.whisperx_hf_token_env
                 and os_environ_has(config.whisperx_hf_token_env)
@@ -737,6 +981,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
         },
         "Watermark": {
             "watermark_enabled": config.watermark_enabled,
+            "watermark_secret_env": config.watermark_secret_env,
             "watermark_strength": config.watermark_strength,
             "watermark_secret_configured": bool(watermark_secret(config)),
             "watermark_detect_upload_max_bytes": config.watermark_detect_upload_max_bytes,
@@ -1060,6 +1305,8 @@ def watermark_copy_status(record: WatermarkCopyRecord) -> WatermarkCopyStatus:
         status=record.status,
         message=record.message,
         error=record.error,
+        phase=record.phase,
+        progress=record.progress,
         created_at=record.created_at,
         updated_at=record.updated_at,
         started_at=record.started_at,
@@ -1468,6 +1715,9 @@ def start_render_chat_job(
             status="running",
             message="Regenerating chat video" if regenerate else "Rendering chat video",
             started_at=now,
+            phase="Queued",
+            progress=0.0,
+            updated_at=now,
         )
 
     thread = Thread(
@@ -1510,6 +1760,9 @@ def start_refresh_chat_job(
             status="running",
             message="Refreshing chat",
             started_at=now,
+            phase="Queued",
+            progress=0.0,
+            updated_at=now,
         )
 
     thread = Thread(
@@ -1535,6 +1788,13 @@ def run_refresh_chat_job(
     media_file: Path,
     chat_file: Path,
 ) -> None:
+    update_refresh_chat_job(
+        key,
+        phase="Refreshing chat replay",
+        progress=0.2,
+        message="Refreshing chat replay",
+        updated_at=time.time(),
+    )
     try:
         result = refresh_chat_sidecar(
             config,
@@ -1550,20 +1810,26 @@ def run_refresh_chat_job(
             media_file,
             chat_file,
         )
+        finished = time.time()
         update_refresh_chat_job(
             key,
             status="failed",
             message=str(exc) or exc.__class__.__name__,
-            finished_at=time.time(),
+            phase="Failed",
+            finished_at=finished,
+            updated_at=finished,
         )
         return
 
     if not result.ok:
+        finished = time.time()
         update_refresh_chat_job(
             key,
             status="failed",
             message=result.message,
-            finished_at=time.time(),
+            phase="Failed",
+            finished_at=finished,
+            updated_at=finished,
         )
         return
 
@@ -1573,11 +1839,15 @@ def run_refresh_chat_job(
         result.source,
         result.message,
     )
+    finished = time.time()
     update_refresh_chat_job(
         key,
         status="done",
         message=result.message,
-        finished_at=time.time(),
+        phase="Complete",
+        progress=1.0,
+        finished_at=finished,
+        updated_at=finished,
     )
 
 
@@ -1634,6 +1904,7 @@ def run_render_chat_process_job(
         output_file,
     )
     LOGGER.debug("isolated manual chat render command: %s", command_for_log(command))
+    update_render_chat_job(key, phase="Starting isolated renderer", progress=0.05, message="Starting isolated renderer", updated_at=time.time())
     try:
         result = subprocess.run(
             command,
@@ -1647,7 +1918,9 @@ def run_render_chat_process_job(
             key,
             status="failed",
             message=str(exc) or exc.__class__.__name__,
+            phase="Failed",
             finished_at=time.time(),
+            updated_at=time.time(),
         )
         return
 
@@ -1664,7 +1937,9 @@ def run_render_chat_process_job(
             key,
             status="failed",
             message=message or f"Chat render exited with code {result.returncode}",
+            phase="Failed",
             finished_at=time.time(),
+            updated_at=time.time(),
         )
         return
 
@@ -1673,7 +1948,10 @@ def run_render_chat_process_job(
         key,
         status="done",
         message="Rendered chat video",
+        phase="Complete",
+        progress=1.0,
         finished_at=time.time(),
+        updated_at=time.time(),
     )
 
 
@@ -1712,6 +1990,13 @@ def run_render_chat_in_process_job(
             panel_workers=config.chat_render_panel_workers,
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
+            progress_callback=lambda phase, value: update_render_chat_job(
+                key,
+                phase=phase,
+                progress=value,
+                message=phase,
+                updated_at=time.time(),
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - web job should capture renderer failures.
         LOGGER.exception(
@@ -1723,7 +2008,9 @@ def run_render_chat_in_process_job(
             key,
             status="failed",
             message=str(exc) or exc.__class__.__name__,
+            phase="Failed",
             finished_at=time.time(),
+            updated_at=time.time(),
         )
         return
 
@@ -1732,7 +2019,10 @@ def run_render_chat_in_process_job(
         key,
         status="done",
         message="Rendered chat video",
+        phase="Complete",
+        progress=1.0,
         finished_at=time.time(),
+        updated_at=time.time(),
     )
 
 
@@ -1768,6 +2058,9 @@ def update_render_chat_job(key: str, **changes: Any) -> None:
             message=changes.get("message", job.message),
             started_at=changes.get("started_at", job.started_at),
             finished_at=changes.get("finished_at", job.finished_at),
+            phase=changes.get("phase", job.phase),
+            progress=changes.get("progress", job.progress),
+            updated_at=changes.get("updated_at", job.updated_at),
         )
 
 
@@ -1784,7 +2077,294 @@ def update_refresh_chat_job(key: str, **changes: Any) -> None:
             message=changes.get("message", job.message),
             started_at=changes.get("started_at", job.started_at),
             finished_at=changes.get("finished_at", job.finished_at),
+            phase=changes.get("phase", job.phase),
+            progress=changes.get("progress", job.progress),
+            updated_at=changes.get("updated_at", job.updated_at),
         )
+
+
+def update_app_config_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    updates = app_config_updates_from_form(params)
+    if not updates:
+        return
+
+    load_config_update_preview(config.config_path, updates)
+    update_config_values(config.config_path, updates)
+    reload_running_config(config)
+
+
+def app_config_updates_from_form(params: dict[str, list[str]]) -> dict[str, object]:
+    updates: dict[str, object] = {}
+    for field in CONFIG_FORM_FIELDS:
+        if field.kind == "extra_args":
+            extra_args = extra_yt_dlp_args_update_from_form(params)
+            if extra_args is not None:
+                updates[field.key] = extra_args
+            continue
+        updates[field.key] = config_form_value_from_params(field, params)
+    return updates
+
+
+def config_form_value_from_params(
+    field: ConfigFormField,
+    params: dict[str, list[str]],
+) -> object:
+    raw = first_query_value(params, field.key)
+    if field.kind == "bool":
+        return form_bool(raw, field.key)
+    if field.kind == "choice":
+        value = raw.strip()
+        if value not in field.options:
+            allowed = ", ".join(field.options)
+            raise ConfigError(f"{field.key} must be one of: {allowed}")
+        return value
+    if field.kind == "int":
+        return form_int(raw, field.key, minimum=field.minimum)
+    if field.kind == "int_list":
+        return form_int_list(raw, field.key)
+    if field.kind == "str_list":
+        return form_string_list(raw, field.key)
+    if field.kind == "optional_text":
+        return raw.strip()
+    if field.kind == "text":
+        return raw.strip()
+    raise ConfigError(f"Unsupported config form field: {field.key}")
+
+
+def extra_yt_dlp_args_update_from_form(
+    params: dict[str, list[str]],
+) -> list[str] | None:
+    mode = (first_query_value(params, "extra_yt_dlp_args_mode") or "keep").strip()
+    if mode == "keep":
+        return None
+    if mode == "clear":
+        return []
+    if mode == "replace":
+        return form_string_list(
+            first_query_value(params, "extra_yt_dlp_args"),
+            "extra_yt_dlp_args",
+            split_commas=False,
+        )
+    raise ConfigError("extra_yt_dlp_args_mode must be keep, replace, or clear")
+
+
+def form_bool(value: str, name: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ConfigError(f"{name} must be true or false")
+
+
+def form_int(value: str, name: str, *, minimum: int | None = None) -> int:
+    raw = value.strip()
+    if not raw:
+        raise ConfigError(f"{name} must be an integer")
+    try:
+        parsed = int(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be an integer") from exc
+    if minimum is not None and parsed < minimum:
+        raise ConfigError(f"{name} must be at least {minimum}")
+    return parsed
+
+
+def form_int_list(value: str, name: str) -> list[int]:
+    parts = [part for part in re.split(r"[,\s]+", value.strip()) if part]
+    result: list[int] = []
+    for part in parts:
+        try:
+            result.append(int(part))
+        except ValueError as exc:
+            raise ConfigError(f"{name} must contain only integers") from exc
+    return result
+
+
+def form_string_list(
+    value: str,
+    name: str,
+    *,
+    split_commas: bool = True,
+) -> list[str]:
+    if not value.strip():
+        return []
+    if split_commas and "\n" not in value:
+        parts = value.split(",")
+    else:
+        parts = value.splitlines()
+    result = [part.strip() for part in parts if part.strip()]
+    if any(not item for item in result):
+        raise ConfigError(f"{name} must not contain empty values")
+    return result
+
+
+def load_config_update_preview(
+    config_path: Path,
+    updates: dict[str, object],
+) -> BotConfig:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp:
+            temp.write(current_text)
+            temp_path = Path(temp.name)
+        update_config_values(temp_path, updates)
+        return load_config(temp_path)
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def reload_running_config(config: BotConfig) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    loaded = load_config(config.config_path)
+    for name in config.__dataclass_fields__:
+        if name == "config_path":
+            continue
+        setattr(config, name, getattr(loaded, name))
+
+def update_voice_detection_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    scope = first_query_value(params, "scope") or "global"
+    mode = first_query_value(params, "mode") or "auto"
+    if scope == "global":
+        updates = voice_detection_root_updates(params, mode)
+        update_config_values(config.config_path, updates)
+        config.whisperx_diarize = bool(updates["whisperx_diarize"])
+        config.whisperx_min_speakers = int(updates["whisperx_min_speakers"])
+        config.whisperx_max_speakers = int(updates["whisperx_max_speakers"])
+        if "whisperx_hf_token_env" in updates:
+            config.whisperx_hf_token_env = str(updates["whisperx_hf_token_env"])
+        return
+    if scope == "channel":
+        channel = first_query_value(params, "channel").strip()
+        if mode == "inherit":
+            update_channel_voice_detection_config(config.config_path, channel, None)
+            config.channel_voice_detection.pop(channel, None)
+            return
+        override = voice_detection_override_from_form(params, mode)
+        update_channel_voice_detection_config(
+            config.config_path,
+            channel,
+            override,
+        )
+        config.channel_voice_detection[channel] = override
+        return
+    raise ConfigError("Unknown voice detection scope")
+
+
+def voice_detection_root_updates(
+    params: dict[str, list[str]],
+    mode: str,
+) -> dict[str, object]:
+    override = voice_detection_override_from_form(params, mode)
+    updates: dict[str, object] = {
+        "whisperx_diarize": override.mode != "off",
+        "whisperx_min_speakers": override.min_speakers,
+        "whisperx_max_speakers": override.max_speakers,
+    }
+    if override.hf_token_env:
+        updates["whisperx_hf_token_env"] = override.hf_token_env
+    return updates
+
+
+def voice_detection_override_from_form(
+    params: dict[str, list[str]],
+    mode: str,
+) -> VoiceDetectionConfig:
+    mode = mode.strip().lower()
+    speakers = (
+        positive_form_int(first_query_value(params, "speakers"), "speakers")
+        if mode == "fixed"
+        else 0
+    )
+    min_speakers = (
+        positive_form_int(first_query_value(params, "min_speakers"), "min_speakers")
+        if mode == "range"
+        else 0
+    )
+    max_speakers = (
+        positive_form_int(first_query_value(params, "max_speakers"), "max_speakers")
+        if mode == "range"
+        else 0
+    )
+    hf_token_env = first_query_value(params, "hf_token_env").strip()
+    if hf_token_env:
+        validate_env_var_name(hf_token_env, "hf_token_env")
+
+    if mode == "off":
+        return VoiceDetectionConfig(mode="off", hf_token_env=hf_token_env)
+    if mode == "auto":
+        return VoiceDetectionConfig(mode="auto", hf_token_env=hf_token_env)
+    if mode == "fixed":
+        if not speakers:
+            raise ConfigError("fixed voice detection requires speakers")
+        return VoiceDetectionConfig(
+            mode="fixed",
+            min_speakers=speakers,
+            max_speakers=speakers,
+            hf_token_env=hf_token_env,
+        )
+    if mode == "range":
+        if not min_speakers and not max_speakers:
+            raise ConfigError("range voice detection requires min and/or max speakers")
+        if min_speakers and max_speakers and min_speakers > max_speakers:
+            raise ConfigError("min_speakers must be less than or equal to max_speakers")
+        return VoiceDetectionConfig(
+            mode="range",
+            min_speakers=min_speakers,
+            max_speakers=max_speakers,
+            hf_token_env=hf_token_env,
+        )
+    raise ConfigError("Unknown voice detection mode")
+
+
+def positive_form_int(value: str, name: str) -> int:
+    value = value.strip()
+    if not value:
+        return 0
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be a positive integer")
+    return parsed
+
+
+def validate_env_var_name(value: str, name: str) -> None:
+    if value.startswith("hf_"):
+        raise ConfigError(f"{name} must be an environment variable name, not a token")
+    if not value.replace("_", "A").isalnum() or value[0].isdigit():
+        raise ConfigError(f"{name} must be a valid environment variable name")
 
 
 def start_transcription_job(
@@ -1798,7 +2378,7 @@ def start_transcription_job(
     if resolved is None:
         return False, "No matching finalized media file found"
 
-    _record, media_file = resolved
+    record, media_file = resolved
     if transcription_outputs_exist(media_file) and not regenerate:
         return True, "Transcript already exists"
 
@@ -1816,11 +2396,14 @@ def start_transcription_job(
                 "Retranscribing subtitles" if regenerate else "Transcribing subtitles"
             ),
             started_at=now,
+            phase="Queued",
+            progress=0.0,
+            updated_at=now,
         )
 
     thread = Thread(
         target=run_transcription_job,
-        args=(config, key, media_file, regenerate),
+        args=(config, key, media_file, regenerate, record.channel),
         name=f"onlysavemevods-transcribe-{video_id}",
         daemon=True,
     )
@@ -1839,14 +2422,26 @@ def run_transcription_job(
     key: str,
     media_file: Path,
     regenerate: bool = False,
+    channel: str = "",
 ) -> None:
+    def progress(phase: str, value: float | None = None) -> None:
+        update_transcription_job(
+            key,
+            phase=phase,
+            progress=value,
+            message=phase,
+            updated_at=time.time(),
+        )
+
+    progress("Starting transcription", 0.02)
     try:
         ok = asyncio.run(
             transcribe_media_file(
-                config,
+                transcription_config_for_channel(config, channel),
                 media_file,
                 overwrite=regenerate,
                 logger=LOGGER,
+                progress_callback=progress,
             )
         )
     except Exception as exc:  # noqa: BLE001 - background job must capture failures.
@@ -1855,7 +2450,9 @@ def run_transcription_job(
             key,
             status="failed",
             message=str(exc) or exc.__class__.__name__,
+            phase="Failed",
             finished_at=time.time(),
+            updated_at=time.time(),
         )
         return
 
@@ -1864,16 +2461,22 @@ def run_transcription_job(
             key,
             status="failed",
             message="WhisperX did not produce both .srt and .vtt outputs",
+            phase="Failed",
             finished_at=time.time(),
+            updated_at=time.time(),
         )
         return
 
     LOGGER.info("Manual transcription completed: %s", media_file)
+    finished = time.time()
     update_transcription_job(
         key,
         status="done",
         message="Transcribed subtitles",
-        finished_at=time.time(),
+        phase="Complete",
+        progress=1.0,
+        finished_at=finished,
+        updated_at=finished,
     )
 
 
@@ -1898,6 +2501,9 @@ def update_transcription_job(key: str, **changes: Any) -> None:
             message=changes.get("message", job.message),
             started_at=changes.get("started_at", job.started_at),
             finished_at=changes.get("finished_at", job.finished_at),
+            phase=changes.get("phase", job.phase),
+            progress=changes.get("progress", job.progress),
+            updated_at=changes.get("updated_at", job.updated_at),
         )
 
 
@@ -1986,6 +2592,8 @@ def run_watermark_job(config: BotConfig, copy_id: str) -> None:
             message="Rendering watermarked copy",
             error="",
             started=True,
+            phase="Preparing watermark",
+            progress=0.02,
         )
         secret = require_watermark_secret(config)
         create_watermarked_copy(
@@ -1998,6 +2606,12 @@ def run_watermark_job(config: BotConfig, copy_id: str) -> None:
             strength=config.watermark_strength,
             ffmpeg_path=config.ffmpeg_path,
             overwrite=True,
+            progress_callback=lambda phase, value: state.update_watermark_copy(
+                copy_id,
+                message=phase,
+                phase=phase,
+                progress=value,
+            ),
         )
     except Exception as exc:  # noqa: BLE001 - background job must capture failures.
         LOGGER.exception("Watermark render failed copy_id=%s", copy_id)
@@ -2104,7 +2718,10 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     if not rows:
         rows = '<section class="empty">No streams have been seen yet.</section>'
     channel_rows = render_channel_rows(snapshot.channel_stats)
+    job_rows = render_job_rows(snapshot.jobs)
     config_sections = render_config_sections(snapshot.configuration)
+    voice_detection_panel = render_voice_detection_panel(snapshot)
+    app_config_form = render_app_config_form(snapshot)
     log_rows = render_log_rows(snapshot.recent_logs)
     watermark_detection = render_watermark_detection_panel(snapshot.configuration)
     about_panel = render_about_panel(snapshot)
@@ -2199,6 +2816,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .tab-panel {{ display: none; }}
     #tab-streams:checked ~ .tabs label[for="tab-streams"],
     #tab-channels:checked ~ .tabs label[for="tab-channels"],
+    #tab-jobs:checked ~ .tabs label[for="tab-jobs"],
     #tab-logs:checked ~ .tabs label[for="tab-logs"],
     #tab-about:checked ~ .tabs label[for="tab-about"],
     #tab-config:checked ~ .tabs label[for="tab-config"] {{
@@ -2208,6 +2826,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     #tab-streams:checked ~ .streams-panel,
     #tab-channels:checked ~ .channels-panel,
+    #tab-jobs:checked ~ .jobs-panel,
     #tab-logs:checked ~ .logs-panel,
     #tab-about:checked ~ .about-panel,
     #tab-config:checked ~ .config-panel {{ display: block; }}
@@ -2267,8 +2886,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       color: var(--muted);
       background: var(--panel-strong);
     }}
-    .badge.downloading {{ color: var(--active); border-color: color-mix(in srgb, var(--active), transparent 55%); }}
-    .badge.checking_after_exit, .badge.waiting_retry, .badge.interrupted {{ color: var(--warn); }}
+    .badge.downloading, .badge.running, .badge.done {{ color: var(--active); border-color: color-mix(in srgb, var(--active), transparent 55%); }}
+    .badge.checking_after_exit, .badge.waiting_retry, .badge.interrupted, .badge.queued {{ color: var(--warn); }}
+    .badge.failed {{ color: var(--bad); border-color: color-mix(in srgb, var(--bad), transparent 55%); }}
     .badge.ended {{ color: var(--muted); }}
     .signals {{
       margin-top: 8px;
@@ -2284,18 +2904,19 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .meta div {{ min-width: 0; overflow-wrap: anywhere; }}
     .wide {{ grid-column: 1 / -1; }}
     .table-wrap {{ overflow-x: auto; }}
-    .files, .channels, .logs, .config-table {{
+    .files, .channels, .jobs, .logs, .config-table {{
       width: 100%;
       border-collapse: collapse;
       margin-top: 8px;
       min-width: 860px;
     }}
     .channels {{ min-width: 980px; }}
+    .jobs {{ min-width: 1180px; }}
     .logs {{ min-width: 860px; }}
     .config-table {{ table-layout: fixed; }}
     .config-table th:first-child, .config-table td:first-child {{ width: 32%; }}
     .config-table th:last-child, .config-table td:last-child {{ width: 68%; }}
-    .files th, .files td, .channels th, .channels td, .logs th, .logs td,
+    .files th, .files td, .channels th, .channels td, .jobs th, .jobs td, .logs th, .logs td,
     .config-table th, .config-table td {{
       border-top: 1px solid var(--line);
       padding: 7px 6px;
@@ -2305,6 +2926,14 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .files th:last-child, .files td:last-child,
     .channels th:last-child, .channels td:last-child {{ text-align: right; }}
     .logs th:last-child, .logs td:last-child {{ text-align: left; }}
+    .job-progress {{
+      display: grid;
+      grid-template-columns: minmax(90px, 1fr) max-content;
+      align-items: center;
+      gap: 6px;
+      min-width: 150px;
+    }}
+    .job-progress progress {{ width: 100%; height: 10px; }}
     .file-name {{ overflow-wrap: anywhere; }}
     .log-message {{
       white-space: pre-wrap;
@@ -2359,6 +2988,79 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel);
       font: inherit;
     }}
+    .voice-form {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 8px;
+      margin: 8px 0 12px;
+    }}
+    .voice-form label {{
+      display: grid;
+      gap: 3px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .voice-form select, .voice-form input {{
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 4px 6px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    .small-input {{ width: 74px; }}
+    .env-input {{ width: 150px; }}
+    .voice-table {{ min-width: 980px; }}
+    .settings-form {{
+      display: grid;
+      gap: 14px;
+      margin-top: 8px;
+    }}
+    .settings-fieldset {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      min-width: 0;
+    }}
+    .settings-fieldset legend {{
+      padding: 0 6px;
+      font-weight: 650;
+    }}
+    .settings-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 10px 12px;
+    }}
+    .settings-field {{
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .settings-field.wide {{ grid-column: 1 / -1; }}
+    .settings-field input, .settings-field select, .settings-field textarea {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    .settings-field textarea {{
+      min-height: 72px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }}
+    .settings-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+    }}
     .upload-form {{
       display: grid;
       gap: 8px;
@@ -2382,6 +3084,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <div class="metric"><strong id="metric-checking">{checking}</strong><span>Checking</span></div>
       <div class="metric"><strong id="metric-attention">{len(attention_streams)}</strong><span>Attention</span></div>
       <div class="metric"><strong id="metric-channels">{len(snapshot.channel_stats)}</strong><span>Channels</span></div>
+      <div class="metric"><strong id="metric-jobs">{active_job_count(snapshot.jobs)}</strong><span>Active Jobs</span></div>
       <div class="metric"><strong id="metric-logs">{len(snapshot.recent_logs)}</strong><span>Logs</span></div>
       <div class="metric"><strong id="metric-storage">{escape(format_bytes(snapshot.total_bytes))}</strong><span>Storage</span></div>
       <div class="metric"><strong id="metric-partial">{escape(format_bytes(snapshot.part_bytes))}</strong><span>Partial</span></div>
@@ -2396,12 +3099,14 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
   <main>
     <input class="tab-radio" type="radio" id="tab-streams" name="dashboard-tab" checked>
     <input class="tab-radio" type="radio" id="tab-channels" name="dashboard-tab">
+    <input class="tab-radio" type="radio" id="tab-jobs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-logs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-about" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-config" name="dashboard-tab">
     <div class="tabs">
       <label for="tab-streams">Streams</label>
       <label for="tab-channels">Channels</label>
+      <label for="tab-jobs">Jobs</label>
       <label for="tab-logs">Logs</label>
       <label for="tab-about">About</label>
       <label for="tab-config">Config</label>
@@ -2443,6 +3148,18 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         </div>
       </section>
     </section>
+    <section class="tab-panel jobs-panel">
+      <section class="panel">
+        <h2>Jobs</h2>
+        <div class="file-meta">Showing up to {snapshot.job_limit} dashboard jobs and watermark copy jobs.</div>
+        <div class="table-wrap">
+          <table class="jobs">
+            <thead><tr><th>Status</th><th>Progress</th><th>Job</th><th>Phase</th><th>Video</th><th>Item</th><th>Detail</th><th>Started</th><th>Updated</th><th>Duration</th><th>Message</th></tr></thead>
+            <tbody id="job-rows">{job_rows}</tbody>
+          </table>
+        </div>
+      </section>
+    </section>
     <section class="tab-panel logs-panel">
       <section class="panel">
         <h2>Recent Logs</h2>
@@ -2461,6 +3178,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     <section class="tab-panel config-panel">
       <h2>Current Configuration</h2>
       <div class="file-meta">Sensitive yt-dlp arguments are redacted before display.</div>
+      {app_config_form}
+      {voice_detection_panel}
       <div class="config-stack" id="config-sections">
         {config_sections}
       </div>
@@ -2478,7 +3197,7 @@ def dashboard_script() -> str:
   const tabKey = "onlysavemevods.dashboardTab";
   const collapsedKey = "onlysavemevods.collapsedStreams";
   const expandedKey = "onlysavemevods.expandedStreams";
-  const tabs = ["tab-streams", "tab-channels", "tab-logs", "tab-about", "tab-config"];
+  const tabs = ["tab-streams", "tab-channels", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
     detected: "detected",
@@ -2824,6 +3543,41 @@ def dashboard_script() -> str:
     }).join("");
   };
 
+  const activeJobCount = (jobs) => (jobs || []).filter((job) => ["queued", "running"].includes(job.status)).length;
+
+  const renderJobProgress = (value) => {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+    const percent = Math.max(0, Math.min(100, Math.round(Number(value) * 100)));
+    return `<div class="job-progress"><progress max="100" value="${percent}"></progress><span>${percent}%</span></div>`;
+  };
+
+  const renderJobRows = (jobs) => {
+    if (!jobs || !jobs.length) {
+      return '<tr><td colspan="11" class="file-meta">No dashboard jobs have been seen yet</td></tr>';
+    }
+    return jobs.map((job) => {
+      const started = job.started_at === null || job.started_at === undefined ? "-" : formatEpoch(job.started_at);
+      const updated = job.updated_at === null || job.updated_at === undefined ? "-" : formatEpoch(job.updated_at);
+      const end = job.finished_at === null || job.finished_at === undefined ? Date.now() / 1000 : Number(job.finished_at);
+      const duration = job.started_at === null || job.started_at === undefined ? "-" : formatDuration(Math.max(0, end - Number(job.started_at)));
+      return [
+        "<tr>",
+        `<td><span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span></td>`,
+        `<td>${renderJobProgress(job.progress)}</td>`,
+        `<td>${escapeHtml(job.kind || "-")}</td>`,
+        `<td class="file-name">${escapeHtml(job.phase || "-")}</td>`,
+        `<td class="file-name">${escapeHtml(job.video_id || "-")}</td>`,
+        `<td class="file-name">${escapeHtml(job.item || "-")}</td>`,
+        `<td class="file-name">${escapeHtml(job.detail || "-")}</td>`,
+        `<td>${escapeHtml(started)}</td>`,
+        `<td>${escapeHtml(updated)}</td>`,
+        `<td>${escapeHtml(duration)}</td>`,
+        `<td class="log-message">${escapeHtml(job.message || "-")}</td>`,
+        "</tr>",
+      ].join("");
+    }).join("");
+  };
+
   const renderLogRows = (logs) => {
     if (!logs || !logs.length) {
       return '<tr><td colspan="4" class="file-meta">No in-process logs captured yet</td></tr>';
@@ -2870,6 +3624,7 @@ def dashboard_script() -> str:
     setText("metric-checking", counts.checking_after_exit || 0);
     setText("metric-attention", streams.filter(streamNeedsAttention).length);
     setText("metric-channels", (snapshot.channel_stats || []).length);
+    setText("metric-jobs", activeJobCount(snapshot.jobs || []));
     setText("metric-logs", (snapshot.recent_logs || []).length);
     setText("metric-storage", formatBytes(snapshot.total_bytes));
     setText("metric-partial", formatBytes(snapshot.part_bytes));
@@ -2895,6 +3650,8 @@ def dashboard_script() -> str:
     }
     const channelRows = byId("channel-rows");
     if (channelRows) channelRows.innerHTML = renderChannelRows(snapshot.channel_stats || []);
+    const jobRows = byId("job-rows");
+    if (jobRows) jobRows.innerHTML = renderJobRows(snapshot.jobs || []);
     const logRows = byId("log-rows");
     if (logRows) logRows.innerHTML = renderLogRows(snapshot.recent_logs || []);
     const configSections = byId("config-sections");
@@ -2933,6 +3690,242 @@ def render_about_panel(snapshot: StatusSnapshot) -> str:
     <dt>Status generated</dt><dd>{escape(generated)}</dd>
   </dl>
 </section>"""
+
+
+def voice_detection_overrides_for_summary(config: BotConfig) -> dict[str, str]:
+    return {
+        channel: voice_detection_config_summary(override)
+        for channel, override in sorted(config.channel_voice_detection.items())
+    }
+
+
+def voice_detection_config_summary(override: VoiceDetectionConfig) -> str:
+    if override.mode == "off":
+        return "off"
+    if override.mode == "auto":
+        return "auto"
+    if override.mode == "fixed":
+        return f"fixed, exactly {override.min_speakers}"
+    if override.min_speakers and override.max_speakers:
+        speakers = f"{override.min_speakers}-{override.max_speakers}"
+    elif override.min_speakers:
+        speakers = f"at least {override.min_speakers}"
+    else:
+        speakers = f"up to {override.max_speakers}"
+    return f"range, {speakers}"
+
+
+
+def render_app_config_form(snapshot: StatusSnapshot) -> str:
+    config_path = str(
+        snapshot.configuration.get("Paths", {}).get("config_path", "-")
+    )
+    if config_path == "-":
+        return """<section class="panel">
+  <h2>App Settings</h2>
+  <div class="file-meta">Config file path is not available.</div>
+</section>"""
+
+    fieldsets: list[str] = []
+    for section in CONFIG_FORM_SECTIONS:
+        fields = [field for field in CONFIG_FORM_FIELDS if field.section == section]
+        rendered_fields = "\n".join(
+            render_app_config_field(snapshot, field)
+            for field in fields
+        )
+        fieldsets.append(
+            f"""<fieldset class="settings-fieldset">
+  <legend>{escape(section)}</legend>
+  <div class="settings-grid">{rendered_fields}</div>
+</fieldset>"""
+        )
+    return f"""<section class="panel">
+  <h2>App Settings</h2>
+  <form class="settings-form" method="post" action="/config">
+    {''.join(fieldsets)}
+    <div class="settings-actions">
+      <button class="download action-button" type="submit">Save App Settings</button>
+      <span class="file-meta">{escape(config_path)}</span>
+    </div>
+  </form>
+</section>"""
+
+
+def render_app_config_field(snapshot: StatusSnapshot, field: ConfigFormField) -> str:
+    value = app_config_field_value(snapshot, field)
+    wide = " wide" if field.kind in {"str_list", "int_list", "extra_args"} else ""
+    control = render_app_config_control(field, value)
+    return (
+        f'<label class="settings-field{wide}">'
+        f"{escape(field.key)}"
+        f"{control}"
+        "</label>"
+    )
+
+
+def render_app_config_control(field: ConfigFormField, value: Any) -> str:
+    name = escape(field.key, quote=True)
+    if field.kind == "bool":
+        selected = "true" if bool(value) else "false"
+        return render_form_select(name, selected, ("true", "false"))
+    if field.kind == "choice":
+        return render_form_select(name, str(value), field.options)
+    if field.kind == "int":
+        min_attr = f' min="{field.minimum}"' if field.minimum is not None else ""
+        return (
+            f'<input name="{name}" type="number"{min_attr} '
+            f'value="{escape(str(value), quote=True)}">'
+        )
+    if field.kind == "int_list":
+        text = ", ".join(str(item) for item in value) if isinstance(value, list) else str(value)
+        return (
+            f'<textarea name="{name}" rows="{field.rows}">'
+            f"{escape(text)}"
+            "</textarea>"
+        )
+    if field.kind == "str_list":
+        if isinstance(value, list):
+            text = "\n".join(str(item) for item in value)
+        else:
+            text = str(value)
+        return (
+            f'<textarea name="{name}" rows="{field.rows}">'
+            f"{escape(text)}"
+            "</textarea>"
+        )
+    if field.kind == "extra_args":
+        configured = "configured" if app_config_extra_args_configured(value) else "empty"
+        return (
+            '<select name="extra_yt_dlp_args_mode">'
+            '<option value="keep" selected>keep current</option>'
+            '<option value="replace">replace</option>'
+            '<option value="clear">clear</option>'
+            '</select>'
+            f'<textarea name="{name}" rows="{field.rows}" '
+            f'placeholder="{escape(configured, quote=True)}"></textarea>'
+        )
+    input_type = "text"
+    return (
+        f'<input name="{name}" type="{input_type}" '
+        f'value="{escape(str(value), quote=True)}">'
+    )
+
+
+def render_form_select(name: str, selected: str, options: tuple[str, ...]) -> str:
+    rendered: list[str] = []
+    for option in options:
+        selected_attr = " selected" if option == selected else ""
+        rendered.append(
+            f'<option value="{escape(option, quote=True)}"{selected_attr}>'
+            f"{escape(option)}</option>"
+        )
+    return f'<select name="{name}">{"".join(rendered)}</select>'
+
+
+def app_config_field_value(snapshot: StatusSnapshot, field: ConfigFormField) -> Any:
+    if field.key == "channels":
+        return list(snapshot.configured_channels)
+    if field.key == "extra_yt_dlp_args":
+        return snapshot.configuration.get("Download", {}).get(
+            "extra_yt_dlp_args_configured",
+            False,
+        )
+    if field.key == "chat_render_nvenc_devices":
+        return snapshot.configuration.get("Live Chat", {}).get(
+            "chat_render_nvenc_device_values",
+            [],
+        )
+    if field.key == "whisperx_language":
+        return snapshot.configuration.get("Transcription", {}).get(
+            "whisperx_language_value",
+            "",
+        )
+    values = snapshot.configuration.get(field.section, {})
+    return values.get(field.key, "")
+
+
+def app_config_extra_args_configured(value: Any) -> bool:
+    return bool(value)
+
+def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
+    transcription = snapshot.configuration.get("Transcription", {})
+    token_env = transcription.get("whisperx_hf_token_env", "HF_TOKEN")
+    min_speakers = transcription.get("whisperx_min_speakers", "")
+    max_speakers = transcription.get("whisperx_max_speakers", "")
+    min_value = "" if min_speakers == "-" else str(min_speakers)
+    max_value = "" if max_speakers == "-" else str(max_speakers)
+    fixed_value = min_value if min_value and min_value == max_value else ""
+    overrides = transcription.get("channel_overrides", {})
+    if not isinstance(overrides, dict):
+        overrides = {}
+    rows = "\n".join(
+        render_voice_detection_channel_row(channel, overrides)
+        for channel in snapshot.channel_stats
+    )
+    if not rows:
+        rows = '<tr><td colspan="5" class="file-meta">No configured channels or stream history found</td></tr>'
+    return f"""<section class="panel voice-detection-panel">
+  <h2>Voice Detection</h2>
+  <form class="voice-form" method="post" action="/voice-detection">
+    <input type="hidden" name="scope" value="global">
+    <label>Default mode {render_voice_detection_mode_select("mode", str(transcription.get("voice_detection", "auto")), include_inherit=False)}</label>
+    <label>Speakers <input class="small-input" name="speakers" type="number" min="1" value="{escape(fixed_value, quote=True)}" placeholder="fixed"></label>
+    <label>Min <input class="small-input" name="min_speakers" type="number" min="1" value="{escape(min_value, quote=True)}" placeholder="range"></label>
+    <label>Max <input class="small-input" name="max_speakers" type="number" min="1" value="{escape(max_value, quote=True)}" placeholder="range"></label>
+    <label>Token env <input class="env-input" name="hf_token_env" value="{escape(str(token_env), quote=True)}"></label>
+    <button class="download action-button" type="submit">Save Default</button>
+  </form>
+  <div class="table-wrap">
+    <table class="config-table voice-table">
+      <thead><tr><th>Channel</th><th>Configured As</th><th>Override</th><th>Speaker Bounds</th><th>Action</th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>"""
+
+
+def render_voice_detection_channel_row(
+    channel: ChannelStatus,
+    overrides: dict[str, str],
+) -> str:
+    configured_as = ", ".join(channel.configured_sources) or "-"
+    key = channel.name
+    summary = overrides.get(channel.name, "Use default")
+    return f"""<tr>
+  <td class="file-name">{escape(channel.name)}</td>
+  <td class="file-name">{escape(configured_as)}</td>
+  <td>{escape(summary)}</td>
+  <td colspan="2">
+    <form class="voice-form" method="post" action="/voice-detection">
+      <input type="hidden" name="scope" value="channel">
+      <input type="hidden" name="channel" value="{escape(key, quote=True)}">
+      {render_voice_detection_mode_select("mode", "inherit", include_inherit=True)}
+      <input class="small-input" name="speakers" type="number" min="1" placeholder="fixed">
+      <input class="small-input" name="min_speakers" type="number" min="1" placeholder="min">
+      <input class="small-input" name="max_speakers" type="number" min="1" placeholder="max">
+      <input class="env-input" name="hf_token_env" placeholder="token env">
+      <button class="download action-button" type="submit">Save</button>
+    </form>
+  </td>
+</tr>"""
+
+
+def render_voice_detection_mode_select(
+    name: str,
+    selected: str,
+    *,
+    include_inherit: bool,
+) -> str:
+    options = ["inherit"] if include_inherit else []
+    options.extend(["off", "auto", "range", "fixed"])
+    rendered = []
+    for option in options:
+        selected_attr = ' selected' if option == selected else ''
+        label = "Use default" if option == "inherit" else option
+        rendered.append(
+            f'<option value="{escape(option, quote=True)}"{selected_attr}>{escape(label)}</option>'
+        )
+    return f'<select name="{escape(name, quote=True)}">{"".join(rendered)}</select>'
 
 
 def render_config_sections(configuration: dict[str, dict[str, Any]]) -> str:
@@ -3261,6 +4254,58 @@ def render_channel_row(channel: ChannelStatus) -> str:
         f'<td>{escape(latest_file)} <span class="muted">{escape(latest_file_age)}</span></td>'
         "</tr>"
     )
+
+
+
+def active_job_count(jobs: list[JobStatus]) -> int:
+    return sum(1 for job in jobs if job.status in {"queued", "running"})
+
+
+def render_job_rows(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        return '<tr><td colspan="11" class="file-meta">No dashboard jobs have been seen yet</td></tr>'
+    return "\n".join(render_job_row(job) for job in jobs)
+
+
+def render_job_row(job: JobStatus) -> str:
+    started = format_optional_epoch(job.started_at)
+    updated = format_optional_epoch(job.updated_at)
+    duration = format_job_duration(job)
+    return (
+        "<tr>"
+        f"<td><span class=\"badge {escape(job.status, quote=True)}\">"
+        f"{escape(job.status or '-')}</span></td>"
+        f"<td>{render_job_progress(job.progress)}</td>"
+        f"<td>{escape(job.kind or '-')}</td>"
+        f"<td class=\"file-name\">{escape(job.phase or '-')}</td>"
+        f"<td class=\"file-name\">{escape(job.video_id or '-')}</td>"
+        f"<td class=\"file-name\">{escape(job.item or '-')}</td>"
+        f"<td class=\"file-name\">{escape(job.detail or '-')}</td>"
+        f"<td>{escape(started)}</td>"
+        f"<td>{escape(updated)}</td>"
+        f"<td>{escape(duration)}</td>"
+        f"<td class=\"log-message\">{escape(job.message or '-')}</td>"
+        "</tr>"
+    )
+
+
+def render_job_progress(value: float | None) -> str:
+    if value is None:
+        return "-"
+    percent = max(0, min(100, round(value * 100)))
+    return (
+        "<div class=\"job-progress\">"
+        f"<progress max=\"100\" value=\"{percent}\"></progress>"
+        f"<span>{percent}%</span>"
+        "</div>"
+    )
+
+
+def format_job_duration(job: JobStatus) -> str:
+    if job.started_at is None:
+        return "-"
+    ended_at = job.finished_at if job.finished_at is not None else time.time()
+    return format_duration(max(0, int(ended_at - job.started_at)))
 
 
 def render_log_rows(logs: list[LogEntry]) -> str:

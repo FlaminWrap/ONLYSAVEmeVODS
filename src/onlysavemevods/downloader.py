@@ -40,7 +40,7 @@ from .chat_timing import (
 from .config import BotConfig
 from .models import LiveStream
 from .state import StateStore
-from .transcription import transcribe_media_file
+from .transcription import transcribe_media_file, transcription_config_for_channel
 from .youtube import TerminalVideoUnavailableError, YoutubeProbe
 
 
@@ -101,6 +101,7 @@ class FinalizePlan:
 @dataclass(slots=True)
 class FinalizedSegmentFiles:
     segment_index: int
+    channel: str
     media_file: Path | None
     chat_file: Path | None
     timing_file: Path | None
@@ -830,6 +831,7 @@ class DownloadManager:
             finalized_files.append(
                 FinalizedSegmentFiles(
                     segment_index=index,
+                    channel=stream.channel,
                     media_file=media_file,
                     chat_file=chat_file,
                     timing_file=timing_file,
@@ -950,7 +952,7 @@ class DownloadManager:
                 continue
             async with self._transcription_semaphore:
                 await transcribe_media_file(
-                    self.config,
+                    transcription_config_for_channel(self.config, files.channel),
                     files.media_file,
                     logger=self.logger,
                 )

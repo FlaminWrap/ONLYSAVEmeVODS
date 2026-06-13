@@ -34,6 +34,8 @@ class WatermarkCopyRecord:
     status: str
     message: str
     error: str
+    phase: str
+    progress: float | None
     created_at: str
     updated_at: str
     started_at: str | None
@@ -80,6 +82,8 @@ class StateStore:
                 status TEXT NOT NULL,
                 message TEXT NOT NULL DEFAULT '',
                 error TEXT NOT NULL DEFAULT '',
+                phase TEXT NOT NULL DEFAULT '',
+                progress REAL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 started_at TEXT,
@@ -87,6 +91,7 @@ class StateStore:
             )
             """
         )
+        self._ensure_watermark_progress_columns()
         self.conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_watermark_copies_video_source
@@ -94,6 +99,20 @@ class StateStore:
             """
         )
         self.conn.commit()
+
+    def _ensure_watermark_progress_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(watermark_copies)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "phase" not in columns:
+            self.conn.execute(
+                "ALTER TABLE watermark_copies "
+                "ADD COLUMN phase TEXT NOT NULL DEFAULT ''"
+            )
+        if "progress" not in columns:
+            self.conn.execute(
+                "ALTER TABLE watermark_copies "
+                "ADD COLUMN progress REAL"
+            )
 
     def mark_stale_downloads_interrupted(self) -> None:
         now = utc_now()
@@ -114,6 +133,8 @@ class StateStore:
             UPDATE watermark_copies
             SET status = 'interrupted',
                 message = 'Interrupted before completion',
+                phase = 'Interrupted',
+                progress = NULL,
                 updated_at = ?,
                 finished_at = ?
             WHERE status IN ('queued', 'running')
@@ -280,8 +301,8 @@ class StateStore:
             """
             INSERT INTO watermark_copies (
                 copy_id, video_id, source_name, output_name, recipient_label,
-                status, message, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, '', ?, ?)
+                status, message, error, phase, progress, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'queued', ?, '', 'Queued', 0.0, ?, ?)
             """,
             (
                 copy_id,
@@ -306,6 +327,8 @@ class StateStore:
         status: str | None = None,
         message: str | None = None,
         error: str | None = None,
+        phase: str | None = None,
+        progress: float | None = None,
         started: bool = False,
         finished: bool = False,
     ) -> None:
@@ -319,6 +342,8 @@ class StateStore:
             SET status = ?,
                 message = ?,
                 error = ?,
+                phase = ?,
+                progress = ?,
                 updated_at = ?,
                 started_at = ?,
                 finished_at = ?
@@ -328,6 +353,8 @@ class StateStore:
                 status if status is not None else current.status,
                 message if message is not None else current.message,
                 error if error is not None else current.error,
+                phase if phase is not None else current.phase,
+                progress if progress is not None else current.progress,
                 now,
                 now if started else current.started_at,
                 now if finished else current.finished_at,
@@ -340,8 +367,8 @@ class StateStore:
         row = self.conn.execute(
             """
             SELECT copy_id, video_id, source_name, output_name, recipient_label,
-                   status, message, error, created_at, updated_at, started_at,
-                   finished_at
+                   status, message, error, phase, progress, created_at, updated_at,
+                   started_at, finished_at
             FROM watermark_copies
             WHERE copy_id = ?
             """,
@@ -376,8 +403,8 @@ class StateStore:
         rows = self.conn.execute(
             f"""
             SELECT copy_id, video_id, source_name, output_name, recipient_label,
-                   status, message, error, created_at, updated_at, started_at,
-                   finished_at
+                   status, message, error, phase, progress, created_at, updated_at,
+                   started_at, finished_at
             FROM watermark_copies
             {where}
             ORDER BY created_at DESC

@@ -1,4 +1,5 @@
-# Add YouTube channel URLs or @handles here.
+# Add YouTube channel URLs or @handles here. The dashboard Config tab can
+# edit this file after the first run.
 # Examples:
 # channels = ["@SomeChannel", "https://www.youtube.com/@SomeChannel"]
 channels = []
@@ -41,7 +42,13 @@ transcribe_subtitles = false
 # WhisperX jobs without exhausting VRAM.
 transcription_max_concurrent = 1
 
-# WhisperX settings. Diarization labels speakers as SPEAKER_00, SPEAKER_01, etc.
+# WhisperX settings. Voice detection uses WhisperX/pyannote diarization to
+# label speakers as SPEAKER_00, SPEAKER_01, etc. Manage these settings with:
+#   onlysavemevods voice-detection show --config config.toml
+#   onlysavemevods voice-detection set --config config.toml --mode auto
+# Modes: off disables labels, auto lets WhisperX infer the count, range uses
+# whisperx_min_speakers/whisperx_max_speakers, and fixed sets both to one count.
+# The dashboard Config tab can manage the default and per-channel overrides.
 # To use diarization with pyannote, set the environment variable named by
 # whisperx_hf_token_env and accept the required Hugging Face model terms.
 whisperx_path = "whisperx"
@@ -55,12 +62,18 @@ whisperx_hf_token_env = "HF_TOKEN"
 whisperx_min_speakers = 0
 whisperx_max_speakers = 0
 
+# Optional per-channel override. Use the channel name shown in the dashboard.
+# [channel_voice_detection."Example Channel"]
+# mode = "fixed"
+# speakers = 2
+
 # Use "DEBUG" while diagnosing stream detection, resume, and finalize behavior.
 # Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.
 log_level = "INFO"
 
-# Read-only local status page. Use SSH port forwarding or a reverse proxy if you
-# need remote access; there is no built-in authentication.
+# Local dashboard. It can edit config.toml, queue dashboard jobs, and download
+# finalized files. Use SSH port forwarding or a reverse proxy if you need remote
+# access; there is no built-in authentication yet.
 web_enabled = true
 web_host = "127.0.0.1"
 web_port = 8080
@@ -87,6 +100,8 @@ retry_backoff_seconds = [30, 60, 120, 300]
 
 # Extra args are passed before the bot's core yt-dlp download args. Do not use
 # metadata-only or download-suppression flags here, such as --skip-download.
+# The dashboard can replace or clear these args without displaying existing
+# sensitive values such as cookie paths or authorization headers.
 # Example:
 # extra_yt_dlp_args = ["--format", "bestvideo+bestaudio/best"]
 extra_yt_dlp_args = []

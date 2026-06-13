@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 import sys
 import time
@@ -19,9 +20,11 @@ from .config import (
     ConfigError,
     append_missing_config_values,
     load_config,
+    update_config_values,
 )
 from .daemon import OnlySaveMeVodsDaemon
 from .log_buffer import RingBufferLogHandler
+from .transcription import voice_detection_mode, voice_detection_speaker_summary
 from .web import StatusWebServer
 from .state import StateStore
 from .watermark import (
@@ -33,6 +36,9 @@ from .watermark import (
     require_watermark_secret,
 )
 from .youtube import YoutubeProbe, YtDlpRunner
+
+
+VOICE_DETECTION_MODES = ("off", "auto", "range", "fixed")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,6 +55,8 @@ def main(argv: list[str] | None = None) -> int:
             return render_chat_file_command(args)
         if args.command == "detect-watermark":
             return detect_watermark_command(args)
+        if args.command == "voice-detection":
+            return voice_detection_command(args)
         if args.command == "run":
             return run_command(args)
         if args.command == "web":
@@ -123,12 +131,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write the detection result as JSON.",
     )
 
+    voice_detection = subparsers.add_parser(
+        "voice-detection",
+        help="Show or update transcription voice detection settings.",
+    )
+    voice_detection_subparsers = voice_detection.add_subparsers(
+        dest="voice_detection_action",
+        required=True,
+    )
+    voice_detection_show = voice_detection_subparsers.add_parser(
+        "show",
+        help="Show current transcription voice detection settings.",
+    )
+    voice_detection_show.add_argument(
+        "--config",
+        default="config.toml",
+        help="Path to config TOML.",
+    )
+    voice_detection_set = voice_detection_subparsers.add_parser(
+        "set",
+        help="Update transcription voice detection settings in config.toml.",
+    )
+    voice_detection_set.add_argument(
+        "--config",
+        default="config.toml",
+        help="Path to config TOML.",
+    )
+    voice_detection_set.add_argument(
+        "--mode",
+        required=True,
+        choices=VOICE_DETECTION_MODES,
+        help="Voice detection mode: off, auto, range, or fixed.",
+    )
+    voice_detection_set.add_argument(
+        "--min-speakers",
+        type=positive_int_arg,
+        help="Minimum speaker count for range mode.",
+    )
+    voice_detection_set.add_argument(
+        "--max-speakers",
+        type=positive_int_arg,
+        help="Maximum speaker count for range mode.",
+    )
+    voice_detection_set.add_argument(
+        "--speakers",
+        type=positive_int_arg,
+        help="Exact speaker count for fixed mode.",
+    )
+    voice_detection_set.add_argument(
+        "--hf-token-env",
+        help="Environment variable name containing the Hugging Face token.",
+    )
+
     web = subparsers.add_parser("web", help="Run the read-only status web interface.")
     web.add_argument("--config", default="config.toml", help="Path to config TOML.")
     web.add_argument("--host", help="Host/IP to bind. Defaults to config web_host.")
     web.add_argument("--port", type=int, help="Port to bind. Defaults to config web_port.")
 
     return parser
+
+
+def positive_int_arg(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def validate_env_var_name(value: str) -> str:
+    if not value:
+        raise ConfigError("--hf-token-env must be a non-empty environment variable name")
+    if value.startswith("hf_"):
+        raise ConfigError(
+            "--hf-token-env must be an environment variable name, not a token value"
+        )
+    first = value[0]
+    if not (first.isalpha() or first == "_"):
+        raise ConfigError("--hf-token-env must start with a letter or underscore")
+    if not all(char.isalnum() or char == "_" for char in value):
+        raise ConfigError("--hf-token-env may contain only letters, digits, and underscores")
+    return value
 
 
 def configure_logging(verbose: int, log_level: str = "INFO") -> None:
@@ -259,6 +344,104 @@ def detect_watermark_command(args: argparse.Namespace) -> int:
     else:
         print(format_detection_text(result))
     return 0 if result.matched else 1
+
+
+def voice_detection_command(args: argparse.Namespace) -> int:
+    if args.voice_detection_action == "show":
+        return voice_detection_show_command(args)
+    if args.voice_detection_action == "set":
+        return voice_detection_set_command(args)
+    raise ConfigError("Unknown voice detection action")
+
+
+def voice_detection_show_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    print(f"Voice detection: {voice_detection_mode(config)}")
+    print(f"Speaker count: {voice_detection_speaker_summary(config)}")
+    print(f"WhisperX diarization: {'enabled' if config.whisperx_diarize else 'disabled'}")
+    if config.whisperx_hf_token_env:
+        status = (
+            "set"
+            if os.environ.get(config.whisperx_hf_token_env, "").strip()
+            else "not set"
+        )
+        print(f"Hugging Face token env: {config.whisperx_hf_token_env} ({status})")
+    else:
+        print("Hugging Face token env: disabled")
+    return 0
+
+
+def voice_detection_set_command(args: argparse.Namespace) -> int:
+    updates = voice_detection_updates(args)
+    changed = update_config_values(args.config, updates)
+    config = load_config(args.config)
+    if changed:
+        print(f"Updated voice detection settings: {', '.join(changed)}")
+    else:
+        print("Voice detection settings already match requested values.")
+    print(f"Voice detection: {voice_detection_mode(config)}")
+    print(f"Speaker count: {voice_detection_speaker_summary(config)}")
+    return 0
+
+
+def voice_detection_updates(args: argparse.Namespace) -> dict[str, object]:
+    updates: dict[str, object] = {}
+    mode = args.mode
+    if mode in {"off", "auto"} and (
+        args.min_speakers is not None
+        or args.max_speakers is not None
+        or args.speakers is not None
+    ):
+        raise ConfigError(f"--mode {mode} does not accept speaker count options")
+
+    if mode == "off":
+        updates.update(
+            whisperx_diarize=False,
+            whisperx_min_speakers=0,
+            whisperx_max_speakers=0,
+        )
+    elif mode == "auto":
+        updates.update(
+            whisperx_diarize=True,
+            whisperx_min_speakers=0,
+            whisperx_max_speakers=0,
+        )
+    elif mode == "fixed":
+        if args.speakers is None:
+            raise ConfigError("--mode fixed requires --speakers")
+        if args.min_speakers is not None or args.max_speakers is not None:
+            raise ConfigError(
+                "--mode fixed uses --speakers, not --min-speakers or --max-speakers"
+            )
+        updates.update(
+            whisperx_diarize=True,
+            whisperx_min_speakers=args.speakers,
+            whisperx_max_speakers=args.speakers,
+        )
+    elif mode == "range":
+        if args.speakers is not None:
+            raise ConfigError(
+                "--mode range uses --min-speakers and/or --max-speakers, not --speakers"
+            )
+        min_speakers = args.min_speakers or 0
+        max_speakers = args.max_speakers or 0
+        if not min_speakers and not max_speakers:
+            raise ConfigError(
+                "--mode range requires --min-speakers and/or --max-speakers"
+            )
+        if min_speakers and max_speakers and min_speakers > max_speakers:
+            raise ConfigError("--min-speakers must be less than or equal to --max-speakers")
+        updates.update(
+            whisperx_diarize=True,
+            whisperx_min_speakers=min_speakers,
+            whisperx_max_speakers=max_speakers,
+        )
+    else:
+        raise ConfigError(f"Unknown voice detection mode: {mode}")
+
+    if args.hf_token_env is not None:
+        updates["whisperx_hf_token_env"] = validate_env_var_name(args.hf_token_env)
+    return updates
 
 
 def run_command(args: argparse.Namespace) -> int:

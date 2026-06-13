@@ -6,7 +6,7 @@ import logging
 import unittest
 
 from onlysavemevods import __version__
-from onlysavemevods.config import BotConfig
+from onlysavemevods.config import BotConfig, ConfigError, VoiceDetectionConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
@@ -20,6 +20,8 @@ from onlysavemevods.web import (
     is_watermarkable_media_file,
     render_file_action,
     render_status_html,
+    update_app_config_from_form,
+    update_voice_detection_from_form,
     resolve_refresh_chat_files,
     resolve_watermark_download_file,
     resolve_transcription_source_file,
@@ -31,6 +33,9 @@ from onlysavemevods.web import (
     RefreshChatJob,
     CHAT_REFRESH_JOBS,
     CHAT_REFRESH_JOBS_LOCK,
+    RenderChatJob,
+    CHAT_RENDER_JOBS,
+    CHAT_RENDER_JOBS_LOCK,
     snapshot_to_dict,
     transcription_job_key,
     TranscriptionJob,
@@ -38,6 +43,50 @@ from onlysavemevods.web import (
     TRANSCRIPTION_JOBS_LOCK,
     StatusWebServer,
 )
+
+
+def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
+    values = {
+        "channels": "@Example\n@Second",
+        "download_dir": "downloads",
+        "state_dir": "state",
+        "poll_interval_seconds": "60",
+        "channel_scan_limit": "10",
+        "discovery_probe_concurrency": "4",
+        "max_concurrent_downloads": "4",
+        "live_from_start": "true",
+        "keep_fragments_for_resume": "true",
+        "reconnect_interval_seconds": "0",
+        "post_exit_check_seconds": "30, 60, 90",
+        "retry_backoff_seconds": "30, 60, 120",
+        "extra_yt_dlp_args_mode": "keep",
+        "extra_yt_dlp_args": "",
+        "record_live_chat": "false",
+        "render_live_chat_video": "false",
+        "chat_render_panel_workers": "0",
+        "chat_render_use_nvenc": "false",
+        "chat_render_nvenc_devices": "",
+        "transcribe_subtitles": "false",
+        "transcription_max_concurrent": "1",
+        "whisperx_path": "whisperx",
+        "whisperx_model": "large-v3",
+        "whisperx_device": "cuda",
+        "whisperx_compute_type": "float16",
+        "whisperx_batch_size": "16",
+        "whisperx_language": "",
+        "web_enabled": "true",
+        "web_host": "127.0.0.1",
+        "web_port": "8080",
+        "log_level": "INFO",
+        "yt_dlp_path": "yt-dlp",
+        "ffmpeg_path": "ffmpeg",
+        "watermark_enabled": "false",
+        "watermark_secret_env": "ONLYSAVEMEVODS_WATERMARK_SECRET",
+        "watermark_strength": "invisible",
+        "watermark_detect_upload_max_bytes": "2147483648",
+    }
+    values.update(overrides)
+    return {key: [value] for key, value in values.items()}
 
 
 class WebStatusTests(unittest.TestCase):
@@ -223,6 +272,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/download?", html)
         self.assertIn("Channels", html)
         self.assertIn("Configured As", html)
+        self.assertIn("Jobs", html)
+        self.assertIn("job-rows", html)
         self.assertIn("Recent Logs", html)
         self.assertIn("About", html)
         self.assertIn("Version", html)
@@ -263,8 +314,12 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_nvenc_devices"], [])
         self.assertIn("Transcription", payload["configuration"])
         self.assertFalse(payload["configuration"]["Transcription"]["transcribe_subtitles"])
+        self.assertEqual(payload["configuration"]["Transcription"]["voice_detection"], "auto")
+        self.assertEqual(payload["configuration"]["Transcription"]["voice_detection_speakers"], "auto")
         self.assertEqual(payload["configuration"]["Transcription"]["whisperx_model"], "large-v3")
         self.assertIn("channel_stats", payload)
+        self.assertIn("jobs", payload)
+        self.assertIn("job_limit", payload)
         self.assertIn("recent_logs", payload)
         self.assertEqual(payload["recent_logs"][0]["level"], "WARNING")
         self.assertIn("download_url", payload["streams"][0]["files"][0])
@@ -276,6 +331,62 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/render-chat?", chat_payload["render_chat_url"])
         self.assertEqual(chat_payload["render_chat_status"], "ready")
         json.dumps(payload)
+
+
+    def test_jobs_tab_shows_dashboard_and_watermark_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            state = StateStore(config.db_path)
+            state.create_watermark_copy(
+                copy_id="wm-copy001",
+                video_id="LIVEVIDEO01",
+                source_name="Live Status [LIVEVIDEO01].mp4",
+                output_name=".watermarks/Live Status [LIVEVIDEO01] - wm-copy001.mp4",
+                recipient_label="Recipient A",
+                message="Queued watermark render",
+            )
+            state.close()
+            key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS[key] = RenderChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name="Live Status [LIVEVIDEO01].live_chat.json",
+                    media_name="Live Status [LIVEVIDEO01].mp4",
+                    output_name="Live Status [LIVEVIDEO01] - chat.mp4",
+                    status="running",
+                    message="Rendering chat video",
+                    started_at=123.0,
+                    phase="Rendering panel frames",
+                    progress=0.42,
+                    updated_at=130.0,
+                )
+
+            try:
+                snapshot = build_status_snapshot(config)
+                payload = snapshot_to_dict(snapshot)
+                html = render_status_html(snapshot)
+            finally:
+                with CHAT_RENDER_JOBS_LOCK:
+                    CHAT_RENDER_JOBS.pop(key, None)
+
+        self.assertIn('for="tab-jobs"', html)
+        self.assertIn('id="job-rows"', html)
+        self.assertIn("Chat render", html)
+        self.assertIn("Rendering chat video", html)
+        self.assertIn("Rendering panel frames", html)
+        self.assertIn("42%", html)
+        self.assertIn("<progress", html)
+        self.assertIn("Watermark", html)
+        self.assertIn("Recipient A", html)
+        self.assertIn("metric-jobs", html)
+        self.assertEqual(payload["jobs"][0]["kind"], "Watermark")
+        self.assertTrue(any(job["kind"] == "Chat render" for job in payload["jobs"]))
+        self.assertTrue(any(job["progress"] == 0.42 for job in payload["jobs"]))
+        self.assertTrue(any(job["status"] == "queued" for job in payload["jobs"]))
+        self.assertEqual(payload["job_limit"], 200)
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -623,6 +734,240 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertEqual(chat_text, "new chat")
         self.assertEqual(output_text, "rendered")
+
+
+    def test_app_config_form_renders_editable_settings_without_sensitive_args(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'channels = ["@Example"]\n'
+                'extra_yt_dlp_args = ["--cookies", "/secret/cookies.txt", "--format", "best"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('action="/config"', html)
+        self.assertIn('name="channels"', html)
+        self.assertIn('name="download_dir"', html)
+        self.assertIn('name="web_port"', html)
+        self.assertIn('name="watermark_strength"', html)
+        self.assertIn('name="whisperx_language" type="text" value=""', html)
+        self.assertIn('name="extra_yt_dlp_args_mode"', html)
+        self.assertIn('value="keep" selected', html)
+        self.assertIn("Save App Settings", html)
+        self.assertIn("&lt;redacted&gt;", html)
+        self.assertNotIn("/secret/cookies.txt", html)
+
+    def test_app_config_form_updates_file_and_running_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'channels = ["@Old"]\n'
+                'extra_yt_dlp_args = ["--cookies", "/secret/cookies.txt"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_app_config_from_form(
+                config,
+                app_config_form_params(
+                    channels="@New\n@Second",
+                    poll_interval_seconds="45",
+                    max_concurrent_downloads="2",
+                    record_live_chat="true",
+                    render_live_chat_video="true",
+                    chat_render_use_nvenc="true",
+                    chat_render_nvenc_devices="0\n1",
+                    transcribe_subtitles="true",
+                    whisperx_language="en",
+                    web_port="9090",
+                    log_level="DEBUG",
+                    watermark_enabled="true",
+                    watermark_secret_env="TEST_WATERMARK_SECRET",
+                    watermark_strength="balanced",
+                    watermark_detect_upload_max_bytes="123456",
+                    extra_yt_dlp_args_mode="keep",
+                ),
+            )
+            updated = load_config(config_path)
+
+        self.assertEqual(updated.channels, ["@New", "@Second"])
+        self.assertEqual(updated.poll_interval_seconds, 45)
+        self.assertEqual(updated.max_concurrent_downloads, 2)
+        self.assertTrue(updated.record_live_chat)
+        self.assertTrue(updated.render_live_chat_video)
+        self.assertTrue(updated.chat_render_use_nvenc)
+        self.assertEqual(updated.chat_render_nvenc_devices, ["0", "1"])
+        self.assertTrue(updated.transcribe_subtitles)
+        self.assertEqual(updated.whisperx_language, "en")
+        self.assertEqual(updated.web_port, 9090)
+        self.assertEqual(updated.log_level, "DEBUG")
+        self.assertTrue(updated.watermark_enabled)
+        self.assertEqual(updated.watermark_secret_env, "TEST_WATERMARK_SECRET")
+        self.assertEqual(updated.watermark_strength, "balanced")
+        self.assertEqual(updated.watermark_detect_upload_max_bytes, 123456)
+        self.assertEqual(updated.extra_yt_dlp_args, ["--cookies", "/secret/cookies.txt"])
+        self.assertEqual(config.channels, ["@New", "@Second"])
+        self.assertEqual(config.web_port, 9090)
+        self.assertEqual(config.extra_yt_dlp_args, ["--cookies", "/secret/cookies.txt"])
+
+    def test_app_config_form_can_replace_or_clear_extra_yt_dlp_args(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'extra_yt_dlp_args = ["--cookies", "/secret/cookies.txt"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_app_config_from_form(
+                config,
+                app_config_form_params(
+                    extra_yt_dlp_args_mode="replace",
+                    extra_yt_dlp_args="--format\nbestvideo+bestaudio/best",
+                ),
+            )
+            replaced = load_config(config_path)
+            update_app_config_from_form(
+                config,
+                app_config_form_params(extra_yt_dlp_args_mode="clear"),
+            )
+            cleared = load_config(config_path)
+
+        self.assertEqual(
+            replaced.extra_yt_dlp_args,
+            ["--format", "bestvideo+bestaudio/best"],
+        )
+        self.assertEqual(cleared.extra_yt_dlp_args, [])
+        self.assertEqual(config.extra_yt_dlp_args, [])
+
+    def test_app_config_form_rejects_invalid_values_without_writing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('web_port = 8080\n', encoding="utf-8")
+            original = config_path.read_text(encoding="utf-8")
+            config = load_config(config_path)
+
+            with self.assertRaisesRegex(ConfigError, "web_port"):
+                update_app_config_from_form(
+                    config,
+                    app_config_form_params(web_port="70000"),
+                )
+
+            unchanged = config_path.read_text(encoding="utf-8")
+
+        self.assertEqual(unchanged, original)
+        self.assertEqual(config.web_port, 8080)
+
+    def test_voice_detection_panel_renders_global_and_channel_forms(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["@ExampleChannel"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                channel_voice_detection={
+                    "Example Channel": VoiceDetectionConfig(
+                        mode="fixed",
+                        min_speakers=2,
+                        max_speakers=2,
+                    )
+                },
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('action="/voice-detection"', html)
+        self.assertIn('name="scope" value="global"', html)
+        self.assertIn('name="scope" value="channel"', html)
+        self.assertIn("fixed, exactly 2", html)
+
+    def test_voice_detection_form_updates_running_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('whisperx_diarize = true\n', encoding="utf-8")
+            config = load_config(config_path)
+
+            update_voice_detection_from_form(
+                config,
+                {
+                    "scope": ["global"],
+                    "mode": ["fixed"],
+                    "speakers": ["2"],
+                },
+            )
+            update_voice_detection_from_form(
+                config,
+                {
+                    "scope": ["channel"],
+                    "channel": ["Example Channel"],
+                    "mode": ["off"],
+                },
+            )
+
+        self.assertTrue(config.whisperx_diarize)
+        self.assertEqual(config.whisperx_min_speakers, 2)
+        self.assertEqual(config.whisperx_max_speakers, 2)
+        self.assertEqual(config.channel_voice_detection["Example Channel"].mode, "off")
+
+    def test_voice_detection_form_ignores_irrelevant_prefilled_values(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "whisperx_diarize = true\n"
+                "whisperx_min_speakers = 2\n"
+                "whisperx_max_speakers = 2\n",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_voice_detection_from_form(
+                config,
+                {
+                    "scope": ["global"],
+                    "mode": ["auto"],
+                    "speakers": ["2"],
+                    "min_speakers": ["2"],
+                    "max_speakers": ["2"],
+                },
+            )
+
+        self.assertTrue(config.whisperx_diarize)
+        self.assertEqual(config.whisperx_min_speakers, 0)
+        self.assertEqual(config.whisperx_max_speakers, 0)
+
+    def test_voice_detection_form_updates_channel_override(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('channels = ["@Example"]\n', encoding="utf-8")
+            config = load_config(config_path)
+
+            update_voice_detection_from_form(
+                config,
+                {
+                    "scope": ["channel"],
+                    "channel": ["Example Channel"],
+                    "mode": ["range"],
+                    "min_speakers": ["2"],
+                    "max_speakers": ["4"],
+                },
+            )
+            updated = load_config(config_path)
+
+        override = updated.channel_voice_detection["Example Channel"]
+        self.assertEqual(override.mode, "range")
+        self.assertEqual(override.min_speakers, 2)
+        self.assertEqual(override.max_speakers, 4)
 
     def test_transcription_action_can_retranscribe_existing_sidecars(self) -> None:
         with TemporaryDirectory() as tmp:

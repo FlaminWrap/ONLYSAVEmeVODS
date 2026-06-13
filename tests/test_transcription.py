@@ -3,14 +3,17 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from onlysavemevods.config import BotConfig
+from onlysavemevods.config import BotConfig, VoiceDetectionConfig
 from onlysavemevods.transcription import (
     build_whisperx_command,
     command_for_log,
     existing_transcription_outputs,
     handle_process_output_line,
     redact_sensitive_text,
+    transcription_config_for_channel,
     transcription_outputs_exist,
+    voice_detection_mode,
+    voice_detection_speaker_summary,
     whisperx_process_env,
 )
 
@@ -64,6 +67,63 @@ class TranscriptionTests(unittest.TestCase):
         self.assertNotIn("--hf_token", command)
         self.assertNotIn("--min_speakers", command)
         self.assertNotIn("--max_speakers", command)
+
+    def test_voice_detection_mode_and_speaker_summary(self) -> None:
+        self.assertEqual(voice_detection_mode(BotConfig(whisperx_diarize=False)), "off")
+        self.assertEqual(
+            voice_detection_speaker_summary(BotConfig(whisperx_diarize=False)),
+            "disabled",
+        )
+        self.assertEqual(voice_detection_mode(BotConfig()), "auto")
+        self.assertEqual(voice_detection_speaker_summary(BotConfig()), "auto")
+        self.assertEqual(
+            voice_detection_mode(
+                BotConfig(whisperx_min_speakers=2, whisperx_max_speakers=4)
+            ),
+            "range",
+        )
+        self.assertEqual(
+            voice_detection_speaker_summary(
+                BotConfig(whisperx_min_speakers=2, whisperx_max_speakers=4)
+            ),
+            "2-4",
+        )
+        self.assertEqual(
+            voice_detection_mode(
+                BotConfig(whisperx_min_speakers=3, whisperx_max_speakers=3)
+            ),
+            "fixed",
+        )
+        self.assertEqual(
+            voice_detection_speaker_summary(
+                BotConfig(whisperx_min_speakers=3, whisperx_max_speakers=3)
+            ),
+            "exactly 3",
+        )
+
+    def test_transcription_config_for_channel_applies_override(self) -> None:
+        config = BotConfig(
+            whisperx_diarize=True,
+            whisperx_min_speakers=0,
+            whisperx_max_speakers=0,
+            whisperx_hf_token_env="HF_TOKEN",
+            channel_voice_detection={
+                "Example Channel": VoiceDetectionConfig(
+                    mode="fixed",
+                    min_speakers=2,
+                    max_speakers=2,
+                    hf_token_env="PYANNOTE_TOKEN",
+                )
+            },
+        )
+
+        effective = transcription_config_for_channel(config, "example channel")
+
+        self.assertIsNot(effective, config)
+        self.assertTrue(effective.whisperx_diarize)
+        self.assertEqual(effective.whisperx_min_speakers, 2)
+        self.assertEqual(effective.whisperx_max_speakers, 2)
+        self.assertEqual(effective.whisperx_hf_token_env, "PYANNOTE_TOKEN")
 
     def test_whisperx_process_env_passes_tokens_without_command_line(self) -> None:
         with patch.dict(

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 from urllib.error import URLError
 from urllib.request import urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -27,6 +27,7 @@ CHAT_VIDEO_HEIGHT = 1080
 CHAT_MEDIA_WIDTH = 1440
 CHAT_PANEL_WIDTH = 480
 CHAT_PANEL_X = CHAT_MEDIA_WIDTH + 20
+ProgressCallback = Callable[[str, float | None], None]
 CHAT_ROW_TOP = 82
 CHAT_ROW_HEIGHT = 94
 CHAT_ROW_COUNT = 10
@@ -791,7 +792,13 @@ def render_chat_panel_video(
     panel_workers: int = 0,
     use_nvenc: bool = False,
     nvenc_device: str = "",
+    progress_callback: ProgressCallback | None = None,
 ) -> bool:
+    def emit(phase: str, progress: float | None = None) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(phase, clamp_progress(progress))
+
     try:
         from PIL import Image  # noqa: F401
     except ImportError as exc:
@@ -800,6 +807,7 @@ def render_chat_panel_video(
     if duration_seconds <= 0:
         raise ChatPanelRenderError("Chat panel duration must be positive")
 
+    emit("Preparing chat panel", 0.02)
     started_at = time.monotonic()
     resolved_workers = resolve_chat_render_panel_workers(panel_workers)
     LOGGER.info(
@@ -864,6 +872,10 @@ def render_chat_panel_video(
             resolved_cache_dir,
             resolved_workers,
             output_file,
+            progress_callback=lambda completed, total: emit(
+                f"Rendering panel frames {completed}/{total}",
+                0.05 + 0.7 * completed / max(total, 1),
+            ),
         )
 
         concat_file = frame_dir / "frames.txt"
@@ -896,6 +908,7 @@ def render_chat_panel_video(
             ),
             str(output_file),
         ]
+        emit("Encoding chat panel video", 0.82)
         LOGGER.debug("ffmpeg chat panel command: %s", shlex.join(command))
         ffmpeg_started_at = time.monotonic()
         result = subprocess.run(command, capture_output=True)
@@ -904,6 +917,7 @@ def render_chat_panel_video(
             output_file.unlink(missing_ok=True)
             message = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
             raise ChatPanelRenderError(f"ffmpeg failed while rendering chat panel: {message}")
+        emit("Chat panel complete", 1.0)
         LOGGER.info(
             "Rendered chat panel video output=%s frames=%d elapsed=%.1fs "
             "ffmpeg_elapsed=%.1fs",
@@ -999,11 +1013,13 @@ def render_chat_panel_frame_jobs(
     cache_dir: Path,
     workers: int,
     output_file: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     if workers <= 1 or len(jobs) <= 1:
         for job in jobs:
             render_chat_panel_frame_job(job, layout, fonts, cache)
             log_chat_panel_frame_progress(job, len(jobs), output_file)
+            maybe_emit_frame_progress(progress_callback, job.index + 1, len(jobs))
         return
 
     LOGGER.info(
@@ -1013,7 +1029,7 @@ def render_chat_panel_frame_jobs(
         workers,
     )
     try:
-        render_chat_panel_frame_jobs_parallel(jobs, layout, cache_dir, workers, output_file)
+        render_chat_panel_frame_jobs_parallel(jobs, layout, cache_dir, workers, output_file, progress_callback)
     except Exception as exc:
         LOGGER.warning(
             "Parallel chat panel frame rendering failed; retrying serial output=%s "
@@ -1026,6 +1042,7 @@ def render_chat_panel_frame_jobs(
             for job in jobs:
                 render_chat_panel_frame_job(job, layout, fonts, cache)
                 log_chat_panel_frame_progress(job, len(jobs), output_file)
+                maybe_emit_frame_progress(progress_callback, job.index + 1, len(jobs))
         except Exception as serial_exc:
             raise ChatPanelRenderError("Unable to render chat panel frames") from serial_exc
 
@@ -1036,6 +1053,7 @@ def render_chat_panel_frame_jobs_parallel(
     cache_dir: Path,
     workers: int,
     output_file: Path,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> None:
     with ProcessPoolExecutor(
         max_workers=workers,
@@ -1050,6 +1068,7 @@ def render_chat_panel_frame_jobs_parallel(
         for future in as_completed(futures):
             index = future.result()
             completed += 1
+            maybe_emit_frame_progress(progress_callback, completed, len(jobs))
             if completed == 1 or completed % 100 == 0 or completed == len(jobs):
                 LOGGER.debug(
                     "Rendered chat panel frame %d/%d output=%s latest_index=%d",
@@ -1058,6 +1077,17 @@ def render_chat_panel_frame_jobs_parallel(
                     output_file,
                     index + 1,
                 )
+
+
+def maybe_emit_frame_progress(
+    progress_callback: Callable[[int, int], None] | None,
+    completed: int,
+    total: int,
+) -> None:
+    if progress_callback is None:
+        return
+    if completed == 1 or completed % 100 == 0 or completed >= total:
+        progress_callback(completed, total)
 
 
 def render_chat_panel_frame_job(
@@ -2110,6 +2140,12 @@ def log_nvenc_environment(ffmpeg_path: str, use_nvenc: bool) -> NvencEnvironment
     return environment
 
 
+def clamp_progress(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return min(1.0, max(0.0, float(value)))
+
+
 def render_chat_video_file(
     media_file: Path,
     chat_file: Path,
@@ -2122,7 +2158,13 @@ def render_chat_video_file(
     use_nvenc: bool = False,
     nvenc_device: str = "",
     nvenc_devices: Sequence[str] | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> Path:
+    def emit(phase: str, progress: float | None = None) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(phase, clamp_progress(progress))
+
     started_at = time.monotonic()
     output_file = output_file or chat_video_output_file(media_file)
     candidate_devices = (
@@ -2141,9 +2183,11 @@ def render_chat_video_file(
     panel_file = output_file.with_name(f"{output_file.stem}.panel.mp4")
 
     if output_file.exists() and not overwrite:
+        emit("Chat video already exists", 1.0)
         LOGGER.info("Chat video already exists; skipping render output=%s", output_file)
         return output_file
 
+    emit("Parsing live chat", 0.04)
     LOGGER.info(
         "Starting chat video %s media=%s chat=%s output=%s encoder=%s "
         "nvenc_device=%s",
@@ -2170,6 +2214,7 @@ def render_chat_video_file(
         entries[-1].offset_seconds,
     )
 
+    emit("Probing media", 0.12)
     try:
         dimensions = probe_video_dimensions(media_file, ffprobe_path_for(ffmpeg_path))
         duration = probe_video_duration(media_file, ffprobe_path_for(ffmpeg_path))
@@ -2215,6 +2260,7 @@ def render_chat_video_file(
                     media_file,
                     len(entries),
                 )
+                emit("Rendering chat panel", 0.18)
                 render_chat_panel_video(
                     entries,
                     layout,
@@ -2225,6 +2271,10 @@ def render_chat_video_file(
                     panel_workers,
                     use_nvenc,
                     selected_nvenc_device,
+                    progress_callback=lambda phase, progress: emit(
+                        phase,
+                        0.18 + 0.52 * (progress if progress is not None else 0.0),
+                    ),
                 )
                 command = build_chat_panel_merge_command(
                     ffmpeg_path,
@@ -2235,6 +2285,7 @@ def render_chat_video_file(
                     use_nvenc=use_nvenc,
                     nvenc_device=selected_nvenc_device,
                 )
+                emit("Preparing final chat video merge", 0.72)
                 LOGGER.info(
                     "Merging media with rendered chat panel media=%s panel=%s "
                     "output=%s",
@@ -2247,6 +2298,7 @@ def render_chat_video_file(
                 LOGGER.exception(
                     "Unable to render image chat panel; falling back to subtitle renderer"
                 )
+                emit("Writing subtitle fallback", 0.45)
                 write_chat_ass_file(ass_file, entries, layout)
                 LOGGER.info(
                     "Writing subtitle fallback for chat render ass=%s output=%s",
@@ -2263,6 +2315,7 @@ def render_chat_video_file(
                     nvenc_device=selected_nvenc_device,
                 )
         else:
+            emit("Writing subtitle fallback", 0.45)
             write_chat_ass_file(ass_file, entries, layout)
             LOGGER.info(
                 "Writing subtitle fallback for chat render ass=%s output=%s",
@@ -2279,6 +2332,7 @@ def render_chat_video_file(
                 nvenc_device=selected_nvenc_device,
             )
 
+        emit("Encoding final chat video", 0.78)
         LOGGER.debug("ffmpeg chat render command: %s", shlex.join(command))
         try:
             ffmpeg_started_at = time.monotonic()
@@ -2304,8 +2358,10 @@ def render_chat_video_file(
                 f"ffmpeg failed while rendering chat video: {message}"
             )
 
+        emit("Finalizing chat video", 0.96)
         temp_output.replace(output_file)
         output_size = output_file.stat().st_size if output_file.exists() else 0
+        emit("Chat render complete", 1.0)
         LOGGER.info(
             "Rendered chat video output=%s size=%s elapsed=%.1fs "
             "ffmpeg_elapsed=%.1fs",

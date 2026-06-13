@@ -25,13 +25,15 @@ Run continuously:
 .venv/bin/onlysavemevods run --config config.toml
 ```
 
-The daemon also starts a read-only local dashboard when `web_enabled = true`.
-It shows stream status, storage totals, attention signals, and current segment
-files. Channel and log tabs summarize the configured channels being archived
-and recent in-process service logs, the About tab shows the app version and
-runtime details, and the config tab shows the currently loaded settings with
-sensitive yt-dlp arguments redacted. Finalized media files and sidecars such as
-live chat and subtitles can be downloaded from the dashboard:
+The daemon also starts a local dashboard when `web_enabled = true`. It shows
+stream status, storage totals, attention signals, and current segment files.
+Channel, Jobs, and Log tabs summarize the configured channels being archived,
+dashboard-triggered processing work with phase and progress, and recent in-process service logs. The
+About tab shows the app version and runtime details, and the Config tab can save
+app settings back to `config.toml` while keeping sensitive yt-dlp arguments
+redacted. Bind address and port changes are saved for the next restart.
+Finalized media files and sidecars such as live chat and subtitles can be
+downloaded from the dashboard:
 
 ```text
 http://127.0.0.1:8080/
@@ -207,13 +209,22 @@ scripts/uninstall-systemd.sh
   `transcription_max_concurrent = 1` for a single GPU. The systemd service
   stores Hugging Face, NLTK, and Matplotlib runtime caches under
   `/opt/onlysavemevods/.cache`.
-- `whisperx_diarize = true` asks WhisperX/pyannote to label speakers as
-  `SPEAKER_00`, `SPEAKER_01`, and so on. Diarization usually needs a Hugging
-  Face token with the relevant pyannote model terms accepted; set the token in
-  the environment variable named by `whisperx_hf_token_env` (`HF_TOKEN` by
-  default). These labels identify recurring voices within a stream, but they do
-  not prove real names. For regular casts, add a later name-resolution layer
-  using known voice samples or transcript/context hints.
+- Most app settings can be changed from the dashboard Config tab and are
+  written back to `config.toml`. The running process reloads the saved values
+  where possible; web bind address and port changes apply after restart.
+- Voice detection for transcription is managed with WhisperX/pyannote
+  diarization. Use the dashboard Config tab to update the default mode or add a
+  per-channel override, or use `onlysavemevods voice-detection show --config
+  config.toml` and `onlysavemevods voice-detection set --config config.toml
+  --mode auto` from the CLI. Modes are `off` for no speaker labels, `auto` to
+  let WhisperX infer the count, `range` with `--min-speakers` and/or
+  `--max-speakers`, and `fixed` with `--speakers N`. Per-channel overrides are
+  stored as `[channel_voice_detection."Channel Name"]` tables keyed by the
+  channel name shown in the dashboard. Diarization usually needs a Hugging Face
+  token with the relevant pyannote model terms accepted; set the token in the
+  environment variable named by `whisperx_hf_token_env` (`HF_TOKEN` by default).
+  These labels identify recurring voices within a stream, but they do not prove
+  real names.
 - The dashboard shows `Transcribe` for finalized media without subtitles and
   `Retranscribe` when `.srt`/`.vtt` sidecars already exist. Retranscription
   replaces only the WhisperX subtitle/transcript sidecars for that media file.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 import hashlib
 import hmac
 import os
@@ -32,6 +32,7 @@ STRENGTH_DELTAS = {
 }
 DETECT_MIN_SCORE = 0.012
 DETECT_MIN_MARGIN = 0.004
+ProgressCallback = Callable[[str, float | None], None]
 
 
 class WatermarkError(RuntimeError):
@@ -190,9 +191,17 @@ def create_watermarked_copy(
     strength: str,
     ffmpeg_path: str,
     overwrite: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> None:
+    def emit(phase: str, progress: float | None = None) -> None:
+        if progress_callback is None:
+            return
+        progress_callback(phase, clamp_progress(progress))
+
     if output_file.exists() and not overwrite:
+        emit("Already exists", 1.0)
         return
+    emit("Preparing watermark", 0.02)
     np, cv2 = optional_cv_dependencies()
     if strength not in STRENGTH_DELTAS:
         raise WatermarkError(f"Unsupported watermark strength: {strength}")
@@ -202,6 +211,7 @@ def create_watermarked_copy(
         raise WatermarkError(f"Unable to open media file: {source_file}")
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if fps <= 0 or fps != fps:
         fps = 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -222,10 +232,12 @@ def create_watermarked_copy(
         cap.release()
         raise WatermarkError(f"Unable to create temporary video: {temp_video}")
 
+    emit("Preparing watermark pattern", 0.05)
     pattern = derive_pattern(secret, copy_id, video_id, source_name)
     frame_pattern = cv2.resize(pattern, (width, height), interpolation=cv2.INTER_CUBIC)
     delta = float(STRENGTH_DELTAS[strength])
     frame_count = 0
+    last_emit_frame = 0
     try:
         while True:
             ok, frame = cap.read()
@@ -233,6 +245,18 @@ def create_watermarked_copy(
                 break
             writer.write(apply_watermark_to_frame(frame, frame_pattern, delta, np, cv2))
             frame_count += 1
+            if (
+                frame_count == 1
+                or frame_count - last_emit_frame >= 100
+                or (total_frames > 0 and frame_count >= total_frames)
+            ):
+                last_emit_frame = frame_count
+                progress = (
+                    0.08 + (0.78 * min(frame_count, total_frames) / total_frames)
+                    if total_frames > 0
+                    else None
+                )
+                emit(f"Watermarking frames {frame_count}/{total_frames or '?'}", progress)
     finally:
         cap.release()
         writer.release()
@@ -241,6 +265,7 @@ def create_watermarked_copy(
         temp_video.unlink(missing_ok=True)
         raise WatermarkError(f"No frames found in media file: {source_file}")
 
+    emit("Muxing audio", 0.9)
     command = build_audio_mux_command(ffmpeg_path, temp_video, source_file, temp_output)
     try:
         result = subprocess.run(command, capture_output=True, check=False)
@@ -262,6 +287,13 @@ def create_watermarked_copy(
         output_file.unlink()
     temp_output.rename(output_file)
     temp_video.unlink(missing_ok=True)
+    emit("Watermark complete", 1.0)
+
+
+def clamp_progress(value: float | None) -> float | None:
+    if value is None:
+        return None
+    return min(1.0, max(0.0, float(value)))
 
 
 def apply_watermark_to_frame(
@@ -401,6 +433,7 @@ def sample_detection_frames(
     if not cap.isOpened():
         raise WatermarkError(f"Unable to open media file: {media_file}")
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if fps <= 0 or fps != fps:
         fps = 30.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
