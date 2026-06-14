@@ -258,8 +258,57 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(streamer.configured_sources, ["@OUMB3rd", "@OUMB3rdVODS"])
         self.assertEqual(streamer.stream_count, 1)
         self.assertEqual(streamer.active_count, 1)
+        streamer_stat = next(
+            item
+            for item in snapshot.streamer_stats
+            if item.name == "OUMB3rd"
+        )
+        self.assertTrue(streamer_stat.configured)
+        self.assertFalse(streamer_stat.needs_grouping)
+        self.assertEqual(streamer_stat.sources, ["@OUMB3rd", "@OUMB3rdVODS"])
+        self.assertEqual(streamer_stat.download_dir_name, "OUMB3rd")
+        self.assertEqual(streamer_stat.stream_count, 1)
+        self.assertEqual(streamer_stat.active_count, 1)
+        self.assertEqual(streamer_stat.streams[0].video_id, "LIVEVIDEO01")
         self.assertEqual(snapshot.configuration["Streamers"]["count"], 1)
         self.assertEqual(snapshot.configuration["Channels"]["monitored_source_count"], 2)
+
+    def test_status_snapshot_marks_top_level_channels_as_needs_grouping(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["@ExampleChannel", "@Unused"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            snapshot = build_status_snapshot(config)
+
+        grouped = next(
+            item
+            for item in snapshot.streamer_stats
+            if item.name == "Example Channel"
+        )
+        self.assertFalse(grouped.configured)
+        self.assertTrue(grouped.needs_grouping)
+        self.assertEqual(grouped.sources, ["@ExampleChannel"])
+        self.assertEqual(grouped.streams[0].video_id, "LIVEVIDEO01")
+        unused = next(
+            item
+            for item in snapshot.streamer_stats
+            if item.name == "@Unused"
+        )
+        self.assertTrue(unused.needs_grouping)
+        self.assertEqual(unused.sources, ["@Unused"])
+        self.assertEqual(unused.stream_count, 0)
 
     def test_status_html_and_json_are_renderable(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -324,8 +373,15 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Render chat", html)
         self.assertIn("/render-chat?", html)
         self.assertIn("/download?", html)
-        self.assertIn("Channels", html)
-        self.assertIn("Configured As", html)
+        self.assertIn("Streamers", html)
+        self.assertIn('id="tab-streamers"', html)
+        self.assertIn('for="tab-streamers"', html)
+        self.assertIn('id="streamer-list"', html)
+        self.assertIn("Needs Grouping", html)
+        self.assertIn("renderStreamerList", html)
+        self.assertNotIn('for="tab-streams"', html)
+        self.assertNotIn('for="tab-channels"', html)
+        self.assertNotIn('for="tab-streamer-groups"', html)
         self.assertIn("Jobs", html)
         self.assertIn("job-rows", html)
         self.assertIn("Recent Logs", html)
@@ -339,6 +395,10 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("tab-about", html)
         self.assertIn("config-stack", html)
         self.assertIn("onlysavemevods.dashboardTab", html)
+        self.assertIn("normalizeTabId", html)
+        self.assertIn('"tab-streams": "tab-streamers"', html)
+        self.assertIn('"tab-channels": "tab-streamers"', html)
+        self.assertIn('"tab-streamer-groups": "tab-streamers"', html)
         self.assertIn("onlysavemevods.collapsedStreams", html)
         self.assertIn("onlysavemevods.expandedStreams", html)
         self.assertIn("Stream log", html)
@@ -380,7 +440,15 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(payload["configuration"]["Transcription"]["voice_detection"], "auto")
         self.assertEqual(payload["configuration"]["Transcription"]["voice_detection_speakers"], "auto")
         self.assertEqual(payload["configuration"]["Transcription"]["whisperx_model"], "large-v3")
+        self.assertIn("streamer_stats", payload)
         self.assertIn("channel_stats", payload)
+        self.assertIn("streamer_groups", payload)
+        self.assertEqual(payload["streamer_stats"][0]["name"], "Example Channel")
+        self.assertTrue(payload["streamer_stats"][0]["needs_grouping"])
+        self.assertEqual(
+            payload["streamer_stats"][0]["streams"][0]["video_id"],
+            "LIVEVIDEO01",
+        )
         self.assertIn("jobs", payload)
         self.assertIn("job_limit", payload)
         self.assertIn("recent_logs", payload)
@@ -494,6 +562,61 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(any(job["progress"] == 0.42 for job in payload["jobs"]))
         self.assertTrue(any(job["status"] == "queued" for job in payload["jobs"]))
         self.assertEqual(payload["job_limit"], 200)
+
+    def test_streamer_stats_include_matching_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                streamers={
+                    "OUMB3rd": StreamerConfig(sources=["@OUMB3rdVODS"]),
+                },
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="OUMB3rd VODS",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS[key] = RenderChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name="Live Status [LIVEVIDEO01].live_chat.json",
+                    media_name="Live Status [LIVEVIDEO01].mp4",
+                    output_name="Live Status [LIVEVIDEO01] - chat.mp4",
+                    status="running",
+                    message="Rendering chat video",
+                    started_at=123.0,
+                    phase="Rendering panel frames",
+                    progress=0.42,
+                    updated_at=130.0,
+                )
+
+            try:
+                snapshot = build_status_snapshot(config)
+                payload = snapshot_to_dict(snapshot)
+            finally:
+                with CHAT_RENDER_JOBS_LOCK:
+                    CHAT_RENDER_JOBS.pop(key, None)
+
+        streamer = next(
+            item
+            for item in snapshot.streamer_stats
+            if item.name == "OUMB3rd"
+        )
+        self.assertEqual(streamer.jobs[0].kind, "Chat render")
+        self.assertEqual(streamer.jobs[0].progress, 0.42)
+        payload_streamer = next(
+            item
+            for item in payload["streamer_stats"]
+            if item["name"] == "OUMB3rd"
+        )
+        self.assertEqual(payload_streamer["jobs"][0]["kind"], "Chat render")
+        self.assertEqual(payload_streamer["jobs"][0]["video_id"], "LIVEVIDEO01")
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -899,7 +1022,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(config.streamers, {})
         self.assertEqual(removed.streamers, {})
         self.assertIn('action="/streamers"', html)
-        self.assertIn("Streamer Groups", html)
+        self.assertIn("Streamers", html)
+        self.assertIn("Save Streamer", html)
 
     def test_app_config_form_updates_file_and_running_config(self) -> None:
         with TemporaryDirectory() as tmp:

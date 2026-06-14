@@ -312,6 +312,34 @@ class StreamerStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamerStatStatus:
+    name: str
+    sources: list[str]
+    download_dir_name: str
+    configured: bool
+    needs_grouping: bool
+    voice_detection: str
+    speaker_label_count: int
+    stream_count: int
+    active_count: int
+    checking_count: int
+    ended_count: int
+    attention_count: int
+    file_count: int
+    downloadable_count: int
+    total_bytes: int
+    part_bytes: int
+    final_bytes: int
+    chat_bytes: int
+    fragment_bytes: int
+    latest_updated_at: str | None
+    latest_file_modified_at: float | None
+    latest_activity_at: float | None
+    jobs: list[JobStatus]
+    streams: list[StreamStatus]
+
+
+@dataclass(frozen=True, slots=True)
 class AppInfo:
     name: str
     version: str
@@ -346,6 +374,7 @@ class StatusSnapshot:
     temporary_bytes: int
     stream_limit: int
     configured_channels: list[str]
+    streamer_stats: list[StreamerStatStatus]
     streamer_groups: list[StreamerStatus]
     configuration: dict[str, dict[str, Any]]
     channel_stats: list[ChannelStatus]
@@ -606,7 +635,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streams")
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -622,7 +651,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streams")
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -648,7 +677,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streams")
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -725,7 +754,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#config")
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -753,7 +782,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streams")
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -877,8 +906,9 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         counts[stream.status] = counts.get(stream.status, 0) + 1
 
     channel_stats = build_channel_stats(streams, config)
-    speaker_labels = build_speaker_label_statuses(config, streams, channel_stats)
     jobs = build_job_statuses(watermark_records)
+    streamer_stats = build_streamer_stats(config, streams, jobs)
+    speaker_labels = build_speaker_label_statuses(config, streams, channel_stats)
     return StatusSnapshot(
         generated_at=time.time(),
         app=build_app_info(),
@@ -894,6 +924,7 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         temporary_bytes=sum(stream.temporary_bytes for stream in streams),
         stream_limit=STREAM_LIMIT,
         configured_channels=list(config.channels),
+        streamer_stats=streamer_stats,
         streamer_groups=build_streamer_statuses(config),
         configuration=build_config_summary(config),
         channel_stats=channel_stats,
@@ -1116,6 +1147,183 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
     ]
 
 
+def build_streamer_stats(
+    config: BotConfig,
+    streams: list[StreamStatus],
+    jobs: list[JobStatus],
+) -> list[StreamerStatStatus]:
+    streams_by_key: dict[str, list[StreamStatus]] = {}
+    display_names: dict[str, str] = {}
+    for stream in streams:
+        raw_name = stream.channel or "unknown channel"
+        name = streamer_display_name_for_channel(config, raw_name) or raw_name
+        key = channel_group_key(name)
+        streams_by_key.setdefault(key, []).append(stream)
+        if name != "unknown channel" or key not in display_names:
+            display_names[key] = name
+
+    stats: list[StreamerStatStatus] = []
+    claimed_keys: set[str] = set()
+    for name, streamer in sorted(config.streamers.items()):
+        key = channel_group_key(name)
+        claimed_keys.add(key)
+        streamer_streams = streams_by_key.get(key, [])
+        status = channel_status_from_streams(name, streamer_streams, list(streamer.sources))
+        voice_detection = (
+            voice_detection_config_summary(streamer.voice_detection)
+            if streamer.voice_detection is not None
+            else "default"
+        )
+        stats.append(
+            streamer_stat_from_channel_status(
+                status,
+                configured=True,
+                needs_grouping=False,
+                download_dir_name=streamer.download_dir_name or name,
+                voice_detection=voice_detection,
+                speaker_label_count=len(streamer.speaker_labels),
+                jobs=jobs_for_streams(jobs, streamer_streams),
+                streams=streamer_streams,
+            )
+        )
+
+    ungrouped_sources: dict[str, list[str]] = {}
+    ungrouped_names: dict[str, str] = {}
+    for channel in config.channels:
+        if streamer_display_name_for_channel(config, channel):
+            continue
+        name = channel_display_name(channel)
+        key = channel_group_key(name)
+        ungrouped_sources.setdefault(key, []).append(channel)
+        ungrouped_names.setdefault(key, display_names.get(key, name))
+
+    for key, sources in sorted(ungrouped_sources.items(), key=lambda item: item[1][0].lower()):
+        claimed_keys.add(key)
+        name = display_names.get(key, ungrouped_names.get(key, key))
+        group_streams = streams_by_key.get(key, [])
+        status = channel_status_from_streams(name, group_streams, sources)
+        stats.append(
+            streamer_stat_from_channel_status(
+                status,
+                configured=False,
+                needs_grouping=True,
+                download_dir_name=name,
+                voice_detection=voice_detection_summary_for_source_group(config, name, sources),
+                speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
+                jobs=jobs_for_streams(jobs, group_streams),
+                streams=group_streams,
+            )
+        )
+
+    for key, group_streams in streams_by_key.items():
+        if key in claimed_keys:
+            continue
+        name = display_names.get(key, key)
+        status = channel_status_from_streams(name, group_streams, [])
+        stats.append(
+            streamer_stat_from_channel_status(
+                status,
+                configured=False,
+                needs_grouping=True,
+                download_dir_name=name,
+                voice_detection=voice_detection_summary_for_source_group(config, name, []),
+                speaker_label_count=speaker_label_count_for_source_group(config, name, []),
+                jobs=jobs_for_streams(jobs, group_streams),
+                streams=group_streams,
+            )
+        )
+
+    return sorted(stats, key=streamer_stat_sort_key)
+
+
+def streamer_stat_from_channel_status(
+    status: ChannelStatus,
+    *,
+    configured: bool,
+    needs_grouping: bool,
+    download_dir_name: str,
+    voice_detection: str,
+    speaker_label_count: int,
+    jobs: list[JobStatus],
+    streams: list[StreamStatus],
+) -> StreamerStatStatus:
+    latest_updated = iso_to_epoch(status.latest_updated_at)
+    latest_file = status.latest_file_modified_at
+    latest_activity = max(
+        (value for value in (latest_updated, latest_file) if value is not None),
+        default=None,
+    )
+    return StreamerStatStatus(
+        name=status.name,
+        sources=list(status.configured_sources),
+        download_dir_name=download_dir_name,
+        configured=configured,
+        needs_grouping=needs_grouping,
+        voice_detection=voice_detection,
+        speaker_label_count=speaker_label_count,
+        stream_count=status.stream_count,
+        active_count=status.active_count,
+        checking_count=status.checking_count,
+        ended_count=status.ended_count,
+        attention_count=status.attention_count,
+        file_count=status.file_count,
+        downloadable_count=status.downloadable_count,
+        total_bytes=status.total_bytes,
+        part_bytes=status.part_bytes,
+        final_bytes=status.final_bytes,
+        chat_bytes=status.chat_bytes,
+        fragment_bytes=status.fragment_bytes,
+        latest_updated_at=status.latest_updated_at,
+        latest_file_modified_at=status.latest_file_modified_at,
+        latest_activity_at=latest_activity,
+        jobs=jobs,
+        streams=list(streams),
+    )
+
+
+def jobs_for_streams(
+    jobs: list[JobStatus],
+    streams: list[StreamStatus],
+) -> list[JobStatus]:
+    video_ids = {stream.video_id for stream in streams}
+    if not video_ids:
+        return []
+    return [job for job in jobs if job.video_id in video_ids]
+
+
+def voice_detection_summary_for_source_group(
+    config: BotConfig,
+    name: str,
+    sources: list[str],
+) -> str:
+    for target in [name, *sources]:
+        override = config.channel_voice_detection.get(target)
+        if override is not None:
+            return voice_detection_config_summary(override)
+    return "default"
+
+
+def speaker_label_count_for_source_group(
+    config: BotConfig,
+    name: str,
+    sources: list[str],
+) -> int:
+    labels = speaker_labels_for_channel(config, name)
+    for source in sources:
+        labels.update(speaker_labels_for_channel(config, source))
+    return len(labels)
+
+
+def streamer_stat_sort_key(status: StreamerStatStatus) -> tuple[bool, bool, bool, float, str]:
+    return (
+        not status.configured,
+        status.active_count == 0,
+        status.attention_count == 0,
+        -(status.latest_activity_at or 0.0),
+        status.name.lower(),
+    )
+
+
 def nvenc_devices_for_config_summary(devices: list[str]) -> list[str]:
     if not devices:
         return []
@@ -1329,7 +1537,14 @@ def build_speaker_label_statuses(
                     transcript_count=transcript_count,
                 )
             )
-    return sorted(speaker_statuses, key=lambda item: item.channel.lower())
+    streamer_keys = {channel_group_key(name) for name in config.streamers}
+    return sorted(
+        speaker_statuses,
+        key=lambda item: (
+            channel_group_key(item.channel) not in streamer_keys,
+            item.channel.lower(),
+        ),
+    )
 
 
 def detected_speaker_labels_for_directory(directory: Path) -> tuple[set[str], int]:
@@ -3229,16 +3444,12 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         if stream_needs_attention(stream)
     ]
     status_counts = render_status_counts(snapshot.counts)
-    rows = "\n".join(render_stream_card(stream) for stream in snapshot.streams)
-    if not rows:
-        rows = '<section class="empty">No streams have been seen yet.</section>'
-    channel_rows = render_channel_rows(snapshot.channel_stats)
+    streamer_cards = render_streamer_dashboard(snapshot)
     job_rows = render_job_rows(snapshot.jobs)
     config_sections = render_config_sections(snapshot.configuration)
     voice_detection_panel = render_voice_detection_panel(snapshot)
     speaker_labels_panel = render_speaker_labels_panel(snapshot)
     app_config_form = render_app_config_form(snapshot)
-    streamer_groups_panel = render_streamer_groups_panel(snapshot)
     log_rows = render_log_rows(snapshot.recent_logs)
     watermark_detection = render_watermark_detection_panel(snapshot.configuration)
     about_panel = render_about_panel(snapshot)
@@ -3289,6 +3500,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     main {{ padding: 18px clamp(16px, 4vw, 42px) 36px; }}
     h1 {{ margin: 0 0 12px; font-size: 24px; font-weight: 700; }}
     h2 {{ margin: 0 0 10px; font-size: 16px; }}
+    h3 {{ margin: 0 0 8px; font-size: 14px; }}
     .summary {{
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -3331,8 +3543,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel);
     }}
     .tab-panel {{ display: none; }}
-    #tab-streams:checked ~ .tabs label[for="tab-streams"],
-    #tab-channels:checked ~ .tabs label[for="tab-channels"],
+    #tab-streamers:checked ~ .tabs label[for="tab-streamers"],
     #tab-jobs:checked ~ .tabs label[for="tab-jobs"],
     #tab-logs:checked ~ .tabs label[for="tab-logs"],
     #tab-about:checked ~ .tabs label[for="tab-about"],
@@ -3341,8 +3552,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel-strong);
       font-weight: 650;
     }}
-    #tab-streams:checked ~ .streams-panel,
-    #tab-channels:checked ~ .channels-panel,
+    #tab-streamers:checked ~ .streamers-panel,
     #tab-jobs:checked ~ .jobs-panel,
     #tab-logs:checked ~ .logs-panel,
     #tab-about:checked ~ .about-panel,
@@ -3375,6 +3585,71 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       margin-top: 12px;
     }}
     .stream {{ padding: 14px; margin-top: 14px; }}
+    .streamer-list {{ display: grid; gap: 18px; }}
+    .streamer-section {{
+      border-top: 1px solid var(--line);
+      padding: 16px 0 4px;
+    }}
+    .streamer-section:first-child {{ border-top: 0; padding-top: 0; }}
+    .streamer-section.needs-grouping {{
+      border-left: 4px solid var(--warn);
+      padding-left: 12px;
+    }}
+    .streamer-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+      margin-bottom: 10px;
+    }}
+    .streamer-title {{ display: grid; gap: 6px; min-width: 0; }}
+    .streamer-badges, .source-chips {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }}
+    .source-chip {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: var(--muted);
+      background: var(--panel-strong);
+      overflow-wrap: anywhere;
+    }}
+    .streamer-stat-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+      gap: 8px 12px;
+      margin: 10px 0 14px;
+    }}
+    .streamer-stat-grid div {{ min-width: 0; overflow-wrap: anywhere; }}
+    .streamer-body-grid {{
+      display: grid;
+      grid-template-columns: minmax(260px, 0.75fr) minmax(260px, 1fr);
+      gap: 14px;
+      align-items: start;
+      margin-bottom: 14px;
+    }}
+    @media (max-width: 760px) {{
+      .streamer-head, .streamer-body-grid {{ display: grid; }}
+    }}
+    .streamer-streams {{ display: grid; gap: 8px; }}
+    .streamer-streams .stream {{ margin-top: 0; }}
+    .streamer-jobs {{
+      display: grid;
+      gap: 8px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+    }}
+    .streamer-job-row {{
+      display: grid;
+      grid-template-columns: max-content minmax(120px, 1fr) minmax(100px, 1fr);
+      gap: 8px;
+      align-items: center;
+    }}
+    .streamer-job-row .job-progress {{ min-width: 120px; }}
     .stream-head {{
       display: flex;
       justify-content: space-between;
@@ -3655,7 +3930,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <div class="metric"><strong id="metric-downloading">{active}</strong><span>Downloading</span></div>
       <div class="metric"><strong id="metric-checking">{checking}</strong><span>Checking</span></div>
       <div class="metric"><strong id="metric-attention">{len(attention_streams)}</strong><span>Attention</span></div>
-      <div class="metric"><strong id="metric-channels">{len(snapshot.channel_stats)}</strong><span>Channels</span></div>
+      <div class="metric"><strong id="metric-streamers">{len(snapshot.streamer_stats)}</strong><span>Streamers</span></div>
       <div class="metric"><strong id="metric-jobs">{active_job_count(snapshot.jobs)}</strong><span>Active Jobs</span></div>
       <div class="metric"><strong id="metric-logs">{len(snapshot.recent_logs)}</strong><span>Logs</span></div>
       <div class="metric"><strong id="metric-storage">{escape(format_bytes(snapshot.total_bytes))}</strong><span>Storage</span></div>
@@ -3669,21 +3944,19 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     {status_counts}
   </header>
   <main>
-    <input class="tab-radio" type="radio" id="tab-streams" name="dashboard-tab" checked>
-    <input class="tab-radio" type="radio" id="tab-channels" name="dashboard-tab">
+    <input class="tab-radio" type="radio" id="tab-streamers" name="dashboard-tab" checked>
     <input class="tab-radio" type="radio" id="tab-jobs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-logs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-about" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-config" name="dashboard-tab">
     <div class="tabs">
-      <label for="tab-streams">Streams</label>
-      <label for="tab-channels">Channels</label>
+      <label for="tab-streamers">Streamers</label>
       <label for="tab-jobs">Jobs</label>
       <label for="tab-logs">Logs</label>
       <label for="tab-about">About</label>
       <label for="tab-config">Config</label>
     </div>
-    <section class="tab-panel streams-panel">
+    <section class="tab-panel streamers-panel">
       <div class="dashboard-grid">
         <section class="panel">
           <h2>Storage</h2>
@@ -3707,18 +3980,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         </section>
         {watermark_detection}
       </div>
-      <div id="streams-list">{rows}</div>
-    </section>
-    <section class="tab-panel channels-panel">
-      <section class="panel">
-        <h2>Channels</h2>
-        <div class="table-wrap">
-          <table class="channels">
-            <thead><tr><th>Channel</th><th>Configured As</th><th>Streams</th><th>Downloading</th><th>Checking</th><th>Ended</th><th>Attention</th><th>Clips</th><th>Files</th><th>Final</th><th>Partial</th><th>Chat</th><th>Total</th><th>Latest Update</th><th>Latest File</th></tr></thead>
-            <tbody id="channel-rows">{channel_rows}</tbody>
-          </table>
-        </div>
-      </section>
+      <div class="streamer-list" id="streamer-list">{streamer_cards}</div>
     </section>
     <section class="tab-panel jobs-panel">
       <section class="panel">
@@ -3751,7 +4013,6 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <h2>Current Configuration</h2>
       <div class="file-meta">Sensitive yt-dlp arguments are redacted before display.</div>
       {app_config_form}
-      {streamer_groups_panel}
       {voice_detection_panel}
       {speaker_labels_panel}
       <div class="config-stack" id="config-sections">
@@ -3771,7 +4032,7 @@ def dashboard_script() -> str:
   const tabKey = "onlysavemevods.dashboardTab";
   const collapsedKey = "onlysavemevods.collapsedStreams";
   const expandedKey = "onlysavemevods.expandedStreams";
-  const tabs = ["tab-streams", "tab-channels", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
+  const tabs = ["tab-streamers", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
     detected: "detected",
@@ -3878,7 +4139,14 @@ def dashboard_script() -> str:
     collapsedStreams.has(videoId) || (status === "ended" && !expandedStreams.has(videoId))
   );
 
+  const normalizeTabId = (id) => ({
+    "tab-streams": "tab-streamers",
+    "tab-channels": "tab-streamers",
+    "tab-streamer-groups": "tab-streamers",
+  }[id] || id);
+
   const selectTab = (id, updateHash) => {
+    id = normalizeTabId(id);
     if (!tabs.includes(id)) return;
     const tab = byId(id);
     if (!tab) return;
@@ -3890,8 +4158,8 @@ def dashboard_script() -> str:
   };
 
   let stored = "";
-  stored = readLocalStorageValue(tabKey);
-  const hashTab = location.hash ? "tab-" + location.hash.slice(1) : "";
+  stored = normalizeTabId(readLocalStorageValue(tabKey));
+  const hashTab = location.hash ? normalizeTabId("tab-" + location.hash.slice(1)) : "";
   selectTab(tabs.includes(hashTab) ? hashTab : stored, false);
 
   for (const id of tabs) {
@@ -4105,33 +4373,147 @@ def dashboard_script() -> str:
 </section>`;
   };
 
-  const renderChannelRows = (channels) => {
-    if (!channels || !channels.length) {
-      return '<tr><td colspan="15" class="file-meta">No configured channels, streamers, or stream history found</td></tr>';
+  const snapshotConfigPath = (snapshot) => String((((snapshot || {}).configuration || {}).Paths || {}).config_path || "-");
+
+  const renderSourceChips = (sources) => {
+    sources = sources || [];
+    if (!sources.length) return '<div class="source-chips"><span class="source-chip">No configured sources</span></div>';
+    return `<div class="source-chips">${sources.map((source) => `<span class="source-chip">${escapeHtml(source)}</span>`).join("")}</div>`;
+  };
+
+  const renderStreamerForm = (streamer) => {
+    const isExisting = Boolean(streamer && streamer.configured);
+    const name = isExisting ? String(streamer.name || "") : "";
+    const sources = isExisting ? (streamer.sources || []).join("\n") : "";
+    const downloadDirName = isExisting ? String(streamer.download_dir_name || "") : "";
+    const readonly = isExisting ? " readonly" : "";
+    const deleteButton = isExisting
+      ? '<button class="download action-button" name="action" value="delete" type="submit">Delete</button>'
+      : "";
+    const saveLabel = isExisting ? "Save Streamer" : "Add Streamer";
+    const meta = isExisting
+      ? `<span class="streamer-meta">Voice ${escapeHtml(streamer.voice_detection || "default")}; labels ${escapeHtml(streamer.speaker_label_count || 0)}</span>`
+      : '<span class="streamer-meta">&nbsp;</span>';
+    return `<form class="streamer-form" method="post" action="/streamers">
+  <label class="settings-field">Name
+    <input name="streamer_name" value="${escapeAttr(name)}"${readonly}>
+  </label>
+  <label class="settings-field">Download Dir Name
+    <input name="download_dir_name" value="${escapeAttr(downloadDirName)}">
+  </label>
+  ${meta}
+  <label class="settings-field wide">Sources
+    <textarea name="sources" rows="3">${escapeHtml(sources)}</textarea>
+  </label>
+  <div class="settings-actions">
+    <button class="download action-button" name="action" value="save" type="submit">${saveLabel}</button>
+    ${deleteButton}
+  </div>
+</form>`;
+  };
+
+  const renderStreamerCreatePanel = (snapshot) => {
+    if (snapshotConfigPath(snapshot) === "-") return "";
+    return `<section class="panel streamer-create-panel">
+  <h2>Add Streamer</h2>
+  <div class="streamer-groups">${renderStreamerForm(null)}</div>
+</section>`;
+  };
+
+  const renderStreamerSettingsArea = (streamer, snapshot) => {
+    if (snapshotConfigPath(snapshot) === "-") {
+      return `<div class="streamer-jobs">
+  <h3>Settings</h3>
+  <div class="file-meta">Config file path is not available.</div>
+</div>`;
     }
-    return channels.map((channel) => {
-      const configuredAs = (channel.configured_sources || []).join(", ") || "-";
-      const latestFileAge = formatEpochAge(channel.latest_file_modified_at);
-      return [
-        "<tr>",
-        `<td class="file-name">${escapeHtml(channel.name)}</td>`,
-        `<td class="file-name">${escapeHtml(configuredAs)}</td>`,
-        `<td>${escapeHtml(channel.stream_count)}</td>`,
-        `<td>${escapeHtml(channel.active_count)}</td>`,
-        `<td>${escapeHtml(channel.checking_count)}</td>`,
-        `<td>${escapeHtml(channel.ended_count)}</td>`,
-        `<td>${escapeHtml(channel.attention_count)}</td>`,
-        `<td>${escapeHtml(channel.downloadable_count)}</td>`,
-        `<td>${escapeHtml(channel.file_count)}</td>`,
-        `<td>${escapeHtml(formatBytes(channel.final_bytes))}</td>`,
-        `<td>${escapeHtml(formatBytes(channel.part_bytes))}</td>`,
-        `<td>${escapeHtml(formatBytes(channel.chat_bytes))}</td>`,
-        `<td>${escapeHtml(formatBytes(channel.total_bytes))}</td>`,
-        `<td>${escapeHtml(formatIso(channel.latest_updated_at))}</td>`,
-        `<td>${escapeHtml(formatEpoch(channel.latest_file_modified_at))} <span class="muted">${escapeHtml(latestFileAge)}</span></td>`,
-        "</tr>",
-      ].join("");
-    }).join("");
+    if (streamer.configured) {
+      return `<div class="streamer-settings">
+  <h3>Settings</h3>
+  ${renderStreamerForm(streamer)}
+</div>`;
+    }
+    return `<div class="streamer-jobs">
+  <h3>Settings</h3>
+  <div class="file-meta">Create a streamer entry for these sources to share settings and voices.</div>
+</div>`;
+  };
+
+  const renderStreamerJobRow = (job) => {
+    const detail = job.item || job.detail || job.video_id || "-";
+    return `<div class="streamer-job-row">
+  <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
+  <div class="file-name">${escapeHtml(job.kind || "Job")}<br><span class="muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
+  <div>${renderJobProgress(job.progress)}<div class="file-meta">${escapeHtml(detail)}</div></div>
+</div>`;
+  };
+
+  const renderStreamerJobsSummary = (jobs) => {
+    jobs = jobs || [];
+    const body = jobs.length
+      ? jobs.slice(0, 8).map(renderStreamerJobRow).join("")
+      : '<div class="file-meta">No active or recent jobs for this streamer.</div>';
+    return `<div class="streamer-jobs">
+  <h3>Jobs</h3>
+  ${body}
+</div>`;
+  };
+
+  const renderStreamerStreams = (streams) => {
+    streams = streams || [];
+    if (!streams.length) return '<section class="empty">No streams have been seen for this streamer.</section>';
+    return streams.map(renderStreamCard).join("");
+  };
+
+  const renderStreamerCard = (streamer, snapshot) => {
+    const stateLabel = streamer.needs_grouping ? "Needs Grouping" : "Configured";
+    const stateClass = streamer.needs_grouping ? "waiting_retry" : "done";
+    const needsClass = streamer.needs_grouping ? " needs-grouping" : "";
+    const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
+    const latestAge = formatEpochAge(streamer.latest_activity_at);
+    return `<section class="streamer-section${needsClass}" data-streamer-name="${escapeAttr(streamer.name || "")}">
+  <div class="streamer-head">
+    <div class="streamer-title">
+      <h2>${escapeHtml(streamer.name || "unknown streamer")}</h2>
+      ${renderSourceChips(streamer.sources || [])}
+    </div>
+    <div class="streamer-badges">
+      <span class="badge ${stateClass}">${stateLabel}</span>
+      <span class="badge downloading">Active ${escapeHtml(streamer.active_count || 0)}</span>
+      <span class="badge checking_after_exit">Attention ${escapeHtml(streamer.attention_count || 0)}</span>
+    </div>
+  </div>
+  ${warning}
+  <div class="streamer-stat-grid">
+    <div><strong>${escapeHtml(streamer.stream_count || 0)}</strong><br><span class="muted">Streams</span></div>
+    <div><strong>${escapeHtml(streamer.file_count || 0)}</strong><br><span class="muted">Files</span></div>
+    <div><strong>${escapeHtml(formatBytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+    <div><strong>${escapeHtml(formatBytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
+    <div><strong>${escapeHtml(formatBytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
+    <div><strong>${escapeHtml(formatBytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
+    <div><strong>${escapeHtml(formatEpoch(streamer.latest_activity_at))}</strong><br><span class="muted">Latest ${escapeHtml(latestAge)}</span></div>
+    <div><strong>${escapeHtml(streamer.download_dir_name || "-")}</strong><br><span class="muted">Download dir</span></div>
+    <div><strong>${escapeHtml(streamer.voice_detection || "default")}</strong><br><span class="muted">Voice</span></div>
+    <div><strong>${escapeHtml(streamer.speaker_label_count || 0)}</strong><br><span class="muted">Speaker labels</span></div>
+  </div>
+  <div class="streamer-body-grid">
+    ${renderStreamerSettingsArea(streamer, snapshot)}
+    ${renderStreamerJobsSummary(streamer.jobs || [])}
+  </div>
+  <div class="streamer-streams">
+    <h3>Streams</h3>
+    ${renderStreamerStreams(streamer.streams || [])}
+  </div>
+</section>`;
+  };
+
+  const renderStreamerList = (snapshot) => {
+    const streamers = snapshot.streamer_stats || [];
+    const createPanel = renderStreamerCreatePanel(snapshot);
+    const cards = streamers.length
+      ? streamers.map((streamer) => renderStreamerCard(streamer, snapshot)).join("")
+      : '<section class="empty">No streamers or streams have been seen yet.</section>';
+    return createPanel + cards;
   };
 
   const activeJobCount = (jobs) => (jobs || []).filter((job) => ["queued", "running"].includes(job.status)).length;
@@ -4214,7 +4596,7 @@ def dashboard_script() -> str:
     setText("metric-downloading", counts.downloading || 0);
     setText("metric-checking", counts.checking_after_exit || 0);
     setText("metric-attention", streams.filter(streamNeedsAttention).length);
-    setText("metric-channels", (snapshot.channel_stats || []).length);
+    setText("metric-streamers", (snapshot.streamer_stats || []).length);
     setText("metric-jobs", activeJobCount(snapshot.jobs || []));
     setText("metric-logs", (snapshot.recent_logs || []).length);
     setText("metric-storage", formatBytes(snapshot.total_bytes));
@@ -4233,14 +4615,14 @@ def dashboard_script() -> str:
 
     const statusCounts = byId("status-counts");
     if (statusCounts) statusCounts.innerHTML = renderStatusCounts(counts);
-    const streamList = byId("streams-list");
-    if (streamList) {
-      streamList.innerHTML = streams.length
-        ? streams.map(renderStreamCard).join("")
-        : '<section class="empty">No streams have been seen yet.</section>';
+    const streamerList = byId("streamer-list");
+    if (streamerList) {
+      const activeElement = document.activeElement;
+      if (!activeElement || !streamerList.contains(activeElement)) {
+        streamerList.innerHTML = renderStreamerList(snapshot);
+        applyCollapsedState(streamerList);
+      }
     }
-    const channelRows = byId("channel-rows");
-    if (channelRows) channelRows.innerHTML = renderChannelRows(snapshot.channel_stats || []);
     const jobRows = byId("job-rows");
     if (jobRows) jobRows.innerHTML = renderJobRows(snapshot.jobs || []);
     const logRows = byId("log-rows");
@@ -4337,24 +4719,141 @@ def voice_detection_config_summary(override: VoiceDetectionConfig) -> str:
 
 
 
-def render_streamer_groups_panel(snapshot: StatusSnapshot) -> str:
-    config_path = str(
-        snapshot.configuration.get("Paths", {}).get("config_path", "-")
-    )
-    if config_path == "-":
+def render_streamer_dashboard(snapshot: StatusSnapshot) -> str:
+    sections: list[str] = []
+    create_panel = render_streamer_create_panel(snapshot)
+    if create_panel:
+        sections.append(create_panel)
+    if snapshot.streamer_stats:
+        sections.extend(render_streamer_card(streamer, snapshot) for streamer in snapshot.streamer_stats)
+    else:
+        sections.append('<section class="empty">No streamers or streams have been seen yet.</section>')
+    return "\n".join(sections)
+
+
+def render_streamer_create_panel(snapshot: StatusSnapshot) -> str:
+    if snapshot_config_path(snapshot) == "-":
         return ""
-    forms = "".join(
-        render_streamer_group_form(streamer)
-        for streamer in snapshot.streamer_groups
-    )
-    forms += render_streamer_group_form(None)
-    return f"""<section class="panel streamer-groups-panel">
-  <h2>Streamer Groups</h2>
-  <div class="streamer-groups">{forms}</div>
+    return f"""<section class="panel streamer-create-panel">
+  <h2>Add Streamer</h2>
+  <div class="streamer-groups">{render_streamer_group_form(None)}</div>
 </section>"""
 
 
-def render_streamer_group_form(streamer: StreamerStatus | None) -> str:
+def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
+    state_label = "Needs Grouping" if streamer.needs_grouping else "Configured"
+    state_class = "waiting_retry" if streamer.needs_grouping else "done"
+    needs_class = " needs-grouping" if streamer.needs_grouping else ""
+    warning = (
+        '<div class="signals">Needs streamer group</div>'
+        if streamer.needs_grouping
+        else ""
+    )
+    settings = render_streamer_settings_area(streamer, snapshot)
+    jobs = render_streamer_jobs_summary(streamer.jobs)
+    streams = render_streamer_streams(streamer.streams)
+    latest_activity = format_optional_epoch(streamer.latest_activity_at)
+    latest_activity_age = format_epoch_age(streamer.latest_activity_at)
+    return f"""<section class="streamer-section{needs_class}" data-streamer-name="{escape(streamer.name, quote=True)}">
+  <div class="streamer-head">
+    <div class="streamer-title">
+      <h2>{escape(streamer.name)}</h2>
+      {render_source_chips(streamer.sources)}
+    </div>
+    <div class="streamer-badges">
+      <span class="badge {state_class}">{escape(state_label)}</span>
+      <span class="badge downloading">Active {streamer.active_count}</span>
+      <span class="badge checking_after_exit">Attention {streamer.attention_count}</span>
+    </div>
+  </div>
+  {warning}
+  <div class="streamer-stat-grid">
+    <div><strong>{streamer.stream_count}</strong><br><span class="muted">Streams</span></div>
+    <div><strong>{streamer.file_count}</strong><br><span class="muted">Files</span></div>
+    <div><strong>{escape(format_bytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+    <div><strong>{escape(format_bytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
+    <div><strong>{escape(format_bytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
+    <div><strong>{escape(format_bytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
+    <div><strong>{escape(latest_activity)}</strong><br><span class="muted">Latest {escape(latest_activity_age)}</span></div>
+    <div><strong>{escape(streamer.download_dir_name or '-')}</strong><br><span class="muted">Download dir</span></div>
+    <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
+    <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
+  </div>
+  <div class="streamer-body-grid">
+    {settings}
+    {jobs}
+  </div>
+  <div class="streamer-streams">
+    <h3>Streams</h3>
+    {streams}
+  </div>
+</section>"""
+
+
+def render_source_chips(sources: list[str]) -> str:
+    if not sources:
+        return '<div class="source-chips"><span class="source-chip">No configured sources</span></div>'
+    chips = "".join(
+        f'<span class="source-chip">{escape(source)}</span>'
+        for source in sources
+    )
+    return f'<div class="source-chips">{chips}</div>'
+
+
+def render_streamer_settings_area(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    if snapshot_config_path(snapshot) == "-":
+        return """<div class="streamer-jobs">
+  <h3>Settings</h3>
+  <div class="file-meta">Config file path is not available.</div>
+</div>"""
+    if streamer.configured:
+        return f"""<div class="streamer-settings">
+  <h3>Settings</h3>
+  {render_streamer_group_form(streamer)}
+</div>"""
+    return """<div class="streamer-jobs">
+  <h3>Settings</h3>
+  <div class="file-meta">Create a streamer entry for these sources to share settings and voices.</div>
+</div>"""
+
+
+def render_streamer_jobs_summary(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        body = '<div class="file-meta">No active or recent jobs for this streamer.</div>'
+    else:
+        body = "".join(render_streamer_job_row(job) for job in jobs[:8])
+    return f"""<div class="streamer-jobs">
+  <h3>Jobs</h3>
+  {body}
+</div>"""
+
+
+def render_streamer_job_row(job: JobStatus) -> str:
+    detail = job.item or job.detail or job.video_id or "-"
+    return (
+        '<div class="streamer-job-row">'
+        f'<span class="badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span>'
+        f'<div class="file-name">{escape(job.kind or "Job")}<br><span class="muted">{escape(job.phase or job.message or "-")}</span></div>'
+        f'<div>{render_job_progress(job.progress)}<div class="file-meta">{escape(detail)}</div></div>'
+        '</div>'
+    )
+
+
+def render_streamer_streams(streams: list[StreamStatus]) -> str:
+    if not streams:
+        return '<section class="empty">No streams have been seen for this streamer.</section>'
+    return "\n".join(render_stream_card(stream) for stream in streams)
+
+
+def snapshot_config_path(snapshot: StatusSnapshot) -> str:
+    return str(snapshot.configuration.get("Paths", {}).get("config_path", "-"))
+
+
+
+def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | None) -> str:
     is_existing = streamer is not None
     name = streamer.name if streamer is not None else ""
     sources = "\n".join(streamer.sources) if streamer is not None else ""
@@ -4536,10 +5035,10 @@ def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
         overrides = {}
     rows = "\n".join(
         render_voice_detection_channel_row(channel, overrides)
-        for channel in snapshot.channel_stats
+        for channel in streamer_first_channel_stats(snapshot, overrides)
     )
     if not rows:
-        rows = '<tr><td colspan="4" class="file-meta">No configured channels, streamers, or stream history found</td></tr>'
+        rows = '<tr><td colspan="4" class="file-meta">No streamers, source overrides, or stream history found</td></tr>'
     return f"""<section class="panel voice-detection-panel">
   <h2>Voice Detection</h2>
   <form class="voice-form voice-default-form" method="post" action="/voice-detection">
@@ -4553,11 +5052,56 @@ def render_voice_detection_panel(snapshot: StatusSnapshot) -> str:
   </form>
   <div class="table-wrap">
     <table class="voice-table">
-      <thead><tr><th>Channel</th><th>Configured As</th><th>Current Override</th><th>Update Override</th></tr></thead>
+      <thead><tr><th>Streamer / Source</th><th>Sources</th><th>Current Override</th><th>Update Override</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
   </div>
 </section>"""
+
+
+def streamer_first_channel_stats(
+    snapshot: StatusSnapshot,
+    overrides: dict[str, str],
+) -> list[ChannelStatus]:
+    statuses_by_key = {
+        channel_group_key(status.name): status
+        for status in snapshot.channel_stats
+    }
+    for name in overrides:
+        key = channel_group_key(name)
+        statuses_by_key.setdefault(
+            key,
+            ChannelStatus(
+                name=name,
+                configured_sources=[],
+                stream_count=0,
+                active_count=0,
+                checking_count=0,
+                ended_count=0,
+                attention_count=0,
+                file_count=0,
+                downloadable_count=0,
+                total_bytes=0,
+                part_bytes=0,
+                final_bytes=0,
+                chat_bytes=0,
+                fragment_bytes=0,
+                latest_updated_at=None,
+                latest_file_modified_at=None,
+            ),
+        )
+    streamer_keys = {
+        channel_group_key(streamer.name)
+        for streamer in snapshot.streamer_stats
+        if streamer.configured
+    }
+    return sorted(
+        statuses_by_key.values(),
+        key=lambda status: (
+            channel_group_key(status.name) not in streamer_keys,
+            status.name.lower(),
+        ),
+    )
 
 
 def render_voice_detection_channel_row(
@@ -4597,7 +5141,7 @@ def render_speaker_labels_panel(snapshot: StatusSnapshot) -> str:
   <h2>Speaker Names</h2>
   <div class="table-wrap">
     <table class="speaker-table">
-      <thead><tr><th>Channel</th><th>Configured As</th><th>Detected Labels</th><th>Speaker Names</th></tr></thead>
+      <thead><tr><th>Streamer / Source</th><th>Sources</th><th>Detected Labels</th><th>Speaker Names</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
   </div>
@@ -4726,7 +5270,7 @@ def render_watermark_detection_result(result: Any) -> str:
 <body>
   <h1>Watermark Detection</h1>
   <table>{rendered_rows}</table>
-  <p><a href="/#streams">Back to dashboard</a></p>
+  <p><a href="/#streamers">Back to dashboard</a></p>
 </body>
 </html>
 """
@@ -4739,7 +5283,7 @@ def render_watermark_detection_error(message: str) -> str:
 <body>
   <h1>Watermark Detection</h1>
   <p>{escape(message)}</p>
-  <p><a href="/#streams">Back to dashboard</a></p>
+  <p><a href="/#streamers">Back to dashboard</a></p>
 </body>
 </html>
 """
@@ -4987,42 +5531,10 @@ def render_file_action(file: FileStatus) -> str:
     return f'<div class="actions">{"".join(actions)}</div>'
 
 
-def render_channel_rows(channels: list[ChannelStatus]) -> str:
-    if not channels:
-        return '<tr><td colspan="15" class="file-meta">No configured channels, streamers, or stream history found</td></tr>'
-    return "\n".join(render_channel_row(channel) for channel in channels)
-
-
-def render_channel_row(channel: ChannelStatus) -> str:
-    configured_as = ", ".join(channel.configured_sources) or "-"
-    latest_update = format_optional_iso(channel.latest_updated_at)
-    latest_file = format_optional_epoch(channel.latest_file_modified_at)
-    latest_file_age = format_epoch_age(channel.latest_file_modified_at)
-    return (
-        "<tr>"
-        f'<td class="file-name">{escape(channel.name)}</td>'
-        f'<td class="file-name">{escape(configured_as)}</td>'
-        f"<td>{channel.stream_count}</td>"
-        f"<td>{channel.active_count}</td>"
-        f"<td>{channel.checking_count}</td>"
-        f"<td>{channel.ended_count}</td>"
-        f"<td>{channel.attention_count}</td>"
-        f"<td>{channel.downloadable_count}</td>"
-        f"<td>{channel.file_count}</td>"
-        f"<td>{escape(format_bytes(channel.final_bytes))}</td>"
-        f"<td>{escape(format_bytes(channel.part_bytes))}</td>"
-        f"<td>{escape(format_bytes(channel.chat_bytes))}</td>"
-        f"<td>{escape(format_bytes(channel.total_bytes))}</td>"
-        f"<td>{escape(latest_update)}</td>"
-        f'<td>{escape(latest_file)} <span class="muted">{escape(latest_file_age)}</span></td>'
-        "</tr>"
-    )
-
 
 
 def active_job_count(jobs: list[JobStatus]) -> int:
     return sum(1 for job in jobs if job.status in {"queued", "running"})
-
 
 def render_job_rows(jobs: list[JobStatus]) -> str:
     if not jobs:
