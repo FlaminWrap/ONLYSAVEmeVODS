@@ -47,15 +47,15 @@ Run continuously:
 ```
 
 The daemon also starts a local dashboard when `web_enabled = true`. It shows
-stream status, storage totals, attention signals, and current segment files.
-Channel, Jobs, and Log tabs summarize the configured channels or streamer
-sources being archived, dashboard-triggered processing work with phase and
-progress, and recent in-process service logs. The About tab shows the app
-version and runtime details, and the Config tab can save
-app settings back to `config.toml` while keeping sensitive yt-dlp arguments
-redacted. Bind address and port changes are saved for the next restart.
-Finalized media files and sidecars such as live chat and subtitles can be
-downloaded from the dashboard:
+streamer cards with grouped sources, storage totals, attention signals, current
+segment files, per-stream file/log/job tabs, and dashboard-triggered processing
+work with phase and progress. Each streamer card has Settings and Voices actions
+for shared source settings, voice detection, known voice samples, and speaker
+attribution review. The About tab shows the app version and runtime details, and
+the Config tab can save app settings back to `config.toml` while keeping
+sensitive yt-dlp arguments redacted. Bind address and port changes are saved for
+the next restart. Finalized media files and sidecars such as live chat and
+subtitles can be downloaded from the dashboard:
 
 ```text
 http://127.0.0.1:8080/
@@ -114,11 +114,15 @@ under `.deno/` because yt-dlp's current YouTube support uses EJS challenge
 solver scripts with an external JavaScript runtime. If `transcribe_subtitles =
 true` is set in `config.toml`, the installer also installs `whisperx` into the
 project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to force that install or
-`ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it.
+`ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it. If `voice_match_enabled = true`,
+the installer also installs the `onlysavemevods[voice-match]` extra for
+pyannote-backed known-voice matching. Set `ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1`
+to force it or `ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=0` to skip it.
 
 The installer also enables a nightly root-run Python dependency updater. It
-refreshes the project venv, `yt-dlp[default]`, and installed/enabled WhisperX,
-but skips the run if the service is recording, checking a recent exit, waiting
+refreshes the project venv, `yt-dlp[default]`, installed/enabled WhisperX, and
+installed/enabled voice-match dependencies, but skips the run if the service is
+recording, checking a recent exit, waiting
 to retry, or running queued dashboard/watermark jobs. By default it runs at
 `04:15` with up to `45m` randomized delay. If the service is active but the
 local status endpoint cannot be read, the updater skips that run rather than
@@ -159,6 +163,13 @@ To install WhisperX even before transcription is enabled in `config.toml`:
 
 ```bash
 ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-almalinux.sh
+```
+
+To install voice matching even before `voice_match_enabled = true` is present in
+`config.toml`:
+
+```bash
+ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1 scripts/install-almalinux.sh
 ```
 
 To update a config file manually without changing existing values:
@@ -251,31 +262,40 @@ scripts/uninstall-systemd.sh
   stores Hugging Face, NLTK, and Matplotlib runtime caches under
   `/opt/onlysavemevods/.cache`.
 - Most app settings can be changed from the dashboard Config tab and are
-  written back to `config.toml`. The Streamer Groups panel can add, update, or
-  delete grouped sources. The running process reloads the saved values where
-  possible; web bind address and port changes apply after restart.
+  written back to `config.toml`. The Streamers tab can add, update, or delete
+  grouped sources, and each streamer card keeps shared settings behind its
+  Settings button. The running process reloads the saved values where possible;
+  web bind address and port changes apply after restart.
 - Voice detection for transcription is managed with WhisperX/pyannote
-  diarization. Use the dashboard Config tab to update the default mode or add a
-  shared streamer/source override, or use `onlysavemevods voice-detection show --config
-  config.toml` and `onlysavemevods voice-detection set --config config.toml
-  --mode auto` from the CLI. Modes are `off` for no speaker labels, `auto` to
-  let WhisperX infer the count, `range` with `--min-speakers` and/or
-  `--max-speakers`, and `fixed` with `--speakers N`. Streamer defaults are
-  stored under `[streamers."Name".voice_detection]`; source-specific overrides
-  can still be stored as `[channel_voice_detection."Channel Name"]` tables and
-  take precedence. Diarization usually needs a Hugging Face
-  token with the relevant pyannote model terms accepted; set the token in the
-  environment variable named by `whisperx_hf_token_env` (`HF_TOKEN` by default).
-  These labels identify recurring voices within a stream, but they do not prove
-  real names.
+  diarization. Use the dashboard Config tab to update the default mode, use a
+  streamer card's Settings button for shared streamer overrides, or use
+  `onlysavemevods voice-detection show --config config.toml` and
+  `onlysavemevods voice-detection set --config config.toml --mode auto` from the
+  CLI. Modes are `off` for no speaker labels, `auto` to let WhisperX infer the
+  count, `range` with `--min-speakers` and/or `--max-speakers`, and `fixed` with
+  `--speakers N`. Streamer defaults are stored under
+  `[streamers."Name".voice_detection]`; source-specific overrides can still be
+  stored as `[channel_voice_detection."Channel Name"]` tables and take
+  precedence. Diarization usually needs a Hugging Face token with the relevant
+  pyannote model terms accepted; set the token in the environment variable named
+  by `whisperx_hf_token_env` (`HF_TOKEN` by default).
+- The dashboard has a Voices button on configured streamer cards. It manages
+  `[streamers."Name".voices."Voice Name"]` profiles, uploaded samples under
+  `state/voice_samples/<streamer>/<voice>/`, samples made from existing diarized
+  transcript segments, and review of low-confidence matches. The systemd installer
+  installs the optional matcher dependency when `voice_match_enabled = true`; for
+  manual installs, use `.venv/bin/python -m pip install -e ".[voice-match]"`.
+  When available, the matcher
+  writes `<media>.voice-attribution.json` after WhisperX, auto-applies confident
+  matches to `.srt`/`.vtt`, and leaves weak matches for review. Manual
+  `[streamers."Name".speaker_labels]` and `[channel_speaker_labels."Channel Name"]`
+  mappings still win because WhisperX `SPEAKER_00` IDs are per transcript.
 - The dashboard Config tab also has a Speaker Names section. After WhisperX has
   produced a diarized `.json` sidecar, the dashboard lists detected labels such
-  as `SPEAKER_00` and `SPEAKER_01` per channel or streamer group. Save names
-  there to write `[streamers."Name".speaker_labels]` or
-  `[channel_speaker_labels."Channel Name"]` mappings into `config.toml`; existing
-  `.srt` and `.vtt` subtitles for that group are rewritten with names such as
-  `Host: ...` or `Guest: ...`. The mapping is manual because WhisperX speaker
-  numbers can change between videos.
+  as `SPEAKER_00` and `SPEAKER_01` per streamer first, with source-specific
+  overrides available for advanced cases. Save names there to write manual
+  speaker-label mappings into `config.toml`; existing `.srt` and `.vtt` subtitles
+  for that group are rewritten with names such as `Host: ...` or `Guest: ...`.
 - The dashboard shows `Transcribe` for finalized media without subtitles and
   `Retranscribe` when `.srt`/`.vtt` sidecars already exist. Retranscription
   replaces only the WhisperX subtitle/transcript sidecars for that media file.

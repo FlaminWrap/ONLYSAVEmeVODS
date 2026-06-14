@@ -12,6 +12,7 @@ import shlex
 import time
 
 from .config import BotConfig, VoiceDetectionConfig, streamer_for_channel
+from .voice_match import match_known_voices_for_media, voice_attribution_file, voice_attribution_labels_for_media
 
 
 LOGGER = logging.getLogger(__name__)
@@ -170,6 +171,7 @@ async def transcribe_media_file(
     if overwrite:
         cleanup_transcription_outputs(media_file, logger)
     if transcription_outputs_exist(media_file):
+        match_known_voices_for_media(config, media_file, channel=channel, logger=logger)
         rewrite_speaker_labels_for_media(config, media_file, channel=channel, logger=logger)
         logger.info("Subtitle output already exists for %s", media_file)
         return True
@@ -243,6 +245,8 @@ async def transcribe_media_file(
         return False
 
     log_process_output(logger, "WhisperX", output_buffer)
+    emit("Matching known voices", 0.92)
+    match_known_voices_for_media(config, media_file, channel=channel, logger=logger)
     rewrite_speaker_labels_for_media(config, media_file, channel=channel, logger=logger)
     outputs = existing_transcription_outputs(media_file)
     logger.info(
@@ -268,7 +272,8 @@ def rewrite_speaker_labels_for_media(
     if not segments or not any(segment.get("speaker") for segment in segments):
         return False
 
-    speaker_labels = speaker_labels_for_channel(config, channel)
+    speaker_labels = voice_attribution_labels_for_media(media_file)
+    speaker_labels.update(speaker_labels_for_channel(config, channel))
     srt_file = transcription_output_file(media_file, ".srt")
     vtt_file = transcription_output_file(media_file, ".vtt")
     try:
@@ -494,8 +499,12 @@ def cleanup_transcription_outputs(
     media_file: Path,
     logger: logging.Logger = LOGGER,
 ) -> None:
-    for suffix in TRANSCRIPTION_OUTPUT_SUFFIXES:
-        path = transcription_output_file(media_file, suffix)
+    paths = [
+        transcription_output_file(media_file, suffix)
+        for suffix in TRANSCRIPTION_OUTPUT_SUFFIXES
+    ]
+    paths.append(voice_attribution_file(media_file))
+    for path in paths:
         try:
             path.unlink(missing_ok=True)
         except OSError:

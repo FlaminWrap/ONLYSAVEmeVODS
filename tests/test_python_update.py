@@ -107,5 +107,22 @@ class PythonUpdateUnitTests(unittest.TestCase):
         self.assertIn("Unit=onlysavemevods-python-update.service", timer)
 
 
+class PythonUpdateScriptTests(unittest.TestCase):
+    def test_installer_can_install_voice_match_extra(self) -> None:
+        script = Path("scripts/install-almalinux.sh").read_text(encoding="utf-8")
+
+        self.assertIn("ONLYSAVEMEVODS_INSTALL_VOICE_MATCH", script)
+        self.assertIn("config.voice_match_enabled", script)
+        self.assertIn('"${APP_DIR}[voice-match]"', script)
+        self.assertIn("install_voice_match_if_needed", script)
+
+    def test_python_updater_refreshes_voice_match_extra(self) -> None:
+        script = Path("scripts/update-python-deps.sh").read_text(encoding="utf-8")
+
+        self.assertIn("config_enables_voice_match", script)
+        self.assertIn("voice_match_dependency_installed", script)
+        self.assertIn('"${APP_DIR}[voice-match]"', script)
+
+
 if __name__ == "__main__":
     unittest.main()

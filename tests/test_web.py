@@ -7,7 +7,7 @@ import subprocess
 import unittest
 
 from onlysavemevods import __version__
-from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, load_config
+from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, VoiceProfileConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
@@ -24,6 +24,9 @@ from onlysavemevods.web import (
     render_status_html,
     update_app_config_from_form,
     update_speaker_labels_from_form,
+    update_streamer_voice_from_form,
+    store_streamer_voice_sample_upload,
+    create_streamer_voice_sample_from_transcript_form,
     update_streamer_from_form,
     update_voice_detection_from_form,
     resolve_refresh_chat_files,
@@ -82,6 +85,11 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "whisperx_compute_type": "float16",
         "whisperx_batch_size": "16",
         "whisperx_language": "",
+        "voice_match_enabled": "true",
+        "voice_match_model": "pyannote/embedding",
+        "voice_match_threshold": "0.35",
+        "voice_match_min_margin": "0.05",
+        "voice_sample_max_bytes": "104857600",
         "web_enabled": "true",
         "web_host": "127.0.0.1",
         "web_port": "8080",
@@ -711,6 +719,85 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('renderStreamerGroupingAction', html)
         self.assertNotIn('streamer-create-panel', html)
         self.assertNotIn('renderStreamerCreatePanel', html)
+
+    def test_status_html_renders_streamer_voice_manager(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '[streamers."OUMB3rd".voices."Host"]\n'
+                'enabled = true\n'
+                'samples = ["host.wav"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            segment_dir = config.download_dir / "OUMB3rd" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.5,
+                                "speaker": "SPEAKER_00",
+                                "text": "hello",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".srt").write_text("1\n", encoding="utf-8")
+            media_file.with_suffix(".vtt").write_text("WEBVTT\n", encoding="utf-8")
+            media_file.with_suffix(".voice-attribution.json").write_text(
+                json.dumps(
+                    {
+                        "matches": {
+                            "SPEAKER_00": {
+                                "voice": "Host",
+                                "status": "suggested",
+                                "distance": 0.2,
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('data-open-voice-manager="voice-manager-OUMB3rd"', html)
+        self.assertIn('id="voice-manager-OUMB3rd"', html)
+        self.assertIn("Known Voices", html)
+        self.assertIn("Add Voice", html)
+        self.assertIn("Detected Speakers", html)
+        self.assertIn("Review Matches", html)
+        self.assertIn("Host", html)
+        self.assertIn("Known voices", html)
+        self.assertIn('action="/streamer-voices"', html)
+        self.assertIn('action="/streamer-voice-samples"', html)
+        self.assertIn('action="/streamer-voice-samples/from-transcript"', html)
+        self.assertIn('action="/streamer-voice-attributions"', html)
+        self.assertIn("SPEAKER_00", html)
+        self.assertIn("Approve", html)
+        self.assertIn("Reject", html)
+        self.assertIn("Match Voices", html)
 
     def test_dashboard_script_does_not_emit_literal_newlines_in_js_strings(self) -> None:
         script = dashboard_script()
@@ -1495,6 +1582,131 @@ class WebStatusTests(unittest.TestCase):
         assert updated.streamers["OUMB3rd"].voice_detection is not None
         self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.mode, "fixed")
         self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.min_speakers, 2)
+
+    def test_streamer_voice_form_updates_profile_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_streamer_voice_from_form(
+                config,
+                {
+                    "streamer_name": ["OUMB3rd"],
+                    "voice_name": ["Host"],
+                    "enabled": ["false"],
+                    "threshold": ["0.2"],
+                    "samples": ["host.wav\nsecond.wav"],
+                    "notes": ["main voice"],
+                    "action": ["save"],
+                },
+            )
+            updated = load_config(config_path)
+
+        profile = updated.streamers["OUMB3rd"].voices["Host"]
+        self.assertFalse(profile.enabled)
+        self.assertEqual(profile.threshold, 0.2)
+        self.assertEqual(profile.samples, ["host.wav", "second.wav"])
+        self.assertEqual(profile.notes, "main voice")
+        self.assertIn("Host", config.streamers["OUMB3rd"].voices)
+
+    def test_streamer_voice_upload_stores_sample_and_updates_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'state_dir = "{(root / "state").as_posix()}"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            store_streamer_voice_sample_upload(
+                config,
+                {"streamer_name": ["OUMB3rd"], "voice_name": ["Host"]},
+                {"media": ("../Host Voice!!.mp3", b"sample-data")},
+            )
+            updated = load_config(config_path)
+            sample_path = (
+                updated.state_dir
+                / "voice_samples"
+                / "OUMB3rd"
+                / "Host"
+                / "Host_Voice.mp3"
+            )
+            sample_exists = sample_path.is_file()
+            sample_bytes = sample_path.read_bytes()
+
+        self.assertTrue(sample_exists)
+        self.assertEqual(sample_bytes, b"sample-data")
+        self.assertEqual(updated.streamers["OUMB3rd"].voices["Host"].samples, ["Host_Voice.mp3"])
+        self.assertEqual(config.streamers["OUMB3rd"].voices["Host"].samples, ["Host_Voice.mp3"])
+
+    def test_streamer_voice_sample_can_be_created_from_transcript_speaker(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            segment_dir = config.download_dir / "OUMB3rd" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 1.0,
+                                "end": 3.0,
+                                "speaker": "SPEAKER_00",
+                                "text": "sample me",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            create_streamer_voice_sample_from_transcript_form(
+                config,
+                {
+                    "streamer_name": ["OUMB3rd"],
+                    "voice_name": ["Host"],
+                    "video_id": ["LIVEVIDEO01"],
+                    "media_name": ["Live Status [LIVEVIDEO01].mp4"],
+                    "speaker_label": ["SPEAKER_00"],
+                },
+            )
+            updated = load_config(config_path)
+            samples = updated.streamers["OUMB3rd"].voices["Host"].samples
+            sample_path = updated.state_dir / "voice_samples" / "OUMB3rd" / "Host" / samples[0]
+            payload = json.loads(sample_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(payload["kind"], "transcript-segments")
+        self.assertEqual(payload["speaker_label"], "SPEAKER_00")
+        self.assertEqual(payload["ranges"], [[1.0, 3.0]])
 
     def test_voice_detection_form_ignores_irrelevant_prefilled_values(self) -> None:
         with TemporaryDirectory() as tmp:

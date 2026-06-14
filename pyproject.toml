@@ -15,6 +15,11 @@ dependencies = [
   "opencv-python-headless>=4.9.0",
 ]
 
+[project.optional-dependencies]
+voice-match = [
+  "pyannote.audio>=3.1.0",
+]
+
 [project.scripts]
 onlysavemevods = "onlysavemevods.cli:main"
 

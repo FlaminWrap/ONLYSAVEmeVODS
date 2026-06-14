@@ -106,11 +106,38 @@ refresh_console_script_if_stale() {
 
 config_enables_transcription() {
   set +e
-  "${PYTHON_BIN}" -m onlysavemevods.python_update config-enables-transcription \
-    --config "${CONFIG_FILE}"
+  "${PYTHON_BIN}" -m onlysavemevods.python_update config-enables-transcription --config "${CONFIG_FILE}"
   local transcription_status=$?
   set -e
   return "${transcription_status}"
+}
+
+config_enables_voice_match() {
+  set +e
+  "${PYTHON_BIN}" -c '
+from onlysavemevods.config import ConfigError, load_config
+import sys
+try:
+    enabled = load_config(sys.argv[1]).voice_match_enabled
+except ConfigError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(0 if enabled else 1)
+' "${CONFIG_FILE}"
+  local voice_match_status=$?
+  set -e
+  return "${voice_match_status}"
+}
+
+voice_match_dependency_installed() {
+  set +e
+  "${PYTHON_BIN}" -c '
+from onlysavemevods.voice_match import voice_matcher_status
+raise SystemExit(0 if voice_matcher_status().get("available") else 1)
+'
+  local voice_match_installed_status=$?
+  set -e
+  return "${voice_match_installed_status}"
 }
 
 update_python_dependencies() {
@@ -140,6 +167,21 @@ update_python_dependencies() {
       echo "Could not read transcription setting from ${CONFIG_FILE}; skipping WhisperX."
     else
       echo "WhisperX is not installed and transcription is disabled; skipping WhisperX."
+    fi
+  fi
+
+  if voice_match_dependency_installed; then
+    echo "Voice-match dependencies are installed; upgrading them..."
+    "${PYTHON_BIN}" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+  elif config_enables_voice_match; then
+    echo "Voice matching is enabled; installing/upgrading voice-match dependencies..."
+    "${PYTHON_BIN}" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+  else
+    local voice_match_status=$?
+    if [[ "${voice_match_status}" == "2" ]]; then
+      echo "Could not read voice-match setting from ${CONFIG_FILE}; skipping voice-match dependencies."
+    else
+      echo "Voice-match dependencies are not installed and voice matching is disabled; skipping them."
     fi
   fi
 

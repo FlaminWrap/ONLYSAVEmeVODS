@@ -38,6 +38,8 @@ from .config import (
     BotConfig,
     ConfigError,
     VoiceDetectionConfig,
+    VoiceProfileConfig,
+    add_voice_sample_to_profile,
     load_config,
     monitored_sources,
     remove_streamer_config,
@@ -48,6 +50,10 @@ from .config import (
     update_streamer_config,
     update_streamer_speaker_labels_config,
     update_streamer_voice_detection_config,
+    update_streamer_voice_profile_config,
+    sanitize_voice_sample_filename,
+    validate_voice_name,
+    voice_sample_dir,
 )
 from .downloader import (
     command_for_log,
@@ -60,6 +66,16 @@ from .downloader import (
 )
 from .log_buffer import LogEntry, get_recent_log_entries
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
+from .voice_match import (
+    create_transcript_voice_sample,
+    load_transcript_segments,
+    match_known_voices_for_media,
+    speaker_labels_in_segments,
+    update_voice_attribution_decision,
+    voice_attribution_file,
+    voice_match_rows_for_media,
+    voice_matcher_status,
+)
 from .transcription import (
     load_whisperx_subtitle_segments,
     rewrite_speaker_labels_for_media,
@@ -305,12 +321,23 @@ class SpeakerLabelStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceProfileStatus:
+    name: str
+    enabled: bool
+    sample_count: int
+    threshold: float
+    notes: str
+    samples: list[str]
+
+
+@dataclass(frozen=True, slots=True)
 class StreamerStatus:
     name: str
     sources: list[str]
     download_dir_name: str
     voice_detection: str
     speaker_label_count: int
+    voices: list[VoiceProfileStatus]
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,6 +349,7 @@ class StreamerStatStatus:
     needs_grouping: bool
     voice_detection: str
     speaker_label_count: int
+    voices: list[VoiceProfileStatus]
     stream_count: int
     active_count: int
     checking_count: int
@@ -416,6 +444,11 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("whisperx_compute_type", "Transcription", "text"),
     ConfigFormField("whisperx_batch_size", "Transcription", "int", minimum=1),
     ConfigFormField("whisperx_language", "Transcription", "optional_text"),
+    ConfigFormField("voice_match_enabled", "Transcription", "bool"),
+    ConfigFormField("voice_match_model", "Transcription", "text"),
+    ConfigFormField("voice_match_threshold", "Transcription", "float", minimum=0),
+    ConfigFormField("voice_match_min_margin", "Transcription", "float", minimum=0),
+    ConfigFormField("voice_sample_max_bytes", "Transcription", "int", minimum=1),
     ConfigFormField("web_enabled", "Web", "bool"),
     ConfigFormField("web_host", "Web", "text"),
     ConfigFormField("web_port", "Web", "int", minimum=1),
@@ -544,6 +577,18 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
             if parts.path == "/speaker-labels":
                 self._update_speaker_labels()
+                return
+            if parts.path == "/streamer-voices":
+                self._update_streamer_voice()
+                return
+            if parts.path == "/streamer-voice-samples":
+                self._upload_streamer_voice_sample()
+                return
+            if parts.path == "/streamer-voice-samples/from-transcript":
+                self._create_streamer_voice_sample_from_transcript()
+                return
+            if parts.path == "/streamer-voice-attributions":
+                self._update_streamer_voice_attribution()
                 return
             if parts.path == "/streamers":
                 self._update_streamers()
@@ -717,6 +762,99 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
 
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/#config")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_streamer_voice(self) -> None:
+            body = self._read_request_body(128 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_streamer_voice_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _upload_streamer_voice_sample(self) -> None:
+            length_header = self.headers.get("Content-Length", "0")
+            try:
+                length = int(length_header)
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid content length")
+                return
+            if length <= 0:
+                self.send_error(HTTPStatus.BAD_REQUEST, "No upload supplied")
+                return
+            if length > config.voice_sample_max_bytes + 1024 * 1024:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Upload is too large")
+                self.rfile.read(min(length, 1024 * 1024))
+                return
+            content_type = self.headers.get("Content-Type", "")
+            if not content_type.startswith("multipart/form-data"):
+                self.send_error(HTTPStatus.BAD_REQUEST, "Expected multipart form upload")
+                self.rfile.read(length)
+                return
+            body = self.rfile.read(length)
+            try:
+                fields, files = parse_multipart_form(content_type, body)
+                store_streamer_voice_sample_upload(config, fields, files)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _create_streamer_voice_sample_from_transcript(self) -> None:
+            body = self._read_request_body(64 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                create_streamer_voice_sample_from_transcript_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_streamer_voice_attribution(self) -> None:
+            body = self._read_request_body(64 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_streamer_voice_attribution_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1116,6 +1254,12 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             ),
             "whisperx_min_speakers": config.whisperx_min_speakers or "-",
             "whisperx_max_speakers": config.whisperx_max_speakers or "-",
+            "voice_match_enabled": config.voice_match_enabled,
+            "voice_match_model": config.voice_match_model,
+            "voice_match_threshold": config.voice_match_threshold,
+            "voice_match_min_margin": config.voice_match_min_margin,
+            "voice_sample_max_bytes": config.voice_sample_max_bytes,
+            "voice_match_backend": voice_matcher_status(config),
         },
         "Watermark": {
             "watermark_enabled": config.watermark_enabled,
@@ -1137,6 +1281,20 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
     }
 
 
+def voice_profile_statuses(voices: dict[str, VoiceProfileConfig]) -> list[VoiceProfileStatus]:
+    return [
+        VoiceProfileStatus(
+            name=name,
+            enabled=profile.enabled,
+            sample_count=len(profile.samples),
+            threshold=profile.threshold,
+            notes=profile.notes,
+            samples=list(profile.samples),
+        )
+        for name, profile in sorted(voices.items())
+    ]
+
+
 def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
     return [
         StreamerStatus(
@@ -1149,6 +1307,7 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
                 else "default"
             ),
             speaker_label_count=len(streamer.speaker_labels),
+            voices=voice_profile_statuses(streamer.voices),
         )
         for name, streamer in sorted(config.streamers.items())
     ]
@@ -1189,6 +1348,7 @@ def build_streamer_stats(
                 download_dir_name=streamer.download_dir_name or name,
                 voice_detection=voice_detection,
                 speaker_label_count=len(streamer.speaker_labels),
+                voices=voice_profile_statuses(streamer.voices),
                 jobs=jobs_for_streams(jobs, streamer_streams),
                 streams=streamer_streams,
             )
@@ -1217,6 +1377,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 voice_detection=voice_detection_summary_for_source_group(config, name, sources),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
+                voices=[],
                 jobs=jobs_for_streams(jobs, group_streams),
                 streams=group_streams,
             )
@@ -1235,6 +1396,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 voice_detection=voice_detection_summary_for_source_group(config, name, []),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, []),
+                voices=[],
                 jobs=jobs_for_streams(jobs, group_streams),
                 streams=group_streams,
             )
@@ -1251,6 +1413,7 @@ def streamer_stat_from_channel_status(
     download_dir_name: str,
     voice_detection: str,
     speaker_label_count: int,
+    voices: list[VoiceProfileStatus],
     jobs: list[JobStatus],
     streams: list[StreamStatus],
 ) -> StreamerStatStatus:
@@ -1268,6 +1431,7 @@ def streamer_stat_from_channel_status(
         needs_grouping=needs_grouping,
         voice_detection=voice_detection,
         speaker_label_count=speaker_label_count,
+        voices=list(voices),
         stream_count=status.stream_count,
         active_count=status.active_count,
         checking_count=status.checking_count,
@@ -1577,6 +1741,7 @@ def transcript_json_files(directory: Path) -> list[Path]:
         path
         for path in directory.glob("*.json")
         if path.is_file()
+        and not path.name.endswith(".voice-attribution.json")
         and not is_live_chat_file(path.name)
         and not is_chat_timing_file(path.name)
     )
@@ -1813,6 +1978,36 @@ def parse_multipart_upload(
             return filename, None
         return filename, payload
     return "", None
+
+
+def parse_multipart_form(
+    content_type: str,
+    body: bytes,
+) -> tuple[dict[str, list[str]], dict[str, tuple[str, bytes]]]:
+    message = BytesParser(policy=email_policy).parsebytes(
+        (
+            f"Content-Type: {content_type}\r\n"
+            "MIME-Version: 1.0\r\n\r\n"
+        ).encode("utf-8")
+        + body
+    )
+    if not message.is_multipart():
+        raise ConfigError("Expected multipart form upload")
+    fields: dict[str, list[str]] = {}
+    files: dict[str, tuple[str, bytes]] = {}
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        name = part.get_param("name", header="content-disposition") or ""
+        if not name:
+            continue
+        payload = part.get_payload(decode=True) or b""
+        filename = part.get_filename()
+        if filename is not None:
+            files[name] = (filename, payload)
+        else:
+            fields.setdefault(name, []).append(payload.decode("utf-8", "replace"))
+    return fields, files
 
 
 def resolve_download_file(
@@ -2771,6 +2966,8 @@ def config_form_value_from_params(
         return value
     if field.kind == "int":
         return form_int(raw, field.key, minimum=field.minimum)
+    if field.kind == "float":
+        return form_float(raw, field.key, minimum=field.minimum)
     if field.kind == "int_list":
         return form_int_list(raw, field.key)
     if field.kind == "str_list":
@@ -2806,6 +3003,19 @@ def form_bool(value: str, name: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ConfigError(f"{name} must be true or false")
+
+
+def form_float(value: str, name: str, *, minimum: int | None = None) -> float:
+    raw = value.strip()
+    if not raw:
+        raise ConfigError(f"{name} must be a number")
+    try:
+        parsed = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    if minimum is not None and parsed < minimum:
+        raise ConfigError(f"{name} must be at least {minimum}")
+    return parsed
 
 
 def form_int(value: str, name: str, *, minimum: int | None = None) -> int:
@@ -3025,6 +3235,180 @@ def update_voice_detection_from_form(
         config.channel_voice_detection[channel] = override
         return
     raise ConfigError("Unknown voice detection scope")
+
+
+def update_streamer_voice_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    streamer_name = first_query_value(params, "streamer_name").strip()
+    voice_name = validate_voice_name(first_query_value(params, "voice_name"))
+    action = (first_query_value(params, "action") or "save").strip().lower()
+    if streamer_name not in config.streamers:
+        raise ConfigError(f"streamer is not configured: {streamer_name}")
+    if action == "delete":
+        update_streamer_voice_profile_config(config.config_path, streamer_name, voice_name, None)
+        reload_running_config(config)
+        return
+    if action != "save":
+        raise ConfigError("Unknown voice profile action")
+
+    existing = config.streamers[streamer_name].voices.get(voice_name)
+    samples_text = first_query_value(params, "samples")
+    samples = (
+        form_string_list(samples_text, "samples", split_commas=False)
+        if samples_text.strip()
+        else list(existing.samples if existing is not None else [])
+    )
+    threshold = optional_form_float(first_query_value(params, "threshold"), "threshold")
+    profile = VoiceProfileConfig(
+        enabled=form_bool(first_query_value(params, "enabled") or "true", "enabled"),
+        samples=samples,
+        threshold=threshold,
+        notes=first_query_value(params, "notes").strip(),
+    )
+    update_streamer_voice_profile_config(
+        config.config_path,
+        streamer_name,
+        voice_name,
+        profile,
+    )
+    reload_running_config(config)
+
+
+def optional_form_float(value: str, name: str) -> float:
+    raw = value.strip()
+    if not raw:
+        return 0.0
+    try:
+        parsed = float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    if parsed < 0:
+        raise ConfigError(f"{name} must not be negative")
+    return parsed
+
+
+def store_streamer_voice_sample_upload(
+    config: BotConfig,
+    fields: dict[str, list[str]],
+    files: dict[str, tuple[str, bytes]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    streamer_name = first_query_value(fields, "streamer_name").strip()
+    voice_name = validate_voice_name(first_query_value(fields, "voice_name"))
+    if streamer_name not in config.streamers:
+        raise ConfigError(f"streamer is not configured: {streamer_name}")
+    upload = files.get("media")
+    if upload is None:
+        raise ConfigError("Missing voice sample upload")
+    upload_filename, upload_bytes = upload
+    if not upload_bytes:
+        raise ConfigError("Voice sample upload is empty")
+    if len(upload_bytes) > config.voice_sample_max_bytes:
+        raise ConfigError("Voice sample upload is too large")
+
+    directory = voice_sample_dir(config, streamer_name, voice_name)
+    directory.mkdir(parents=True, exist_ok=True)
+    sample_name = unique_upload_sample_name(directory, sanitize_voice_sample_filename(upload_filename))
+    (directory / sample_name).write_bytes(upload_bytes)
+
+    streamer = config.streamers[streamer_name]
+    profile = add_voice_sample_to_profile(streamer.voices.get(voice_name), sample_name)
+    update_streamer_voice_profile_config(
+        config.config_path,
+        streamer_name,
+        voice_name,
+        profile,
+    )
+    reload_running_config(config)
+
+
+def unique_upload_sample_name(directory: Path, sample_name: str) -> str:
+    candidate = sample_name
+    if not (directory / candidate).exists():
+        return candidate
+    stem = Path(sample_name).stem
+    suffix = Path(sample_name).suffix
+    for index in range(2, 1000):
+        candidate = f"{stem}-{index}{suffix}"
+        if not (directory / candidate).exists():
+            return candidate
+    raise ConfigError("Unable to allocate a unique voice sample filename")
+
+
+def create_streamer_voice_sample_from_transcript_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    streamer_name = first_query_value(params, "streamer_name").strip()
+    voice_name = validate_voice_name(first_query_value(params, "voice_name"))
+    video_id = first_query_value(params, "video_id")
+    media_name = first_query_value(params, "media_name")
+    speaker_label = first_query_value(params, "speaker_label").strip()
+    if streamer_name not in config.streamers:
+        raise ConfigError(f"streamer is not configured: {streamer_name}")
+    resolved = resolve_transcription_source_file(config, video_id, media_name)
+    if resolved is None:
+        raise ConfigError("Transcript source media was not found")
+    record, media_file = resolved
+    if streamer_display_name_for_channel(config, record.channel) != streamer_name:
+        raise ConfigError("Transcript source does not belong to this streamer")
+    try:
+        sample_name = create_transcript_voice_sample(
+            config,
+            streamer_name,
+            voice_name,
+            media_file,
+            speaker_label,
+        )
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    streamer = config.streamers[streamer_name]
+    profile = add_voice_sample_to_profile(streamer.voices.get(voice_name), sample_name)
+    update_streamer_voice_profile_config(
+        config.config_path,
+        streamer_name,
+        voice_name,
+        profile,
+    )
+    reload_running_config(config)
+
+
+def update_streamer_voice_attribution_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    action = (first_query_value(params, "action") or "").strip().lower()
+    video_id = first_query_value(params, "video_id")
+    media_name = first_query_value(params, "media_name")
+    resolved = resolve_transcription_source_file(config, video_id, media_name)
+    if resolved is None:
+        raise ConfigError("Transcript source media was not found")
+    record, media_file = resolved
+    effective = transcription_config_for_channel(config, record.channel)
+    if action == "rematch":
+        match_known_voices_for_media(effective, media_file, channel=record.channel, logger=LOGGER)
+        rewrite_speaker_labels_for_media(effective, media_file, channel=record.channel, logger=LOGGER)
+        return
+    if action not in {"approve", "reject"}:
+        raise ConfigError("Unknown voice attribution action")
+    speaker_label = first_query_value(params, "speaker_label")
+    voice_name = first_query_value(params, "voice_name")
+    if not update_voice_attribution_decision(
+        media_file,
+        speaker_label,
+        action,
+        voice_name=voice_name,
+    ):
+        raise ConfigError("Unable to update voice attribution")
+    rewrite_speaker_labels_for_media(effective, media_file, channel=record.channel, logger=LOGGER)
 
 
 def update_speaker_labels_from_form(
@@ -3555,7 +3939,7 @@ def file_kind(name: str) -> str:
         return "part"
     if name.endswith(".ytdl"):
         return "state"
-    if is_chat_timing_file(name):
+    if is_chat_timing_file(name) or name.endswith(".voice-attribution.json"):
         return "state"
     if is_live_chat_file(name):
         return "chat"
@@ -4130,6 +4514,68 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .wizard-step {{ padding: 14px; }}
     .wizard-step[hidden] {{ display: none; }}
     .wizard-speaker-rows {{ display: grid; gap: 7px; margin-bottom: 8px; }}
+    .voice-manager {{
+      width: min(980px, calc(100vw - 28px));
+      max-height: min(860px, calc(100vh - 28px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0;
+      color: var(--text);
+      background: var(--panel);
+    }}
+    .voice-manager::backdrop {{ background: rgba(0, 0, 0, 0.42); }}
+    .voice-manager-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .voice-manager-head h2 {{ margin: 0; font-size: 1rem; }}
+    .voice-manager-note {{ padding: 10px 14px 0; }}
+    .voice-tabs {{
+      display: grid;
+      grid-template-columns: repeat(4, max-content) 1fr;
+      gap: 0 8px;
+      padding: 12px 14px 14px;
+    }}
+    .voice-tabs > input {{ position: absolute; opacity: 0; pointer-events: none; }}
+    .voice-tabs > label {{
+      grid-row: 1;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 7px 7px 0 0;
+      background: var(--panel-strong);
+      cursor: pointer;
+      font-size: 0.9rem;
+    }}
+    .voice-tabs > section {{
+      display: none;
+      grid-column: 1 / -1;
+      grid-row: 2;
+      border: 1px solid var(--line);
+      padding: 12px;
+      min-height: 160px;
+      overflow: auto;
+    }}
+    .voice-tabs > input:checked + label {{ background: var(--panel); font-weight: 650; }}
+    .voice-tabs > input:checked + label + section {{ display: grid; gap: 10px; }}
+    .voice-profile-form, .voice-sample-row, .voice-match-row {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(180px, 1fr));
+      gap: 9px;
+      align-items: end;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      margin: 0;
+    }}
+    .voice-profile-title, .voice-profile-form .wide, .voice-sample-row .file-name, .voice-match-row .file-name {{ grid-column: 1 / -1; }}
+    .voice-profile-form textarea {{ min-height: 54px; }}
+    .voice-add-grid {{ display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 12px; }}
+    .voice-match-row {{ grid-template-columns: max-content 1fr repeat(2, max-content); align-items: center; }}
     .upload-form {{
       display: grid;
       gap: 8px;
@@ -4498,6 +4944,26 @@ def dashboard_script() -> str:
   });
 
   document.addEventListener("click", (event) => {
+    const voiceButton = event.target.closest("[data-open-voice-manager]");
+    if (voiceButton) {
+      event.preventDefault();
+      const id = voiceButton.getAttribute("data-open-voice-manager") || "";
+      const dialog = id ? byId(id) : null;
+      if (dialog) {
+        if (typeof dialog.showModal === "function") dialog.showModal();
+        else dialog.setAttribute("open", "");
+      }
+      return;
+    }
+    const closeVoiceButton = event.target.closest("[data-close-voice-manager]");
+    if (closeVoiceButton) {
+      event.preventDefault();
+      const dialog = closeVoiceButton.closest("dialog");
+      if (dialog && typeof dialog.close === "function") dialog.close();
+      else if (dialog) dialog.removeAttribute("open");
+      return;
+    }
+
     const settingsButton = event.target.closest("[data-streamer-settings-toggle]");
     if (settingsButton) {
       const key = settingsButton.getAttribute("data-streamer-settings-toggle") || "";
@@ -4649,6 +5115,13 @@ def dashboard_script() -> str:
       if (event.target === wizard) wizard.close();
     });
   }
+
+  document.addEventListener("click", (event) => {
+    const dialog = event.target.closest ? event.target.closest("dialog.voice-manager") : null;
+    if (dialog && event.target === dialog && typeof dialog.close === "function") {
+      dialog.close();
+    }
+  });
 
   const renderStatusCounts = (counts) => {
     const entries = Object.entries(counts || {}).sort(([a], [b]) => a.localeCompare(b));
@@ -4938,6 +5411,58 @@ def dashboard_script() -> str:
     return `<button class="download action-button" type="button" data-open-streamer-wizard data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-sources="${escapeAttr(sources)}"${disabled}>Create Streamer</button>`;
   };
 
+  const streamerDomId = (value) => String(value || "streamer").trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "streamer";
+
+  const renderStreamerVoiceAction = (streamer, snapshot) => {
+    if (!streamer.configured) return "";
+    const disabled = snapshotConfigPath(snapshot) === "-" ? " disabled" : "";
+    const dialogId = `voice-manager-${streamerDomId(streamer.name)}`;
+    return `<button class="download action-button" type="button" data-open-voice-manager="${escapeAttr(dialogId)}"${disabled}>Voices</button>`;
+  };
+
+  const renderVoiceNameDatalist = (streamer) => {
+    const id = `voices-${streamerDomId(streamer.name)}`;
+    const options = (streamer.voices || []).map((voice) => `<option value="${escapeAttr(voice.name || "")}"></option>`).join("");
+    return `<datalist id="${escapeAttr(id)}">${options}</datalist>`;
+  };
+
+  const renderVoiceProfileForm = (streamer, voice) => {
+    const samples = Array.isArray(voice.samples) ? voice.samples.join(String.fromCharCode(10)) : "";
+    const enabled = voice.enabled ? "true" : "false";
+    return `<form class="voice-profile-form" method="post" action="/streamer-voices">
+  <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+  <input type="hidden" name="voice_name" value="${escapeAttr(voice.name || "")}">
+  <div class="voice-profile-title"><strong>${escapeHtml(voice.name || "Voice")}</strong><span class="file-meta">${escapeHtml(voice.sample_count || 0)} samples</span></div>
+  <label>Enabled <select name="enabled"><option value="true"${enabled === "true" ? " selected" : ""}>true</option><option value="false"${enabled === "false" ? " selected" : ""}>false</option></select></label>
+  <label>Threshold <input name="threshold" type="number" step="0.001" min="0" value="${escapeAttr(voice.threshold || "")}" placeholder="app default"></label>
+  <label class="wide">Samples <textarea name="samples" rows="3">${escapeHtml(samples)}</textarea></label>
+  <label class="wide">Notes <textarea name="notes" rows="2">${escapeHtml(voice.notes || "")}</textarea></label>
+  <div class="settings-actions"><button class="download action-button" name="action" value="save" type="submit">Save Voice</button><button class="download action-button" name="action" value="delete" type="submit">Delete</button></div>
+</form>`;
+  };
+
+  const renderVoiceManager = (streamer, snapshot) => {
+    if (!streamer.configured || snapshotConfigPath(snapshot) === "-") return "";
+    const dialogId = `voice-manager-${streamerDomId(streamer.name)}`;
+    const backend = (((snapshot || {}).configuration || {}).Transcription || {}).voice_match_backend || {};
+    const voices = streamer.voices || [];
+    const profiles = voices.length ? voices.map((voice) => renderVoiceProfileForm(streamer, voice)).join("") : '<div class="file-meta">No known voices yet.</div>';
+    const datalist = renderVoiceNameDatalist(streamer);
+    const voiceListId = `voices-${streamerDomId(streamer.name)}`;
+    return `<dialog class="voice-manager" id="${escapeAttr(dialogId)}">
+  <div class="voice-manager-head"><h2>${escapeHtml(streamer.name || "Streamer")} Voices</h2><button class="download action-button" type="button" data-close-voice-manager>Close</button></div>
+  <div class="voice-manager-note file-meta">${escapeHtml(backend.message || "")}</div>
+  <div class="voice-tabs">
+    <input id="${escapeAttr(dialogId)}-known" name="${escapeAttr(dialogId)}-tab" type="radio" checked><label for="${escapeAttr(dialogId)}-known">Known Voices</label><section>${profiles}</section>
+    <input id="${escapeAttr(dialogId)}-add" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-add">Add Voice</label><section><div class="voice-add-grid">
+      <form class="voice-profile-form" method="post" action="/streamer-voices"><input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}"><label>Name <input name="voice_name" required placeholder="Host"></label><label>Enabled <select name="enabled"><option value="true" selected>true</option><option value="false">false</option></select></label><label>Threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="app default"></label><label class="wide">Notes <textarea name="notes" rows="2"></textarea></label><button class="download action-button" name="action" value="save" type="submit">Add Voice</button></form>
+      <form class="voice-profile-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data"><input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}"><label>Voice <input name="voice_name" list="${escapeAttr(voiceListId)}" required placeholder="Host"></label>${datalist}<label class="wide">Upload sample <input name="media" type="file" accept="audio/*,video/*" required></label><button class="download action-button" type="submit">Upload Sample</button></form>
+    </div></section>
+    <input id="${escapeAttr(dialogId)}-review" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-review">Review Matches</label><section><div class="file-meta">Refresh the page for transcript sample and match review rows.</div></section>
+  </div>
+</dialog>`;
+  };
+
   const streamerActiveJobCount = (streamer) => (streamer && streamer.jobs || [])
     .filter((job) => ["queued", "running"].includes(job.status)).length;
 
@@ -4952,6 +5477,8 @@ def dashboard_script() -> str:
     const needsClass = streamer.needs_grouping ? " needs-grouping" : "";
     const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
     const groupAction = renderStreamerGroupingAction(streamer, snapshot);
+    const voiceAction = renderStreamerVoiceAction(streamer, snapshot);
+    const voiceManager = renderVoiceManager(streamer, snapshot);
     const latestAge = formatEpochAge(streamer.latest_activity_at);
     return `<section class="streamer-section${needsClass}${collapsedClass}" data-streamer-key="${escapeAttr(streamer.name || "")}" data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-active="${escapeAttr(streamer.active_count || 0)}" data-streamer-attention="${escapeAttr(streamer.attention_count || 0)}" data-streamer-active-jobs="${escapeAttr(activeJobs)}" data-streamer-needs-grouping="${streamer.needs_grouping ? "true" : "false"}">
   <div class="streamer-head">
@@ -4966,6 +5493,7 @@ def dashboard_script() -> str:
       <span class="badge">Storage ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
       <span class="badge">Latest ${escapeHtml(latestAge || "-")}</span>
       ${groupAction}
+      ${voiceAction}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="${toggleExpanded}">${toggleLabel}</button>
     </div>
@@ -4983,6 +5511,7 @@ def dashboard_script() -> str:
       <div><strong>${escapeHtml(streamer.download_dir_name || "-")}</strong><br><span class="muted">Download dir</span></div>
       <div><strong>${escapeHtml(streamer.voice_detection || "default")}</strong><br><span class="muted">Voice</span></div>
       <div><strong>${escapeHtml(streamer.speaker_label_count || 0)}</strong><br><span class="muted">Speaker labels</span></div>
+      <div><strong>${escapeHtml((streamer.voices || []).length)}</strong><br><span class="muted">Known voices</span></div>
     </div>
     <div class="streamer-settings-panel" data-streamer-settings-panel hidden>
       ${renderStreamerSettingsArea(streamer, snapshot)}
@@ -4995,6 +5524,7 @@ def dashboard_script() -> str:
       ${renderStreamerStreams(streamer.streams || [])}
     </div>
   </div>
+  ${voiceManager}
 </section>`;
   };
 
@@ -5314,6 +5844,8 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
         else ""
     )
     group_action = render_needs_grouping_action(streamer, snapshot)
+    voice_action = render_streamer_voice_action(streamer, snapshot)
+    voice_manager = render_streamer_voice_manager(streamer, snapshot)
     settings = render_streamer_settings_area(streamer, snapshot)
     jobs = render_streamer_jobs_summary(streamer.jobs)
     streams = render_streamer_streams(streamer.streams)
@@ -5333,6 +5865,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge">Storage {escape(format_bytes(streamer.total_bytes))}</span>
       <span class="badge">Latest {escape(latest_activity_age or '-')}</span>
       {group_action}
+      {voice_action}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="{streamer_key}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="{streamer_key}" aria-expanded="{toggle_expanded}">{toggle_label}</button>
     </div>
@@ -5350,6 +5883,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <div><strong>{escape(streamer.download_dir_name or '-')}</strong><br><span class="muted">Download dir</span></div>
       <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
       <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
+      <div><strong>{len(streamer.voices)}</strong><br><span class="muted">Known voices</span></div>
     </div>
     <div class="streamer-settings-panel" data-streamer-settings-panel hidden>
       {settings}
@@ -5362,7 +5896,213 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       {streams}
     </div>
   </div>
+  {voice_manager}
 </section>"""
+
+
+def streamer_dom_id(value: str) -> str:
+    key = re.sub(r"[^A-Za-z0-9_-]+", "-", value.strip()).strip("-")
+    return key or "streamer"
+
+
+def render_streamer_voice_action(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    if not streamer.configured:
+        return ""
+    disabled = ' disabled' if snapshot_config_path(snapshot) == "-" else ""
+    dialog_id = f"voice-manager-{streamer_dom_id(streamer.name)}"
+    return (
+        f'<button class="download action-button" type="button" '
+        f'data-open-voice-manager="{escape(dialog_id, quote=True)}"{disabled}>Voices</button>'
+    )
+
+
+def render_streamer_voice_manager(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    if not streamer.configured or snapshot_config_path(snapshot) == "-":
+        return ""
+    dialog_id = f"voice-manager-{streamer_dom_id(streamer.name)}"
+    backend = snapshot.configuration.get("Transcription", {}).get("voice_match_backend", {})
+    backend_message = ""
+    if isinstance(backend, dict):
+        backend_message = str(backend.get("message") or "")
+    profiles = render_voice_profile_forms(streamer)
+    transcript_samples = render_voice_transcript_sample_forms(streamer)
+    review_rows = render_voice_review_rows(streamer)
+    return f"""<dialog class="voice-manager" id="{escape(dialog_id, quote=True)}">
+  <div class="voice-manager-head">
+    <h2>{escape(streamer.name)} Voices</h2>
+    <button class="download action-button" type="button" data-close-voice-manager>Close</button>
+  </div>
+  <div class="voice-manager-note file-meta">{escape(backend_message)}</div>
+  <div class="voice-tabs">
+    <input id="{escape(dialog_id, quote=True)}-known" name="{escape(dialog_id, quote=True)}-tab" type="radio" checked>
+    <label for="{escape(dialog_id, quote=True)}-known">Known Voices</label>
+    <section>{profiles}</section>
+    <input id="{escape(dialog_id, quote=True)}-add" name="{escape(dialog_id, quote=True)}-tab" type="radio">
+    <label for="{escape(dialog_id, quote=True)}-add">Add Voice</label>
+    <section>{render_voice_add_forms(streamer)}</section>
+    <input id="{escape(dialog_id, quote=True)}-detected" name="{escape(dialog_id, quote=True)}-tab" type="radio">
+    <label for="{escape(dialog_id, quote=True)}-detected">Detected Speakers</label>
+    <section>{transcript_samples}</section>
+    <input id="{escape(dialog_id, quote=True)}-review" name="{escape(dialog_id, quote=True)}-tab" type="radio">
+    <label for="{escape(dialog_id, quote=True)}-review">Review Matches</label>
+    <section>{review_rows}</section>
+  </div>
+</dialog>"""
+
+
+def render_voice_profile_forms(streamer: StreamerStatStatus) -> str:
+    if not streamer.voices:
+        return '<div class="file-meta">No known voices yet.</div>'
+    return "".join(render_voice_profile_form(streamer.name, profile) for profile in streamer.voices)
+
+
+def render_voice_profile_form(streamer_name: str, profile: VoiceProfileStatus) -> str:
+    samples = "\n".join(profile.samples)
+    enabled = "true" if profile.enabled else "false"
+    return f"""<form class="voice-profile-form" method="post" action="/streamer-voices">
+  <input type="hidden" name="streamer_name" value="{escape(streamer_name, quote=True)}">
+  <input type="hidden" name="voice_name" value="{escape(profile.name, quote=True)}">
+  <div class="voice-profile-title"><strong>{escape(profile.name)}</strong><span class="file-meta">{profile.sample_count} samples</span></div>
+  <label>Enabled {render_form_select("enabled", enabled, ("true", "false"))}</label>
+  <label>Threshold <input name="threshold" type="number" step="0.001" min="0" value="{escape(str(profile.threshold or ''), quote=True)}" placeholder="app default"></label>
+  <label class="wide">Samples <textarea name="samples" rows="3">{escape(samples)}</textarea></label>
+  <label class="wide">Notes <textarea name="notes" rows="2">{escape(profile.notes)}</textarea></label>
+  <div class="settings-actions">
+    <button class="download action-button" name="action" value="save" type="submit">Save Voice</button>
+    <button class="download action-button" name="action" value="delete" type="submit">Delete</button>
+  </div>
+</form>"""
+
+
+def render_voice_add_forms(streamer: StreamerStatStatus) -> str:
+    streamer_name = escape(streamer.name, quote=True)
+    options = render_voice_name_options(streamer)
+    return f"""<div class="voice-add-grid">
+  <form class="voice-profile-form" method="post" action="/streamer-voices">
+    <input type="hidden" name="streamer_name" value="{streamer_name}">
+    <label>Name <input name="voice_name" required placeholder="Host"></label>
+    <label>Enabled {render_form_select("enabled", "true", ("true", "false"))}</label>
+    <label>Threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="app default"></label>
+    <label class="wide">Notes <textarea name="notes" rows="2"></textarea></label>
+    <button class="download action-button" name="action" value="save" type="submit">Add Voice</button>
+  </form>
+  <form class="voice-profile-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
+    <input type="hidden" name="streamer_name" value="{streamer_name}">
+    <label>Voice <input name="voice_name" list="voices-{escape(streamer_dom_id(streamer.name), quote=True)}" required placeholder="Host"></label>
+    {options}
+    <label class="wide">Upload sample <input name="media" type="file" accept="audio/*,video/*" required></label>
+    <button class="download action-button" type="submit">Upload Sample</button>
+  </form>
+</div>"""
+
+
+def render_voice_name_options(streamer: StreamerStatStatus) -> str:
+    options = "".join(
+        f'<option value="{escape(profile.name, quote=True)}"></option>'
+        for profile in streamer.voices
+    )
+    return f'<datalist id="voices-{escape(streamer_dom_id(streamer.name), quote=True)}">{options}</datalist>'
+
+
+def render_voice_transcript_sample_forms(streamer: StreamerStatStatus) -> str:
+    options = streamer_transcript_voice_options(streamer)
+    if not options:
+        return '<div class="file-meta">No diarized transcript speakers found yet. Transcribe a stream with voice detection first.</div>'
+    return "".join(render_voice_transcript_sample_form(streamer, option) for option in options[:25])
+
+
+def streamer_transcript_voice_options(streamer: StreamerStatStatus) -> list[dict[str, str]]:
+    options: list[dict[str, str]] = []
+    for stream in streamer.streams:
+        directory = Path(stream.directory)
+        for json_file in transcript_json_files(directory):
+            media_file = media_file_for_transcript_json(json_file)
+            if media_file is None:
+                continue
+            labels = speaker_labels_in_segments(load_transcript_segments(json_file, logger=LOGGER))
+            for label in labels:
+                options.append({
+                    "video_id": stream.video_id,
+                    "media_name": media_file.name,
+                    "speaker_label": label,
+                    "title": stream.title,
+                })
+    return options
+
+
+def media_file_for_transcript_json(json_file: Path) -> Path | None:
+    for suffix in (".mp4", ".mkv", ".webm", ".m4a", ".mp3", ".wav", ".flac", ".ogg"):
+        candidate = json_file.with_suffix(suffix)
+        if candidate.is_file() and is_transcribable_media_file(candidate.name):
+            return candidate
+    return None
+
+
+def render_voice_transcript_sample_form(streamer: StreamerStatStatus, option: dict[str, str]) -> str:
+    voice_options = render_voice_name_options(streamer)
+    label = option["speaker_label"]
+    return f"""<form class="voice-sample-row" method="post" action="/streamer-voice-samples/from-transcript">
+  <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+  <input type="hidden" name="video_id" value="{escape(option['video_id'], quote=True)}">
+  <input type="hidden" name="media_name" value="{escape(option['media_name'], quote=True)}">
+  <input type="hidden" name="speaker_label" value="{escape(label, quote=True)}">
+  <div class="file-name"><strong>{escape(label)}</strong><br><span class="muted">{escape(option['title'])}</span></div>
+  <label>Voice <input name="voice_name" list="voices-{escape(streamer_dom_id(streamer.name), quote=True)}" required placeholder="Name"></label>
+  {voice_options}
+  <button class="download action-button" type="submit">Add Sample</button>
+</form>"""
+
+
+def render_voice_review_rows(streamer: StreamerStatStatus) -> str:
+    rows: list[str] = []
+    for stream in streamer.streams:
+        directory = Path(stream.directory)
+        for file in stream.files:
+            if not is_transcribable_media_file(file.name):
+                continue
+            media_file = directory / file.name
+            if voice_attribution_file(media_file).is_file():
+                rows.extend(render_voice_review_row(stream, media_file, row) for row in voice_match_rows_for_media(media_file))
+            if transcription_outputs_exist(media_file):
+                rows.append(render_voice_rematch_row(streamer, stream, media_file))
+    if not rows:
+        return '<div class="file-meta">No voice matches have been generated yet.</div>'
+    return "".join(rows[:40])
+
+
+def render_voice_review_row(stream: StreamStatus, media_file: Path, row: dict[str, Any]) -> str:
+    distance = row.get("distance")
+    distance_text = "-" if distance is None else f"{float(distance):.3f}"
+    speaker = str(row.get("speaker") or "")
+    voice = str(row.get("voice") or "")
+    status = str(row.get("status") or "")
+    return f"""<form class="voice-match-row" method="post" action="/streamer-voice-attributions">
+  <input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">
+  <input type="hidden" name="media_name" value="{escape(media_file.name, quote=True)}">
+  <input type="hidden" name="speaker_label" value="{escape(speaker, quote=True)}">
+  <input type="hidden" name="voice_name" value="{escape(voice, quote=True)}">
+  <span class="badge {escape(status, quote=True)}">{escape(status or '-')}</span>
+  <div class="file-name"><strong>{escape(speaker)}</strong> -> {escape(voice or '-')}<br><span class="muted">{escape(media_file.name)} distance {escape(distance_text)}</span></div>
+  <button class="download action-button" name="action" value="approve" type="submit">Approve</button>
+  <button class="download action-button" name="action" value="reject" type="submit">Reject</button>
+</form>"""
+
+
+def render_voice_rematch_row(streamer: StreamerStatStatus, stream: StreamStatus, media_file: Path) -> str:
+    disabled = "" if streamer.voices else " disabled"
+    return f"""<form class="voice-match-row" method="post" action="/streamer-voice-attributions">
+  <input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">
+  <input type="hidden" name="media_name" value="{escape(media_file.name, quote=True)}">
+  <span class="badge">Rematch</span>
+  <div class="file-name">{escape(media_file.name)}<br><span class="muted">Run known-voice matching for this transcript</span></div>
+  <button class="download action-button" name="action" value="rematch" type="submit"{disabled}>Match Voices</button>
+</form>"""
 
 
 def render_needs_grouping_action(
@@ -5542,6 +6282,12 @@ def render_app_config_control(field: ConfigFormField, value: Any) -> str:
         min_attr = f' min="{field.minimum}"' if field.minimum is not None else ""
         return (
             f'<input name="{name}" type="number"{min_attr} '
+            f'value="{escape(str(value), quote=True)}">'
+        )
+    if field.kind == "float":
+        min_attr = f' min="{field.minimum}"' if field.minimum is not None else ""
+        return (
+            f'<input name="{name}" type="number" step="0.001"{min_attr} '
             f'value="{escape(str(value), quote=True)}">'
         )
     if field.kind == "int_list":

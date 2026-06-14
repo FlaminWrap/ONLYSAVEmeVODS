@@ -18,6 +18,15 @@ channels = []
 # [streamers."Some Streamer".speaker_labels]
 # SPEAKER_00 = "Host"
 # SPEAKER_01 = "Guest"
+#
+# Known voices can be shared across every source in the streamer group. Use the
+# dashboard Voices button to upload samples or make samples from diarized
+# transcript segments; managed files live under state/voice_samples/.
+# [streamers."Some Streamer".voices."Host"]
+# enabled = true
+# samples = ["intro-clip.wav", "host-from-transcript.voice-sample.json"]
+# threshold = 0.35
+# notes = "Main streamer voice"
 
 download_dir = "downloads"
 state_dir = "state"
@@ -80,6 +89,17 @@ whisperx_diarize = true
 whisperx_hf_token_env = "HF_TOKEN"
 whisperx_min_speakers = 0
 whisperx_max_speakers = 0
+
+# Optional sample-backed voice matching after WhisperX diarization. This needs
+# the optional pyannote.audio dependency and the Hugging Face token/model access
+# required by voice_match_model. Strong matches are written to
+# <media>.voice-attribution.json and applied to subtitles unless a manual
+# speaker label already exists.
+voice_match_enabled = true
+voice_match_model = "pyannote/embedding"
+voice_match_threshold = 0.35
+voice_match_min_margin = 0.05
+voice_sample_max_bytes = 104857600
 
 # Optional source-specific override. Use the channel name shown in the dashboard.
 # If a streamer also has voice_detection settings, this source-specific table wins.

@@ -240,6 +240,53 @@ class TranscriptionTests(unittest.TestCase):
         self.assertIn("00:00:01.200 --> 00:00:02.400", vtt_text)
         self.assertIn("OUMB3rd: hello there", vtt_text)
 
+    def test_manual_speaker_labels_override_voice_attribution_sidecar(self) -> None:
+        with TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "speaker": "SPEAKER_00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".voice-attribution.json").write_text(
+                json.dumps(
+                    {
+                        "matches": {
+                            "SPEAKER_00": {
+                                "voice": "Auto Host",
+                                "status": "auto",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = BotConfig(
+                channel_speaker_labels={"Example Channel": {"SPEAKER_00": "Manual Host"}}
+            )
+
+            rewritten = rewrite_speaker_labels_for_media(
+                config,
+                media_file,
+                channel="Example Channel",
+            )
+            srt_text = media_file.with_suffix(".srt").read_text(encoding="utf-8")
+
+        self.assertTrue(rewritten)
+        self.assertIn("Manual Host: hello", srt_text)
+        self.assertNotIn("Auto Host: hello", srt_text)
+
     def test_whisperx_process_env_passes_tokens_without_command_line(self) -> None:
         with patch.dict(
             "os.environ",

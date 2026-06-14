@@ -46,6 +46,10 @@ DISALLOWED_EXTRA_YT_DLP_ARGS = {
 }
 DEFAULT_DB_FILENAME = "onlysavemevods.sqlite3"
 DEFAULT_WATERMARK_SECRET_ENV = "ONLYSAVEMEVODS_WATERMARK_SECRET"
+DEFAULT_VOICE_MATCH_MODEL = "pyannote/embedding"
+DEFAULT_VOICE_MATCH_THRESHOLD = 0.35
+DEFAULT_VOICE_MATCH_MIN_MARGIN = 0.05
+DEFAULT_VOICE_SAMPLE_MAX_BYTES = 104_857_600
 
 
 class ConfigError(ValueError):
@@ -64,11 +68,20 @@ class VoiceDetectionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceProfileConfig:
+    enabled: bool = True
+    samples: list[str] = field(default_factory=list)
+    threshold: float = 0.0
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class StreamerConfig:
     sources: list[str] = field(default_factory=list)
     download_dir_name: str = ""
     voice_detection: VoiceDetectionConfig | None = None
     speaker_labels: dict[str, str] = field(default_factory=dict)
+    voices: dict[str, VoiceProfileConfig] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -100,6 +113,11 @@ class BotConfig:
     whisperx_max_speakers: int = 0
     channel_voice_detection: dict[str, VoiceDetectionConfig] = field(default_factory=dict)
     channel_speaker_labels: dict[str, dict[str, str]] = field(default_factory=dict)
+    voice_match_enabled: bool = True
+    voice_match_model: str = DEFAULT_VOICE_MATCH_MODEL
+    voice_match_threshold: float = DEFAULT_VOICE_MATCH_THRESHOLD
+    voice_match_min_margin: float = DEFAULT_VOICE_MATCH_MIN_MARGIN
+    voice_sample_max_bytes: int = DEFAULT_VOICE_SAMPLE_MAX_BYTES
     keep_fragments_for_resume: bool = True
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
@@ -244,6 +262,26 @@ def load_config(path: str | Path) -> BotConfig:
         whisperx_max_speakers=whisperx_max_speakers,
         channel_voice_detection=channel_voice_detection,
         channel_speaker_labels=channel_speaker_labels,
+        voice_match_enabled=_as_bool(
+            raw.get("voice_match_enabled", True),
+            "voice_match_enabled",
+        ),
+        voice_match_model=_as_str(
+            raw.get("voice_match_model", DEFAULT_VOICE_MATCH_MODEL),
+            "voice_match_model",
+        ),
+        voice_match_threshold=_as_non_negative_float(
+            raw.get("voice_match_threshold", DEFAULT_VOICE_MATCH_THRESHOLD),
+            "voice_match_threshold",
+        ),
+        voice_match_min_margin=_as_non_negative_float(
+            raw.get("voice_match_min_margin", DEFAULT_VOICE_MATCH_MIN_MARGIN),
+            "voice_match_min_margin",
+        ),
+        voice_sample_max_bytes=_as_positive_int(
+            raw.get("voice_sample_max_bytes", DEFAULT_VOICE_SAMPLE_MAX_BYTES),
+            "voice_sample_max_bytes",
+        ),
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),
             "keep_fragments_for_resume",
@@ -651,6 +689,102 @@ def update_streamer_speaker_labels_config(
     return updated_text != current_text
 
 
+def update_streamer_voice_profile_config(
+    config_path: str | Path,
+    streamer_name: str,
+    voice_name: str,
+    voice_profile: VoiceProfileConfig | None,
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    voice_name = validate_voice_name(voice_name)
+    if not streamer_name:
+        raise ConfigError("voice profile requires a streamer")
+    _require_configured_streamer(current_text, streamer_name, target)
+
+    table_name = f"streamers.{_toml_key(streamer_name)}.voices.{_toml_key(voice_name)}"
+    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
+    if voice_profile is None:
+        updated_text, count = pattern.subn("", current_text, count=1)
+        updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+        if count == 0:
+            return False
+    else:
+        normalized = _normalize_voice_profile(
+            voice_profile,
+            f"streamers.{streamer_name}.voices.{voice_name}",
+        )
+        block = _streamer_voice_profile_block(streamer_name, voice_name, normalized)
+        if pattern.search(current_text):
+            updated_text = pattern.sub(block + "\n", current_text, count=1)
+        else:
+            prefix = current_text.rstrip()
+            updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def validate_voice_name(value: str) -> str:
+    name = _as_optional_str(value, "voice name")
+    if not name:
+        raise ConfigError("voice name is required")
+    if any(char in name for char in "\r\n"):
+        raise ConfigError("voice name must be a single line")
+    return name
+
+
+def sanitize_voice_component(value: str, *, fallback: str = "voice") -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._-")
+    return cleaned[:80] or fallback
+
+
+def sanitize_voice_sample_filename(filename: str) -> str:
+    name = Path(filename or "sample").name
+    if name in {"", ".", ".."}:
+        name = "sample"
+    stem = sanitize_voice_component(Path(name).stem, fallback="sample")
+    suffix = re.sub(r"[^A-Za-z0-9.]", "", Path(name).suffix.lower())[:16]
+    return f"{stem}{suffix or '.wav'}"
+
+
+def voice_sample_dir(config: BotConfig, streamer_name: str, voice_name: str) -> Path:
+    streamer_part = sanitize_voice_component(streamer_name, fallback="streamer")
+    voice_part = sanitize_voice_component(voice_name, fallback="voice")
+    return config.state_dir / "voice_samples" / streamer_part / voice_part
+
+
+def voice_sample_path(config: BotConfig, streamer_name: str, voice_name: str, sample: str) -> Path:
+    sample_name = _as_voice_sample_name(sample, "sample")
+    return voice_sample_dir(config, streamer_name, voice_name) / sample_name
+
+
+def add_voice_sample_to_profile(profile: VoiceProfileConfig | None, sample_name: str) -> VoiceProfileConfig:
+    sample_name = _as_voice_sample_name(sample_name, "sample")
+    existing = profile or VoiceProfileConfig()
+    samples = list(existing.samples)
+    if sample_name not in samples:
+        samples.append(sample_name)
+    return VoiceProfileConfig(
+        enabled=existing.enabled,
+        samples=samples,
+        threshold=existing.threshold,
+        notes=existing.notes,
+    )
+
+
 def update_channel_voice_detection_config(
     config_path: str | Path,
     channel: str,
@@ -811,6 +945,21 @@ def _streamer_speaker_labels_block(streamer_name: str, labels: dict[str, str]) -
     return "\n".join(lines)
 
 
+def _streamer_voice_profile_block(
+    streamer_name: str,
+    voice_name: str,
+    profile: VoiceProfileConfig,
+) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}.voices.{_toml_key(voice_name)}]"]
+    lines.append(f"enabled = {_toml_value(profile.enabled, 'enabled')}")
+    lines.append(f"samples = {_toml_value(profile.samples, 'samples')}")
+    if profile.threshold:
+        lines.append(f"threshold = {_toml_value(profile.threshold, 'threshold')}")
+    if profile.notes:
+        lines.append(f"notes = {_toml_value(profile.notes, 'notes')}")
+    return "\n".join(lines)
+
+
 def _channel_voice_detection_block(
     channel: str,
     voice_config: VoiceDetectionConfig,
@@ -924,6 +1073,11 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             f"{name}.{streamer_name}.speaker_labels",
         )
 
+        voices = _as_voice_profiles(
+            raw_config.get("voices", {}),
+            f"{name}.{streamer_name}.voices",
+        )
+
         streamers[streamer_name] = StreamerConfig(
             sources=sources,
             download_dir_name=_as_optional_str(
@@ -932,8 +1086,63 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             ),
             voice_detection=voice_detection,
             speaker_labels=speaker_labels,
+            voices=voices,
         )
     return streamers
+
+
+def _as_voice_profiles(value: Any, name: str) -> dict[str, VoiceProfileConfig]:
+    if not isinstance(value, dict):
+        raise ConfigError(f"{name} must be a TOML table")
+    profiles: dict[str, VoiceProfileConfig] = {}
+    for raw_voice_name, raw_profile in value.items():
+        if not isinstance(raw_voice_name, str) or not raw_voice_name.strip():
+            raise ConfigError(f"{name} keys must be non-empty voice names")
+        if not isinstance(raw_profile, dict):
+            raise ConfigError(f"{name}.{raw_voice_name} must be a TOML table")
+        voice_name = validate_voice_name(raw_voice_name)
+        profiles[voice_name] = _as_voice_profile_config(
+            raw_profile,
+            f"{name}.{voice_name}",
+        )
+    return profiles
+
+
+def _as_voice_profile_config(raw: dict[str, Any], name: str) -> VoiceProfileConfig:
+    return _normalize_voice_profile(
+        VoiceProfileConfig(
+            enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
+            samples=_as_voice_sample_list(raw.get("samples", []), f"{name}.samples"),
+            threshold=_as_non_negative_float(raw.get("threshold", 0.0), f"{name}.threshold"),
+            notes=_as_optional_str(raw.get("notes", ""), f"{name}.notes"),
+        ),
+        name,
+    )
+
+
+def _normalize_voice_profile(profile: VoiceProfileConfig, name: str) -> VoiceProfileConfig:
+    return VoiceProfileConfig(
+        enabled=bool(profile.enabled),
+        samples=_as_voice_sample_list(profile.samples, f"{name}.samples"),
+        threshold=_as_non_negative_float(profile.threshold, f"{name}.threshold"),
+        notes=_as_optional_str(profile.notes, f"{name}.notes"),
+    )
+
+
+def _as_voice_sample_list(value: Any, name: str) -> list[str]:
+    return [
+        _as_voice_sample_name(item, f"{name} item")
+        for item in _as_str_list(value, name)
+    ]
+
+
+def _as_voice_sample_name(value: Any, name: str) -> str:
+    sample = _as_str(value, name).strip()
+    if not sample:
+        raise ConfigError(f"{name} must be a non-empty sample filename")
+    if sample in {".", ".."} or "/" in sample or "\\" in sample or Path(sample).is_absolute():
+        raise ConfigError(f"{name} must be a managed sample filename")
+    return sample
 
 
 def _as_channel_voice_detection(
@@ -990,6 +1199,18 @@ def _as_speaker_label(value: Any, name: str) -> str:
     if any(char.isspace() for char in label):
         raise ConfigError(f"{name} must not contain whitespace")
     return label
+
+
+def _as_non_negative_float(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{name} must be a number")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+    if parsed < 0:
+        raise ConfigError(f"{name} must not be negative")
+    return parsed
 
 
 def _as_voice_detection_config(raw: dict[str, Any], name: str) -> VoiceDetectionConfig:

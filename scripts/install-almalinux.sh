@@ -27,6 +27,7 @@ SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-0}"
 SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-0}"
 SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-0}"
 INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-auto}"
+INSTALL_VOICE_MATCH="${ONLYSAVEMEVODS_INSTALL_VOICE_MATCH:-auto}"
 ENABLE_PYTHON_UPDATER="${ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER:-1}"
 PYTHON_UPDATE_CALENDAR="${ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR:-*-*-* 04:15:00}"
 PYTHON_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY:-45m}"
@@ -614,6 +615,14 @@ print(load_config("'"${CONFIG_FILE}"'").whisperx_path)
 '
 }
 
+config_enables_voice_match() {
+  sudo "${VENV_DIR}/bin/python" -c '
+from onlysavemevods.config import load_config
+config = load_config("'"${CONFIG_FILE}"'")
+raise SystemExit(0 if config.voice_match_enabled else 1)
+'
+}
+
 should_install_whisperx() {
   case "${INSTALL_WHISPERX}" in
     1|true|yes|always)
@@ -656,6 +665,40 @@ install_whisperx_if_needed() {
   if [[ ! -x "${VENV_DIR}/bin/whisperx" ]]; then
     die "WhisperX install completed but ${VENV_DIR}/bin/whisperx was not found"
   fi
+}
+
+should_install_voice_match() {
+  case "${INSTALL_VOICE_MATCH}" in
+    1|true|yes|always)
+      return 0
+      ;;
+    0|false|no|never)
+      return 1
+      ;;
+    auto|"")
+      config_enables_voice_match
+      return $?
+      ;;
+    *)
+      die "ONLYSAVEMEVODS_INSTALL_VOICE_MATCH must be auto, 1, or 0"
+      ;;
+  esac
+}
+
+install_voice_match_if_needed() {
+  if ! should_install_voice_match; then
+    if [[ "${INSTALL_VOICE_MATCH}" == "auto" || -z "${INSTALL_VOICE_MATCH}" ]]; then
+      echo "Voice matching disabled; skipping pyannote voice-match dependencies"
+    else
+      echo "Skipping voice-match installation because ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=${INSTALL_VOICE_MATCH}"
+    fi
+    return 0
+  fi
+
+  echo "Installing voice-match dependencies into ${VENV_DIR}..."
+  sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+  sudo chown -R root:root "${VENV_DIR}"
+  sudo chmod -R a+rX "${VENV_DIR}"
 }
 
 python_updater_enabled() {
@@ -742,6 +785,7 @@ sudo "${VENV_DIR}/bin/python" -m onlysavemevods update-config \
   --defaults "${APP_DIR}/config.example.toml"
 ensure_config_file_service_writable
 install_whisperx_if_needed
+install_voice_match_if_needed
 
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
 [Unit]

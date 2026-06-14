@@ -6,6 +6,7 @@ from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     ConfigError,
     VoiceDetectionConfig,
+    VoiceProfileConfig,
     append_missing_config_values,
     download_group_name_for_channel,
     load_config,
@@ -18,6 +19,8 @@ from onlysavemevods.config import (
     update_streamer_config,
     update_streamer_speaker_labels_config,
     update_streamer_voice_detection_config,
+    update_streamer_voice_profile_config,
+    sanitize_voice_sample_filename,
 )
 
 
@@ -123,6 +126,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.watermark_secret_env, "ONLYSAVEMEVODS_WATERMARK_SECRET")
         self.assertEqual(config.watermark_strength, "invisible")
         self.assertEqual(config.watermark_detect_upload_max_bytes, 2_147_483_648)
+        self.assertTrue(config.voice_match_enabled)
+        self.assertEqual(config.voice_match_model, "pyannote/embedding")
+        self.assertEqual(config.voice_match_threshold, 0.35)
+        self.assertEqual(config.voice_match_min_margin, 0.05)
+        self.assertEqual(config.voice_sample_max_bytes, 104_857_600)
 
     def test_relative_paths_resolve_next_to_config(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -459,6 +467,79 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(labels_removed)
         self.assertIsNone(config_after_remove.streamers["OUMB3rd"].voice_detection)
         self.assertEqual(config_after_remove.streamers["OUMB3rd"].speaker_labels, {})
+
+
+    def test_streamer_voice_profiles_can_be_configured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '[streamers."OUMB3rd".voices."Host"]\n'
+                'enabled = true\n'
+                'samples = ["host.wav", "known.voice-sample.json"]\n'
+                'threshold = 0.22\n'
+                'notes = "main streamer"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+            profile = config.streamers["OUMB3rd"].voices["Host"]
+
+        self.assertTrue(profile.enabled)
+        self.assertEqual(profile.samples, ["host.wav", "known.voice-sample.json"])
+        self.assertEqual(profile.threshold, 0.22)
+        self.assertEqual(profile.notes, "main streamer")
+
+    def test_streamer_voice_profile_update_writes_and_removes_table(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+
+            changed = update_streamer_voice_profile_config(
+                config_path,
+                "OUMB3rd",
+                "Host",
+                VoiceProfileConfig(
+                    enabled=True,
+                    samples=["host.wav"],
+                    threshold=0.25,
+                    notes="main voice",
+                ),
+            )
+            config = load_config(config_path)
+            removed = update_streamer_voice_profile_config(config_path, "OUMB3rd", "Host", None)
+            config_after_remove = load_config(config_path)
+
+        self.assertTrue(changed)
+        self.assertEqual(config.streamers["OUMB3rd"].voices["Host"].samples, ["host.wav"])
+        self.assertEqual(config.streamers["OUMB3rd"].voices["Host"].threshold, 0.25)
+        self.assertTrue(removed)
+        self.assertEqual(config_after_remove.streamers["OUMB3rd"].voices, {})
+
+    def test_streamer_voice_profile_rejects_path_traversal_samples(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '[streamers."OUMB3rd".voices."Host"]\n'
+                'samples = ["../host.wav"]\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
+    def test_voice_sample_filename_is_sanitized(self) -> None:
+        self.assertEqual(
+            sanitize_voice_sample_filename("../Host Voice!!.mp3"),
+            "Host_Voice.mp3",
+        )
 
     def test_channel_voice_detection_overrides_can_be_configured(self) -> None:
         with TemporaryDirectory() as tmp:
