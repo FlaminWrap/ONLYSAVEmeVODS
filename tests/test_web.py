@@ -508,6 +508,41 @@ class WebStatusTests(unittest.TestCase):
         render.assert_called_once()
         self.assertEqual(render.call_args.kwargs["timeout_seconds"], 7200.0)
 
+    def test_status_html_renders_streamer_wizard_and_prefill_buttons(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'channels = ["@ExampleChannel"]\n'
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('data-open-streamer-wizard', html)
+        self.assertIn('id="streamer-wizard"', html)
+        self.assertIn('name="form_kind" value="streamer_wizard"', html)
+        self.assertIn('data-wizard-next', html)
+        self.assertIn('data-add-wizard-speaker', html)
+        self.assertIn('Create Streamer', html)
+        self.assertIn('data-streamer-name="Example Channel"', html)
+        self.assertIn('data-streamer-sources="@ExampleChannel"', html)
+        self.assertIn('renderStreamerGroupingAction', html)
+        self.assertNotIn('streamer-create-panel', html)
+        self.assertNotIn('renderStreamerCreatePanel', html)
+
     def test_jobs_tab_shows_dashboard_and_watermark_jobs(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -1024,6 +1059,76 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('action="/streamers"', html)
         self.assertIn("Streamers", html)
         self.assertIn("Save Streamer", html)
+
+    def test_streamer_wizard_form_creates_full_config_and_rewrites_subtitles(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.0,
+                                "end": 1.0,
+                                "text": "hello",
+                                "speaker": "SPEAKER_00",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".srt").write_text("old", encoding="utf-8")
+            media_file.with_suffix(".vtt").write_text("old", encoding="utf-8")
+
+            update_streamer_from_form(
+                config,
+                {
+                    "form_kind": ["streamer_wizard"],
+                    "action": ["save"],
+                    "streamer_name": ["Example Channel"],
+                    "sources": ["@ExampleChannel"],
+                    "download_dir_name": [""],
+                    "mode": ["fixed"],
+                    "speakers": ["2"],
+                    "speaker_label": ["SPEAKER_00", ""],
+                    "speaker_name": ["OUMB3rd", ""],
+                },
+            )
+            updated = load_config(config_path)
+            srt_text = media_file.with_suffix(".srt").read_text(encoding="utf-8")
+
+        streamer = updated.streamers["Example Channel"]
+        self.assertEqual(streamer.sources, ["@ExampleChannel"])
+        self.assertEqual(streamer.download_dir_name, "")
+        self.assertIsNotNone(streamer.voice_detection)
+        assert streamer.voice_detection is not None
+        self.assertEqual(streamer.voice_detection.mode, "fixed")
+        self.assertEqual(streamer.voice_detection.min_speakers, 2)
+        self.assertEqual(streamer.speaker_labels, {"SPEAKER_00": "OUMB3rd"})
+        self.assertEqual(config.streamers["Example Channel"].speaker_labels, {"SPEAKER_00": "OUMB3rd"})
+        self.assertIn("OUMB3rd: hello", srt_text)
 
     def test_app_config_form_updates_file_and_running_config(self) -> None:
         with TemporaryDirectory() as tmp:

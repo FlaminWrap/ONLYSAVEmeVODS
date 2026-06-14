@@ -2822,6 +2822,11 @@ def update_streamer_from_form(
 ) -> None:
     if config.config_path is None:
         raise ConfigError("Config path is not available")
+    form_kind = (first_query_value(params, "form_kind") or "streamer_form").strip()
+    if form_kind == "streamer_wizard":
+        update_streamer_from_wizard_form(config, params)
+        return
+
     action = (first_query_value(params, "action") or "save").strip().lower()
     streamer_name = first_query_value(params, "streamer_name").strip()
     if action == "delete":
@@ -2842,6 +2847,62 @@ def update_streamer_from_form(
         download_dir_name,
     )
     reload_running_config(config)
+
+
+def update_streamer_from_wizard_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    assert config.config_path is not None
+    action = (first_query_value(params, "action") or "save").strip().lower()
+    if action != "save":
+        raise ConfigError("Unknown streamer action")
+
+    streamer_name = first_query_value(params, "streamer_name").strip()
+    if not streamer_name:
+        raise ConfigError("streamer name is required")
+    sources = form_string_list(
+        first_query_value(params, "sources"),
+        "sources",
+    )
+    download_dir_name = first_query_value(params, "download_dir_name").strip()
+    mode = (first_query_value(params, "mode") or "inherit").strip().lower()
+    if mode not in {"inherit", "off", "auto", "fixed", "range"}:
+        raise ConfigError("Unknown voice detection mode")
+    voice_config = (
+        None
+        if mode == "inherit"
+        else voice_detection_override_from_form(params, mode)
+    )
+    labels = speaker_labels_from_form(params)
+
+    update_streamer_config(
+        config.config_path,
+        streamer_name,
+        sources,
+        download_dir_name,
+    )
+    if mode != "inherit":
+        update_streamer_voice_detection_config(
+            config.config_path,
+            streamer_name,
+            voice_config,
+        )
+    if labels:
+        update_streamer_speaker_labels_config(
+            config.config_path,
+            streamer_name,
+            labels,
+        )
+    reload_running_config(config)
+    if labels:
+        rewritten = rewrite_speaker_subtitles_for_channel(config, streamer_name)
+        LOGGER.info(
+            "Created streamer from wizard streamer=%s labels=%d subtitles_rewritten=%d",
+            streamer_name,
+            len(labels),
+            rewritten,
+        )
 
 
 def update_voice_detection_from_form(
@@ -3444,6 +3505,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         if stream_needs_attention(stream)
     ]
     status_counts = render_status_counts(snapshot.counts)
+    streamer_toolbar = render_streamer_toolbar(snapshot)
+    streamer_wizard = render_streamer_wizard(snapshot)
     streamer_cards = render_streamer_dashboard(snapshot)
     job_rows = render_job_rows(snapshot.jobs)
     config_sections = render_config_sections(snapshot.configuration)
@@ -3585,6 +3648,15 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       margin-top: 12px;
     }}
     .stream {{ padding: 14px; margin-top: 14px; }}
+    .streamer-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 14px;
+    }}
+    .primary-action {{ font-weight: 650; }}
     .streamer-list {{ display: grid; gap: 18px; }}
     .streamer-section {{
       border-top: 1px solid var(--line);
@@ -3908,6 +3980,44 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-form .wide, .streamer-form .settings-actions {{ grid-column: 1 / -1; }}
     .streamer-meta {{ color: var(--muted); align-self: end; }}
+    .streamer-wizard {{
+      width: min(760px, calc(100vw - 32px));
+      max-height: min(760px, calc(100vh - 32px));
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0;
+      color: var(--text);
+      background: var(--panel);
+    }}
+    .streamer-wizard::backdrop {{ background: rgba(0, 0, 0, 0.42); }}
+    .streamer-wizard-form {{ display: grid; gap: 0; }}
+    .wizard-head, .wizard-footer {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px;
+      border-bottom: 1px solid var(--line);
+    }}
+    .wizard-footer {{ border-top: 1px solid var(--line); border-bottom: 0; }}
+    .wizard-steps {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 12px 14px 0;
+    }}
+    .wizard-step-tab {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 9px;
+      color: var(--muted);
+      background: var(--panel-strong);
+    }}
+    .wizard-step-tab.active {{ color: var(--text); font-weight: 650; }}
+    .wizard-step {{ padding: 14px; }}
+    .wizard-step[hidden] {{ display: none; }}
+    .wizard-speaker-rows {{ display: grid; gap: 7px; margin-bottom: 8px; }}
     .upload-form {{
       display: grid;
       gap: 8px;
@@ -3980,6 +4090,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
         </section>
         {watermark_detection}
       </div>
+      {streamer_toolbar}
+      {streamer_wizard}
       <div class="streamer-list" id="streamer-list">{streamer_cards}</div>
     </section>
     <section class="tab-panel jobs-panel">
@@ -4210,6 +4322,93 @@ def dashboard_script() -> str:
 
   applyCollapsedState(document);
 
+  const wizard = byId("streamer-wizard");
+  const wizardForm = byId("streamer-wizard-form");
+  let wizardStepIndex = 0;
+  const wizardSteps = () => wizard ? Array.from(wizard.querySelectorAll("[data-wizard-step]")) : [];
+  const wizardStepTabs = () => wizard ? Array.from(wizard.querySelectorAll("[data-wizard-step-tab]")) : [];
+  const setWizardStep = (index) => {
+    const steps = wizardSteps();
+    if (!steps.length) return;
+    wizardStepIndex = Math.max(0, Math.min(index, steps.length - 1));
+    steps.forEach((step, stepIndex) => { step.hidden = stepIndex !== wizardStepIndex; });
+    wizardStepTabs().forEach((tab, stepIndex) => tab.classList.toggle("active", stepIndex === wizardStepIndex));
+    const back = wizard.querySelector("[data-wizard-back]");
+    const next = wizard.querySelector("[data-wizard-next]");
+    const submit = wizard.querySelector("[data-wizard-submit]");
+    const progress = wizard.querySelector("[data-wizard-progress]");
+    if (back) back.hidden = wizardStepIndex === 0;
+    if (next) next.hidden = wizardStepIndex === steps.length - 1;
+    if (submit) submit.hidden = wizardStepIndex !== steps.length - 1;
+    if (progress) progress.textContent = `Step ${wizardStepIndex + 1} of ${steps.length}`;
+  };
+  const addWizardSpeakerRow = (label = "", name = "") => {
+    const rows = byId("streamer-wizard-speaker-rows");
+    if (!rows) return;
+    rows.insertAdjacentHTML("beforeend", `<div class="speaker-label-pair">
+        <input name="speaker_label" value="${escapeAttr(label)}" placeholder="SPEAKER_00">
+        <input name="speaker_name" value="${escapeAttr(name)}" placeholder="Name">
+      </div>`);
+  };
+  const resetWizardSpeakerRows = () => {
+    const rows = byId("streamer-wizard-speaker-rows");
+    if (!rows) return;
+    rows.innerHTML = "";
+    addWizardSpeakerRow();
+  };
+  const openStreamerWizard = (button) => {
+    if (!wizard || !wizardForm) return;
+    wizardForm.reset();
+    resetWizardSpeakerRows();
+    setWizardStep(0);
+    const name = button ? (button.getAttribute("data-streamer-name") || "") : "";
+    const sources = button ? (button.getAttribute("data-streamer-sources") || "") : "";
+    const nameInput = byId("streamer-wizard-name");
+    const sourcesInput = byId("streamer-wizard-sources");
+    const downloadDirInput = byId("streamer-wizard-download-dir");
+    if (nameInput) nameInput.value = name;
+    if (sourcesInput) sourcesInput.value = sources;
+    if (downloadDirInput) downloadDirInput.value = "";
+    if (typeof wizard.showModal === "function") wizard.showModal();
+    else wizard.setAttribute("open", "");
+    if (nameInput) nameInput.focus();
+  };
+
+  document.addEventListener("click", (event) => {
+    const openButton = event.target.closest("[data-open-streamer-wizard]");
+    if (openButton) {
+      event.preventDefault();
+      if (!openButton.disabled) openStreamerWizard(openButton);
+      return;
+    }
+    if (event.target.closest("[data-close-streamer-wizard]")) {
+      event.preventDefault();
+      if (wizard) wizard.close();
+      return;
+    }
+    if (event.target.closest("[data-wizard-next]")) {
+      event.preventDefault();
+      if (wizardStepIndex === 0 && wizardForm && !wizardForm.reportValidity()) return;
+      setWizardStep(wizardStepIndex + 1);
+      return;
+    }
+    if (event.target.closest("[data-wizard-back]")) {
+      event.preventDefault();
+      setWizardStep(wizardStepIndex - 1);
+      return;
+    }
+    if (event.target.closest("[data-add-wizard-speaker]")) {
+      event.preventDefault();
+      addWizardSpeakerRow();
+    }
+  });
+
+  if (wizard) {
+    wizard.addEventListener("click", (event) => {
+      if (event.target === wizard) wizard.close();
+    });
+  }
+
   const renderStatusCounts = (counts) => {
     const entries = Object.entries(counts || {}).sort(([a], [b]) => a.localeCompare(b));
     if (!entries.length) return "";
@@ -4412,14 +4611,6 @@ def dashboard_script() -> str:
 </form>`;
   };
 
-  const renderStreamerCreatePanel = (snapshot) => {
-    if (snapshotConfigPath(snapshot) === "-") return "";
-    return `<section class="panel streamer-create-panel">
-  <h2>Add Streamer</h2>
-  <div class="streamer-groups">${renderStreamerForm(null)}</div>
-</section>`;
-  };
-
   const renderStreamerSettingsArea = (streamer, snapshot) => {
     if (snapshotConfigPath(snapshot) === "-") {
       return `<div class="streamer-jobs">
@@ -4465,11 +4656,19 @@ def dashboard_script() -> str:
     return streams.map(renderStreamCard).join("");
   };
 
+  const renderStreamerGroupingAction = (streamer, snapshot) => {
+    if (!streamer.needs_grouping) return "";
+    const disabled = snapshotConfigPath(snapshot) === "-" ? " disabled" : "";
+    const sources = (streamer.sources || []).join("\n");
+    return `<button class="download action-button" type="button" data-open-streamer-wizard data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-sources="${escapeAttr(sources)}"${disabled}>Create Streamer</button>`;
+  };
+
   const renderStreamerCard = (streamer, snapshot) => {
     const stateLabel = streamer.needs_grouping ? "Needs Grouping" : "Configured";
     const stateClass = streamer.needs_grouping ? "waiting_retry" : "done";
     const needsClass = streamer.needs_grouping ? " needs-grouping" : "";
     const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
+    const groupAction = renderStreamerGroupingAction(streamer, snapshot);
     const latestAge = formatEpochAge(streamer.latest_activity_at);
     return `<section class="streamer-section${needsClass}" data-streamer-name="${escapeAttr(streamer.name || "")}">
   <div class="streamer-head">
@@ -4481,6 +4680,7 @@ def dashboard_script() -> str:
       <span class="badge ${stateClass}">${stateLabel}</span>
       <span class="badge downloading">Active ${escapeHtml(streamer.active_count || 0)}</span>
       <span class="badge checking_after_exit">Attention ${escapeHtml(streamer.attention_count || 0)}</span>
+      ${groupAction}
     </div>
   </div>
   ${warning}
@@ -4509,11 +4709,9 @@ def dashboard_script() -> str:
 
   const renderStreamerList = (snapshot) => {
     const streamers = snapshot.streamer_stats || [];
-    const createPanel = renderStreamerCreatePanel(snapshot);
-    const cards = streamers.length
+    return streamers.length
       ? streamers.map((streamer) => renderStreamerCard(streamer, snapshot)).join("")
       : '<section class="empty">No streamers or streams have been seen yet.</section>';
-    return createPanel + cards;
   };
 
   const activeJobCount = (jobs) => (jobs || []).filter((job) => ["queued", "running"].includes(job.status)).length;
@@ -4720,24 +4918,81 @@ def voice_detection_config_summary(override: VoiceDetectionConfig) -> str:
 
 
 def render_streamer_dashboard(snapshot: StatusSnapshot) -> str:
-    sections: list[str] = []
-    create_panel = render_streamer_create_panel(snapshot)
-    if create_panel:
-        sections.append(create_panel)
-    if snapshot.streamer_stats:
-        sections.extend(render_streamer_card(streamer, snapshot) for streamer in snapshot.streamer_stats)
-    else:
-        sections.append('<section class="empty">No streamers or streams have been seen yet.</section>')
-    return "\n".join(sections)
+    if not snapshot.streamer_stats:
+        return '<section class="empty">No streamers or streams have been seen yet.</section>'
+    return "\n".join(
+        render_streamer_card(streamer, snapshot)
+        for streamer in snapshot.streamer_stats
+    )
 
 
-def render_streamer_create_panel(snapshot: StatusSnapshot) -> str:
+def render_streamer_toolbar(snapshot: StatusSnapshot) -> str:
+    disabled = ' disabled' if snapshot_config_path(snapshot) == "-" else ""
+    note = (
+        '<span class="file-meta">Config file path is not available.</span>'
+        if disabled
+        else ""
+    )
+    return f"""<div class="streamer-toolbar">
+  <button class="download action-button primary-action" type="button" data-open-streamer-wizard{disabled}>Add Streamer</button>
+  {note}
+</div>"""
+
+
+def render_streamer_wizard(snapshot: StatusSnapshot) -> str:
     if snapshot_config_path(snapshot) == "-":
         return ""
-    return f"""<section class="panel streamer-create-panel">
-  <h2>Add Streamer</h2>
-  <div class="streamer-groups">{render_streamer_group_form(None)}</div>
-</section>"""
+    return f"""<dialog class="streamer-wizard" id="streamer-wizard">
+  <form class="streamer-wizard-form" id="streamer-wizard-form" method="post" action="/streamers">
+    <input type="hidden" name="form_kind" value="streamer_wizard">
+    <input type="hidden" name="action" value="save">
+    <div class="wizard-head">
+      <h2>Add Streamer</h2>
+      <button class="download action-button" type="button" data-close-streamer-wizard>Close</button>
+    </div>
+    <div class="wizard-steps" aria-hidden="true">
+      <span class="wizard-step-tab active" data-wizard-step-tab="0">1 Streamer</span>
+      <span class="wizard-step-tab" data-wizard-step-tab="1">2 Voice</span>
+      <span class="wizard-step-tab" data-wizard-step-tab="2">3 Speakers</span>
+    </div>
+    <section class="wizard-step" data-wizard-step="0">
+      <div class="settings-grid">
+        <label class="settings-field">Name
+          <input id="streamer-wizard-name" name="streamer_name" required>
+        </label>
+        <label class="settings-field">Download Dir Name
+          <input id="streamer-wizard-download-dir" name="download_dir_name">
+        </label>
+        <label class="settings-field wide">Sources
+          <textarea id="streamer-wizard-sources" name="sources" rows="4" required></textarea>
+        </label>
+      </div>
+    </section>
+    <section class="wizard-step" data-wizard-step="1" hidden>
+      <div class="voice-form voice-default-form">
+        <label>Mode {render_voice_detection_mode_select("mode", "inherit", include_inherit=True)}</label>
+        <label>Speakers <input class="small-input" name="speakers" type="number" min="1" placeholder="fixed"></label>
+        <label>Min <input class="small-input" name="min_speakers" type="number" min="1" placeholder="range"></label>
+        <label>Max <input class="small-input" name="max_speakers" type="number" min="1" placeholder="range"></label>
+        <label>Token env <input class="env-input" name="hf_token_env" placeholder="HF_TOKEN"></label>
+      </div>
+    </section>
+    <section class="wizard-step" data-wizard-step="2" hidden>
+      <div class="wizard-speaker-rows" id="streamer-wizard-speaker-rows">
+        {render_speaker_label_pair("", "", readonly=False)}
+      </div>
+      <button class="download action-button" type="button" data-add-wizard-speaker>Add Speaker Row</button>
+    </section>
+    <div class="wizard-footer">
+      <button class="download action-button" type="button" data-wizard-back hidden>Back</button>
+      <span class="file-meta" data-wizard-progress>Step 1 of 3</span>
+      <div class="actions">
+        <button class="download action-button" type="button" data-wizard-next>Next</button>
+        <button class="download action-button primary-action" type="submit" data-wizard-submit hidden>Create Streamer</button>
+      </div>
+    </div>
+  </form>
+</dialog>"""
 
 
 def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
@@ -4749,6 +5004,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
         if streamer.needs_grouping
         else ""
     )
+    group_action = render_needs_grouping_action(streamer, snapshot)
     settings = render_streamer_settings_area(streamer, snapshot)
     jobs = render_streamer_jobs_summary(streamer.jobs)
     streams = render_streamer_streams(streamer.streams)
@@ -4764,6 +5020,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge {state_class}">{escape(state_label)}</span>
       <span class="badge downloading">Active {streamer.active_count}</span>
       <span class="badge checking_after_exit">Attention {streamer.attention_count}</span>
+      {group_action}
     </div>
   </div>
   {warning}
@@ -4788,6 +5045,24 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
     {streams}
   </div>
 </section>"""
+
+
+def render_needs_grouping_action(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    if not streamer.needs_grouping:
+        return ""
+    disabled = ' disabled' if snapshot_config_path(snapshot) == "-" else ""
+    sources = "\n".join(streamer.sources)
+    return (
+        '<button class="download action-button" type="button" '
+        'data-open-streamer-wizard '
+        f'data-streamer-name="{escape(streamer.name, quote=True)}" '
+        f'data-streamer-sources="{escape(sources, quote=True)}"'
+        f'{disabled}>Create Streamer</button>'
+    )
+
 
 
 def render_source_chips(sources: list[str]) -> str:
