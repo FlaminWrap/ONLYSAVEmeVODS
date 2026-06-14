@@ -4335,8 +4335,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       place-items: center;
       border-radius: 6px;
       color: var(--muted);
-      background: var(--panel);
-      border: 1px solid var(--line);
+      background: transparent;
+      border: 0;
       font-size: 12px;
       font-weight: 750;
       line-height: 1;
@@ -4349,11 +4349,11 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       padding: 3px;
     }}
     .source-platform-icon img + .source-platform-initial {{ display: none; }}
-    .source-platform-icon.youtube {{ background: #cc0000; }}
-    .source-platform-icon.twitch {{ background: #6441a5; }}
-    .source-platform-icon.kick {{ background: #15803d; }}
-    .source-platform-icon.rumble {{ background: #2563eb; }}
-    .source-platform-icon.unknown {{ background: var(--muted); }}
+    .source-platform-icon.youtube,
+    .source-platform-icon.twitch,
+    .source-platform-icon.kick,
+    .source-platform-icon.rumble,
+    .source-platform-icon.unknown {{ background: transparent; }}
     .source-name {{ font-weight: 650; overflow-wrap: anywhere; }}
     .source-raw {{ overflow-wrap: anywhere; }}
     .source-builder-actions {{
