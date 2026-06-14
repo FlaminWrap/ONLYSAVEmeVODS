@@ -96,6 +96,7 @@ FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
+CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
 )
@@ -2449,13 +2450,19 @@ def run_render_chat_process_job(
         output_file,
     )
     LOGGER.debug("isolated manual chat render command: %s", command_for_log(command))
-    update_render_chat_job(key, phase="Starting isolated renderer", progress=0.05, message="Starting isolated renderer", updated_at=time.time())
+    started_at = time.time()
+    update_render_chat_job(
+        key,
+        phase="Starting isolated renderer",
+        progress=0.05,
+        message="Starting isolated renderer",
+        updated_at=started_at,
+    )
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
-            capture_output=True,
-            text=False,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
     except OSError as exc:
         LOGGER.exception("Unable to start isolated manual chat render process")
@@ -2476,16 +2483,28 @@ def run_render_chat_process_job(
         )
         return
 
+    stdout = b""
+    stderr = b""
+    while True:
+        try:
+            stdout, stderr = process.communicate(
+                timeout=CHAT_RENDER_PROGRESS_POLL_SECONDS,
+            )
+            break
+        except subprocess.TimeoutExpired:
+            update_isolated_render_chat_progress(key, output_file, started_at)
+
+    returncode = process.returncode if process.returncode is not None else 0
     log_process_output(
         LOGGER,
         "isolated manual chat render",
-        result.stdout or b"",
-        result.stderr or b"",
-        failed=result.returncode != 0,
+        stdout or b"",
+        stderr or b"",
+        failed=returncode != 0,
     )
-    if result.returncode != 0:
-        message = process_failure_message(result.stdout or b"", result.stderr or b"")
-        failure_message = message or f"Chat render exited with code {result.returncode}"
+    if returncode != 0:
+        message = process_failure_message(stdout or b"", stderr or b"")
+        failure_message = message or f"Chat render exited with code {returncode}"
         update_render_chat_job(
             key,
             status="failed",
@@ -2517,6 +2536,56 @@ def run_render_chat_process_job(
         video_id_from_job_key(key),
         f"Chat video rendered: {output_file.name}",
     )
+
+
+def update_isolated_render_chat_progress(
+    key: str,
+    output_file: Path,
+    started_at: float,
+) -> None:
+    now = time.time()
+    phase = isolated_render_chat_progress_phase(output_file, now - started_at)
+    update_render_chat_job(
+        key,
+        phase=phase,
+        progress=None,
+        message=phase,
+        updated_at=now,
+    )
+
+
+def isolated_render_chat_progress_phase(output_file: Path, elapsed_seconds: float) -> str:
+    output = current_isolated_render_chat_output(output_file)
+    elapsed = format_duration(max(0, int(elapsed_seconds)))
+    if output is None:
+        return f"Rendering in isolated process; elapsed {elapsed}"
+    label, path, size_bytes = output
+    return (
+        f"Rendering in isolated process; {label} {format_bytes(size_bytes)} "
+        f"written to {path.name}; elapsed {elapsed}"
+    )
+
+
+def current_isolated_render_chat_output(
+    output_file: Path,
+) -> tuple[str, Path, int] | None:
+    candidates = [
+        (
+            "final video",
+            output_file.with_name(f"{output_file.stem}.rendering{output_file.suffix}"),
+        ),
+        (
+            "chat panel",
+            output_file.with_name(f"{output_file.stem}.panel{output_file.suffix}"),
+        ),
+    ]
+    for label, path in candidates:
+        try:
+            if path.is_file():
+                return label, path, path.stat().st_size
+        except OSError:
+            continue
+    return None
 
 
 def process_failure_message(stdout: bytes, stderr: bytes) -> str:
@@ -3703,9 +3772,11 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       margin: 10px 0 14px;
     }}
     .streamer-stat-grid div {{ min-width: 0; overflow-wrap: anywhere; }}
+    .streamer-settings-panel {{ margin-bottom: 14px; }}
+    .streamer-settings-panel[hidden] {{ display: none; }}
     .streamer-body-grid {{
       display: grid;
-      grid-template-columns: minmax(260px, 0.75fr) minmax(260px, 1fr);
+      grid-template-columns: minmax(260px, 1fr);
       gap: 14px;
       align-items: start;
       margin-bottom: 14px;
@@ -3742,7 +3813,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       align-items: center;
       gap: 8px;
     }}
-    .stream-toggle, .streamer-toggle {{
+    .stream-toggle, .streamer-toggle, .streamer-settings-toggle {{
       color: inherit;
       cursor: pointer;
       font: inherit;
@@ -4187,6 +4258,7 @@ def dashboard_script() -> str:
   const expandedKey = "onlysavemevods.expandedStreams";
   const collapsedStreamerKey = "onlysavemevods.collapsedStreamers";
   const expandedStreamerKey = "onlysavemevods.expandedStreamers";
+  const openStreamerSettingsKey = "onlysavemevods.openStreamerSettings";
   const streamTabKey = "onlysavemevods.streamTabs";
   const tabs = ["tab-streamers", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
@@ -4295,6 +4367,7 @@ def dashboard_script() -> str:
   const expandedStreams = readStreamSet(expandedKey);
   const collapsedStreamers = readStreamSet(collapsedStreamerKey);
   const expandedStreamers = readStreamSet(expandedStreamerKey);
+  const openStreamerSettings = readStreamSet(openStreamerSettingsKey);
   const selectedStreamTabs = readStreamTabState();
   const writeCollapsedStreams = () => {
     try { localStorage.setItem(collapsedKey, JSON.stringify([...collapsedStreams])); } catch (_) {}
@@ -4307,6 +4380,9 @@ def dashboard_script() -> str:
   };
   const writeExpandedStreamers = () => {
     try { localStorage.setItem(expandedStreamerKey, JSON.stringify([...expandedStreamers])); } catch (_) {}
+  };
+  const writeOpenStreamerSettings = () => {
+    try { localStorage.setItem(openStreamerSettingsKey, JSON.stringify([...openStreamerSettings])); } catch (_) {}
   };
   const writeSelectedStreamTabs = () => {
     try { localStorage.setItem(streamTabKey, JSON.stringify(selectedStreamTabs)); } catch (_) {}
@@ -4375,6 +4451,19 @@ def dashboard_script() -> str:
     }
   };
 
+  const applyStreamerSettingsState = (root) => {
+    for (const card of root.querySelectorAll(".streamer-section[data-streamer-key]")) {
+      const key = card.getAttribute("data-streamer-key") || "";
+      const button = card.querySelector("[data-streamer-settings-toggle]");
+      const panel = card.querySelector("[data-streamer-settings-panel]");
+      if (!key || !button || !panel) continue;
+      const open = openStreamerSettings.has(key);
+      panel.hidden = !open;
+      button.textContent = open ? "Hide Settings" : "Settings";
+      button.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+  };
+
   const applyStreamTabState = (root) => {
     for (const card of root.querySelectorAll(".stream[data-video-id]")) {
       const videoId = card.getAttribute("data-video-id") || "";
@@ -4387,6 +4476,7 @@ def dashboard_script() -> str:
 
   const applyCollapsedState = (root) => {
     applyStreamerCollapsedState(root);
+    applyStreamerSettingsState(root);
     applyStreamTabState(root);
     for (const card of root.querySelectorAll(".stream[data-video-id]")) {
       const videoId = card.getAttribute("data-video-id");
@@ -4408,6 +4498,26 @@ def dashboard_script() -> str:
   });
 
   document.addEventListener("click", (event) => {
+    const settingsButton = event.target.closest("[data-streamer-settings-toggle]");
+    if (settingsButton) {
+      const key = settingsButton.getAttribute("data-streamer-settings-toggle") || "";
+      const card = settingsButton.closest(".streamer-section");
+      if (!key || !card) return;
+      const opening = !openStreamerSettings.has(key);
+      if (opening) {
+        openStreamerSettings.add(key);
+        collapsedStreamers.delete(key);
+        expandedStreamers.add(key);
+        writeCollapsedStreamers();
+        writeExpandedStreamers();
+      } else {
+        openStreamerSettings.delete(key);
+      }
+      writeOpenStreamerSettings();
+      applyCollapsedState(card.parentElement || document);
+      return;
+    }
+
     const streamerButton = event.target.closest("[data-streamer-toggle]");
     if (streamerButton) {
       const key = streamerButton.getAttribute("data-streamer-toggle") || "";
@@ -4856,6 +4966,7 @@ def dashboard_script() -> str:
       <span class="badge">Storage ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
       <span class="badge">Latest ${escapeHtml(latestAge || "-")}</span>
       ${groupAction}
+      <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="${toggleExpanded}">${toggleLabel}</button>
     </div>
   </div>
@@ -4873,8 +4984,10 @@ def dashboard_script() -> str:
       <div><strong>${escapeHtml(streamer.voice_detection || "default")}</strong><br><span class="muted">Voice</span></div>
       <div><strong>${escapeHtml(streamer.speaker_label_count || 0)}</strong><br><span class="muted">Speaker labels</span></div>
     </div>
-    <div class="streamer-body-grid">
+    <div class="streamer-settings-panel" data-streamer-settings-panel hidden>
       ${renderStreamerSettingsArea(streamer, snapshot)}
+    </div>
+    <div class="streamer-body-grid">
       ${renderStreamerJobsSummary(streamer.jobs || [])}
     </div>
     <div class="streamer-streams">
@@ -5220,6 +5333,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge">Storage {escape(format_bytes(streamer.total_bytes))}</span>
       <span class="badge">Latest {escape(latest_activity_age or '-')}</span>
       {group_action}
+      <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="{streamer_key}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="{streamer_key}" aria-expanded="{toggle_expanded}">{toggle_label}</button>
     </div>
   </div>
@@ -5237,8 +5351,10 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
       <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
     </div>
-    <div class="streamer-body-grid">
+    <div class="streamer-settings-panel" data-streamer-settings-panel hidden>
       {settings}
+    </div>
+    <div class="streamer-body-grid">
       {jobs}
     </div>
     <div class="streamer-streams">

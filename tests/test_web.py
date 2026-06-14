@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 import json
 import logging
+import subprocess
 import unittest
 
 from onlysavemevods import __version__
@@ -32,6 +33,8 @@ from onlysavemevods.web import (
     resolve_download_file,
     run_refresh_chat_job,
     run_render_chat_in_process_job,
+    update_render_chat_job,
+    run_render_chat_process_job,
     run_transcription_job,
     refresh_chat_job_key,
     RefreshChatJob,
@@ -404,10 +407,14 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("onlysavemevods.expandedStreams", html)
         self.assertIn("onlysavemevods.collapsedStreamers", html)
         self.assertIn("onlysavemevods.expandedStreamers", html)
+        self.assertIn("onlysavemevods.openStreamerSettings", html)
         self.assertIn("onlysavemevods.streamTabs", html)
         self.assertIn("data-streamer-toggle", html)
+        self.assertIn("data-streamer-settings-toggle", html)
+        self.assertIn("data-streamer-settings-panel", html)
         self.assertIn("streamer-details", html)
         self.assertIn("applyStreamerCollapsedState", html)
+        self.assertIn("applyStreamerSettingsState", html)
         self.assertIn("applyStreamTabState", html)
         self.assertIn("stream-detail-tabs", html)
         self.assertIn('data-stream-tab="files"', html)
@@ -522,6 +529,85 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Chat render", html)
         self.assertIn("Starting isolated renderer", html)
 
+    def test_isolated_chat_render_reports_output_file_growth(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = config.download_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            output_file = config.download_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
+            panel_file = output_file.with_name(f"{output_file.stem}.panel{output_file.suffix}")
+            media_file.parent.mkdir(parents=True)
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+            key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS[key] = RenderChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name=chat_file.name,
+                    media_name=media_file.name,
+                    output_name=output_file.name,
+                    status="running",
+                    message="Rendering chat video",
+                    started_at=0.0,
+                )
+
+            class FakeProcess:
+                returncode: int | None = None
+
+                def __init__(self, *_args: object, **_kwargs: object) -> None:
+                    self.calls = 0
+
+                def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    self.calls += 1
+                    if self.calls == 1:
+                        panel_file.write_bytes(b"x" * 2048)
+                        raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+                    self.returncode = 0
+                    output_file.write_bytes(b"done")
+                    return b"", b""
+
+            updates: list[dict[str, object]] = []
+
+            def spy_update(job_key: str, **changes: object) -> None:
+                updates.append(dict(changes))
+                update_render_chat_job(job_key, **changes)
+
+            try:
+                with (
+                    patch("onlysavemevods.web.subprocess.Popen", FakeProcess),
+                    patch("onlysavemevods.web.update_render_chat_job", side_effect=spy_update),
+                ):
+                    run_render_chat_process_job(
+                        config,
+                        key,
+                        media_file,
+                        chat_file,
+                        output_file,
+                    )
+                with CHAT_RENDER_JOBS_LOCK:
+                    job = CHAT_RENDER_JOBS[key]
+            finally:
+                with CHAT_RENDER_JOBS_LOCK:
+                    CHAT_RENDER_JOBS.pop(key, None)
+
+        progress_updates = [
+            update
+            for update in updates
+            if "Rendering in isolated process" in str(update.get("phase", ""))
+        ]
+        self.assertTrue(progress_updates)
+        self.assertIn("chat panel 2.0 KiB", str(progress_updates[0]["phase"]))
+        self.assertIsNone(progress_updates[0]["progress"])
+        self.assertEqual(job.status, "done")
+        self.assertEqual(job.progress, 1.0)
+
     def test_manual_chat_render_uses_configured_timeout(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -587,6 +673,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-streamer-attention="0"', html)
         self.assertIn('data-streamer-active-jobs="0"', html)
         self.assertIn('data-streamer-needs-grouping="false"', html)
+        self.assertIn('data-streamer-settings-toggle="OUMB3rd" aria-expanded="false">Settings</button>', html)
+        self.assertIn('<div class="streamer-settings-panel" data-streamer-settings-panel hidden>', html)
         self.assertIn('data-streamer-toggle="OUMB3rd" aria-expanded="false">Expand</button>', html)
 
     def test_status_html_renders_streamer_wizard_and_prefill_buttons(self) -> None:
