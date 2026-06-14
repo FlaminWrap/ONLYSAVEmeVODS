@@ -2,13 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 import re
+import logging
 
 from .models import LiveStream, qualified_stream_id
 from .youtube import YoutubeProbe, YtDlpError, YtDlpRunner, live_stream_from_info
 
 
+LOGGER = logging.getLogger(__name__)
 SUPPORTED_PLATFORMS = {"youtube", "twitch", "kick", "rumble"}
 PREFIX_RE = re.compile(r"^(?P<platform>[A-Za-z][A-Za-z0-9_-]*):(?P<value>.+)$")
 
@@ -54,8 +56,59 @@ class SourceMonitor:
             )
             return [stream_with_source(stream, spec.raw) for stream in streams]
 
-        stream = self.probe_video(spec.url, source=spec.raw, platform=spec.platform)
+        try:
+            stream = self.probe_video(spec.url, source=spec.raw, platform=spec.platform)
+        except YtDlpError as exc:
+            LOGGER.debug("Direct source probe failed source=%s: %s", spec.raw, exc)
+            return self.discover_playlist_live_streams(
+                spec,
+                skip_video_ids=skip_video_ids,
+            )
         return [stream] if stream.is_live else []
+
+    def discover_playlist_live_streams(
+        self,
+        spec: SourceSpec,
+        *,
+        skip_video_ids: set[str] | None = None,
+    ) -> list[LiveStream]:
+        try:
+            playlist = self.runner.run_json(
+                [
+                    "--dump-single-json",
+                    "--flat-playlist",
+                    "--playlist-end",
+                    str(self.youtube.channel_scan_limit),
+                    "--skip-download",
+                    "--no-warnings",
+                    spec.url,
+                ]
+            )
+        except YtDlpError as exc:
+            LOGGER.debug("Playlist source probe failed source=%s: %s", spec.raw, exc)
+            return []
+
+        live_streams: list[LiveStream] = []
+        seen = set(skip_video_ids or ())
+        for candidate in playlist_candidate_urls(playlist, spec.url):
+            if candidate == spec.url:
+                continue
+            try:
+                stream = self.probe_video(candidate, source=spec.raw, platform=spec.platform)
+            except YtDlpError as exc:
+                LOGGER.debug(
+                    "Playlist candidate probe failed source=%s candidate=%s: %s",
+                    spec.raw,
+                    candidate,
+                    exc,
+                )
+                continue
+            if stream.video_id in seen:
+                continue
+            seen.add(stream.video_id)
+            if stream.is_live:
+                live_streams.append(stream)
+        return live_streams
 
     def probe_video(
         self,
@@ -184,6 +237,35 @@ def canonical_source(source: str, *, default_platform: str | None = None) -> str
     if spec.platform == "rumble":
         return f"rumble:{path}" if path else raw
     return raw
+
+
+def playlist_candidate_urls(playlist: dict[str, Any], base_url: str) -> list[str]:
+    entries = playlist.get("entries")
+    if not isinstance(entries, list):
+        return []
+    urls: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        candidate = entry.get("webpage_url") or entry.get("url") or entry.get("id")
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        url = playlist_candidate_url(candidate.strip(), base_url)
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    return urls
+
+
+def playlist_candidate_url(candidate: str, base_url: str) -> str:
+    if candidate.startswith(("http://", "https://", "/")):
+        return urljoin(base_url, candidate)
+    parts = urlsplit(base_url)
+    host = parts.netloc.casefold()
+    if (host == "rumble.com" or host.endswith(".rumble.com")) and candidate.startswith("v"):
+        return f"{parts.scheme}://{parts.netloc}/{candidate}"
+    return urljoin(base_url.rstrip("/") + "/", candidate)
 
 
 def stream_with_source(stream: LiveStream, source: str) -> LiveStream:

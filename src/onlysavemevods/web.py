@@ -4362,10 +4362,6 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       gap: 8px;
       align-items: center;
     }}
-    .source-unsaved-note {{
-      color: var(--warn);
-      font-weight: 650;
-    }}
     .source-popover {{
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -5326,7 +5322,6 @@ def dashboard_script() -> str:
   const renderSourceBuilder = (sources) => `<div class="source-builder" data-source-builder>
   <textarea name="sources" data-source-values hidden>${escapeHtml((sources || []).join("\\n"))}</textarea>
   ${renderSourceList(sources || [])}
-  <div class="source-unsaved-note" data-source-unsaved hidden>Unsaved source changes. Press Save Streamer to keep them.</div>
   <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
   <div class="source-popover" data-source-popover hidden>
     <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>
@@ -5342,9 +5337,6 @@ def dashboard_script() -> str:
   const markStreamerFormDirty = (element) => {
     const form = element ? element.closest("form.streamer-form") : null;
     if (form) form.setAttribute("data-dirty", "true");
-    const builder = element ? element.closest("[data-source-builder]") : null;
-    const note = builder ? builder.querySelector("[data-source-unsaved]") : null;
-    if (note) note.hidden = false;
   };
   const updateSourceBuilder = (builder, sources) => {
     sources = [...new Set((sources || []).map((source) => String(source || "").trim()).filter(Boolean))];
@@ -6897,7 +6889,6 @@ def render_source_editor(sources: list[str]) -> str:
     return f"""<div class="source-builder" data-source-builder>
   <textarea name="sources" data-source-values hidden>{escape(values)}</textarea>
   <div class="source-list" data-source-list>{render_source_list_items(sources)}</div>
-  <div class="source-unsaved-note" data-source-unsaved hidden>Unsaved source changes. Press Save Streamer to keep them.</div>
   <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
   <div class="source-popover" data-source-popover hidden>
     <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>

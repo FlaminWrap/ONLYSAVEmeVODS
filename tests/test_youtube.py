@@ -5,6 +5,7 @@ from unittest.mock import patch
 from onlysavemevods.youtube import (
     TerminalVideoUnavailableError,
     YoutubeProbe,
+    YtDlpError,
     YtDlpRunner,
     channel_live_url,
     channel_streams_url,
@@ -189,4 +190,16 @@ class YoutubeProbeTests(unittest.TestCase):
 
         with patch("subprocess.run", return_value=completed):
             with self.assertRaises(TerminalVideoUnavailableError):
+                YtDlpRunner().run_json(["--dump-json", "https://example.test"])
+
+    def test_runner_reports_empty_json_output(self) -> None:
+        completed = CompletedProcess(
+            args=["yt-dlp"],
+            returncode=0,
+            stdout="",
+            stderr="",
+        )
+
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaisesRegex(YtDlpError, "no JSON output"):
                 YtDlpRunner().run_json(["--dump-json", "https://example.test"])

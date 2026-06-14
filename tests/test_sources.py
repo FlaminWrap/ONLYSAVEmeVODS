@@ -1,6 +1,13 @@
 import unittest
 
-from onlysavemevods.sources import SourceError, SourceMonitor, canonical_source, resolve_source
+from onlysavemevods.sources import (
+    SourceError,
+    SourceMonitor,
+    canonical_source,
+    playlist_candidate_urls,
+    resolve_source,
+)
+from onlysavemevods.youtube import YtDlpError
 
 
 class FakeRunner:
@@ -10,7 +17,12 @@ class FakeRunner:
 
     def run_json(self, args: list[str], timeout: int = 120) -> dict:
         self.calls.append(args)
-        return self.responses[args[-1]]
+        response = self.responses[args[-1]]
+        if isinstance(response, list):
+            response = response.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 class SourceResolutionTests(unittest.TestCase):
@@ -105,6 +117,54 @@ class SourceMonitorTests(unittest.TestCase):
         self.assertEqual(len(streams), 1)
         self.assertEqual(streams[0].platform, "rumble")
         self.assertEqual(streams[0].video_id, "rumble:vabc")
+
+    def test_empty_non_youtube_probe_output_returns_no_streams(self) -> None:
+        runner = FakeRunner(
+            {
+                "https://rumble.com/user/OUMB2": YtDlpError("yt-dlp returned no JSON output"),
+            }
+        )
+        monitor = SourceMonitor(runner)
+
+        self.assertEqual(monitor.discover_live_streams("rumble:user/OUMB2"), [])
+        self.assertTrue(any("--dump-single-json" in call for call in runner.calls))
+
+    def test_rumble_user_playlist_fallback_finds_live_video(self) -> None:
+        runner = FakeRunner(
+            {
+                "https://rumble.com/user/OUMB2": [
+                    YtDlpError("yt-dlp returned no JSON output"),
+                    {
+                        "entries": [
+                            {"webpage_url": "https://rumble.com/vabc-title.html"},
+                        ]
+                    },
+                ],
+                "https://rumble.com/vabc-title.html": {
+                    "id": "vabc",
+                    "title": "Live on Rumble",
+                    "uploader": "OUMB2",
+                    "webpage_url": "https://rumble.com/vabc-title.html",
+                    "is_live": True,
+                },
+            }
+        )
+        monitor = SourceMonitor(runner)
+
+        streams = monitor.discover_live_streams("rumble:user/OUMB2")
+
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].video_id, "rumble:vabc")
+        self.assertEqual(streams[0].source, "rumble:user/OUMB2")
+
+    def test_rumble_playlist_candidates_resolve_at_site_root(self) -> None:
+        self.assertEqual(
+            playlist_candidate_urls(
+                {"entries": [{"url": "vabc-title.html"}]},
+                "https://rumble.com/user/OUMB2",
+            ),
+            ["https://rumble.com/vabc-title.html"],
+        )
 
 
 if __name__ == "__main__":

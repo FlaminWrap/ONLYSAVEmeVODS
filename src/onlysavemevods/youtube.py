@@ -79,6 +79,8 @@ class YtDlpRunner:
 
         output = completed.stdout.strip()
         LOGGER.debug("yt-dlp metadata command returned %s bytes", len(output))
+        if not output:
+            raise YtDlpError("yt-dlp returned no JSON output")
         try:
             parsed = json.loads(output)
         except json.JSONDecodeError as exc:
