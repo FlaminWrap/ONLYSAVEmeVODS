@@ -47,6 +47,8 @@ from onlysavemevods.web import (
     RenderChatJob,
     CHAT_RENDER_JOBS,
     CHAT_RENDER_JOBS_LOCK,
+    FAVICON_ROUTES,
+    PACKAGE_DIR,
     snapshot_to_dict,
     transcription_job_key,
     TranscriptionJob,
@@ -782,9 +784,31 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-source-platform', html)
         self.assertIn('data-source-input', html)
         self.assertIn('data-add-source', html)
+        self.assertIn('data-close-source-popover', html)
+        self.assertIn('data-source-list', html)
+        self.assertIn('source-platform-icon youtube', html)
+        self.assertIn('data-remove-source="@OUMB3rd"', html)
+        self.assertIn('OUMB3rd', html)
         self.assertIn('<option value="twitch">Twitch</option>', html)
         self.assertIn('detectSourcePlatform', html)
         self.assertIn('normalizeSourceValue', html)
+        self.assertIn('renderSourceList', html)
+
+    def test_status_html_links_package_favicons(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('href="/favicon.ico"', html)
+        self.assertIn('href="/favicon-32x32.png"', html)
+        self.assertIn('href="/favicon-16x16.png"', html)
+        self.assertIn('href="/apple-touch-icon.png"', html)
+        self.assertIn('href="/android-chrome-192x192.png"', html)
+        for filename in FAVICON_ROUTES.values():
+            self.assertTrue((PACKAGE_DIR / filename).is_file(), filename)
 
     def test_status_html_renders_streamer_voice_manager(self) -> None:
         with TemporaryDirectory() as tmp:

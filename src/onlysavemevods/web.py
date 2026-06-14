@@ -107,6 +107,16 @@ from .watermark import (
 
 
 LOGGER = logging.getLogger(__name__)
+PACKAGE_DIR = Path(__file__).resolve().parent
+FAVICON_ROUTES = {
+    "/favicon.ico": "favicon.ico",
+    "/favicon-16x16.png": "favicon-16x16.png",
+    "/favicon-32x32.png": "favicon-32x32.png",
+    "/apple-touch-icon.png": "apple-touch-icon.png",
+    "/android-chrome-192x192.png": "android-chrome-192x192.png",
+    "/android-chrome-512x512.png": "android-chrome-512x512.png",
+    "/Favicon.png": "Favicon.png",
+}
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
@@ -555,6 +565,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if path == "/healthz":
                 self._send_text("ok\n", "text/plain; charset=utf-8")
                 return
+            if path in FAVICON_ROUTES:
+                self._send_package_asset(FAVICON_ROUTES[path])
+                return
             if path == "/download":
                 self._send_download(parts.query)
                 return
@@ -615,6 +628,25 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
         def _send_json(self, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
             self._send_text(body, "application/json; charset=utf-8")
+
+        def _send_package_asset(self, filename: str) -> None:
+            if filename not in FAVICON_ROUTES.values():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            path = PACKAGE_DIR / filename
+            if not path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            stat = path.stat()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(stat.st_size))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile)
 
         def _send_download(self, query: str) -> None:
             params = parse_qs(query)
@@ -4033,6 +4065,11 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="/android-chrome-192x192.png">
   <title>ONLYSAVEmeVODS Status</title>
   <style>
     :root {{
@@ -5271,7 +5308,7 @@ def dashboard_script() -> str:
       const textarea = form ? form.querySelector('[data-sources-value]') : null;
       const source = removeSourceButton.getAttribute("data-remove-source") || "";
       if (!textarea || !source) return;
-      textarea.value = sourceRowsFromText(textarea.value).filter((item) => item !== source).join("\n");
+      textarea.value = sourceRowsFromText(textarea.value).filter((item) => item !== source).join("\\n");
       syncSourceList(form);
       return;
     }
@@ -5705,7 +5742,7 @@ def dashboard_script() -> str:
     kick: "K",
     rumble: "R",
   };
-  const sourceRowsFromText = (value) => String(value || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const sourceRowsFromText = (value) => String(value || "").split(/\\r?\\n/).map((line) => line.trim()).filter(Boolean);
   const sourceNameFromValue = (source, platform) => {
     let text = String(source || "").trim();
     if (!text) return "Unknown source";
@@ -5718,7 +5755,7 @@ def dashboard_script() -> str:
       const parts = url.pathname.split("/").map((part) => part.trim()).filter(Boolean);
       return parts.length ? parts[parts.length - 1].replace(/^@+/, "") : url.hostname;
     }
-    text = text.replace(/^@+/, "").replace(/^\/+|\/+$/g, "");
+    text = text.replace(/^@+/, "").replace(/^\\/+|\\/+$/g, "");
     if (platform === "rumble") {
       const parts = text.split("/").filter(Boolean);
       return parts.length ? parts[parts.length - 1] : text;
@@ -6323,7 +6360,8 @@ def render_streamer_wizard(snapshot: StatusSnapshot) -> str:
           <input id="streamer-wizard-download-dir" name="download_dir_name">
         </label>
         <div class="settings-field wide"><span>Sources</span>
-          <textarea id="streamer-wizard-sources" name="sources" rows="4" required></textarea>
+          <textarea id="streamer-wizard-sources" name="sources" data-sources-value hidden></textarea>
+          <div class="source-list" data-source-list>{render_source_list([])}</div>
           {render_source_add_control()}
         </div>
       </div>
@@ -6691,6 +6729,84 @@ def render_source_chips(sources: list[str]) -> str:
     return f'<div class="source-chips">{chips}</div>'
 
 
+SOURCE_PLATFORM_LABELS = {
+    "youtube": "YouTube",
+    "twitch": "Twitch",
+    "kick": "Kick",
+    "rumble": "Rumble",
+}
+SOURCE_PLATFORM_ICONS = {
+    "youtube": "Y",
+    "twitch": "T",
+    "kick": "K",
+    "rumble": "R",
+}
+
+
+def source_platform_for_display(source: str) -> str:
+    value = source.strip()
+    match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*):", value)
+    if match:
+        platform = match.group(1).casefold().replace("_", "-")
+        if platform in SOURCE_PLATFORM_LABELS:
+            return platform
+    if value.startswith(("http://", "https://")):
+        host = urlsplit(value).netloc.casefold()
+        if host.startswith("www."):
+            host = host[4:]
+        if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+            return "youtube"
+        if host == "twitch.tv" or host.endswith(".twitch.tv"):
+            return "twitch"
+        if host == "kick.com" or host.endswith(".kick.com"):
+            return "kick"
+        if host == "rumble.com" or host.endswith(".rumble.com"):
+            return "rumble"
+    return "youtube"
+
+
+def source_name_for_display(source: str, platform: str) -> str:
+    value = source.strip()
+    match = re.match(r"^([A-Za-z][A-Za-z0-9_-]*):(.+)$", value)
+    if match and match.group(1).casefold().replace("_", "-") in SOURCE_PLATFORM_LABELS:
+        value = match.group(2).strip()
+    if value.startswith(("http://", "https://")):
+        parts = [part for part in urlsplit(value).path.strip("/").split("/") if part]
+        if parts:
+            return parts[-1].lstrip("@")
+        return urlsplit(value).netloc
+    value = value.strip("/").lstrip("@")
+    if platform == "rumble":
+        parts = [part for part in value.split("/") if part]
+        if parts:
+            return parts[-1]
+    return value or source
+
+
+def render_source_list(sources: list[str]) -> str:
+    if not sources:
+        return '<div class="source-list-empty">No sources added yet.</div>'
+    rows = []
+    for source in sources:
+        platform = source_platform_for_display(source)
+        label = SOURCE_PLATFORM_LABELS.get(platform, "Source")
+        icon = SOURCE_PLATFORM_ICONS.get(platform, "S")
+        name = source_name_for_display(source, platform)
+        rows.append(
+            '<div class="source-list-row" '
+            f'data-source-value="{escape(source, quote=True)}">'
+            f'<span class="source-platform-icon {escape(platform, quote=True)}" '
+            f'title="{escape(label, quote=True)}" aria-hidden="true">{escape(icon)}</span>'
+            '<div class="source-list-main">'
+            f'<div class="source-list-name">{escape(name)}</div>'
+            f'<div class="source-list-meta">{escape(label)} - {escape(source)}</div>'
+            '</div>'
+            f'<button class="download action-button" type="button" data-remove-source="{escape(source, quote=True)}">Remove</button>'
+            '</div>'
+        )
+    return "".join(rows)
+
+
 def render_source_add_control() -> str:
     return """<div class="source-add-control" data-source-builder>
     <details class="source-add-menu">
@@ -6708,7 +6824,10 @@ def render_source_add_control() -> str:
         <label class="settings-field">Channel or URL
           <input data-source-input type="text" placeholder="Paste URL or channel name">
         </label>
-        <button class="download action-button" type="button" data-add-source>Add Source</button>
+        <div class="source-add-actions">
+          <button class="download action-button" type="button" data-add-source>Add Source</button>
+          <button class="download action-button" type="button" data-close-source-popover>Cancel</button>
+        </div>
         <div class="file-meta wide" data-source-detect-hint>Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.</div>
       </div>
     </details>
@@ -6803,7 +6922,8 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
   </label>
   {meta}
   <div class="settings-field wide"><span>Sources</span>
-    <textarea name="sources" rows="3">{escape(sources)}</textarea>
+    <textarea name="sources" data-sources-value hidden>{escape(sources)}</textarea>
+    <div class="source-list" data-source-list>{render_source_list(streamer.sources if streamer is not None else [])}</div>
     {render_source_add_control()}
   </div>
   <div class="settings-actions">
