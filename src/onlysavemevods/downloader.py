@@ -1173,7 +1173,7 @@ class DownloadManager:
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=FINALIZE_MUX_TIMEOUT_SECONDS,
+                timeout=chat_render_timeout_seconds(self.config),
             )
             ffmpeg_elapsed = time.monotonic() - ffmpeg_started_at
         except asyncio.TimeoutError:
@@ -1245,7 +1245,7 @@ class DownloadManager:
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(),
-                timeout=FINALIZE_MUX_TIMEOUT_SECONDS,
+                timeout=chat_render_timeout_seconds(self.config),
             )
         except asyncio.TimeoutError:
             process.kill()
@@ -1655,6 +1655,12 @@ def build_chat_download_command(
 
 def should_record_chat(config: BotConfig) -> bool:
     return config.record_live_chat or config.render_live_chat_video
+
+
+def chat_render_timeout_seconds(config: BotConfig) -> float | None:
+    if config.chat_render_timeout_seconds <= 0:
+        return None
+    return float(config.chat_render_timeout_seconds)
 
 
 def yt_dlp_args_include_format(args: list[str]) -> bool:

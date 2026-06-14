@@ -30,6 +30,7 @@ from onlysavemevods.web import (
     resolve_render_chat_files,
     resolve_download_file,
     run_refresh_chat_job,
+    run_render_chat_in_process_job,
     run_transcription_job,
     refresh_chat_job_key,
     RefreshChatJob,
@@ -66,6 +67,7 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "record_live_chat": "false",
         "render_live_chat_video": "false",
         "chat_render_panel_workers": "0",
+        "chat_render_timeout_seconds": "3600",
         "chat_render_use_nvenc": "false",
         "chat_render_nvenc_devices": "",
         "transcribe_subtitles": "false",
@@ -370,6 +372,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(payload["configuration"]["Live Chat"]["record_live_chat"])
         self.assertTrue(payload["configuration"]["Live Chat"]["render_live_chat_video"])
         self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_panel_workers"], 0)
+        self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_timeout_seconds"], 3600)
         self.assertFalse(payload["configuration"]["Live Chat"]["chat_render_use_nvenc"])
         self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_nvenc_devices"], [])
         self.assertIn("Transcription", payload["configuration"])
@@ -392,6 +395,50 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(chat_payload["render_chat_status"], "ready")
         json.dumps(payload)
 
+
+    def test_manual_chat_render_uses_configured_timeout(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                chat_render_timeout_seconds=7200,
+            )
+            media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = config.download_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            output_file = config.download_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
+            media_file.parent.mkdir(parents=True)
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+            key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS[key] = RenderChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name=chat_file.name,
+                    media_name=media_file.name,
+                    output_name=output_file.name,
+                    status="running",
+                    message="Rendering chat video",
+                    started_at=0.0,
+                )
+
+            try:
+                with patch("onlysavemevods.web.render_chat_video_file") as render:
+                    run_render_chat_in_process_job(
+                        config,
+                        key,
+                        media_file,
+                        chat_file,
+                        output_file,
+                    )
+                with CHAT_RENDER_JOBS_LOCK:
+                    job = CHAT_RENDER_JOBS[key]
+            finally:
+                with CHAT_RENDER_JOBS_LOCK:
+                    CHAT_RENDER_JOBS.pop(key, None)
+
+        self.assertEqual(job.status, "done")
+        render.assert_called_once()
+        self.assertEqual(render.call_args.kwargs["timeout_seconds"], 7200.0)
 
     def test_jobs_tab_shows_dashboard_and_watermark_jobs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -812,6 +859,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('name="channels"', html)
         self.assertIn('name="download_dir"', html)
         self.assertIn('name="web_port"', html)
+        self.assertIn('name="chat_render_timeout_seconds"', html)
         self.assertIn('name="watermark_strength"', html)
         self.assertIn('name="whisperx_language" type="text" value=""', html)
         self.assertIn('name="extra_yt_dlp_args_mode"', html)
@@ -871,6 +919,7 @@ class WebStatusTests(unittest.TestCase):
                     max_concurrent_downloads="2",
                     record_live_chat="true",
                     render_live_chat_video="true",
+                    chat_render_timeout_seconds="7200",
                     chat_render_use_nvenc="true",
                     chat_render_nvenc_devices="0\n1",
                     transcribe_subtitles="true",
@@ -891,6 +940,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(updated.max_concurrent_downloads, 2)
         self.assertTrue(updated.record_live_chat)
         self.assertTrue(updated.render_live_chat_video)
+        self.assertEqual(updated.chat_render_timeout_seconds, 7200)
         self.assertTrue(updated.chat_render_use_nvenc)
         self.assertEqual(updated.chat_render_nvenc_devices, ["0", "1"])
         self.assertTrue(updated.transcribe_subtitles)

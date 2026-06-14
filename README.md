@@ -227,7 +227,9 @@ scripts/uninstall-systemd.sh
   cached locally and rendered into the panel when available. This option implies
   live chat recording. Set `chat_render_panel_workers` to control Python/Pillow
   panel frame workers: `0` uses all CPU cores, `1` renders serially, and higher
-  values use that exact worker count. Set `chat_render_use_nvenc = true` to use
+  values use that exact worker count. Set `chat_render_timeout_seconds` to
+  raise the one-hour render timeout for very long VODs, or `0` to disable that
+  timeout. Set `chat_render_use_nvenc = true` to use
   NVIDIA NVENC for the FFmpeg chat video encode/merge stages. Leave
   `chat_render_nvenc_devices = []` to use FFmpeg's default GPU, set
   `chat_render_nvenc_devices = ["0"]` to pick one GPU, or set

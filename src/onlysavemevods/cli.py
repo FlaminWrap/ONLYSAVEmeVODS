@@ -17,6 +17,7 @@ from .chat_render import (
     render_chat_video_file,
 )
 from .config import (
+    BotConfig,
     ConfigError,
     append_missing_config_values,
     load_config,
@@ -284,6 +285,12 @@ def update_config_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def chat_render_timeout_seconds(config: BotConfig) -> float | None:
+    if config.chat_render_timeout_seconds <= 0:
+        return None
+    return float(config.chat_render_timeout_seconds)
+
+
 def render_chat_file_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     configure_logging(args.verbose, config.log_level)
@@ -300,6 +307,7 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
             output_file=output_file,
             overwrite=args.overwrite,
             panel_workers=config.chat_render_panel_workers,
+            timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
         )

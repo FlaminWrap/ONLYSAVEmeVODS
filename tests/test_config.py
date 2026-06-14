@@ -100,6 +100,7 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(config.record_live_chat)
         self.assertFalse(config.render_live_chat_video)
         self.assertEqual(config.chat_render_panel_workers, 0)
+        self.assertEqual(config.chat_render_timeout_seconds, 3600)
         self.assertFalse(config.chat_render_use_nvenc)
         self.assertEqual(config.chat_render_nvenc_devices, [])
         self.assertFalse(config.transcribe_subtitles)
@@ -224,6 +225,32 @@ class ConfigTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
             config_path.write_text("chat_render_panel_workers = -1\n", encoding="utf-8")
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
+    def test_chat_render_timeout_can_be_configured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("chat_render_timeout_seconds = 7200\n", encoding="utf-8")
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.chat_render_timeout_seconds, 7200)
+
+    def test_chat_render_timeout_can_be_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("chat_render_timeout_seconds = 0\n", encoding="utf-8")
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.chat_render_timeout_seconds, 0)
+
+    def test_chat_render_timeout_must_not_be_negative(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("chat_render_timeout_seconds = -1\n", encoding="utf-8")
 
             with self.assertRaises(ConfigError):
                 load_config(config_path)

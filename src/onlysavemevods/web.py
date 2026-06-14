@@ -374,6 +374,7 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("record_live_chat", "Live Chat", "bool"),
     ConfigFormField("render_live_chat_video", "Live Chat", "bool"),
     ConfigFormField("chat_render_panel_workers", "Live Chat", "int", minimum=0),
+    ConfigFormField("chat_render_timeout_seconds", "Live Chat", "int", minimum=0),
     ConfigFormField("chat_render_use_nvenc", "Live Chat", "bool"),
     ConfigFormField("chat_render_nvenc_devices", "Live Chat", "str_list", rows=2),
     ConfigFormField("transcribe_subtitles", "Transcription", "bool"),
@@ -1049,6 +1050,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "record_live_chat": config.record_live_chat,
             "render_live_chat_video": config.render_live_chat_video,
             "chat_render_panel_workers": config.chat_render_panel_workers,
+            "chat_render_timeout_seconds": config.chat_render_timeout_seconds,
             "chat_render_use_nvenc": config.chat_render_use_nvenc,
             "chat_render_nvenc_devices": nvenc_devices_for_config_summary(
                 config.chat_render_nvenc_devices
@@ -1967,6 +1969,12 @@ def video_id_from_job_key(key: str) -> str:
     return key.partition("\0")[0]
 
 
+def chat_render_timeout_seconds(config: BotConfig) -> float | None:
+    if config.chat_render_timeout_seconds <= 0:
+        return None
+    return float(config.chat_render_timeout_seconds)
+
+
 def start_render_chat_job(
     config: BotConfig,
     video_id: str,
@@ -2321,6 +2329,7 @@ def run_render_chat_in_process_job(
             output_file=output_file,
             overwrite=regenerate,
             panel_workers=config.chat_render_panel_workers,
+            timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
             progress_callback=lambda phase, value: update_render_chat_job(
@@ -3992,7 +4001,9 @@ def dashboard_script() -> str:
         : "";
       actions.push(`<form class="inline-form" method="post" action="${escapeAttr(file.render_chat_url)}"><button class="download action-button" type="submit"${title}>${label}</button></form>`);
       if (file.render_chat_status === "failed" && file.render_chat_message) {
-        actions.push(`<span class="action-note" title="${escapeAttr(file.render_chat_message)}">Failed</span>`);
+        const message = String(file.render_chat_message || "").trim();
+        const shortMessage = message.length > 140 ? `${message.slice(0, 137)}...` : message;
+        actions.push(`<span class="action-note" title="${escapeAttr(message)}">Failed: ${escapeHtml(shortMessage)}</span>`);
       }
     }
     if (file.transcription_status === "running") {
@@ -4853,6 +4864,13 @@ def render_file_row(file: FileStatus) -> str:
     )
 
 
+def short_action_message(message: str, limit: int = 140) -> str:
+    stripped = message.strip()
+    if len(stripped) <= limit:
+        return stripped
+    return stripped[: max(0, limit - 3)] + "..."
+
+
 def render_file_action(file: FileStatus) -> str:
     actions: list[str] = []
     if file.download_url:
@@ -4906,9 +4924,11 @@ def render_file_action(file: FileStatus) -> str:
             "</form>"
         )
         if file.render_chat_status == "failed" and file.render_chat_message:
+            message = short_action_message(file.render_chat_message)
             actions.append(
                 '<span class="action-note" '
-                f'title="{escape(file.render_chat_message, quote=True)}">Failed</span>'
+                f'title="{escape(file.render_chat_message, quote=True)}">'
+                f"Failed: {escape(message)}</span>"
             )
     if file.transcription_status == "running":
         actions.append('<span class="action-note">Transcribing</span>')

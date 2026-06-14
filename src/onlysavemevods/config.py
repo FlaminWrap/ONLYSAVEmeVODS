@@ -83,6 +83,7 @@ class BotConfig:
     record_live_chat: bool = False
     render_live_chat_video: bool = False
     chat_render_panel_workers: int = 0
+    chat_render_timeout_seconds: int = 60 * 60
     chat_render_use_nvenc: bool = False
     chat_render_nvenc_devices: list[str] = field(default_factory=list)
     transcribe_subtitles: bool = False
@@ -195,6 +196,10 @@ def load_config(path: str | Path) -> BotConfig:
         chat_render_panel_workers=_as_non_negative_int(
             raw.get("chat_render_panel_workers", 0),
             "chat_render_panel_workers",
+        ),
+        chat_render_timeout_seconds=_as_non_negative_int(
+            raw.get("chat_render_timeout_seconds", 60 * 60),
+            "chat_render_timeout_seconds",
         ),
         chat_render_use_nvenc=_as_bool(
             raw.get("chat_render_use_nvenc", False),

@@ -39,6 +39,10 @@ render_live_chat_video = false
 # 1 forces serial rendering, and higher values use that exact worker count.
 chat_render_panel_workers = 0
 
+# Maximum seconds allowed for the final FFmpeg chat render step. Long full-stream
+# renders can need more than the default; set 0 to disable the timeout.
+chat_render_timeout_seconds = 3600
+
 # Use NVIDIA NVENC for the FFmpeg chat video encode/merge stages. This speeds
 # encoding when FFmpeg was built with NVENC support and an NVIDIA driver is
 # available. Leave the device list empty for FFmpeg's default GPU, set
