@@ -116,8 +116,10 @@ true` is set in `config.toml`, the installer also installs `whisperx` into the
 project venv. Set `ONLYSAVEMEVODS_INSTALL_WHISPERX=1` to force that install or
 `ONLYSAVEMEVODS_INSTALL_WHISPERX=0` to skip it. If `voice_match_enabled = true`,
 the installer also installs the `onlysavemevods[voice-match]` extra for
-pyannote-backed known-voice matching. Set `ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1`
-to force it or `ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=0` to skip it.
+pyannote-backed known-voice matching. That extra pins the shared Torch and
+Hugging Face packages to the WhisperX-compatible stack. Set
+`ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1` to force it or
+`ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=0` to skip it.
 
 The installer also enables a nightly root-run Python dependency updater. It
 refreshes the project venv, `yt-dlp[default]`, installed/enabled WhisperX, and
@@ -285,7 +287,8 @@ scripts/uninstall-systemd.sh
   transcript segments, and review of low-confidence matches. The systemd installer
   installs the optional matcher dependency when `voice_match_enabled = true`; for
   manual installs, use `.venv/bin/python -m pip install -e ".[voice-match]"`.
-  When available, the matcher
+  If pip has already upgraded Torch or `huggingface-hub` too far, rerun that
+  command so the WhisperX-compatible pins can downgrade them. When available, the matcher
   writes `<media>.voice-attribution.json` after WhisperX, auto-applies confident
   matches to `.srt`/`.vtt`, and leaves weak matches for review. Manual
   `[streamers."Name".speaker_labels]` and `[channel_speaker_labels."Channel Name"]`

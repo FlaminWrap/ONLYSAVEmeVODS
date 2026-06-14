@@ -432,6 +432,18 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("stream-tab-panel stream-tab-log", html)
         self.assertIn("stream-tab-panel stream-tab-jobs", html)
         self.assertIn("Stream Log", html)
+        stream_tabs = html[html.index('<div class="stream-tab-labels">'):]
+        self.assertLess(
+            stream_tabs.index('class="stream-tab-jobs-label"'),
+            stream_tabs.index('class="stream-tab-log-label"'),
+        )
+        self.assertLess(
+            stream_tabs.index('stream-tab-panel stream-tab-jobs'),
+            stream_tabs.index('stream-tab-panel stream-tab-log'),
+        )
+        self.assertIn("stream-events", html)
+        self.assertIn("stream-event-level", html)
+        self.assertIn(">INFO</div>", html)
         self.assertIn("Post-exit check saw stream live", html)
         self.assertIn("seg 001", html)
         self.assertIn("data-stream-toggle", html)

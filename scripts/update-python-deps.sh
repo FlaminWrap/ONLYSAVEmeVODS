@@ -172,10 +172,10 @@ update_python_dependencies() {
 
   if voice_match_dependency_installed; then
     echo "Voice-match dependencies are installed; upgrading them..."
-    "${PYTHON_BIN}" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+    "${PYTHON_BIN}" -m pip install --upgrade --editable "${APP_DIR}[voice-match]"
   elif config_enables_voice_match; then
     echo "Voice matching is enabled; installing/upgrading voice-match dependencies..."
-    "${PYTHON_BIN}" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+    "${PYTHON_BIN}" -m pip install --upgrade --editable "${APP_DIR}[voice-match]"
   else
     local voice_match_status=$?
     if [[ "${voice_match_status}" == "2" ]]; then

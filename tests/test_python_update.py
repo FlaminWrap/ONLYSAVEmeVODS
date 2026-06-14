@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import tomllib
 import unittest
 
 from onlysavemevods.models import LiveStream
@@ -108,6 +109,16 @@ class PythonUpdateUnitTests(unittest.TestCase):
 
 
 class PythonUpdateScriptTests(unittest.TestCase):
+    def test_voice_match_extra_uses_whisperx_compatible_pins(self) -> None:
+        pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+        extra = pyproject["project"]["optional-dependencies"]["voice-match"]
+
+        self.assertIn("pyannote.audio>=3.1.1,<4.0", extra)
+        self.assertIn("huggingface-hub>=0.34.0,<1.0", extra)
+        self.assertIn("torch~=2.8.0", extra)
+        self.assertIn("torchaudio~=2.8.0", extra)
+        self.assertTrue(any(item.startswith("torchcodec>=0.6.0,<0.8.0") for item in extra))
+
     def test_installer_can_install_voice_match_extra(self) -> None:
         script = Path("scripts/install-almalinux.sh").read_text(encoding="utf-8")
 
@@ -115,6 +126,7 @@ class PythonUpdateScriptTests(unittest.TestCase):
         self.assertIn("config.voice_match_enabled", script)
         self.assertIn('"${APP_DIR}[voice-match]"', script)
         self.assertIn("install_voice_match_if_needed", script)
+        self.assertNotIn('--upgrade-strategy eager --editable "${APP_DIR}[voice-match]"', script)
 
     def test_python_updater_refreshes_voice_match_extra(self) -> None:
         script = Path("scripts/update-python-deps.sh").read_text(encoding="utf-8")
@@ -122,6 +134,7 @@ class PythonUpdateScriptTests(unittest.TestCase):
         self.assertIn("config_enables_voice_match", script)
         self.assertIn("voice_match_dependency_installed", script)
         self.assertIn('"${APP_DIR}[voice-match]"', script)
+        self.assertNotIn('--upgrade-strategy eager --editable "${APP_DIR}[voice-match]"', script)
 
 
 if __name__ == "__main__":

@@ -4236,6 +4236,47 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .stream-tab-files-toggle:checked ~ .stream-tab-panels .stream-tab-files,
     .stream-tab-log-toggle:checked ~ .stream-tab-panels .stream-tab-log,
     .stream-tab-jobs-toggle:checked ~ .stream-tab-panels .stream-tab-jobs {{ display: block; }}
+    .stream-events {{
+      display: grid;
+      gap: 8px;
+    }}
+    .stream-event {{
+      display: grid;
+      grid-template-columns: minmax(145px, max-content) max-content max-content minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-left-width: 4px;
+      border-radius: 7px;
+      padding: 8px 10px;
+      background: var(--panel-strong);
+    }}
+    .stream-event.debug {{ border-left-color: var(--muted); }}
+    .stream-event.info {{ border-left-color: var(--active); }}
+    .stream-event.warning {{ border-left-color: var(--warn); }}
+    .stream-event.error {{ border-left-color: var(--bad); }}
+    .stream-event-time {{ color: var(--muted); white-space: nowrap; }}
+    .stream-event-level, .stream-event-segment {{
+      border: 1px solid var(--line);
+      border-radius: 5px;
+      padding: 1px 6px;
+      color: var(--muted);
+      background: var(--panel);
+      font-size: 0.78rem;
+      line-height: 1.35;
+      white-space: nowrap;
+    }}
+    .stream-event.warning .stream-event-level {{ color: var(--warn); }}
+    .stream-event.error .stream-event-level {{ color: var(--bad); }}
+    .stream-event-message {{
+      min-width: 0;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+    }}
+    @media (max-width: 820px) {{
+      .stream-event {{ grid-template-columns: 1fr; }}
+      .stream-event-time, .stream-event-level, .stream-event-segment {{ justify-self: start; }}
+    }}
     .stream-job-list {{ display: grid; gap: 8px; }}
     .title {{ font-weight: 650; overflow-wrap: anywhere; }}
     .badge {{
@@ -5145,9 +5186,11 @@ def dashboard_script() -> str:
     if (!events || !events.length) return '<div class="file-meta">No stream log entries yet.</div>';
     const rows = events.map((event) => {
       const segment = event.segment_index ? `seg ${String(event.segment_index).padStart(3, "0")}` : "-";
-      const level = event.level || "info";
+      const rawLevel = String(event.level || "info").toLowerCase();
+      const level = ["debug", "info", "warning", "error"].includes(rawLevel) ? rawLevel : "info";
       return `<div class="stream-event ${escapeAttr(level)}">
         <div class="stream-event-time">${escapeHtml(formatIso(event.created_at))}</div>
+        <div class="stream-event-level">${escapeHtml(level.toUpperCase())}</div>
         <div class="stream-event-segment">${escapeHtml(segment)}</div>
         <div class="stream-event-message">${escapeHtml(event.message || "")}</div>
       </div>`;
@@ -5296,12 +5339,12 @@ def dashboard_script() -> str:
     </div>
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(filesTabId)}" data-stream-tab="files" data-video-id="${escapeAttr(videoId)}" checked>
-      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(jobsTabId)}" data-stream-tab="jobs" data-video-id="${escapeAttr(videoId)}">
+      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="${escapeAttr(filesTabId)}">Files</label>
-        <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
         <label class="stream-tab-jobs-label" for="${escapeAttr(jobsTabId)}">Jobs</label>
+        <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
       </div>
       <div class="stream-tab-panels">
         <section class="stream-tab-panel stream-tab-files">
@@ -5312,8 +5355,8 @@ def dashboard_script() -> str:
             </table>
           </div>
         </section>
-        <section class="stream-tab-panel stream-tab-log">${renderStreamEvents(stream.events || [])}</section>
         <section class="stream-tab-panel stream-tab-jobs">${renderStreamJobs(stream.jobs || [])}</section>
+        <section class="stream-tab-panel stream-tab-log">${renderStreamEvents(stream.events || [])}</section>
       </div>
     </div>
   </div>
@@ -6712,12 +6755,12 @@ def render_stream_card(stream: StreamStatus) -> str:
     </div>
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="{tab_name}" id="{files_tab_id}" data-stream-tab="files" data-video-id="{tab_key}" checked>
-      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="{tab_name}" id="{jobs_tab_id}" data-stream-tab="jobs" data-video-id="{tab_key}">
+      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="{files_tab_id}">Files</label>
-        <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
         <label class="stream-tab-jobs-label" for="{jobs_tab_id}">Jobs</label>
+        <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
       </div>
       <div class="stream-tab-panels">
         <section class="stream-tab-panel stream-tab-files">
@@ -6728,8 +6771,8 @@ def render_stream_card(stream: StreamStatus) -> str:
             </table>
           </div>
         </section>
-        <section class="stream-tab-panel stream-tab-log">{events}</section>
         <section class="stream-tab-panel stream-tab-jobs">{jobs}</section>
+        <section class="stream-tab-panel stream-tab-log">{events}</section>
       </div>
     </div>
   </div>
@@ -6749,6 +6792,7 @@ def render_stream_event(event: StreamEventStatus) -> str:
     return (
         f'<div class="stream-event {escape(level, quote=True)}">'
         f'<div class="stream-event-time">{escape(format_optional_iso(event.created_at))}</div>'
+        f'<div class="stream-event-level">{escape(level.upper())}</div>'
         f'<div class="stream-event-segment">{escape(segment)}</div>'
         f'<div class="stream-event-message">{escape(event.message)}</div>'
         "</div>"

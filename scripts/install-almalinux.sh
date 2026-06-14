@@ -696,7 +696,7 @@ install_voice_match_if_needed() {
   fi
 
   echo "Installing voice-match dependencies into ${VENV_DIR}..."
-  sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}[voice-match]"
+  sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --editable "${APP_DIR}[voice-match]"
   sudo chown -R root:root "${VENV_DIR}"
   sudo chmod -R a+rX "${VENV_DIR}"
 }
