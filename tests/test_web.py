@@ -1205,6 +1205,7 @@ class WebStatusTests(unittest.TestCase):
             chat_file.write_text("chat", encoding="utf-8")
 
             snapshot = build_status_snapshot(config)
+            html = render_status_html(snapshot)
 
         chat_status = next(
             file
@@ -1214,6 +1215,10 @@ class WebStatusTests(unittest.TestCase):
         self.assertIsNone(chat_status.render_chat_url)
         self.assertIsNone(chat_status.refresh_chat_url)
         self.assertIn("twitch", snapshot_to_dict(snapshot)["streams"][0]["platform"])
+        self.assertIn('class="stream-title-block"', html)
+        self.assertIn('source-platform-icon twitch', html)
+        self.assertIn('twitch:OUMB3rd', html)
+        self.assertIn('renderStreamSourceMeta', html)
 
     def test_chat_refresh_action_is_available_for_finalized_chat(self) -> None:
         with TemporaryDirectory() as tmp:

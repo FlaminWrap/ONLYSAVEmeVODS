@@ -4460,6 +4460,14 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       gap: 12px;
       align-items: start;
     }}
+    .stream-title-block {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+      min-width: 0;
+    }}
+    .stream-title-text {{ min-width: 0; }}
     .stream-actions {{
       display: flex;
       flex-wrap: wrap;
@@ -5890,8 +5898,26 @@ def dashboard_script() -> str:
     return `<div class="stream-job-list">${jobs.slice(0, 8).map(renderStreamJobRow).join("")}</div>`;
   };
 
+  const streamPlatform = (stream) => {
+    const platform = String(stream && stream.platform || "").toLowerCase();
+    if (sourcePlatforms.has(platform)) return platform;
+    return detectSourcePlatform((stream && (stream.source || stream.url)) || "");
+  };
+
+  const renderStreamSourceMeta = (stream) => {
+    const source = String((stream && stream.source) || "").trim();
+    const channel = escapeHtml((stream && stream.channel) || "unknown channel");
+    const videoId = escapeHtml((stream && stream.video_id) || "-");
+    const url = escapeAttr((stream && stream.url) || "#");
+    const prefix = source ? `${escapeHtml(source)} - ` : "";
+    return `${prefix}${channel} - <a href="${url}">${videoId}</a>`;
+  };
+
   const renderStreamCard = (stream) => {
     const title = stream.title || stream.video_id;
+    const platform = streamPlatform(stream);
+    const platformLabel = sourcePlatformLabels[platform] || sourcePlatformLabels.unknown;
+    const platformInitial = sourcePlatformInitials[platform] || sourcePlatformInitials.unknown;
     const mixed = stream.has_mixed_formats ? "yes" : "no";
     const videoId = String(stream.video_id);
     const collapsed = streamIsCollapsed(videoId, stream.status);
@@ -5906,9 +5932,12 @@ def dashboard_script() -> str:
     const tabName = `stream-tabs-${videoId}`;
     return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}">
   <div class="stream-head">
-    <div>
-      <div class="title">${escapeHtml(title)}</div>
-      <div class="file-meta">${escapeHtml(stream.channel || "unknown channel")} - <a href="${escapeAttr(stream.url)}">${escapeHtml(stream.video_id)}</a></div>
+    <div class="stream-title-block">
+      ${renderPlatformIcon(platform, platformLabel, platformInitial)}
+      <div class="stream-title-text">
+        <div class="title">${escapeHtml(title)}</div>
+        <div class="file-meta">${renderStreamSourceMeta(stream)}</div>
+      </div>
     </div>
     <div class="stream-actions">
       <button class="download stream-toggle" type="button" data-stream-toggle="${escapeAttr(videoId)}" aria-expanded="${expanded}">${toggleLabel}</button>
@@ -6950,6 +6979,22 @@ def render_streamer_job_row(job: JobStatus) -> str:
     )
 
 
+def stream_platform_details(stream: StreamStatus) -> tuple[str, str, str]:
+    platform = (stream.platform or "").casefold()
+    if platform not in SOURCE_PLATFORM_LABELS:
+        platform, label, initial, _name = source_display_details(stream.source or stream.url)
+        return platform, label, initial
+    return platform, SOURCE_PLATFORM_LABELS[platform], SOURCE_PLATFORM_INITIALS[platform]
+
+
+def render_stream_source_meta(stream: StreamStatus) -> str:
+    prefix = f"{escape(stream.source)} - " if stream.source else ""
+    return (
+        f'{prefix}{escape(stream.channel or "unknown channel")} - '
+        f'<a href="{escape(stream.url, quote=True)}">{escape(stream.video_id)}</a>'
+    )
+
+
 def render_streamer_streams(streams: list[StreamStatus]) -> str:
     if not streams:
         return '<section class="empty">No streams have been seen for this streamer.</section>'
@@ -7433,6 +7478,7 @@ def render_stream_jobs(jobs: list[JobStatus]) -> str:
 
 def render_stream_card(stream: StreamStatus) -> str:
     title = stream.title or stream.video_id
+    platform, platform_label, platform_initial = stream_platform_details(stream)
     mixed = "yes" if stream.has_mixed_formats else "no"
     latest_file = format_optional_epoch(stream.latest_file_modified_at)
     latest_age = format_epoch_age(stream.latest_file_modified_at)
@@ -7455,9 +7501,12 @@ def render_stream_card(stream: StreamStatus) -> str:
 
     return f"""<section class="stream{collapsed_class}" data-video-id="{escape(stream.video_id, quote=True)}" data-stream-status="{escape(stream.status, quote=True)}">
   <div class="stream-head">
-    <div>
-      <div class="title">{escape(title)}</div>
-      <div class="file-meta">{escape(stream.channel or "unknown channel")} - <a href="{escape(stream.url, quote=True)}">{escape(stream.video_id)}</a></div>
+    <div class="stream-title-block">
+      {render_platform_icon(platform, platform_label, platform_initial)}
+      <div class="stream-title-text">
+        <div class="title">{escape(title)}</div>
+        <div class="file-meta">{render_stream_source_meta(stream)}</div>
+      </div>
     </div>
     <div class="stream-actions">
       <button class="download stream-toggle" type="button" data-stream-toggle="{escape(stream.video_id, quote=True)}" aria-expanded="{expanded}">{toggle_label}</button>
