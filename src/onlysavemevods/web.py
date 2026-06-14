@@ -109,15 +109,6 @@ from .watermark import (
 
 LOGGER = logging.getLogger(__name__)
 PACKAGE_DIR = Path(__file__).resolve().parent
-FAVICON_ROUTES = {
-    "/favicon.ico": "favicon.ico",
-    "/favicon-16x16.png": "favicon-16x16.png",
-    "/favicon-32x32.png": "favicon-32x32.png",
-    "/apple-touch-icon.png": "apple-touch-icon.png",
-    "/android-chrome-192x192.png": "android-chrome-192x192.png",
-    "/android-chrome-512x512.png": "android-chrome-512x512.png",
-    "/Favicon.png": "Favicon.png",
-}
 SOURCE_PLATFORM_LABELS = {
     "youtube": "YouTube",
     "twitch": "Twitch",
@@ -132,6 +123,71 @@ SOURCE_PLATFORM_INITIALS = {
     "rumble": "R",
     "unknown": "?",
 }
+
+
+def first_existing_dir(*candidates: Path) -> Path:
+    for candidate in candidates:
+        if candidate.is_dir():
+            return candidate
+    return candidates[0]
+
+
+def find_asset_file(directory: Path, *names: str) -> Path | None:
+    for name in names:
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    if not directory.is_dir():
+        return None
+    available = {path.name.casefold(): path for path in directory.iterdir() if path.is_file()}
+    for name in names:
+        match = available.get(name.casefold())
+        if match is not None:
+            return match
+    return None
+
+
+FAVICON_DIR = first_existing_dir(
+    PACKAGE_DIR / "assets" / "favicon",
+    PACKAGE_DIR / "assets" / "favicons",
+    PACKAGE_DIR / "favicons",
+    PACKAGE_DIR,
+)
+PLATFORM_DIR = first_existing_dir(
+    PACKAGE_DIR / "assets" / "platforms",
+    PACKAGE_DIR / "platforms",
+)
+FAVICON_ROUTES = {
+    "/favicon.ico": FAVICON_DIR / "favicon.ico",
+    "/favicon-16x16.png": FAVICON_DIR / "favicon-16x16.png",
+    "/favicon-32x32.png": FAVICON_DIR / "favicon-32x32.png",
+    "/apple-touch-icon.png": FAVICON_DIR / "apple-touch-icon.png",
+    "/android-chrome-192x192.png": FAVICON_DIR / "android-chrome-192x192.png",
+    "/android-chrome-512x512.png": FAVICON_DIR / "android-chrome-512x512.png",
+    "/Favicon.png": FAVICON_DIR / "Favicon.png",
+}
+PLATFORM_ICON_ROUTES = {
+    f"/assets/platforms/{platform}.svg": path
+    for platform, path in (
+        (
+            platform,
+            find_asset_file(
+                PLATFORM_DIR,
+                f"{platform}.svg",
+                f"{platform.title()}.svg",
+                f"{label}.svg",
+            ),
+        )
+        for platform, label in SOURCE_PLATFORM_LABELS.items()
+        if platform != "unknown"
+    )
+    if path is not None
+}
+PLATFORM_ICON_URLS = {
+    route.rsplit("/", 1)[-1].removesuffix(".svg"): route
+    for route in PLATFORM_ICON_ROUTES
+}
+ASSET_ROUTES = {**FAVICON_ROUTES, **PLATFORM_ICON_ROUTES}
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
@@ -580,8 +636,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if path == "/healthz":
                 self._send_text("ok\n", "text/plain; charset=utf-8")
                 return
-            if path in FAVICON_ROUTES:
-                self._send_package_asset(FAVICON_ROUTES[path])
+            asset_path = ASSET_ROUTES.get(path)
+            if asset_path is not None:
+                self._send_package_asset(asset_path)
                 return
             if path == "/download":
                 self._send_download(parts.query)
@@ -644,11 +701,10 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
             self._send_text(body, "application/json; charset=utf-8")
 
-        def _send_package_asset(self, filename: str) -> None:
-            if filename not in FAVICON_ROUTES.values():
+        def _send_package_asset(self, path: Path) -> None:
+            if path not in ASSET_ROUTES.values():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            path = PACKAGE_DIR / filename
             if not path.is_file():
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -4241,10 +4297,13 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .source-chip {{
       border: 1px solid var(--line);
       border-radius: 999px;
-      padding: 2px 8px;
+      padding: 2px 8px 2px 4px;
       color: var(--muted);
       background: var(--panel-strong);
       overflow-wrap: anywhere;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
     }}
     .source-builder {{
       display: grid;
@@ -4275,12 +4334,21 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       display: inline-grid;
       place-items: center;
       border-radius: 6px;
-      color: white;
-      background: var(--muted);
+      color: var(--muted);
+      background: var(--panel);
+      border: 1px solid var(--line);
       font-size: 12px;
       font-weight: 750;
       line-height: 1;
+      overflow: hidden;
     }}
+    .source-platform-icon img {{
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      padding: 3px;
+    }}
+    .source-platform-icon img + .source-platform-initial {{ display: none; }}
     .source-platform-icon.youtube {{ background: #cc0000; }}
     .source-platform-icon.twitch {{ background: #6441a5; }}
     .source-platform-icon.kick {{ background: #15803d; }}
@@ -5157,6 +5225,11 @@ def dashboard_script() -> str:
     rumble: "R",
     unknown: "?",
   };
+  const sourcePlatformIconUrls = {
+    youtube: "/assets/platforms/youtube.svg",
+    kick: "/assets/platforms/kick.svg",
+    rumble: "/assets/platforms/rumble.svg",
+  };
   const sourcePlatforms = new Set(["youtube", "twitch", "kick", "rumble"]);
   const splitSourceValues = (value) => String(value || "")
     .split(/\\r?\\n/)
@@ -5213,6 +5286,11 @@ def dashboard_script() -> str:
     if (sourcePlatforms.has(detected)) return `${detected}:${clean}`;
     return value;
   };
+  const renderPlatformIcon = (platform, label, initial) => {
+    const url = sourcePlatformIconUrls[platform] || "";
+    const image = url ? `<img src="${escapeAttr(url)}" alt="" loading="lazy" onerror="this.remove()">` : "";
+    return `<span class="source-platform-icon ${escapeAttr(platform)}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}">${image}<span class="source-platform-initial">${escapeHtml(initial)}</span></span>`;
+  };
   const renderSourceList = (sources) => {
     sources = sources || [];
     if (!sources.length) return '<div class="source-list" data-source-list><div class="source-list-empty file-meta">No sources configured.</div></div>';
@@ -5221,7 +5299,7 @@ def dashboard_script() -> str:
       const label = sourcePlatformLabels[platform] || sourcePlatformLabels.unknown;
       const initial = sourcePlatformInitials[platform] || sourcePlatformInitials.unknown;
       return `<div class="source-list-row" data-source-row>
-  <span class="source-platform-icon ${escapeAttr(platform)}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}">${escapeHtml(initial)}</span>
+  ${renderPlatformIcon(platform, label, initial)}
   <div><div class="source-name">${escapeHtml(sourceDisplayName(source))}</div><div class="source-raw file-meta">${escapeHtml(source)}</div></div>
   <span class="badge">${escapeHtml(label)}</span>
   <button class="download action-button" type="button" data-remove-source="${escapeAttr(source)}">Remove</button>
@@ -5839,7 +5917,12 @@ def dashboard_script() -> str:
   const renderSourceChips = (sources) => {
     sources = sources || [];
     if (!sources.length) return '<div class="source-chips"><span class="source-chip">No configured sources</span></div>';
-    return `<div class="source-chips">${sources.map((source) => `<span class="source-chip">${escapeHtml(source)}</span>`).join("")}</div>`;
+    return `<div class="source-chips">${sources.map((source) => {
+      const platform = detectSourcePlatform(source);
+      const label = sourcePlatformLabels[platform] || sourcePlatformLabels.unknown;
+      const initial = sourcePlatformInitials[platform] || sourcePlatformInitials.unknown;
+      return `<span class="source-chip">${renderPlatformIcon(platform, label, initial)}<span>${escapeHtml(source)}</span></span>`;
+    }).join("")}</div>`;
   };
 
   const renderStreamerForm = (streamer) => {
@@ -6683,11 +6766,39 @@ def render_needs_grouping_action(
 def render_source_chips(sources: list[str]) -> str:
     if not sources:
         return '<div class="source-chips"><span class="source-chip">No configured sources</span></div>'
-    chips = "".join(
-        f'<span class="source-chip">{escape(source)}</span>'
-        for source in sources
-    )
+    chips = "".join(render_source_chip(source) for source in sources)
     return f'<div class="source-chips">{chips}</div>'
+
+
+def platform_icon_url(platform: str) -> str:
+    route = PLATFORM_ICON_URLS.get(platform)
+    if not route:
+        return ""
+    return f"{route}?v={quote(APP_VERSION)}"
+
+
+def render_platform_icon(platform: str, label: str, initial: str) -> str:
+    url = platform_icon_url(platform)
+    image = (
+        f'<img src="{escape(url, quote=True)}" alt="" loading="lazy" onerror="this.remove()">'
+        if url
+        else ""
+    )
+    return (
+        f'<span class="source-platform-icon {escape(platform, quote=True)}" '
+        f'title="{escape(label, quote=True)}" aria-label="{escape(label, quote=True)}">'
+        f'{image}<span class="source-platform-initial">{escape(initial)}</span></span>'
+    )
+
+
+def render_source_chip(source: str) -> str:
+    platform, label, initial, _name = source_display_details(source)
+    return (
+        '<span class="source-chip">'
+        f'{render_platform_icon(platform, label, initial)}'
+        f'<span>{escape(source)}</span>'
+        '</span>'
+    )
 
 
 def source_display_details(source: str) -> tuple[str, str, str, str]:
@@ -6713,9 +6824,7 @@ def render_source_list_items(sources: list[str]) -> str:
         platform, label, initial, name = source_display_details(source)
         rows.append(
             '<div class="source-list-row" data-source-row>'
-            f'<span class="source-platform-icon {escape(platform, quote=True)}" '
-            f'title="{escape(label, quote=True)}" aria-label="{escape(label, quote=True)}">'
-            f'{escape(initial)}</span>'
+            f'{render_platform_icon(platform, label, initial)}'
             '<div>'
             f'<div class="source-name">{escape(name)}</div>'
             f'<div class="source-raw file-meta">{escape(source)}</div>'

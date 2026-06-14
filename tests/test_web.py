@@ -48,7 +48,7 @@ from onlysavemevods.web import (
     CHAT_RENDER_JOBS,
     CHAT_RENDER_JOBS_LOCK,
     FAVICON_ROUTES,
-    PACKAGE_DIR,
+    PLATFORM_ICON_ROUTES,
     snapshot_to_dict,
     transcription_job_key,
     TranscriptionJob,
@@ -787,6 +787,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-close-source-popover', html)
         self.assertIn('data-source-list', html)
         self.assertIn('source-platform-icon youtube', html)
+        self.assertIn('src="/assets/platforms/youtube.svg?v=', html)
         self.assertIn('data-remove-source="@OUMB3rd"', html)
         self.assertIn('OUMB3rd', html)
         self.assertIn('<option value="twitch">Twitch</option>', html)
@@ -807,8 +808,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('href="/favicon-16x16.png?v=', html)
         self.assertIn('href="/apple-touch-icon.png?v=', html)
         self.assertIn('href="/android-chrome-192x192.png?v=', html)
-        for filename in FAVICON_ROUTES.values():
-            self.assertTrue((PACKAGE_DIR / filename).is_file(), filename)
+        for path in FAVICON_ROUTES.values():
+            self.assertTrue(Path(path).is_file(), path)
+            self.assertIn("assets/favicons", Path(path).as_posix())
+        self.assertIn("/assets/platforms/youtube.svg", PLATFORM_ICON_ROUTES)
+        self.assertTrue(Path(PLATFORM_ICON_ROUTES["/assets/platforms/youtube.svg"]).is_file())
 
     def test_status_html_renders_streamer_voice_manager(self) -> None:
         with TemporaryDirectory() as tmp:
