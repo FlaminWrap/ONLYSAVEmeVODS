@@ -279,7 +279,7 @@ def check_command(args: argparse.Namespace) -> int:
 def update_config_command(args: argparse.Namespace) -> int:
     added = append_missing_config_values(args.config, args.defaults)
     if added:
-        print(f"Added missing config settings: {', '.join(added)}")
+        print(f"Added or repaired config settings: {', '.join(added)}")
     else:
         print("Config already has all default settings.")
     return 0

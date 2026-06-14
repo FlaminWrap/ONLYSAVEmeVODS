@@ -50,6 +50,11 @@ DEFAULT_VOICE_MATCH_MODEL = "pyannote/embedding"
 DEFAULT_VOICE_MATCH_THRESHOLD = 0.35
 DEFAULT_VOICE_MATCH_MIN_MARGIN = 0.05
 DEFAULT_VOICE_SAMPLE_MAX_BYTES = 104_857_600
+CONFIG_UPDATE_COMMENT = (
+    "# Added by ONLYSAVEmeVODS config update. "
+    "Existing settings above were left unchanged."
+)
+BARE_TOML_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=", re.MULTILINE)
 
 
 class ConfigError(ValueError):
@@ -403,6 +408,89 @@ def source_lookup_key(source: str) -> str:
     return compact or folded
 
 
+def _insert_root_config_block(current_text: str, lines: list[str]) -> str:
+    addition = "\n".join(lines) + "\n"
+    table_match = re.search(r"(?m)^\[", current_text)
+    if table_match is None:
+        prefix = current_text
+        if prefix and not prefix.endswith("\n"):
+            prefix += "\n"
+        return prefix + addition
+
+    prefix = current_text[: table_match.start()].rstrip()
+    suffix = current_text[table_match.start() :].lstrip("\n")
+    if prefix:
+        return prefix + addition + "\n" + suffix
+    return addition + "\n" + suffix
+
+
+def _repair_misplaced_root_config_values(
+    current_text: str,
+    defaults: dict[str, Any],
+) -> tuple[str, list[str]]:
+    root_default_keys = {
+        key for key, value in defaults.items() if not isinstance(value, dict)
+    }
+    table_match = re.search(r"(?m)^\[", current_text)
+    if not root_default_keys or table_match is None:
+        return current_text, []
+
+    root_text = current_text[: table_match.start()]
+    root_keys = {
+        match.group(1)
+        for match in BARE_TOML_ASSIGNMENT_RE.finditer(root_text)
+    }
+    repaired_keys: list[str] = []
+    moved_lines: list[str] = []
+    pending_update_comments: list[str] = []
+    output_lines: list[str] = []
+    in_root = True
+
+    def remember_repaired(key: str) -> None:
+        if key not in repaired_keys:
+            repaired_keys.append(key)
+
+    for line in current_text.splitlines(keepends=True):
+        if re.match(r"^\s*\[", line):
+            in_root = False
+        if not in_root and line.strip() == CONFIG_UPDATE_COMMENT:
+            pending_update_comments.append(line)
+            continue
+
+        assignment_match = BARE_TOML_ASSIGNMENT_RE.match(line)
+        if (
+            not in_root
+            and assignment_match is not None
+            and assignment_match.group(1) in root_default_keys
+        ):
+            key = assignment_match.group(1)
+            pending_update_comments.clear()
+            remember_repaired(key)
+            if key not in root_keys:
+                moved_lines.append(line.rstrip("\r\n"))
+                root_keys.add(key)
+            continue
+
+        if pending_update_comments:
+            output_lines.extend(pending_update_comments)
+            pending_update_comments.clear()
+        output_lines.append(line)
+
+    if pending_update_comments:
+        output_lines.extend(pending_update_comments)
+
+    if not repaired_keys:
+        return current_text, []
+
+    repaired_text = "".join(output_lines)
+    if moved_lines:
+        repaired_text = _insert_root_config_block(
+            repaired_text,
+            ["", CONFIG_UPDATE_COMMENT, *moved_lines],
+        )
+    return repaired_text, repaired_keys
+
+
 def append_missing_config_values(
     config_path: str | Path,
     defaults_path: str | Path,
@@ -425,36 +513,47 @@ def append_missing_config_values(
         ) from exc
 
     try:
-        current = tomllib.loads(current_text)
-    except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
-    try:
         defaults = tomllib.loads(defaults_text)
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML in {defaults_file}: {exc}") from exc
+    if not isinstance(defaults, dict):
+        raise ConfigError("Config files must have TOML tables at the root")
 
-    if not isinstance(current, dict) or not isinstance(defaults, dict):
+    repaired: list[str] = []
+    try:
+        current = tomllib.loads(current_text)
+    except tomllib.TOMLDecodeError as exc:
+        repaired_text, repaired = _repair_misplaced_root_config_values(
+            current_text,
+            defaults,
+        )
+        if not repaired or repaired_text == current_text:
+            raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+        try:
+            current = tomllib.loads(repaired_text)
+        except tomllib.TOMLDecodeError:
+            raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+        current_text = repaired_text
+
+    if not isinstance(current, dict):
         raise ConfigError("Config files must have TOML tables at the root")
 
     missing = [key for key in defaults if key not in current]
-    if not missing:
+    if not missing and not repaired:
         return []
 
-    block = [
-        "",
-        "# Added by ONLYSAVEmeVODS config update. Existing settings above were left unchanged.",
-    ]
-    for key in missing:
-        block.append(f"{key} = {_toml_value(defaults[key], key)}")
+    updated_text = current_text
+    if missing:
+        block = ["", CONFIG_UPDATE_COMMENT]
+        for key in missing:
+            block.append(f"{key} = {_toml_value(defaults[key], key)}")
+        updated_text = _insert_root_config_block(current_text, block)
 
-    prefix = current_text
-    if prefix and not prefix.endswith("\n"):
-        prefix += "\n"
     try:
-        target.write_text(prefix + "\n".join(block) + "\n", encoding="utf-8")
+        target.write_text(updated_text, encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
-    return missing
+    return [*repaired, *missing]
 
 
 def update_config_values(
@@ -494,23 +593,10 @@ def update_config_values(
             missing.append(key)
 
     if missing:
-        lines = [
-            "",
-            "# Added by ONLYSAVEmeVODS config update. Existing settings above were left unchanged.",
-        ]
+        lines = ["", CONFIG_UPDATE_COMMENT]
         for key in missing:
             lines.append(f"{key} = {_toml_value(updates[key], key)}")
-        addition = "\n".join(lines) + "\n"
-        table_match = re.search(r"(?m)^\[", updated_text)
-        if table_match is None:
-            prefix = updated_text
-            if prefix and not prefix.endswith("\n"):
-                prefix += "\n"
-            updated_text = prefix + addition
-        else:
-            prefix = updated_text[: table_match.start()].rstrip()
-            suffix = updated_text[table_match.start() :].lstrip("\n")
-            updated_text = (prefix + addition + "\n" if prefix else addition + "\n") + suffix
+        updated_text = _insert_root_config_block(updated_text, lines)
         changed.extend(missing)
 
     if not changed:

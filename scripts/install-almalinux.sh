@@ -602,10 +602,15 @@ install_deno_runtime() {
 
 config_enables_transcription() {
   sudo "${VENV_DIR}/bin/python" -c '
-from onlysavemevods.config import load_config
-config = load_config("'"${CONFIG_FILE}"'")
+from onlysavemevods.config import ConfigError, load_config
+import sys
+try:
+    config = load_config(sys.argv[1])
+except ConfigError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2)
 raise SystemExit(0 if config.transcribe_subtitles else 1)
-'
+' "${CONFIG_FILE}"
 }
 
 config_whisperx_path() {
@@ -617,10 +622,15 @@ print(load_config("'"${CONFIG_FILE}"'").whisperx_path)
 
 config_enables_voice_match() {
   sudo "${VENV_DIR}/bin/python" -c '
-from onlysavemevods.config import load_config
-config = load_config("'"${CONFIG_FILE}"'")
+from onlysavemevods.config import ConfigError, load_config
+import sys
+try:
+    config = load_config(sys.argv[1])
+except ConfigError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2)
 raise SystemExit(0 if config.voice_match_enabled else 1)
-'
+' "${CONFIG_FILE}"
 }
 
 should_install_whisperx() {
@@ -632,8 +642,14 @@ should_install_whisperx() {
       return 1
       ;;
     auto|"")
+      set +e
       config_enables_transcription
-      return $?
+      local transcription_status=$?
+      set -e
+      if [[ "${transcription_status}" == "2" ]]; then
+        die "Unable to read transcription setting from ${CONFIG_FILE}; fix the config before continuing."
+      fi
+      return "${transcription_status}"
       ;;
     *)
       die "ONLYSAVEMEVODS_INSTALL_WHISPERX must be auto, 1, or 0"
@@ -676,8 +692,14 @@ should_install_voice_match() {
       return 1
       ;;
     auto|"")
+      set +e
       config_enables_voice_match
-      return $?
+      local voice_match_status=$?
+      set -e
+      if [[ "${voice_match_status}" == "2" ]]; then
+        die "Unable to read voice-match setting from ${CONFIG_FILE}; fix the config before continuing."
+      fi
+      return "${voice_match_status}"
       ;;
     *)
       die "ONLYSAVEMEVODS_INSTALL_VOICE_MATCH must be auto, 1, or 0"
@@ -699,6 +721,11 @@ install_voice_match_if_needed() {
   sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --editable "${APP_DIR}[voice-match]"
   sudo chown -R root:root "${VENV_DIR}"
   sudo chmod -R a+rX "${VENV_DIR}"
+}
+
+verify_python_dependencies() {
+  echo "Checking Python dependency compatibility..."
+  sudo "${VENV_DIR}/bin/python" -m pip check
 }
 
 python_updater_enabled() {
@@ -755,7 +782,7 @@ install_application_files
 cd "${APP_DIR}"
 sudo "${PYTHON_BIN}" -m venv "${VENV_DIR}"
 
-sudo "${VENV_DIR}/bin/python" -m pip install --upgrade pip setuptools wheel
+sudo "${VENV_DIR}/bin/python" -m pip install --upgrade pip "setuptools<82" wheel
 sudo "${VENV_DIR}/bin/python" -m pip install --upgrade "yt-dlp[default]"
 refresh_console_script_if_stale "yt-dlp[default]" "${VENV_DIR}/bin/yt-dlp" "yt-dlp"
 
@@ -786,6 +813,7 @@ sudo "${VENV_DIR}/bin/python" -m onlysavemevods update-config \
 ensure_config_file_service_writable
 install_whisperx_if_needed
 install_voice_match_if_needed
+verify_python_dependencies
 
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
 [Unit]

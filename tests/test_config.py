@@ -87,6 +87,103 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(added, [])
         self.assertEqual(text, original)
 
+    def test_append_missing_config_values_inserts_root_values_before_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            defaults_path = root / "config.example.toml"
+            config_path.write_text(
+                'channels = ["@Existing"]\n'
+                '\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '\n'
+                '[streamers."OUMB3rd".voices."Host"]\n'
+                'enabled = true\n'
+                'samples = []\n',
+                encoding="utf-8",
+            )
+            defaults_path.write_text(
+                "channels = []\n"
+                "voice_match_enabled = true\n"
+                'voice_match_model = "pyannote/embedding"\n'
+                '\n'
+                '[streamers."Example"]\n'
+                'sources = ["@Example"]\n',
+                encoding="utf-8",
+            )
+
+            added = append_missing_config_values(config_path, defaults_path)
+            text = config_path.read_text(encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(added, ["voice_match_enabled", "voice_match_model"])
+        self.assertLess(
+            text.index("voice_match_enabled = true"),
+            text.index('[streamers."OUMB3rd"]'),
+        )
+        self.assertLess(
+            text.index('voice_match_model = "pyannote/embedding"'),
+            text.index('[streamers."OUMB3rd"]'),
+        )
+        self.assertTrue(config.voice_match_enabled)
+        self.assertEqual(config.voice_match_model, "pyannote/embedding")
+        self.assertIn("OUMB3rd", config.streamers)
+        self.assertIn("Host", config.streamers["OUMB3rd"].voices)
+
+    def test_append_missing_config_values_repairs_misplaced_root_values(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            defaults_path = root / "config.example.toml"
+            config_path.write_text(
+                'channels = ["@Existing"]\n'
+                '\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '\n'
+                '# Added by ONLYSAVEmeVODS config update. Existing settings above were left unchanged.\n'
+                'voice_match_enabled = true\n'
+                'voice_match_model = "pyannote/embedding"\n'
+                'voice_match_model = "pyannote/embedding"\n'
+                'voice_match_threshold = 0.35\n'
+                'voice_match_min_margin = 0.05\n'
+                'voice_sample_max_bytes = 104857600\n',
+                encoding="utf-8",
+            )
+            defaults_path.write_text(
+                "channels = []\n"
+                "voice_match_enabled = true\n"
+                'voice_match_model = "pyannote/embedding"\n'
+                "voice_match_threshold = 0.35\n"
+                "voice_match_min_margin = 0.05\n"
+                "voice_sample_max_bytes = 104857600\n",
+                encoding="utf-8",
+            )
+
+            changed = append_missing_config_values(config_path, defaults_path)
+            text = config_path.read_text(encoding="utf-8")
+            config = load_config(config_path)
+
+        self.assertEqual(
+            changed,
+            [
+                "voice_match_enabled",
+                "voice_match_model",
+                "voice_match_threshold",
+                "voice_match_min_margin",
+                "voice_sample_max_bytes",
+            ],
+        )
+        self.assertLess(
+            text.index("voice_match_enabled = true"),
+            text.index('[streamers."OUMB3rd"]'),
+        )
+        self.assertEqual(text.count('voice_match_model = "pyannote/embedding"'), 1)
+        self.assertTrue(config.voice_match_enabled)
+        self.assertEqual(config.voice_sample_max_bytes, 104_857_600)
+        self.assertIn("OUMB3rd", config.streamers)
+
     def test_defaults_include_requested_post_exit_schedule(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"

@@ -767,15 +767,31 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
 
         def _update_streamer_voice(self) -> None:
-            body = self._read_request_body(128 * 1024)
-            if body is None:
-                return
+            content_type = self.headers.get("Content-Type", "")
             try:
-                params = parse_qs(
-                    body.decode("utf-8", "replace"),
-                    keep_blank_values=True,
-                )
-                update_streamer_voice_from_form(config, params)
+                if content_type.startswith("multipart/form-data"):
+                    length_header = self.headers.get("Content-Length", "0")
+                    try:
+                        length = int(length_header)
+                    except ValueError:
+                        self.send_error(HTTPStatus.BAD_REQUEST, "Invalid content length")
+                        return
+                    if length > config.voice_sample_max_bytes + 1024 * 1024:
+                        self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Upload is too large")
+                        self.rfile.read(min(length, 1024 * 1024))
+                        return
+                    body = self.rfile.read(length)
+                    fields, files = parse_multipart_form(content_type, body)
+                    update_streamer_voice_with_optional_sample(config, fields, files)
+                else:
+                    body = self._read_request_body(128 * 1024)
+                    if body is None:
+                        return
+                    params = parse_qs(
+                        body.decode("utf-8", "replace"),
+                        keep_blank_values=True,
+                    )
+                    update_streamer_voice_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -3278,6 +3294,24 @@ def update_streamer_voice_from_form(
     reload_running_config(config)
 
 
+def update_streamer_voice_with_optional_sample(
+    config: BotConfig,
+    fields: dict[str, list[str]],
+    files: dict[str, tuple[str, bytes]],
+) -> None:
+    action = (first_query_value(fields, "action") or "save").strip().lower()
+    update_streamer_voice_from_form(config, fields)
+    if action != "save":
+        return
+    upload = files.get("media")
+    if upload is None:
+        return
+    upload_filename, upload_bytes = upload
+    if not upload_filename and not upload_bytes:
+        return
+    store_streamer_voice_sample_upload(config, fields, {"media": upload})
+
+
 def optional_form_float(value: str, name: str) -> float:
     raw = value.strip()
     if not raw:
@@ -4179,11 +4213,27 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-job-row {{
       display: grid;
-      grid-template-columns: max-content minmax(120px, 1fr) minmax(100px, 1fr);
-      gap: 8px;
-      align-items: center;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 8px 10px;
+      align-items: start;
+      padding: 8px 0;
     }}
-    .streamer-job-row .job-progress {{ min-width: 120px; }}
+    .streamer-job-row + .streamer-job-row {{ border-top: 1px solid var(--line); }}
+    .streamer-job-body {{
+      min-width: 0;
+      display: grid;
+      gap: 5px;
+    }}
+    .streamer-job-heading {{
+      min-width: 0;
+      display: flex;
+      gap: 6px 10px;
+      align-items: baseline;
+      flex-wrap: wrap;
+    }}
+    .streamer-job-kind {{ font-weight: 650; color: var(--text); }}
+    .streamer-job-phase, .streamer-job-detail {{ min-width: 0; overflow-wrap: anywhere; }}
+    .streamer-job-row .job-progress {{ width: min(420px, 100%); min-width: 0; }}
     .stream-head {{
       display: flex;
       justify-content: space-between;
@@ -4574,10 +4624,26 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       border-bottom: 1px solid var(--line);
     }}
     .voice-manager-head h2 {{ margin: 0; font-size: 1rem; }}
+    .voice-manager-actions {{ display: flex; align-items: center; gap: 8px; }}
     .voice-manager-note {{ padding: 10px 14px 0; }}
+    .voice-add-menu {{ position: relative; }}
+    .voice-add-menu > summary {{ list-style: none; cursor: pointer; }}
+    .voice-add-menu > summary::-webkit-details-marker {{ display: none; }}
+    .voice-add-popover {{
+      position: absolute;
+      right: 0;
+      top: calc(100% + 8px);
+      z-index: 5;
+      width: min(560px, calc(100vw - 56px));
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.18);
+    }}
     .voice-tabs {{
       display: grid;
-      grid-template-columns: repeat(4, max-content) 1fr;
+      grid-template-columns: repeat(3, max-content) 1fr;
       gap: 0 8px;
       padding: 12px 14px 14px;
     }}
@@ -4613,10 +4679,39 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       padding: 10px;
       margin: 0;
     }}
-    .voice-profile-title, .voice-profile-form .wide, .voice-sample-row .file-name, .voice-match-row .file-name {{ grid-column: 1 / -1; }}
+    .voice-profile-title, .voice-task-title, .voice-profile-form .wide, .voice-sample-row .file-name, .voice-match-row .file-name {{ grid-column: 1 / -1; }}
+    .voice-task-title {{
+      margin: 0 0 2px;
+      font-size: 0.95rem;
+    }}
+    .voice-task-form {{
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      align-items: end;
+    }}
     .voice-profile-form textarea {{ min-height: 54px; }}
-    .voice-add-grid {{ display: grid; grid-template-columns: repeat(2, minmax(260px, 1fr)); gap: 12px; }}
+    .voice-list {{ display: grid; gap: 8px; }}
+    .voice-card {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }}
+    .voice-card > summary {{
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) repeat(3, max-content);
+      gap: 8px;
+      align-items: center;
+      padding: 10px;
+      cursor: pointer;
+      list-style: none;
+    }}
+    .voice-card > summary::-webkit-details-marker {{ display: none; }}
+    .voice-card-name {{ font-weight: 650; overflow-wrap: anywhere; }}
+    .voice-card-action {{ color: var(--link); font-size: 12px; }}
+    .voice-card-body {{ display: grid; gap: 10px; padding: 0 10px 10px; }}
+    .voice-sample-form {{ grid-template-columns: minmax(180px, 1fr) max-content; }}
     .voice-match-row {{ grid-template-columns: max-content 1fr repeat(2, max-content); align-items: center; }}
+    @media (max-width: 760px) {{
+      .voice-manager-head {{ align-items: flex-start; }}
+      .voice-manager-actions {{ flex-wrap: wrap; justify-content: flex-end; }}
+      .voice-card > summary {{ grid-template-columns: 1fr; justify-items: start; }}
+      .voice-sample-form {{ grid-template-columns: 1fr; }}
+    }}
     .upload-form {{
       display: grid;
       gap: 8px;
@@ -5282,8 +5377,11 @@ def dashboard_script() -> str:
     const detail = job.item || job.detail || job.video_id || "-";
     return `<div class="streamer-job-row">
   <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
-  <div class="file-name">${escapeHtml(job.kind || "Job")}<br><span class="muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
-  <div>${renderJobProgress(job.progress)}<div class="file-meta">${escapeHtml(detail)}</div></div>
+  <div class="streamer-job-body">
+    <div class="streamer-job-heading"><span class="streamer-job-kind">${escapeHtml(job.kind || "Job")}</span><span class="streamer-job-phase muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
+    <div class="streamer-job-progress">${renderJobProgress(job.progress)}</div>
+    <div class="streamer-job-detail file-meta">${escapeHtml(detail)}</div>
+  </div>
 </div>`;
   };
 
@@ -5425,8 +5523,11 @@ def dashboard_script() -> str:
     const detail = job.item || job.detail || job.video_id || "-";
     return `<div class="streamer-job-row">
   <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
-  <div class="file-name">${escapeHtml(job.kind || "Job")}<br><span class="muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
-  <div>${renderJobProgress(job.progress)}<div class="file-meta">${escapeHtml(detail)}</div></div>
+  <div class="streamer-job-body">
+    <div class="streamer-job-heading"><span class="streamer-job-kind">${escapeHtml(job.kind || "Job")}</span><span class="streamer-job-phase muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
+    <div class="streamer-job-progress">${renderJobProgress(job.progress)}</div>
+    <div class="streamer-job-detail file-meta">${escapeHtml(detail)}</div>
+  </div>
 </div>`;
   };
 
@@ -5463,25 +5564,51 @@ def dashboard_script() -> str:
     return `<button class="download action-button" type="button" data-open-voice-manager="${escapeAttr(dialogId)}"${disabled}>Voices</button>`;
   };
 
-  const renderVoiceNameDatalist = (streamer) => {
-    const id = `voices-${streamerDomId(streamer.name)}`;
-    const options = (streamer.voices || []).map((voice) => `<option value="${escapeAttr(voice.name || "")}"></option>`).join("");
-    return `<datalist id="${escapeAttr(id)}">${options}</datalist>`;
+  const renderVoiceAddMenu = (streamer) => {
+    return `<details class="voice-add-menu">
+  <summary class="download action-button">Add Voice</summary>
+  <div class="voice-add-popover">
+    <form class="voice-profile-form voice-task-form" method="post" action="/streamer-voices" enctype="multipart/form-data">
+      <h3 class="voice-task-title">Add Voice</h3>
+      <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+      <input type="hidden" name="action" value="save">
+      <label>Voice name <input name="voice_name" required placeholder="Host"></label>
+      <label>Matching <select name="enabled"><option value="true" selected>On</option><option value="false">Off</option></select></label>
+      <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="default"></label>
+      <label class="wide">Optional sample <input name="media" type="file" accept="audio/*,video/*"></label>
+      <label class="wide">Notes <textarea name="notes" rows="2"></textarea></label>
+      <button class="download action-button" type="submit">Add Voice</button>
+    </form>
+  </div>
+</details>`;
   };
 
   const renderVoiceProfileForm = (streamer, voice) => {
     const samples = Array.isArray(voice.samples) ? voice.samples.join(String.fromCharCode(10)) : "";
     const enabled = voice.enabled ? "true" : "false";
-    return `<form class="voice-profile-form" method="post" action="/streamer-voices">
-  <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
-  <input type="hidden" name="voice_name" value="${escapeAttr(voice.name || "")}">
-  <div class="voice-profile-title"><strong>${escapeHtml(voice.name || "Voice")}</strong><span class="file-meta">${escapeHtml(voice.sample_count || 0)} samples</span></div>
-  <label>Enabled <select name="enabled"><option value="true"${enabled === "true" ? " selected" : ""}>true</option><option value="false"${enabled === "false" ? " selected" : ""}>false</option></select></label>
-  <label>Threshold <input name="threshold" type="number" step="0.001" min="0" value="${escapeAttr(voice.threshold || "")}" placeholder="app default"></label>
-  <label class="wide">Samples <textarea name="samples" rows="3">${escapeHtml(samples)}</textarea></label>
-  <label class="wide">Notes <textarea name="notes" rows="2">${escapeHtml(voice.notes || "")}</textarea></label>
-  <div class="settings-actions"><button class="download action-button" name="action" value="save" type="submit">Save Voice</button><button class="download action-button" name="action" value="delete" type="submit">Delete</button></div>
-</form>`;
+    const status = voice.enabled ? "On" : "Off";
+    const statusClass = voice.enabled ? "running" : "ended";
+    return `<details class="voice-card">
+  <summary><span class="voice-card-name">${escapeHtml(voice.name || "Voice")}</span><span class="badge ${statusClass}">${status}</span><span class="file-meta">${escapeHtml(voice.sample_count || 0)} samples</span><span class="voice-card-action">Edit</span></summary>
+  <div class="voice-card-body">
+    <form class="voice-profile-form" method="post" action="/streamer-voices">
+      <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+      <input type="hidden" name="voice_name" value="${escapeAttr(voice.name || "")}">
+      <div class="voice-profile-title"><strong>Edit Voice</strong></div>
+      <label>Matching <select name="enabled"><option value="true"${enabled === "true" ? " selected" : ""}>On</option><option value="false"${enabled === "false" ? " selected" : ""}>Off</option></select></label>
+      <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" value="${escapeAttr(voice.threshold || "")}" placeholder="default"></label>
+      <label class="wide">Sample files <textarea name="samples" rows="3">${escapeHtml(samples)}</textarea></label>
+      <label class="wide">Notes <textarea name="notes" rows="2">${escapeHtml(voice.notes || "")}</textarea></label>
+      <div class="settings-actions"><button class="download action-button" name="action" value="save" type="submit">Save Voice</button><button class="download action-button" name="action" value="delete" type="submit">Delete</button></div>
+    </form>
+    <form class="voice-profile-form voice-sample-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
+      <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+      <input type="hidden" name="voice_name" value="${escapeAttr(voice.name || "")}">
+      <label>Sample file <input name="media" type="file" accept="audio/*,video/*" required></label>
+      <button class="download action-button" type="submit">Upload Sample</button>
+    </form>
+  </div>
+</details>`;
   };
 
   const renderVoiceManager = (streamer, snapshot) => {
@@ -5489,18 +5616,14 @@ def dashboard_script() -> str:
     const dialogId = `voice-manager-${streamerDomId(streamer.name)}`;
     const backend = (((snapshot || {}).configuration || {}).Transcription || {}).voice_match_backend || {};
     const voices = streamer.voices || [];
-    const profiles = voices.length ? voices.map((voice) => renderVoiceProfileForm(streamer, voice)).join("") : '<div class="file-meta">No known voices yet.</div>';
-    const datalist = renderVoiceNameDatalist(streamer);
-    const voiceListId = `voices-${streamerDomId(streamer.name)}`;
+    const profiles = voices.length ? `<div class="voice-list">${voices.map((voice) => renderVoiceProfileForm(streamer, voice)).join("")}</div>` : '<div class="file-meta">No known voices yet.</div>';
+    const addMenu = renderVoiceAddMenu(streamer);
     return `<dialog class="voice-manager" id="${escapeAttr(dialogId)}">
-  <div class="voice-manager-head"><h2>${escapeHtml(streamer.name || "Streamer")} Voices</h2><button class="download action-button" type="button" data-close-voice-manager>Close</button></div>
+  <div class="voice-manager-head"><h2>${escapeHtml(streamer.name || "Streamer")} Voices</h2><div class="voice-manager-actions">${addMenu}<button class="download action-button" type="button" data-close-voice-manager>Close</button></div></div>
   <div class="voice-manager-note file-meta">${escapeHtml(backend.message || "")}</div>
   <div class="voice-tabs">
     <input id="${escapeAttr(dialogId)}-known" name="${escapeAttr(dialogId)}-tab" type="radio" checked><label for="${escapeAttr(dialogId)}-known">Known Voices</label><section>${profiles}</section>
-    <input id="${escapeAttr(dialogId)}-add" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-add">Add Voice</label><section><div class="voice-add-grid">
-      <form class="voice-profile-form" method="post" action="/streamer-voices"><input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}"><label>Name <input name="voice_name" required placeholder="Host"></label><label>Enabled <select name="enabled"><option value="true" selected>true</option><option value="false">false</option></select></label><label>Threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="app default"></label><label class="wide">Notes <textarea name="notes" rows="2"></textarea></label><button class="download action-button" name="action" value="save" type="submit">Add Voice</button></form>
-      <form class="voice-profile-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data"><input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}"><label>Voice <input name="voice_name" list="${escapeAttr(voiceListId)}" required placeholder="Host"></label>${datalist}<label class="wide">Upload sample <input name="media" type="file" accept="audio/*,video/*" required></label><button class="download action-button" type="submit">Upload Sample</button></form>
-    </div></section>
+    <input id="${escapeAttr(dialogId)}-detected" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-detected">Detected Speakers</label><section><div class="file-meta">Refresh the page for transcript sample rows.</div></section>
     <input id="${escapeAttr(dialogId)}-review" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-review">Review Matches</label><section><div class="file-meta">Refresh the page for transcript sample and match review rows.</div></section>
   </div>
 </dialog>`;
@@ -5974,21 +6097,22 @@ def render_streamer_voice_manager(
     if isinstance(backend, dict):
         backend_message = str(backend.get("message") or "")
     profiles = render_voice_profile_forms(streamer)
+    add_menu = render_voice_add_menu(streamer)
     transcript_samples = render_voice_transcript_sample_forms(streamer)
     review_rows = render_voice_review_rows(streamer)
     return f"""<dialog class="voice-manager" id="{escape(dialog_id, quote=True)}">
   <div class="voice-manager-head">
     <h2>{escape(streamer.name)} Voices</h2>
-    <button class="download action-button" type="button" data-close-voice-manager>Close</button>
+    <div class="voice-manager-actions">
+      {add_menu}
+      <button class="download action-button" type="button" data-close-voice-manager>Close</button>
+    </div>
   </div>
   <div class="voice-manager-note file-meta">{escape(backend_message)}</div>
   <div class="voice-tabs">
     <input id="{escape(dialog_id, quote=True)}-known" name="{escape(dialog_id, quote=True)}-tab" type="radio" checked>
     <label for="{escape(dialog_id, quote=True)}-known">Known Voices</label>
     <section>{profiles}</section>
-    <input id="{escape(dialog_id, quote=True)}-add" name="{escape(dialog_id, quote=True)}-tab" type="radio">
-    <label for="{escape(dialog_id, quote=True)}-add">Add Voice</label>
-    <section>{render_voice_add_forms(streamer)}</section>
     <input id="{escape(dialog_id, quote=True)}-detected" name="{escape(dialog_id, quote=True)}-tab" type="radio">
     <label for="{escape(dialog_id, quote=True)}-detected">Detected Speakers</label>
     <section>{transcript_samples}</section>
@@ -6002,47 +6126,64 @@ def render_streamer_voice_manager(
 def render_voice_profile_forms(streamer: StreamerStatStatus) -> str:
     if not streamer.voices:
         return '<div class="file-meta">No known voices yet.</div>'
-    return "".join(render_voice_profile_form(streamer.name, profile) for profile in streamer.voices)
+    rows = "".join(render_voice_profile_form(streamer.name, profile) for profile in streamer.voices)
+    return f'<div class="voice-list">{rows}</div>'
 
 
 def render_voice_profile_form(streamer_name: str, profile: VoiceProfileStatus) -> str:
     samples = "\n".join(profile.samples)
     enabled = "true" if profile.enabled else "false"
-    return f"""<form class="voice-profile-form" method="post" action="/streamer-voices">
-  <input type="hidden" name="streamer_name" value="{escape(streamer_name, quote=True)}">
-  <input type="hidden" name="voice_name" value="{escape(profile.name, quote=True)}">
-  <div class="voice-profile-title"><strong>{escape(profile.name)}</strong><span class="file-meta">{profile.sample_count} samples</span></div>
-  <label>Enabled {render_form_select("enabled", enabled, ("true", "false"))}</label>
-  <label>Threshold <input name="threshold" type="number" step="0.001" min="0" value="{escape(str(profile.threshold or ''), quote=True)}" placeholder="app default"></label>
-  <label class="wide">Samples <textarea name="samples" rows="3">{escape(samples)}</textarea></label>
-  <label class="wide">Notes <textarea name="notes" rows="2">{escape(profile.notes)}</textarea></label>
-  <div class="settings-actions">
-    <button class="download action-button" name="action" value="save" type="submit">Save Voice</button>
-    <button class="download action-button" name="action" value="delete" type="submit">Delete</button>
+    status = "On" if profile.enabled else "Off"
+    status_class = "running" if profile.enabled else "ended"
+    return f"""<details class="voice-card">
+  <summary>
+    <span class="voice-card-name">{escape(profile.name)}</span>
+    <span class="badge {status_class}">{status}</span>
+    <span class="file-meta">{profile.sample_count} samples</span>
+    <span class="voice-card-action">Edit</span>
+  </summary>
+  <div class="voice-card-body">
+    <form class="voice-profile-form" method="post" action="/streamer-voices">
+      <input type="hidden" name="streamer_name" value="{escape(streamer_name, quote=True)}">
+      <input type="hidden" name="voice_name" value="{escape(profile.name, quote=True)}">
+      <div class="voice-profile-title"><strong>Edit Voice</strong></div>
+      <label>Matching <select name="enabled"><option value="true"{' selected' if enabled == 'true' else ''}>On</option><option value="false"{' selected' if enabled == 'false' else ''}>Off</option></select></label>
+      <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" value="{escape(str(profile.threshold or ''), quote=True)}" placeholder="default"></label>
+      <label class="wide">Sample files <textarea name="samples" rows="3">{escape(samples)}</textarea></label>
+      <label class="wide">Notes <textarea name="notes" rows="2">{escape(profile.notes)}</textarea></label>
+      <div class="settings-actions">
+        <button class="download action-button" name="action" value="save" type="submit">Save Voice</button>
+        <button class="download action-button" name="action" value="delete" type="submit">Delete</button>
+      </div>
+    </form>
+    <form class="voice-profile-form voice-sample-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
+      <input type="hidden" name="streamer_name" value="{escape(streamer_name, quote=True)}">
+      <input type="hidden" name="voice_name" value="{escape(profile.name, quote=True)}">
+      <label>Sample file <input name="media" type="file" accept="audio/*,video/*" required></label>
+      <button class="download action-button" type="submit">Upload Sample</button>
+    </form>
   </div>
-</form>"""
+</details>"""
 
 
-def render_voice_add_forms(streamer: StreamerStatStatus) -> str:
+def render_voice_add_menu(streamer: StreamerStatStatus) -> str:
     streamer_name = escape(streamer.name, quote=True)
-    options = render_voice_name_options(streamer)
-    return f"""<div class="voice-add-grid">
-  <form class="voice-profile-form" method="post" action="/streamer-voices">
+    return f"""<details class="voice-add-menu">
+  <summary class="download action-button">Add Voice</summary>
+  <div class="voice-add-popover">
+  <form class="voice-profile-form voice-task-form" method="post" action="/streamer-voices" enctype="multipart/form-data">
+    <h3 class="voice-task-title">Add Voice</h3>
     <input type="hidden" name="streamer_name" value="{streamer_name}">
-    <label>Name <input name="voice_name" required placeholder="Host"></label>
-    <label>Enabled {render_form_select("enabled", "true", ("true", "false"))}</label>
-    <label>Threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="app default"></label>
+    <input type="hidden" name="action" value="save">
+    <label>Voice name <input name="voice_name" required placeholder="Host"></label>
+    <label>Matching <select name="enabled"><option value="true" selected>On</option><option value="false">Off</option></select></label>
+    <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" placeholder="default"></label>
+    <label class="wide">Optional sample <input name="media" type="file" accept="audio/*,video/*"></label>
     <label class="wide">Notes <textarea name="notes" rows="2"></textarea></label>
-    <button class="download action-button" name="action" value="save" type="submit">Add Voice</button>
+    <button class="download action-button" type="submit">Add Voice</button>
   </form>
-  <form class="voice-profile-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
-    <input type="hidden" name="streamer_name" value="{streamer_name}">
-    <label>Voice <input name="voice_name" list="voices-{escape(streamer_dom_id(streamer.name), quote=True)}" required placeholder="Host"></label>
-    {options}
-    <label class="wide">Upload sample <input name="media" type="file" accept="audio/*,video/*" required></label>
-    <button class="download action-button" type="submit">Upload Sample</button>
-  </form>
-</div>"""
+</div>
+</details>"""
 
 
 def render_voice_name_options(streamer: StreamerStatStatus) -> str:
@@ -6212,8 +6353,14 @@ def render_streamer_job_row(job: JobStatus) -> str:
     return (
         '<div class="streamer-job-row">'
         f'<span class="badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span>'
-        f'<div class="file-name">{escape(job.kind or "Job")}<br><span class="muted">{escape(job.phase or job.message or "-")}</span></div>'
-        f'<div>{render_job_progress(job.progress)}<div class="file-meta">{escape(detail)}</div></div>'
+        '<div class="streamer-job-body">'
+        '<div class="streamer-job-heading">'
+        f'<span class="streamer-job-kind">{escape(job.kind or "Job")}</span>'
+        f'<span class="streamer-job-phase muted">{escape(job.phase or job.message or "-")}</span>'
+        '</div>'
+        f'<div class="streamer-job-progress">{render_job_progress(job.progress)}</div>'
+        f'<div class="streamer-job-detail file-meta">{escape(detail)}</div>'
+        '</div>'
         '</div>'
     )
 

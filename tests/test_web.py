@@ -25,6 +25,7 @@ from onlysavemevods.web import (
     update_app_config_from_form,
     update_speaker_labels_from_form,
     update_streamer_voice_from_form,
+    update_streamer_voice_with_optional_sample,
     store_streamer_voice_sample_upload,
     create_streamer_voice_sample_from_transcript_form,
     update_streamer_from_form,
@@ -548,6 +549,10 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('stream-tab-panel stream-tab-jobs', html)
         self.assertIn("Chat render", html)
         self.assertIn("Starting isolated renderer", html)
+        self.assertIn("streamer-job-body", html)
+        self.assertIn("streamer-job-heading", html)
+        self.assertIn("streamer-job-progress", html)
+        self.assertIn("streamer-job-detail", html)
 
     def test_isolated_chat_render_reports_output_file_growth(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -798,6 +803,17 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('id="voice-manager-OUMB3rd"', html)
         self.assertIn("Known Voices", html)
         self.assertIn("Add Voice", html)
+        self.assertIn("voice-manager-actions", html)
+        self.assertIn("voice-add-menu", html)
+        self.assertIn("voice-add-popover", html)
+        self.assertIn("Optional sample", html)
+        self.assertIn("voice-list", html)
+        self.assertIn("voice-card", html)
+        self.assertIn("voice-card-action", html)
+        self.assertIn("Edit Voice", html)
+        self.assertIn("Voice name", html)
+        self.assertIn("Sample files", html)
+        self.assertIn("Upload Sample", html)
         self.assertIn("Detected Speakers", html)
         self.assertIn("Review Matches", html)
         self.assertIn("Host", html)
@@ -1658,6 +1674,47 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(sample_bytes, b"sample-data")
         self.assertEqual(updated.streamers["OUMB3rd"].voices["Host"].samples, ["Host_Voice.mp3"])
         self.assertEqual(config.streamers["OUMB3rd"].voices["Host"].samples, ["Host_Voice.mp3"])
+
+    def test_streamer_voice_add_can_include_optional_sample_upload(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                f'state_dir = "{(root / "state").as_posix()}"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_streamer_voice_with_optional_sample(
+                config,
+                {
+                    "streamer_name": ["OUMB3rd"],
+                    "voice_name": ["Blade"],
+                    "enabled": ["true"],
+                    "threshold": ["0.25"],
+                    "notes": ["first pass"],
+                    "action": ["save"],
+                },
+                {"media": ("Blade Intro.wav", b"sample-data")},
+            )
+            updated = load_config(config_path)
+            profile = updated.streamers["OUMB3rd"].voices["Blade"]
+            sample_path = (
+                updated.state_dir
+                / "voice_samples"
+                / "OUMB3rd"
+                / "Blade"
+                / "Blade_Intro.wav"
+            )
+            sample_bytes = sample_path.read_bytes()
+
+        self.assertTrue(profile.enabled)
+        self.assertEqual(profile.threshold, 0.25)
+        self.assertEqual(profile.notes, "first pass")
+        self.assertEqual(profile.samples, ["Blade_Intro.wav"])
+        self.assertEqual(sample_bytes, b"sample-data")
 
     def test_streamer_voice_sample_can_be_created_from_transcript_speaker(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -140,11 +140,16 @@ raise SystemExit(0 if voice_matcher_status().get("available") else 1)
   return "${voice_match_installed_status}"
 }
 
+verify_python_dependencies() {
+  echo "Checking Python dependency compatibility..."
+  "${PYTHON_BIN}" -m pip check
+}
+
 update_python_dependencies() {
   cd "${APP_DIR}"
 
   echo "Upgrading Python packaging tools..."
-  "${PYTHON_BIN}" -m pip install --upgrade pip setuptools wheel
+  "${PYTHON_BIN}" -m pip install --upgrade pip "setuptools<82" wheel
 
   echo "Upgrading project dependencies with eager dependency resolution..."
   "${PYTHON_BIN}" -m pip install --upgrade --upgrade-strategy eager --editable "${APP_DIR}"
@@ -184,6 +189,8 @@ update_python_dependencies() {
       echo "Voice-match dependencies are not installed and voice matching is disabled; skipping them."
     fi
   fi
+
+  verify_python_dependencies
 
   chown -R root:root "${VENV_DIR}"
   chmod -R a+rX "${VENV_DIR}"

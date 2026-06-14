@@ -17,7 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 voice-match = [
-  "pyannote.audio>=3.1.1,<4.0",
+  "pyannote.audio>=4.0.0,<5.0",
   "huggingface-hub>=0.34.0,<1.0",
   "torch~=2.8.0",
   "torchaudio~=2.8.0",

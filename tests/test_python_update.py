@@ -113,7 +113,7 @@ class PythonUpdateScriptTests(unittest.TestCase):
         pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
         extra = pyproject["project"]["optional-dependencies"]["voice-match"]
 
-        self.assertIn("pyannote.audio>=3.1.1,<4.0", extra)
+        self.assertIn("pyannote.audio>=4.0.0,<5.0", extra)
         self.assertIn("huggingface-hub>=0.34.0,<1.0", extra)
         self.assertIn("torch~=2.8.0", extra)
         self.assertIn("torchaudio~=2.8.0", extra)
@@ -123,6 +123,12 @@ class PythonUpdateScriptTests(unittest.TestCase):
         script = Path("scripts/install-almalinux.sh").read_text(encoding="utf-8")
 
         self.assertIn("ONLYSAVEMEVODS_INSTALL_VOICE_MATCH", script)
+        self.assertIn("from onlysavemevods.config import ConfigError, load_config", script)
+        self.assertIn("Unable to read transcription setting from ${CONFIG_FILE}", script)
+        self.assertIn("Unable to read voice-match setting from ${CONFIG_FILE}", script)
+        self.assertIn('"setuptools<82"', script)
+        self.assertIn("verify_python_dependencies", script)
+        self.assertIn("-m pip check", script)
         self.assertIn("config.voice_match_enabled", script)
         self.assertIn('"${APP_DIR}[voice-match]"', script)
         self.assertIn("install_voice_match_if_needed", script)
@@ -133,6 +139,9 @@ class PythonUpdateScriptTests(unittest.TestCase):
 
         self.assertIn("config_enables_voice_match", script)
         self.assertIn("voice_match_dependency_installed", script)
+        self.assertIn('"setuptools<82"', script)
+        self.assertIn("verify_python_dependencies", script)
+        self.assertIn("-m pip check", script)
         self.assertIn('"${APP_DIR}[voice-match]"', script)
         self.assertNotIn('--upgrade-strategy eager --editable "${APP_DIR}[voice-match]"', script)
 
