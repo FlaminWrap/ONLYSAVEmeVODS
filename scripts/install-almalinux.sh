@@ -187,17 +187,29 @@ install_application_files() {
   fi
 }
 
+ensure_config_file_service_writable() {
+  local service_group
+  service_group="$(id -gn "${SERVICE_USER}")"
+
+  sudo chown root:"${service_group}" "${CONFIG_FILE}"
+  sudo chmod 0664 "${CONFIG_FILE}"
+}
+
 install_or_preserve_config() {
+  local service_group
+  service_group="$(id -gn "${SERVICE_USER}")"
+
   if [[ -f "${CONFIG_FILE}" ]]; then
     echo "Keeping existing ${CONFIG_FILE}"
+    ensure_config_file_service_writable
     return 0
   fi
 
   if [[ -f "${ROOT_DIR}/config.toml" ]]; then
-    sudo install -m 0644 -o root -g root "${ROOT_DIR}/config.toml" "${CONFIG_FILE}"
+    sudo install -m 0664 -o root -g "${service_group}" "${ROOT_DIR}/config.toml" "${CONFIG_FILE}"
     echo "Copied existing config to ${CONFIG_FILE}"
   else
-    sudo install -m 0644 -o root -g root "${APP_DIR}/config.example.toml" "${CONFIG_FILE}"
+    sudo install -m 0664 -o root -g "${service_group}" "${APP_DIR}/config.example.toml" "${CONFIG_FILE}"
     echo "Created ${CONFIG_FILE}; edit channels before expecting downloads."
   fi
 }
@@ -728,6 +740,7 @@ install_or_preserve_secrets_file
 sudo "${VENV_DIR}/bin/python" -m onlysavemevods update-config \
   --config "${CONFIG_FILE}" \
   --defaults "${APP_DIR}/config.example.toml"
+ensure_config_file_service_writable
 install_whisperx_if_needed
 
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF
@@ -757,7 +770,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${CACHE_DIR} ${DOWNLOAD_DIR} ${STATE_DIR}
+ReadWritePaths=${CACHE_DIR} ${DOWNLOAD_DIR} ${STATE_DIR} ${CONFIG_FILE}
 
 [Install]
 WantedBy=multi-user.target

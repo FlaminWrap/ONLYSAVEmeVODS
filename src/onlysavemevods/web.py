@@ -270,6 +270,7 @@ class StreamStatus:
     has_part_files: bool
     has_mixed_formats: bool
     events: list[StreamEventStatus]
+    jobs: list[JobStatus]
     files: list[FileStatus]
 
 
@@ -892,12 +893,18 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
             watermark_record
         )
 
+    jobs = build_job_statuses(watermark_records)
+    jobs_by_video: dict[str, list[JobStatus]] = {}
+    for job in jobs:
+        jobs_by_video.setdefault(job.video_id, []).append(job)
+
     streams = [
         stream_status_from_record(
             config,
             record,
             watermarks_by_video.get(record.video_id, []),
             stream_events.get(record.video_id, []),
+            jobs_by_video.get(record.video_id, []),
         )
         for record in records
     ]
@@ -906,7 +913,6 @@ def build_status_snapshot(config: BotConfig) -> StatusSnapshot:
         counts[stream.status] = counts.get(stream.status, 0) + 1
 
     channel_stats = build_channel_stats(streams, config)
-    jobs = build_job_statuses(watermark_records)
     streamer_stats = build_streamer_stats(config, streams, jobs)
     speaker_labels = build_speaker_label_statuses(config, streams, channel_stats)
     return StatusSnapshot(
@@ -1580,6 +1586,7 @@ def stream_status_from_record(
     record: StreamRecord,
     watermark_records: list[WatermarkCopyRecord] | None = None,
     event_records: list[StreamEventRecord] | None = None,
+    job_records: list[JobStatus] | None = None,
 ) -> StreamStatus:
     directory = segment_directory(config, record.video_id, record.channel)
     files = summarize_files(
@@ -1631,6 +1638,7 @@ def stream_status_from_record(
             record.channel,
         ),
         events=[stream_event_status(event) for event in event_records or []],
+        jobs=list(job_records or []),
         files=files[:FILE_LIMIT_PER_STREAM],
     )
 
@@ -3569,7 +3577,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
       gap: 10px;
     }}
-    .metric, .stream, .empty, .panel {{
+    .metric, .stream, .empty, .panel, .streamer-section {{
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -3657,12 +3665,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       margin-bottom: 14px;
     }}
     .primary-action {{ font-weight: 650; }}
-    .streamer-list {{ display: grid; gap: 18px; }}
-    .streamer-section {{
-      border-top: 1px solid var(--line);
-      padding: 16px 0 4px;
-    }}
-    .streamer-section:first-child {{ border-top: 0; padding-top: 0; }}
+    .streamer-list {{ display: grid; gap: 12px; }}
+    .streamer-section {{ padding: 14px; }}
     .streamer-section.needs-grouping {{
       border-left: 4px solid var(--warn);
       padding-left: 12px;
@@ -3672,15 +3676,18 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       justify-content: space-between;
       gap: 12px;
       align-items: start;
-      margin-bottom: 10px;
     }}
     .streamer-title {{ display: grid; gap: 6px; min-width: 0; }}
+    .streamer-title h2 {{ margin: 0; }}
+    .streamer-details {{ margin-top: 12px; }}
+    .streamer-section.collapsed .streamer-details {{ display: none; }}
     .streamer-badges, .source-chips {{
       display: flex;
       flex-wrap: wrap;
       gap: 6px;
       align-items: center;
     }}
+    .streamer-badges {{ justify-content: flex-end; }}
     .source-chip {{
       border: 1px solid var(--line);
       border-radius: 999px;
@@ -3735,12 +3742,46 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       align-items: center;
       gap: 8px;
     }}
-    .stream-toggle {{
+    .stream-toggle, .streamer-toggle {{
       color: inherit;
       cursor: pointer;
       font: inherit;
     }}
     .stream.collapsed .stream-body {{ display: none; }}
+    .stream-detail-tabs {{ margin-top: 12px; }}
+    .stream-tab-radio {{
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }}
+    .stream-tab-labels {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 10px;
+    }}
+    .stream-tab-labels label {{
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      padding: 6px 10px;
+      color: var(--muted);
+      background: var(--panel);
+      cursor: pointer;
+    }}
+    .stream-tab-panel {{ display: none; }}
+    .stream-tab-files-toggle:checked ~ .stream-tab-labels .stream-tab-files-label,
+    .stream-tab-log-toggle:checked ~ .stream-tab-labels .stream-tab-log-label,
+    .stream-tab-jobs-toggle:checked ~ .stream-tab-labels .stream-tab-jobs-label {{
+      color: var(--text);
+      background: var(--panel-strong);
+      font-weight: 650;
+    }}
+    .stream-tab-files-toggle:checked ~ .stream-tab-panels .stream-tab-files,
+    .stream-tab-log-toggle:checked ~ .stream-tab-panels .stream-tab-log,
+    .stream-tab-jobs-toggle:checked ~ .stream-tab-panels .stream-tab-jobs {{ display: block; }}
+    .stream-job-list {{ display: grid; gap: 8px; }}
     .title {{ font-weight: 650; overflow-wrap: anywhere; }}
     .badge {{
       border: 1px solid var(--line);
@@ -4144,6 +4185,9 @@ def dashboard_script() -> str:
   const tabKey = "onlysavemevods.dashboardTab";
   const collapsedKey = "onlysavemevods.collapsedStreams";
   const expandedKey = "onlysavemevods.expandedStreams";
+  const collapsedStreamerKey = "onlysavemevods.collapsedStreamers";
+  const expandedStreamerKey = "onlysavemevods.expandedStreamers";
+  const streamTabKey = "onlysavemevods.streamTabs";
   const tabs = ["tab-streamers", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
@@ -4239,16 +4283,53 @@ def dashboard_script() -> str:
       return new Set();
     }
   };
+  const readStreamTabState = () => {
+    try {
+      const parsed = JSON.parse(readLocalStorageValue(streamTabKey) || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  };
   const collapsedStreams = readStreamSet(collapsedKey);
   const expandedStreams = readStreamSet(expandedKey);
+  const collapsedStreamers = readStreamSet(collapsedStreamerKey);
+  const expandedStreamers = readStreamSet(expandedStreamerKey);
+  const selectedStreamTabs = readStreamTabState();
   const writeCollapsedStreams = () => {
     try { localStorage.setItem(collapsedKey, JSON.stringify([...collapsedStreams])); } catch (_) {}
   };
   const writeExpandedStreams = () => {
     try { localStorage.setItem(expandedKey, JSON.stringify([...expandedStreams])); } catch (_) {}
   };
+  const writeCollapsedStreamers = () => {
+    try { localStorage.setItem(collapsedStreamerKey, JSON.stringify([...collapsedStreamers])); } catch (_) {}
+  };
+  const writeExpandedStreamers = () => {
+    try { localStorage.setItem(expandedStreamerKey, JSON.stringify([...expandedStreamers])); } catch (_) {}
+  };
+  const writeSelectedStreamTabs = () => {
+    try { localStorage.setItem(streamTabKey, JSON.stringify(selectedStreamTabs)); } catch (_) {}
+  };
   const streamIsCollapsed = (videoId, status) => (
     collapsedStreams.has(videoId) || (status === "ended" && !expandedStreams.has(videoId))
+  );
+  const streamerExpandsByDefault = (streamer) => (
+    Boolean(streamer && streamer.needs_grouping)
+    || Number(streamer && streamer.active_count || 0) > 0
+    || Number(streamer && streamer.attention_count || 0) > 0
+    || (streamerActiveJobCount(streamer) > 0)
+  );
+  const streamerCardExpandsByDefault = (card) => (
+    card && (
+      card.getAttribute("data-streamer-needs-grouping") === "true"
+      || Number(card.getAttribute("data-streamer-active") || 0) > 0
+      || Number(card.getAttribute("data-streamer-attention") || 0) > 0
+      || Number(card.getAttribute("data-streamer-active-jobs") || 0) > 0
+    )
+  );
+  const streamerIsCollapsed = (key, expandsDefault) => (
+    collapsedStreamers.has(key) || (!expandsDefault && !expandedStreamers.has(key))
   );
 
   const normalizeTabId = (id) => ({
@@ -4282,7 +4363,31 @@ def dashboard_script() -> str:
     });
   }
 
+  const applyStreamerCollapsedState = (root) => {
+    for (const card of root.querySelectorAll(".streamer-section[data-streamer-key]")) {
+      const key = card.getAttribute("data-streamer-key") || "";
+      const button = card.querySelector("[data-streamer-toggle]");
+      if (!key || !button) continue;
+      const collapsed = streamerIsCollapsed(key, streamerCardExpandsByDefault(card));
+      card.classList.toggle("collapsed", collapsed);
+      button.textContent = collapsed ? "Expand" : "Collapse";
+      button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    }
+  };
+
+  const applyStreamTabState = (root) => {
+    for (const card of root.querySelectorAll(".stream[data-video-id]")) {
+      const videoId = card.getAttribute("data-video-id") || "";
+      const selected = selectedStreamTabs[videoId];
+      if (!["files", "log", "jobs"].includes(selected)) continue;
+      const input = card.querySelector(`[data-stream-tab="${selected}"]`);
+      if (input) input.checked = true;
+    }
+  };
+
   const applyCollapsedState = (root) => {
+    applyStreamerCollapsedState(root);
+    applyStreamTabState(root);
     for (const card of root.querySelectorAll(".stream[data-video-id]")) {
       const videoId = card.getAttribute("data-video-id");
       const status = card.getAttribute("data-stream-status") || "";
@@ -4295,7 +4400,33 @@ def dashboard_script() -> str:
     }
   };
 
+  document.addEventListener("change", (event) => {
+    const input = event.target.closest("[data-stream-tab][data-video-id]");
+    if (!input || !input.checked) return;
+    selectedStreamTabs[input.getAttribute("data-video-id") || ""] = input.getAttribute("data-stream-tab") || "files";
+    writeSelectedStreamTabs();
+  });
+
   document.addEventListener("click", (event) => {
+    const streamerButton = event.target.closest("[data-streamer-toggle]");
+    if (streamerButton) {
+      const key = streamerButton.getAttribute("data-streamer-toggle") || "";
+      const card = streamerButton.closest(".streamer-section");
+      if (!key || !card) return;
+      const currentlyCollapsed = streamerIsCollapsed(key, streamerCardExpandsByDefault(card));
+      if (currentlyCollapsed) {
+        collapsedStreamers.delete(key);
+        expandedStreamers.add(key);
+      } else {
+        collapsedStreamers.add(key);
+        expandedStreamers.delete(key);
+      }
+      writeCollapsedStreamers();
+      writeExpandedStreamers();
+      applyStreamerCollapsedState(card.parentElement || document);
+      return;
+    }
+
     const button = event.target.closest("[data-stream-toggle]");
     if (!button) return;
     const videoId = button.getAttribute("data-stream-toggle");
@@ -4428,7 +4559,7 @@ def dashboard_script() -> str:
   };
 
   const renderStreamEvents = (events) => {
-    if (!events || !events.length) return "";
+    if (!events || !events.length) return '<div class="file-meta">No stream log entries yet.</div>';
     const rows = events.map((event) => {
       const segment = event.segment_index ? `seg ${String(event.segment_index).padStart(3, "0")}` : "-";
       const level = event.level || "info";
@@ -4438,7 +4569,7 @@ def dashboard_script() -> str:
         <div class="stream-event-message">${escapeHtml(event.message || "")}</div>
       </div>`;
     }).join("");
-    return `<div class="stream-events"><div class="stream-events-title">Stream log</div>${rows}</div>`;
+    return `<div class="stream-events">${rows}</div>`;
   };
 
   const renderFileAction = (file) => {
@@ -4521,6 +4652,21 @@ def dashboard_script() -> str:
     ].join("");
   };
 
+  const renderStreamJobRow = (job) => {
+    const detail = job.item || job.detail || job.video_id || "-";
+    return `<div class="streamer-job-row">
+  <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
+  <div class="file-name">${escapeHtml(job.kind || "Job")}<br><span class="muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
+  <div>${renderJobProgress(job.progress)}<div class="file-meta">${escapeHtml(detail)}</div></div>
+</div>`;
+  };
+
+  const renderStreamJobs = (jobs) => {
+    jobs = jobs || [];
+    if (!jobs.length) return '<div class="file-meta">No jobs have been seen for this stream.</div>';
+    return `<div class="stream-job-list">${jobs.slice(0, 8).map(renderStreamJobRow).join("")}</div>`;
+  };
+
   const renderStreamCard = (stream) => {
     const title = stream.title || stream.video_id;
     const mixed = stream.has_mixed_formats ? "yes" : "no";
@@ -4531,6 +4677,10 @@ def dashboard_script() -> str:
     const expanded = collapsed ? "false" : "true";
     const files = (stream.files || []).slice(0, 20).map(renderFileRow).join("")
       || '<tr><td colspan="7" class="file-meta">No files found</td></tr>';
+    const filesTabId = `stream-tab-${videoId}-files`;
+    const logTabId = `stream-tab-${videoId}-log`;
+    const jobsTabId = `stream-tab-${videoId}-jobs`;
+    const tabName = `stream-tabs-${videoId}`;
     return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}">
   <div class="stream-head">
     <div>
@@ -4544,7 +4694,6 @@ def dashboard_script() -> str:
   </div>
   <div class="stream-body">
     ${renderStreamSignals(stream)}
-    ${renderStreamEvents(stream.events || [])}
     <div class="meta">
       <div>Segment: ${String(stream.segment_index).padStart(3, "0")}</div>
       <div>Files: ${escapeHtml(stream.file_count)}</div>
@@ -4562,11 +4711,27 @@ def dashboard_script() -> str:
       <div class="wide">Kinds: ${escapeHtml(formatKindCounts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: ${escapeHtml(stream.directory)}</div>
     </div>
-    <div class="table-wrap">
-      <table class="files">
-        <thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead>
-        <tbody>${files}</tbody>
-      </table>
+    <div class="stream-detail-tabs">
+      <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(filesTabId)}" data-stream-tab="files" data-video-id="${escapeAttr(videoId)}" checked>
+      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
+      <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(jobsTabId)}" data-stream-tab="jobs" data-video-id="${escapeAttr(videoId)}">
+      <div class="stream-tab-labels">
+        <label class="stream-tab-files-label" for="${escapeAttr(filesTabId)}">Files</label>
+        <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
+        <label class="stream-tab-jobs-label" for="${escapeAttr(jobsTabId)}">Jobs</label>
+      </div>
+      <div class="stream-tab-panels">
+        <section class="stream-tab-panel stream-tab-files">
+          <div class="table-wrap">
+            <table class="files">
+              <thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead>
+              <tbody>${files}</tbody>
+            </table>
+          </div>
+        </section>
+        <section class="stream-tab-panel stream-tab-log">${renderStreamEvents(stream.events || [])}</section>
+        <section class="stream-tab-panel stream-tab-jobs">${renderStreamJobs(stream.jobs || [])}</section>
+      </div>
     </div>
   </div>
 </section>`;
@@ -4583,7 +4748,7 @@ def dashboard_script() -> str:
   const renderStreamerForm = (streamer) => {
     const isExisting = Boolean(streamer && streamer.configured);
     const name = isExisting ? String(streamer.name || "") : "";
-    const sources = isExisting ? (streamer.sources || []).join("\n") : "";
+    const sources = isExisting ? (streamer.sources || []).join(String.fromCharCode(10)) : "";
     const downloadDirName = isExisting ? String(streamer.download_dir_name || "") : "";
     const readonly = isExisting ? " readonly" : "";
     const deleteButton = isExisting
@@ -4659,18 +4824,26 @@ def dashboard_script() -> str:
   const renderStreamerGroupingAction = (streamer, snapshot) => {
     if (!streamer.needs_grouping) return "";
     const disabled = snapshotConfigPath(snapshot) === "-" ? " disabled" : "";
-    const sources = (streamer.sources || []).join("\n");
+    const sources = (streamer.sources || []).join(String.fromCharCode(10));
     return `<button class="download action-button" type="button" data-open-streamer-wizard data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-sources="${escapeAttr(sources)}"${disabled}>Create Streamer</button>`;
   };
+
+  const streamerActiveJobCount = (streamer) => (streamer && streamer.jobs || [])
+    .filter((job) => ["queued", "running"].includes(job.status)).length;
 
   const renderStreamerCard = (streamer, snapshot) => {
     const stateLabel = streamer.needs_grouping ? "Needs Grouping" : "Configured";
     const stateClass = streamer.needs_grouping ? "waiting_retry" : "done";
+    const activeJobs = streamerActiveJobCount(streamer);
+    const expandsDefault = streamerExpandsByDefault(streamer);
+    const collapsedClass = expandsDefault ? "" : " collapsed";
+    const toggleLabel = expandsDefault ? "Collapse" : "Expand";
+    const toggleExpanded = expandsDefault ? "true" : "false";
     const needsClass = streamer.needs_grouping ? " needs-grouping" : "";
     const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
     const groupAction = renderStreamerGroupingAction(streamer, snapshot);
     const latestAge = formatEpochAge(streamer.latest_activity_at);
-    return `<section class="streamer-section${needsClass}" data-streamer-name="${escapeAttr(streamer.name || "")}">
+    return `<section class="streamer-section${needsClass}${collapsedClass}" data-streamer-key="${escapeAttr(streamer.name || "")}" data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-active="${escapeAttr(streamer.active_count || 0)}" data-streamer-attention="${escapeAttr(streamer.attention_count || 0)}" data-streamer-active-jobs="${escapeAttr(activeJobs)}" data-streamer-needs-grouping="${streamer.needs_grouping ? "true" : "false"}">
   <div class="streamer-head">
     <div class="streamer-title">
       <h2>${escapeHtml(streamer.name || "unknown streamer")}</h2>
@@ -4680,29 +4853,34 @@ def dashboard_script() -> str:
       <span class="badge ${stateClass}">${stateLabel}</span>
       <span class="badge downloading">Active ${escapeHtml(streamer.active_count || 0)}</span>
       <span class="badge checking_after_exit">Attention ${escapeHtml(streamer.attention_count || 0)}</span>
+      <span class="badge">Storage ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
+      <span class="badge">Latest ${escapeHtml(latestAge || "-")}</span>
       ${groupAction}
+      <button class="download streamer-toggle" type="button" data-streamer-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="${toggleExpanded}">${toggleLabel}</button>
     </div>
   </div>
-  ${warning}
-  <div class="streamer-stat-grid">
-    <div><strong>${escapeHtml(streamer.stream_count || 0)}</strong><br><span class="muted">Streams</span></div>
-    <div><strong>${escapeHtml(streamer.file_count || 0)}</strong><br><span class="muted">Files</span></div>
-    <div><strong>${escapeHtml(formatBytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
-    <div><strong>${escapeHtml(formatBytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
-    <div><strong>${escapeHtml(formatBytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
-    <div><strong>${escapeHtml(formatBytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
-    <div><strong>${escapeHtml(formatEpoch(streamer.latest_activity_at))}</strong><br><span class="muted">Latest ${escapeHtml(latestAge)}</span></div>
-    <div><strong>${escapeHtml(streamer.download_dir_name || "-")}</strong><br><span class="muted">Download dir</span></div>
-    <div><strong>${escapeHtml(streamer.voice_detection || "default")}</strong><br><span class="muted">Voice</span></div>
-    <div><strong>${escapeHtml(streamer.speaker_label_count || 0)}</strong><br><span class="muted">Speaker labels</span></div>
-  </div>
-  <div class="streamer-body-grid">
-    ${renderStreamerSettingsArea(streamer, snapshot)}
-    ${renderStreamerJobsSummary(streamer.jobs || [])}
-  </div>
-  <div class="streamer-streams">
-    <h3>Streams</h3>
-    ${renderStreamerStreams(streamer.streams || [])}
+  <div class="streamer-details">
+    ${warning}
+    <div class="streamer-stat-grid">
+      <div><strong>${escapeHtml(streamer.stream_count || 0)}</strong><br><span class="muted">Streams</span></div>
+      <div><strong>${escapeHtml(streamer.file_count || 0)}</strong><br><span class="muted">Files</span></div>
+      <div><strong>${escapeHtml(formatBytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+      <div><strong>${escapeHtml(formatBytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
+      <div><strong>${escapeHtml(formatBytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
+      <div><strong>${escapeHtml(formatBytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
+      <div><strong>${escapeHtml(formatEpoch(streamer.latest_activity_at))}</strong><br><span class="muted">Latest ${escapeHtml(latestAge)}</span></div>
+      <div><strong>${escapeHtml(streamer.download_dir_name || "-")}</strong><br><span class="muted">Download dir</span></div>
+      <div><strong>${escapeHtml(streamer.voice_detection || "default")}</strong><br><span class="muted">Voice</span></div>
+      <div><strong>${escapeHtml(streamer.speaker_label_count || 0)}</strong><br><span class="muted">Speaker labels</span></div>
+    </div>
+    <div class="streamer-body-grid">
+      ${renderStreamerSettingsArea(streamer, snapshot)}
+      ${renderStreamerJobsSummary(streamer.jobs || [])}
+    </div>
+    <div class="streamer-streams">
+      <h3>Streams</h3>
+      ${renderStreamerStreams(streamer.streams || [])}
+    </div>
   </div>
 </section>`;
   };
@@ -4995,10 +5173,28 @@ def render_streamer_wizard(snapshot: StatusSnapshot) -> str:
 </dialog>"""
 
 
+def streamer_active_job_count(streamer: StreamerStatStatus) -> int:
+    return sum(1 for job in streamer.jobs if job.status in {"queued", "running"})
+
+
+def streamer_expands_by_default(streamer: StreamerStatStatus) -> bool:
+    return (
+        streamer.needs_grouping
+        or streamer.active_count > 0
+        or streamer.attention_count > 0
+        or streamer_active_job_count(streamer) > 0
+    )
+
+
 def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
     state_label = "Needs Grouping" if streamer.needs_grouping else "Configured"
     state_class = "waiting_retry" if streamer.needs_grouping else "done"
+    active_jobs = streamer_active_job_count(streamer)
+    expands_default = streamer_expands_by_default(streamer)
     needs_class = " needs-grouping" if streamer.needs_grouping else ""
+    collapsed_class = "" if expands_default else " collapsed"
+    toggle_label = "Collapse" if expands_default else "Expand"
+    toggle_expanded = "true" if expands_default else "false"
     warning = (
         '<div class="signals">Needs streamer group</div>'
         if streamer.needs_grouping
@@ -5010,7 +5206,8 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
     streams = render_streamer_streams(streamer.streams)
     latest_activity = format_optional_epoch(streamer.latest_activity_at)
     latest_activity_age = format_epoch_age(streamer.latest_activity_at)
-    return f"""<section class="streamer-section{needs_class}" data-streamer-name="{escape(streamer.name, quote=True)}">
+    streamer_key = escape(streamer.name, quote=True)
+    return f"""<section class="streamer-section{needs_class}{collapsed_class}" data-streamer-key="{streamer_key}" data-streamer-name="{streamer_key}" data-streamer-active="{streamer.active_count}" data-streamer-attention="{streamer.attention_count}" data-streamer-active-jobs="{active_jobs}" data-streamer-needs-grouping="{'true' if streamer.needs_grouping else 'false'}">
   <div class="streamer-head">
     <div class="streamer-title">
       <h2>{escape(streamer.name)}</h2>
@@ -5020,29 +5217,34 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge {state_class}">{escape(state_label)}</span>
       <span class="badge downloading">Active {streamer.active_count}</span>
       <span class="badge checking_after_exit">Attention {streamer.attention_count}</span>
+      <span class="badge">Storage {escape(format_bytes(streamer.total_bytes))}</span>
+      <span class="badge">Latest {escape(latest_activity_age or '-')}</span>
       {group_action}
+      <button class="download streamer-toggle" type="button" data-streamer-toggle="{streamer_key}" aria-expanded="{toggle_expanded}">{toggle_label}</button>
     </div>
   </div>
-  {warning}
-  <div class="streamer-stat-grid">
-    <div><strong>{streamer.stream_count}</strong><br><span class="muted">Streams</span></div>
-    <div><strong>{streamer.file_count}</strong><br><span class="muted">Files</span></div>
-    <div><strong>{escape(format_bytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
-    <div><strong>{escape(format_bytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
-    <div><strong>{escape(format_bytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
-    <div><strong>{escape(format_bytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
-    <div><strong>{escape(latest_activity)}</strong><br><span class="muted">Latest {escape(latest_activity_age)}</span></div>
-    <div><strong>{escape(streamer.download_dir_name or '-')}</strong><br><span class="muted">Download dir</span></div>
-    <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
-    <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
-  </div>
-  <div class="streamer-body-grid">
-    {settings}
-    {jobs}
-  </div>
-  <div class="streamer-streams">
-    <h3>Streams</h3>
-    {streams}
+  <div class="streamer-details">
+    {warning}
+    <div class="streamer-stat-grid">
+      <div><strong>{streamer.stream_count}</strong><br><span class="muted">Streams</span></div>
+      <div><strong>{streamer.file_count}</strong><br><span class="muted">Files</span></div>
+      <div><strong>{escape(format_bytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+      <div><strong>{escape(format_bytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
+      <div><strong>{escape(format_bytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
+      <div><strong>{escape(format_bytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
+      <div><strong>{escape(latest_activity)}</strong><br><span class="muted">Latest {escape(latest_activity_age)}</span></div>
+      <div><strong>{escape(streamer.download_dir_name or '-')}</strong><br><span class="muted">Download dir</span></div>
+      <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
+      <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
+    </div>
+    <div class="streamer-body-grid">
+      {settings}
+      {jobs}
+    </div>
+    <div class="streamer-streams">
+      <h3>Streams</h3>
+      {streams}
+    </div>
   </div>
 </section>"""
 
@@ -5587,6 +5789,13 @@ def format_config_value(value: Any) -> str:
     return str(value)
 
 
+def render_stream_jobs(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        return '<div class="file-meta">No jobs have been seen for this stream.</div>'
+    rows = "".join(render_streamer_job_row(job) for job in jobs[:8])
+    return f'<div class="stream-job-list">{rows}</div>'
+
+
 def render_stream_card(stream: StreamStatus) -> str:
     title = stream.title or stream.video_id
     mixed = "yes" if stream.has_mixed_formats else "no"
@@ -5602,6 +5811,12 @@ def render_stream_card(stream: StreamStatus) -> str:
     if not files:
         files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
     events = render_stream_event_timeline(stream.events)
+    jobs = render_stream_jobs(stream.jobs)
+    tab_key = escape(stream.video_id, quote=True)
+    files_tab_id = f"stream-tab-{tab_key}-files"
+    log_tab_id = f"stream-tab-{tab_key}-log"
+    jobs_tab_id = f"stream-tab-{tab_key}-jobs"
+    tab_name = f"stream-tabs-{tab_key}"
 
     return f"""<section class="stream{collapsed_class}" data-video-id="{escape(stream.video_id, quote=True)}" data-stream-status="{escape(stream.status, quote=True)}">
   <div class="stream-head">
@@ -5616,7 +5831,6 @@ def render_stream_card(stream: StreamStatus) -> str:
   </div>
   <div class="stream-body">
     {signals}
-    {events}
     <div class="meta">
       <div>Segment: {stream.segment_index:03d}</div>
       <div>Files: {stream.file_count}</div>
@@ -5634,11 +5848,27 @@ def render_stream_card(stream: StreamStatus) -> str:
       <div class="wide">Kinds: {escape(format_kind_counts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: {escape(stream.directory)}</div>
     </div>
-    <div class="table-wrap">
-      <table class="files">
-        <thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead>
-        <tbody>{files}</tbody>
-      </table>
+    <div class="stream-detail-tabs">
+      <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="{tab_name}" id="{files_tab_id}" data-stream-tab="files" data-video-id="{tab_key}" checked>
+      <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
+      <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="{tab_name}" id="{jobs_tab_id}" data-stream-tab="jobs" data-video-id="{tab_key}">
+      <div class="stream-tab-labels">
+        <label class="stream-tab-files-label" for="{files_tab_id}">Files</label>
+        <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
+        <label class="stream-tab-jobs-label" for="{jobs_tab_id}">Jobs</label>
+      </div>
+      <div class="stream-tab-panels">
+        <section class="stream-tab-panel stream-tab-files">
+          <div class="table-wrap">
+            <table class="files">
+              <thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead>
+              <tbody>{files}</tbody>
+            </table>
+          </div>
+        </section>
+        <section class="stream-tab-panel stream-tab-log">{events}</section>
+        <section class="stream-tab-panel stream-tab-jobs">{jobs}</section>
+      </div>
     </div>
   </div>
 </section>"""
@@ -5646,14 +5876,9 @@ def render_stream_card(stream: StreamStatus) -> str:
 
 def render_stream_event_timeline(events: list[StreamEventStatus]) -> str:
     if not events:
-        return ""
+        return '<div class="file-meta">No stream log entries yet.</div>'
     rows = "".join(render_stream_event(event) for event in events)
-    return (
-        '<div class="stream-events">'
-        '<div class="stream-events-title">Stream log</div>'
-        f"{rows}"
-        "</div>"
-    )
+    return f'<div class="stream-events">{rows}</div>'
 
 
 def render_stream_event(event: StreamEventStatus) -> str:

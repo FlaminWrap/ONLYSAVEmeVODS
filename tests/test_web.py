@@ -14,6 +14,7 @@ from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     build_config_summary,
     build_status_snapshot,
+    dashboard_script,
     chat_media_file_for_chat_file,
     file_kind,
     format_bytes,
@@ -401,7 +402,21 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('"tab-streamer-groups": "tab-streamers"', html)
         self.assertIn("onlysavemevods.collapsedStreams", html)
         self.assertIn("onlysavemevods.expandedStreams", html)
-        self.assertIn("Stream log", html)
+        self.assertIn("onlysavemevods.collapsedStreamers", html)
+        self.assertIn("onlysavemevods.expandedStreamers", html)
+        self.assertIn("onlysavemevods.streamTabs", html)
+        self.assertIn("data-streamer-toggle", html)
+        self.assertIn("streamer-details", html)
+        self.assertIn("applyStreamerCollapsedState", html)
+        self.assertIn("applyStreamTabState", html)
+        self.assertIn("stream-detail-tabs", html)
+        self.assertIn('data-stream-tab="files"', html)
+        self.assertIn('data-stream-tab="log"', html)
+        self.assertIn('data-stream-tab="jobs"', html)
+        self.assertIn("stream-tab-panel stream-tab-files", html)
+        self.assertIn("stream-tab-panel stream-tab-log", html)
+        self.assertIn("stream-tab-panel stream-tab-jobs", html)
+        self.assertIn("Stream Log", html)
         self.assertIn("Post-exit check saw stream live", html)
         self.assertIn("seg 001", html)
         self.assertIn("data-stream-toggle", html)
@@ -464,6 +479,49 @@ class WebStatusTests(unittest.TestCase):
         json.dumps(payload)
 
 
+    def test_stream_detail_tabs_include_matching_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS[key] = RenderChatJob(
+                    video_id="LIVEVIDEO01",
+                    chat_name="Live Status [LIVEVIDEO01].live_chat.json",
+                    media_name="Live Status [LIVEVIDEO01].mp4",
+                    output_name="Live Status [LIVEVIDEO01] - chat.mp4",
+                    status="running",
+                    message="Rendering chat",
+                    phase="Starting isolated renderer",
+                    progress=0.05,
+                    started_at=0.0,
+                )
+            try:
+                snapshot = build_status_snapshot(config)
+                html = render_status_html(snapshot)
+                payload = snapshot_to_dict(snapshot)
+            finally:
+                with CHAT_RENDER_JOBS_LOCK:
+                    CHAT_RENDER_JOBS.pop(key, None)
+
+        self.assertEqual(snapshot.streams[0].jobs[0].kind, "Chat render")
+        self.assertEqual(payload["streams"][0]["jobs"][0]["kind"], "Chat render")
+        self.assertIn('data-stream-tab="jobs"', html)
+        self.assertIn('stream-tab-panel stream-tab-jobs', html)
+        self.assertIn("Chat render", html)
+        self.assertIn("Starting isolated renderer", html)
+
     def test_manual_chat_render_uses_configured_timeout(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -508,6 +566,29 @@ class WebStatusTests(unittest.TestCase):
         render.assert_called_once()
         self.assertEqual(render.call_args.kwargs["timeout_seconds"], 7200.0)
 
+    def test_inactive_configured_streamers_render_collapsed_by_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n'
+                '[streamers.OUMB3rd]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('class="streamer-section collapsed"', html)
+        self.assertIn('data-streamer-key="OUMB3rd"', html)
+        self.assertIn('data-streamer-active="0"', html)
+        self.assertIn('data-streamer-attention="0"', html)
+        self.assertIn('data-streamer-active-jobs="0"', html)
+        self.assertIn('data-streamer-needs-grouping="false"', html)
+        self.assertIn('data-streamer-toggle="OUMB3rd" aria-expanded="false">Expand</button>', html)
+
     def test_status_html_renders_streamer_wizard_and_prefill_buttons(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -542,6 +623,12 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('renderStreamerGroupingAction', html)
         self.assertNotIn('streamer-create-panel', html)
         self.assertNotIn('renderStreamerCreatePanel', html)
+
+    def test_dashboard_script_does_not_emit_literal_newlines_in_js_strings(self) -> None:
+        script = dashboard_script()
+
+        self.assertIn("join(String.fromCharCode(10))", script)
+        self.assertNotIn('join("' + "\n" + '")', script)
 
     def test_jobs_tab_shows_dashboard_and_watermark_jobs(self) -> None:
         with TemporaryDirectory() as tmp:

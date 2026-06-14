@@ -91,7 +91,8 @@ missing top-level settings from the current `config.example.toml` to an existing
 By default the systemd installer deploys to `/opt/onlysavemevods`, creates a dedicated
 `onlysavemevods` system user, and runs the service as that user instead of as root or
 your login account. The application code, venv, and Deno runtime are root-owned;
-only `downloads/`, `state/`, and `.cache/` are writable by the service user.
+only `config.toml`, `downloads/`, `state/`, and `.cache/` are writable by the
+service user so the web UI can save settings without making app code writable.
 
 The generic installer auto-detects `dnf` or `apt-get` for OS dependencies. On
 Debian/Ubuntu systems, it uses `apt-get` to install systemd, curl, certificates,
