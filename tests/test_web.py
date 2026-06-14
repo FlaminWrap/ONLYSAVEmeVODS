@@ -53,6 +53,8 @@ from onlysavemevods.web import (
     TRANSCRIPTION_JOBS,
     TRANSCRIPTION_JOBS_LOCK,
     StatusWebServer,
+    StreamEventStatus,
+    render_stream_event_timeline,
 )
 
 
@@ -452,6 +454,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Collapse", html)
         self.assertIn('fetch("/status.json"', html)
         self.assertIn("applySnapshot", html)
+        self.assertIn("const rows = [...events].reverse().map", html)
         self.assertIn("window.setInterval(refreshStatus, 15000)", html)
         self.assertNotIn("window.location.reload", html)
         self.assertNotIn('http-equiv="refresh"', html)
@@ -505,6 +508,29 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/render-chat?", chat_payload["render_chat_url"])
         self.assertEqual(chat_payload["render_chat_status"], "ready")
         json.dumps(payload)
+
+    def test_stream_event_timeline_renders_newest_first(self) -> None:
+        html = render_stream_event_timeline(
+            [
+                StreamEventStatus(
+                    event_id=1,
+                    level="info",
+                    message="Older event",
+                    segment_index=None,
+                    created_at="2026-06-14T11:00:00Z",
+                ),
+                StreamEventStatus(
+                    event_id=2,
+                    level="warning",
+                    message="Newer event",
+                    segment_index=2,
+                    created_at="2026-06-14T12:00:00Z",
+                ),
+            ]
+        )
+
+        self.assertLess(html.index("Newer event"), html.index("Older event"))
+        self.assertIn("seg 002", html)
 
 
     def test_stream_detail_tabs_include_matching_jobs(self) -> None:
@@ -736,6 +762,29 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('renderStreamerGroupingAction', html)
         self.assertNotIn('streamer-create-panel', html)
         self.assertNotIn('renderStreamerCreatePanel', html)
+
+    def test_streamer_settings_include_source_builder(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'download_dir = "downloads"\n'
+                'state_dir = "state"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('data-source-builder', html)
+        self.assertIn('data-source-platform', html)
+        self.assertIn('data-source-input', html)
+        self.assertIn('data-add-source', html)
+        self.assertIn('<option value="twitch">Twitch</option>', html)
+        self.assertIn('detectSourcePlatform', html)
+        self.assertIn('normalizeSourceValue', html)
 
     def test_status_html_renders_streamer_voice_manager(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1092,6 +1141,45 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Regenerate chat video", action)
         self.assertIn("Re-render and replace the existing chat video", action)
         self.assertNotIn("Chat video", action)
+
+    def test_non_youtube_streams_do_not_offer_youtube_chat_actions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+                render_live_chat_video=True,
+            )
+            stream = LiveStream(
+                video_id="twitch:OUMB3rd",
+                url="https://www.twitch.tv/OUMB3rd",
+                title="Live on Twitch",
+                channel="OUMB3rd",
+                platform="twitch",
+                source="twitch:OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "OUMB3rd" / "twitch_OUMB3rd"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live on Twitch [twitch_OUMB3rd].mp4"
+            chat_file = segment_dir / "Live on Twitch [twitch_OUMB3rd].live_chat.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+
+            snapshot = build_status_snapshot(config)
+
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertIsNone(chat_status.render_chat_url)
+        self.assertIsNone(chat_status.refresh_chat_url)
+        self.assertIn("twitch", snapshot_to_dict(snapshot)["streams"][0]["platform"])
 
     def test_chat_refresh_action_is_available_for_finalized_chat(self) -> None:
         with TemporaryDirectory() as tmp:

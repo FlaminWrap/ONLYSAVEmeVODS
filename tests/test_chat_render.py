@@ -662,15 +662,16 @@ class ChatRenderTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            def fake_run(command: list[str], **_kwargs: object) -> object:
-                Path(command[-1]).write_text("new chat render", encoding="utf-8")
+            class FakeProcess:
+                returncode: int | None = None
 
-                class Result:
-                    returncode = 0
-                    stdout = b""
-                    stderr = b""
+                def __init__(self, command: list[str], **_kwargs: object) -> None:
+                    self.command = command
 
-                return Result()
+                def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    self.returncode = 0
+                    Path(self.command[-1]).write_text("new chat render", encoding="utf-8")
+                    return b"", b""
 
             with (
                 patch(
@@ -678,7 +679,7 @@ class ChatRenderTests(unittest.TestCase):
                     side_effect=VideoProbeError("no probe"),
                 ),
                 patch("onlysavemevods.chat_render.LOGGER.exception"),
-                patch("onlysavemevods.chat_render.subprocess.run", side_effect=fake_run),
+                patch("onlysavemevods.chat_render.subprocess.Popen", FakeProcess),
             ):
                 result = render_chat_video_file(
                     media_file,
@@ -689,3 +690,72 @@ class ChatRenderTests(unittest.TestCase):
 
             self.assertEqual(result, output_file)
             self.assertEqual(output_file.read_text(encoding="utf-8"), "new chat render")
+
+    def test_render_chat_video_file_keeps_waiting_while_output_grows(self) -> None:
+        with TemporaryDirectory() as tmp:
+            media_file = Path(tmp) / "Live [ID].mp4"
+            chat_file = Path(tmp) / "Live [ID].live_chat.json"
+            output_file = chat_video_output_file(media_file)
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "replayChatItemAction": {
+                            "videoOffsetTimeMsec": "0",
+                            "actions": [
+                                {
+                                    "addChatItemAction": {
+                                        "item": {
+                                            "liveChatTextMessageRenderer": {
+                                                "timestampUsec": "1779054300000000",
+                                                "authorName": {"simpleText": "Alice"},
+                                                "message": {"simpleText": "hello"},
+                                            }
+                                        }
+                                    }
+                                }
+                            ],
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeProcess:
+                returncode: int | None = None
+
+                def __init__(self, command: list[str], **_kwargs: object) -> None:
+                    self.command = command
+                    self.calls = 0
+
+                def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+                    self.calls += 1
+                    if self.calls == 1:
+                        Path(self.command[-1]).write_bytes(b"partial output")
+                        raise subprocess.TimeoutExpired(cmd=self.command, timeout=timeout)
+                    self.returncode = 0
+                    Path(self.command[-1]).write_bytes(b"finished output")
+                    return b"", b""
+
+                def kill(self) -> None:
+                    raise AssertionError("active ffmpeg render should not be killed")
+
+            with (
+                patch(
+                    "onlysavemevods.chat_render.probe_video_dimensions",
+                    side_effect=VideoProbeError("no probe"),
+                ),
+                patch("onlysavemevods.chat_render.LOGGER.exception"),
+                patch("onlysavemevods.chat_render.subprocess.Popen", FakeProcess),
+                patch("onlysavemevods.chat_render.FFMPEG_OUTPUT_PROGRESS_POLL_SECONDS", 0.1),
+            ):
+                result = render_chat_video_file(
+                    media_file,
+                    chat_file,
+                    output_file=output_file,
+                    timeout_seconds=0.1,
+                    overwrite=True,
+                )
+
+            self.assertEqual(result, output_file)
+            self.assertEqual(output_file.read_bytes(), b"finished output")

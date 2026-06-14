@@ -7,9 +7,10 @@ from .chat_render import log_nvenc_environment
 from .config import BotConfig, ensure_config_dirs, monitored_sources
 from .downloader import DownloadManager
 from .models import LiveStream
+from .sources import SourceMonitor
 from .state import StateStore
 from .web import StatusWebServer
-from .youtube import YoutubeProbe, YtDlpRunner
+from .youtube import YtDlpRunner
 
 
 LOGGER = logging.getLogger(__name__)
@@ -20,12 +21,12 @@ class OnlySaveMeVodsDaemon:
         self.config = config
         ensure_config_dirs(config)
         self.state = StateStore(config.db_path)
-        self.probe = YoutubeProbe(
+        self.sources = SourceMonitor(
             YtDlpRunner(config.yt_dlp_path),
             channel_scan_limit=config.channel_scan_limit,
             discovery_probe_concurrency=config.discovery_probe_concurrency,
         )
-        self.downloads = DownloadManager(config, self.state, self.probe)
+        self.downloads = DownloadManager(config, self.state, self.sources)
         self.web = StatusWebServer(config) if config.web_enabled else None
         self._stop_event = asyncio.Event()
 
@@ -107,52 +108,26 @@ class OnlySaveMeVodsDaemon:
         self._stop_event.set()
 
     async def poll_once(self) -> None:
-        for channel in monitored_sources(self.config):
-            LOGGER.info("Checking channel %s", channel)
-            skip_video_ids: set[str] = set()
+        for source in monitored_sources(self.config):
+            LOGGER.info("Checking source %s", source)
             try:
-                LOGGER.debug("Checking fast /live endpoint for %s", channel)
-                fast_stream = await asyncio.to_thread(
-                    self.probe.probe_channel_live_stream,
-                    channel,
-                )
-            except Exception as exc:
-                LOGGER.warning("Failed to check channel live URL %s: %s", channel, exc)
-            else:
-                if fast_stream:
-                    LOGGER.info(
-                        "Live stream found via fast path for %s video_id=%s title=%r",
-                        channel,
-                        fast_stream.video_id,
-                        fast_stream.title,
-                    )
-                    skip_video_ids.add(fast_stream.video_id)
-                    await self._start_stream(fast_stream)
-
-            try:
-                LOGGER.debug(
-                    "Scanning streams page for %s skip_video_ids=%s",
-                    channel,
-                    sorted(skip_video_ids),
-                )
                 streams = await asyncio.to_thread(
-                    self.probe.discover_channel_live_streams,
-                    channel,
-                    skip_video_ids=skip_video_ids,
-                    include_channel_live=False,
+                    self.sources.discover_live_streams,
+                    source,
                 )
             except Exception as exc:
-                LOGGER.warning("Failed to check channel %s: %s", channel, exc)
+                LOGGER.warning("Failed to check source %s: %s", source, exc)
                 continue
 
-            if not streams and not skip_video_ids:
-                LOGGER.info("No live streams detected for %s", channel)
+            if not streams:
+                LOGGER.info("No live streams detected for %s", source)
                 continue
 
             for stream in streams:
                 LOGGER.info(
-                    "Live stream found via stream scan for %s video_id=%s title=%r",
-                    channel,
+                    "Live stream found for %s platform=%s video_id=%s title=%r",
+                    source,
+                    stream.platform,
                     stream.video_id,
                     stream.title,
                 )

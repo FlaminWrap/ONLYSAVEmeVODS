@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Awaitable, Callable, Protocol
 import asyncio
 import json
 import logging
 import re
 import shlex
+import subprocess
 import sys
 import time
 
@@ -26,6 +27,7 @@ from .chat_render import (
     probe_video_dimensions,
     probe_video_duration,
     render_chat_panel_video,
+    run_ffmpeg_command_with_output_progress,
     write_chat_ass_file,
 )
 from .chat_refresh import refresh_chat_sidecar
@@ -41,7 +43,7 @@ from .config import BotConfig, download_group_name_for_channel
 from .models import LiveStream
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
-from .youtube import TerminalVideoUnavailableError, YoutubeProbe
+from .youtube import TerminalVideoUnavailableError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -73,6 +75,11 @@ KEPT_FRAGMENT_RE = re.compile(r"-Frag(?P<fragment>\d+)$")
 
 SleepFunc = Callable[[float], Awaitable[None]]
 ProbeVideoFunc = Callable[[str], Awaitable[LiveStream]]
+
+
+class StreamProbe(Protocol):
+    def probe_video(self, url: str) -> LiveStream:
+        ...
 
 
 @dataclass(slots=True)
@@ -145,7 +152,7 @@ class DownloadManager:
         self,
         config: BotConfig,
         state: StateStore,
-        probe: YoutubeProbe,
+        probe: StreamProbe,
         *,
         sleep_func: SleepFunc = asyncio.sleep,
         probe_video_func: ProbeVideoFunc | None = None,
@@ -249,7 +256,7 @@ class DownloadManager:
             await self._schedule_spawn_retry(stream)
             return False
 
-        record_chat = should_record_chat(self.config)
+        record_chat = should_record_chat_for_stream(self.config, stream)
         if record_chat:
             self.write_segment_timing_started(
                 stream,
@@ -795,12 +802,12 @@ class DownloadManager:
             stream.channel,
         )
         finalized_files = self.rename_finalized_segments(stream, segment_index)
-        if should_record_chat(self.config):
+        if should_record_chat_for_stream(self.config, stream):
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
         if self.config.transcribe_subtitles:
             await self.transcribe_finalized_media(finalized_files)
-        if self.config.render_live_chat_video:
+        if self.config.render_live_chat_video and stream.platform == "youtube":
             await self.render_finalized_chat_videos(finalized_files)
 
     def rename_finalized_segments(
@@ -1150,12 +1157,12 @@ class DownloadManager:
         self.logger.debug("ffmpeg chat render command: %s", command_for_log(command))
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result, ffmpeg_elapsed = await asyncio.to_thread(
+                run_ffmpeg_command_with_output_progress,
+                command,
+                temp_output,
+                chat_render_timeout_seconds(self.config),
             )
-            ffmpeg_started_at = time.monotonic()
         except FileNotFoundError:
             self.logger.warning(
                 "Unable to render chat video; ffmpeg not found: %s",
@@ -1169,28 +1176,21 @@ class DownloadManager:
             ass_file.unlink(missing_ok=True)
             panel_file.unlink(missing_ok=True)
             return False
-
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=chat_render_timeout_seconds(self.config),
-            )
-            ffmpeg_elapsed = time.monotonic() - ffmpeg_started_at
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+        except subprocess.TimeoutExpired:
             temp_output.unlink(missing_ok=True)
             ass_file.unlink(missing_ok=True)
             panel_file.unlink(missing_ok=True)
-            self.logger.warning("ffmpeg timed out while rendering chat video")
+            self.logger.warning(
+                "ffmpeg made no output progress while rendering chat video"
+            )
             return False
         finally:
             ass_file.unlink(missing_ok=True)
             panel_file.unlink(missing_ok=True)
 
-        if process.returncode != 0:
+        if result.returncode != 0:
             temp_output.unlink(missing_ok=True)
-            message = (stderr or stdout).decode("utf-8", "replace").strip()
+            message = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
             self.logger.warning("ffmpeg failed while rendering chat video: %s", message)
             return False
 
@@ -1242,16 +1242,7 @@ class DownloadManager:
             self.logger.exception("Unable to start isolated chat render process")
             return False
 
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(),
-                timeout=chat_render_timeout_seconds(self.config),
-            )
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            self.logger.warning("Isolated chat render process timed out")
-            return False
+        stdout, stderr = await process.communicate()
 
         log_process_output(
             self.logger,
@@ -1599,10 +1590,10 @@ def build_download_command(
 ) -> list[str]:
     output_template = output_template_for(config, stream, segment_index)
     command = [config.yt_dlp_path, *config.extra_yt_dlp_args]
-    record_chat = should_record_chat(config)
+    record_chat = should_record_chat_for_stream(config, stream)
     if record_chat and not yt_dlp_args_include_format(config.extra_yt_dlp_args):
         command.extend(["--format", DEFAULT_MEDIA_FORMAT])
-    if config.live_from_start:
+    if config.live_from_start and stream.platform == "youtube":
         command.append("--live-from-start")
     if config.keep_fragments_for_resume:
         command.append("--keep-fragments")
@@ -1628,9 +1619,11 @@ def build_chat_download_command(
     stream: LiveStream,
     segment_index: int,
 ) -> list[str]:
+    if stream.platform != "youtube":
+        raise ValueError("live chat recording is currently YouTube-only")
     output_template = output_template_for(config, stream, segment_index)
     command = [config.yt_dlp_path, *config.extra_yt_dlp_args]
-    if config.live_from_start:
+    if config.live_from_start and stream.platform == "youtube":
         command.append("--live-from-start")
     command.extend(
         [
@@ -1655,6 +1648,10 @@ def build_chat_download_command(
 
 def should_record_chat(config: BotConfig) -> bool:
     return config.record_live_chat or config.render_live_chat_video
+
+
+def should_record_chat_for_stream(config: BotConfig, stream: LiveStream) -> bool:
+    return stream.platform == "youtube" and should_record_chat(config)
 
 
 def chat_render_timeout_seconds(config: BotConfig) -> float | None:

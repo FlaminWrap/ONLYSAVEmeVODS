@@ -37,7 +37,8 @@ from .watermark import (
     format_detection_text,
     require_watermark_secret,
 )
-from .youtube import YoutubeProbe, YtDlpRunner
+from .sources import SourceMonitor
+from .youtube import YtDlpRunner
 
 
 VOICE_DETECTION_MODES = ("off", "auto", "range", "fixed")
@@ -239,7 +240,7 @@ def configure_logging(verbose: int, log_level: str = "INFO") -> None:
 def check_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     configure_logging(args.verbose, config.log_level)
-    probe = YoutubeProbe(
+    sources_monitor = SourceMonitor(
         YtDlpRunner(config.yt_dlp_path),
         channel_scan_limit=config.channel_scan_limit,
         discovery_probe_concurrency=config.discovery_probe_concurrency,
@@ -252,10 +253,10 @@ def check_command(args: argparse.Namespace) -> int:
         print("No channels or streamers configured.")
         return 0
 
-    for channel in sources:
-        print(f"Checking {channel}")
+    for source in sources:
+        print(f"Checking {source}")
         try:
-            streams = probe.discover_channel_live_streams(channel)
+            streams = sources_monitor.discover_live_streams(source)
         except Exception as exc:
             failures += 1
             print(f"  ERROR: {exc}")

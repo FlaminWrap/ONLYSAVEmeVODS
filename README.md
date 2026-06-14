@@ -1,9 +1,11 @@
 # ONLYSAVEmeVODS
 
-ONLYSAVEmeVODS watches YouTube channel stream pages and starts `yt-dlp` for every live
-stream it finds. It supports multiple simultaneous streams from the same
-channel and treats a `yt-dlp` exit as uncertain until YouTube has been checked
-for the configured post-exit window.
+ONLYSAVEmeVODS watches streamer sources and starts `yt-dlp` for every live
+stream it finds. YouTube keeps the existing fast channel discovery, while
+Twitch, Kick, and Rumble are probed conservatively through yt-dlp and recorded
+only when the source is currently live. It supports multiple simultaneous
+streams from the same streamer and treats a `yt-dlp` exit as uncertain until the
+source has been checked for the configured post-exit window.
 
 ## Quick Start
 
@@ -19,12 +21,18 @@ Edit `config.toml`, then run a one-shot check:
 .venv/bin/onlysavemevods check --config config.toml
 ```
 
-For a streamer with multiple channels, group them in `config.toml` so shared
+For a streamer with multiple sources, group them in `config.toml` so shared
 settings only need to be maintained once:
 
 ```toml
 [streamers."OUMB3rd"]
-sources = ["@OUMB3rd", "https://www.youtube.com/@OUMB3rdVODS"]
+sources = [
+  "@OUMB3rd",
+  "https://www.youtube.com/@OUMB3rdVODS",
+  "twitch:OUMB3rd",
+  "kick:OUMB3rd",
+  "https://rumble.com/user/OUMB3rd",
+]
 download_dir_name = "OUMB3rd"
 
 [streamers."OUMB3rd".voice_detection]
@@ -36,9 +44,10 @@ SPEAKER_00 = "OUMB3rd"
 SPEAKER_01 = "Guest"
 ```
 
-The top-level `channels = [...]` list still works for simple setups. Streamer
-`sources` currently use the same YouTube channel URL or `@handle` inputs as
-`channels`.
+The top-level `channels = [...]` list still works for simple setups, but the
+dashboard treats it as ungrouped sources. Source inputs can be existing YouTube
+handles or URLs, explicit shorthands such as `twitch:name`, `kick:name`, and
+`rumble:user/name`, or full URLs for supported platforms.
 
 Run continuously:
 
@@ -192,7 +201,7 @@ journalctl -u onlysavemevods-python-update.service
 ```
 
 Set `log_level = "DEBUG"` in `config.toml` and restart the service when you need
-more detail about channel discovery, post-exit probes, resume decisions, and
+more detail about source discovery, post-exit probes, resume decisions, and
 finalization.
 
 On the default config, the status page is available on the host at
@@ -206,26 +215,31 @@ scripts/uninstall-systemd.sh
 
 ## Notes
 
-- Public YouTube streams only; no cookies are configured by default.
+- Public YouTube, Twitch, Kick, and Rumble livestream sources are supported; no
+  cookies are configured by default.
 - Logging defaults to `INFO`. Set `log_level = "DEBUG"` in `config.toml`, or add
   `-v` when running the CLI manually, for verbose diagnostics.
 - Dashboard downloads are limited to finalized files for streams already present
   in the state database, plus finalized live chat and subtitle sidecars.
   `.part`, fragment, and `.ytdl` files are not served.
-- Discovery checks each channel's `/live` page first, then scans up to
+- YouTube discovery checks each source's `/live` page first, then scans up to
   `channel_scan_limit` recent stream entries with up to
-  `discovery_probe_concurrency` yt-dlp probes at once.
-- New downloads are stored under `download_dir/<channel>/<video_id>/`. Existing
+  `discovery_probe_concurrency` yt-dlp probes at once. Twitch, Kick, and Rumble
+  v1 discovery probes the configured source URL and starts a download only when
+  yt-dlp reports it as live.
+- New downloads are stored under `download_dir/<streamer-or-source>/<video_id>/`. Existing
   in-progress `download_dir/<video_id>/` folders are reused so resumable partials
   are not abandoned after an update.
 - Active and resumable files use stable `segment-001.*` names. When a stream is
   finally marked ended, finalized segment files are renamed to the video title
   and ID, for example `Live Title [VIDEOID].mp4`. If a continuation file is
   needed, it uses `Live Title [VIDEOID] - part 002`.
-- Downloads use `--live-from-start`, `--continue`, `--part`, `--keep-fragments`,
-  and `--no-playlist` by default. Keeping fragments costs extra disk space while
-  a segment is active, but it gives the bot enough state to resume a format that
-  yt-dlp accidentally finalized.
+- Downloads use `--continue`, `--part`, `--keep-fragments`, and `--no-playlist`
+  by default. YouTube downloads also use `--live-from-start` when
+  `live_from_start = true`; other platforms are left to yt-dlp's platform
+  behavior. Keeping fragments costs extra disk space while a segment is active,
+  but it gives the bot enough state to resume a format that yt-dlp accidentally
+  finalized.
 - Set `record_live_chat = true` to ask yt-dlp to write YouTube live chat with
   `--write-subs --sub-langs live_chat`. The bot keeps it as a sidecar
   `.live_chat.json` file and renames it with the finalized stream title and ID
@@ -234,6 +248,9 @@ scripts/uninstall-systemd.sh
   waiting behind live chat fragments. When live chat is enabled and no custom
   format is configured, the media process also passes
   `--format bestvideo*+bestaudio/best` so media download remains explicit.
+  Chat recording, refresh, and rendered chat videos are currently YouTube-only;
+  non-YouTube sources are recorded as video/audio only in this first adapter
+  pass.
 - Set `render_live_chat_video = true` to also create a separate
   `Title [VIDEOID] - chat.mp4` after the stream ends. The original finalized
   media file is left untouched; the chat version is re-encoded with the video on

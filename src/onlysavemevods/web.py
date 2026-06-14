@@ -266,6 +266,8 @@ class StreamStatus:
     title: str
     channel: str
     url: str
+    platform: str
+    source: str
     status: str
     segment_index: int
     first_seen_at: str
@@ -1629,6 +1631,10 @@ def channel_display_name(channel: str) -> str:
     target = channel.strip().rstrip("/")
     if not target:
         return "unknown channel"
+    if ":" in target and not target.startswith(("http://", "https://")):
+        prefix, value = target.split(":", 1)
+        if prefix.casefold() in {"youtube", "twitch", "kick", "rumble"}:
+            target = value.strip().rstrip("/")
     if "/" in target:
         target = target.rsplit("/", 1)[-1]
     return target or channel
@@ -1777,6 +1783,7 @@ def stream_status_from_record(
         record.video_id,
         config.watermark_enabled and bool(watermark_secret(config)),
         watermark_records or [],
+        platform=record.platform,
     )
     total_bytes = sum(file.size_bytes for file in files)
     bytes_by_kind = summarize_bytes_by_kind(files)
@@ -1787,6 +1794,8 @@ def stream_status_from_record(
         title=record.title,
         channel=record.channel,
         url=record.url,
+        platform=record.platform,
+        source=record.source,
         status=record.status,
         segment_index=record.segment_index,
         first_seen_at=record.first_seen_at,
@@ -1841,6 +1850,7 @@ def summarize_files(
     video_id: str,
     watermark_enabled: bool = False,
     watermark_records: list[WatermarkCopyRecord] | None = None,
+    platform: str = "youtube",
 ) -> list[FileStatus]:
     if not directory.exists():
         return []
@@ -1858,11 +1868,16 @@ def summarize_files(
         except OSError:
             continue
         details = file_details(path.name)
+        chat_actions_enabled = platform == "youtube"
         render_chat_url, render_chat_output_url, render_chat_status, render_chat_message = (
             chat_render_action_for_file(directory, video_id, path.name)
+            if chat_actions_enabled
+            else (None, None, None, None)
         )
         refresh_chat_url, refresh_chat_status, refresh_chat_message = (
             chat_refresh_action_for_file(config, directory, video_id, path.name)
+            if chat_actions_enabled
+            else (None, None, None)
         )
         transcription_url, transcription_status, transcription_message = (
             transcription_action_for_file(directory, video_id, path.name)
@@ -4567,6 +4582,77 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-form .wide, .streamer-form .settings-actions {{ grid-column: 1 / -1; }}
     .streamer-meta {{ color: var(--muted); align-self: end; }}
+    .source-add-control {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      margin-top: 6px;
+    }}
+    .source-add-menu {{ position: relative; }}
+    .source-add-menu > summary {{ list-style: none; cursor: pointer; }}
+    .source-add-menu > summary::-webkit-details-marker {{ display: none; }}
+    .source-add-popover {{
+      position: absolute;
+      left: 0;
+      top: calc(100% + 8px);
+      z-index: 6;
+      width: min(620px, calc(100vw - 56px));
+      display: grid;
+      grid-template-columns: 160px minmax(220px, 1fr) max-content;
+      gap: 10px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.12);
+    }}
+    .source-add-popover .wide {{ grid-column: 1 / -1; }}
+    .source-add-actions {{ display: flex; gap: 8px; align-items: center; }}
+    .source-list {{ display: grid; gap: 8px; margin-top: 4px; }}
+    .source-list-empty {{
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      color: var(--muted);
+      background: var(--panel-strong);
+    }}
+    .source-list-row {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr) max-content;
+      gap: 10px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 10px;
+      background: var(--panel);
+    }}
+    .source-platform-icon {{
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      color: #fff;
+      background: #64748b;
+      font-weight: 800;
+      font-size: 12px;
+    }}
+    .source-platform-icon.youtube {{ background: #c4302b; }}
+    .source-platform-icon.twitch {{ background: #6441a5; }}
+    .source-platform-icon.kick {{ background: #168a2f; }}
+    .source-platform-icon.rumble {{ background: #2563eb; }}
+    .source-list-main {{ min-width: 0; display: grid; gap: 2px; }}
+    .source-list-name {{ color: var(--text); font-weight: 650; overflow-wrap: anywhere; }}
+    .source-list-meta {{ color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }}
+    @media (max-width: 760px) {{
+      .source-add-popover {{ position: static; width: min(100%, calc(100vw - 56px)); grid-template-columns: 1fr; margin-top: 8px; }}
+      .source-add-popover .wide {{ grid-column: auto; }}
+      .source-list-row {{ grid-template-columns: max-content minmax(0, 1fr); }}
+      .source-list-row button {{ grid-column: 1 / -1; justify-self: start; }}
+    }}
     .streamer-wizard {{
       width: min(760px, calc(100vw - 32px));
       max-height: min(760px, calc(100vh - 32px));
@@ -4671,15 +4757,67 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .voice-tabs > input:checked + label + section {{ display: grid; gap: 10px; }}
     .voice-profile-form, .voice-sample-row, .voice-match-row {{
       display: grid;
-      grid-template-columns: repeat(2, minmax(180px, 1fr));
-      gap: 9px;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
       align-items: end;
       border: 1px solid var(--line);
       border-radius: 8px;
-      padding: 10px;
+      padding: 12px;
       margin: 0;
+      background: var(--panel-strong);
     }}
     .voice-profile-title, .voice-task-title, .voice-profile-form .wide, .voice-sample-row .file-name, .voice-match-row .file-name {{ grid-column: 1 / -1; }}
+    .voice-profile-form label, .voice-sample-row label, .voice-match-row label {{
+      display: grid;
+      gap: 5px;
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }}
+    .voice-profile-form label > :where(input, select, textarea),
+    .voice-sample-row label > :where(input, select, textarea),
+    .voice-match-row label > :where(input, select, textarea) {{
+      width: 100%;
+      min-width: 0;
+      box-sizing: border-box;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+      font-weight: 400;
+    }}
+    .voice-profile-form label > input[type="file"],
+    .voice-sample-row label > input[type="file"] {{
+      padding: 5px;
+    }}
+    .voice-profile-title {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--text);
+    }}
+    .voice-advanced {{
+      border: 1px dashed var(--line);
+      border-radius: 7px;
+      padding: 8px 10px;
+      background: var(--panel);
+    }}
+    .voice-advanced > summary {{
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      list-style-position: inside;
+    }}
+    .voice-advanced label {{ margin-top: 8px; }}
+    .voice-profile-form .settings-actions {{
+      grid-column: 1 / -1;
+      margin-top: 2px;
+    }}
     .voice-task-title {{
       margin: 0 0 2px;
       font-size: 0.95rem;
@@ -4688,9 +4826,15 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       align-items: end;
     }}
-    .voice-profile-form textarea {{ min-height: 54px; }}
+    .voice-profile-form textarea {{
+      min-height: 68px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+    }}
     .voice-list {{ display: grid; gap: 8px; }}
-    .voice-card {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }}
+    .voice-card {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); overflow: hidden; }}
+    .voice-card[open] {{ box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }}
     .voice-card > summary {{
       display: grid;
       grid-template-columns: minmax(0, 1fr) repeat(3, max-content);
@@ -4700,11 +4844,23 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       cursor: pointer;
       list-style: none;
     }}
+    .voice-card[open] > summary {{
+      border-bottom: 1px solid var(--line);
+      background: var(--panel-strong);
+    }}
     .voice-card > summary::-webkit-details-marker {{ display: none; }}
     .voice-card-name {{ font-weight: 650; overflow-wrap: anywhere; }}
-    .voice-card-action {{ color: var(--link); font-size: 12px; }}
-    .voice-card-body {{ display: grid; gap: 10px; padding: 0 10px 10px; }}
-    .voice-sample-form {{ grid-template-columns: minmax(180px, 1fr) max-content; }}
+    .voice-card-action {{
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      color: var(--muted);
+      background: var(--panel);
+      font-size: 12px;
+    }}
+    .voice-card-body {{ display: grid; gap: 10px; padding: 10px; }}
+    .voice-sample-form {{ grid-template-columns: minmax(220px, 1fr) max-content; }}
+    .voice-sample-form button {{ justify-self: end; }}
     .voice-match-row {{ grid-template-columns: max-content 1fr repeat(2, max-content); align-items: center; }}
     @media (max-width: 760px) {{
       .voice-manager-head {{ align-items: flex-start; }}
@@ -5073,13 +5229,53 @@ def dashboard_script() -> str:
   };
 
   document.addEventListener("change", (event) => {
+    const sourcePlatform = event.target.closest("[data-source-platform]");
+    if (sourcePlatform) {
+      const builder = sourcePlatform.closest("[data-source-builder]");
+      const input = builder ? builder.querySelector("[data-source-input]") : null;
+      if (input) updateSourceDetectionHint(input);
+      return;
+    }
+
     const input = event.target.closest("[data-stream-tab][data-video-id]");
     if (!input || !input.checked) return;
     selectedStreamTabs[input.getAttribute("data-video-id") || ""] = input.getAttribute("data-stream-tab") || "files";
     writeSelectedStreamTabs();
   });
 
+  document.addEventListener("input", (event) => {
+    const sourceInput = event.target.closest("[data-source-input]");
+    if (sourceInput) updateSourceDetectionHint(sourceInput);
+  });
+
   document.addEventListener("click", (event) => {
+    const closeSourceButton = event.target.closest("[data-close-source-popover]");
+    if (closeSourceButton) {
+      event.preventDefault();
+      const menu = closeSourceButton.closest("details");
+      if (menu) menu.removeAttribute("open");
+      return;
+    }
+
+    const addSourceButton = event.target.closest("[data-add-source]");
+    if (addSourceButton) {
+      event.preventDefault();
+      addSourceFromBuilder(addSourceButton);
+      return;
+    }
+
+    const removeSourceButton = event.target.closest("[data-remove-source]");
+    if (removeSourceButton) {
+      event.preventDefault();
+      const form = removeSourceButton.closest("form");
+      const textarea = form ? form.querySelector('[data-sources-value]') : null;
+      const source = removeSourceButton.getAttribute("data-remove-source") || "";
+      if (!textarea || !source) return;
+      textarea.value = sourceRowsFromText(textarea.value).filter((item) => item !== source).join("\n");
+      syncSourceList(form);
+      return;
+    }
+
     const voiceButton = event.target.closest("[data-open-voice-manager]");
     if (voiceButton) {
       event.preventDefault();
@@ -5212,6 +5408,7 @@ def dashboard_script() -> str:
     if (nameInput) nameInput.value = name;
     if (sourcesInput) sourcesInput.value = sources;
     if (downloadDirInput) downloadDirInput.value = "";
+    syncSourceList(wizardForm);
     if (typeof wizard.showModal === "function") wizard.showModal();
     else wizard.setAttribute("open", "");
     if (nameInput) nameInput.focus();
@@ -5279,7 +5476,7 @@ def dashboard_script() -> str:
 
   const renderStreamEvents = (events) => {
     if (!events || !events.length) return '<div class="file-meta">No stream log entries yet.</div>';
-    const rows = events.map((event) => {
+    const rows = [...events].reverse().map((event) => {
       const segment = event.segment_index ? `seg ${String(event.segment_index).padStart(3, "0")}` : "-";
       const rawLevel = String(event.level || "info").toLowerCase();
       const level = ["debug", "info", "warning", "error"].includes(rawLevel) ? rawLevel : "info";
@@ -5395,6 +5592,8 @@ def dashboard_script() -> str:
     const title = stream.title || stream.video_id;
     const mixed = stream.has_mixed_formats ? "yes" : "no";
     const videoId = String(stream.video_id);
+    const platform = stream.platform || "youtube";
+    const sourceName = stream.channel || stream.source || "unknown source";
     const collapsed = streamIsCollapsed(videoId, stream.status);
     const collapsedClass = collapsed ? " collapsed" : "";
     const toggleLabel = collapsed ? "Expand" : "Collapse";
@@ -5409,7 +5608,7 @@ def dashboard_script() -> str:
   <div class="stream-head">
     <div>
       <div class="title">${escapeHtml(title)}</div>
-      <div class="file-meta">${escapeHtml(stream.channel || "unknown channel")} - <a href="${escapeAttr(stream.url)}">${escapeHtml(stream.video_id)}</a></div>
+      <div class="file-meta"><span class="badge">${escapeHtml(platform)}</span> ${escapeHtml(sourceName)} - <a href="${escapeAttr(stream.url)}">${escapeHtml(stream.video_id)}</a></div>
     </div>
     <div class="stream-actions">
       <button class="download stream-toggle" type="button" data-stream-toggle="${escapeAttr(videoId)}" aria-expanded="${expanded}">${toggleLabel}</button>
@@ -5469,6 +5668,176 @@ def dashboard_script() -> str:
     return `<div class="source-chips">${sources.map((source) => `<span class="source-chip">${escapeHtml(source)}</span>`).join("")}</div>`;
   };
 
+  const sourcePlatformLabels = {
+    youtube: "YouTube",
+    twitch: "Twitch",
+    kick: "Kick",
+    rumble: "Rumble",
+  };
+  const supportedSourcePlatforms = new Set(Object.keys(sourcePlatformLabels));
+  const parseUrlLikeSource = (value) => {
+    const text = String(value || "").trim();
+    if (!text) return null;
+    const candidate = /^https?:\\/\\//i.test(text) ? text : (/^(?:www\\.)?[a-z0-9.-]+\\//i.test(text) ? `https://${text}` : "");
+    if (!candidate) return null;
+    try { return new URL(candidate); } catch (_) { return null; }
+  };
+  const detectSourcePlatform = (value) => {
+    const text = String(value || "").trim();
+    const prefix = text.match(/^([A-Za-z][A-Za-z0-9_-]*):/);
+    if (prefix) {
+      const platform = prefix[1].toLowerCase().replaceAll("_", "-");
+      if (supportedSourcePlatforms.has(platform)) return platform;
+    }
+    const url = parseUrlLikeSource(text);
+    if (!url) return "";
+    let host = url.hostname.toLowerCase();
+    if (host.startsWith("www.")) host = host.slice(4);
+    if (host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com")) return "youtube";
+    if (host === "twitch.tv" || host.endsWith(".twitch.tv")) return "twitch";
+    if (host === "kick.com" || host.endsWith(".kick.com")) return "kick";
+    if (host === "rumble.com" || host.endsWith(".rumble.com")) return "rumble";
+    return "";
+  };
+  const sourcePlatformIcons = {
+    youtube: "Y",
+    twitch: "T",
+    kick: "K",
+    rumble: "R",
+  };
+  const sourceRowsFromText = (value) => String(value || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const sourceNameFromValue = (source, platform) => {
+    let text = String(source || "").trim();
+    if (!text) return "Unknown source";
+    const prefix = text.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
+    if (prefix && supportedSourcePlatforms.has(prefix[1].toLowerCase().replaceAll("_", "-"))) {
+      text = prefix[2].trim();
+    }
+    const url = parseUrlLikeSource(text);
+    if (url) {
+      const parts = url.pathname.split("/").map((part) => part.trim()).filter(Boolean);
+      return parts.length ? parts[parts.length - 1].replace(/^@+/, "") : url.hostname;
+    }
+    text = text.replace(/^@+/, "").replace(/^\/+|\/+$/g, "");
+    if (platform === "rumble") {
+      const parts = text.split("/").filter(Boolean);
+      return parts.length ? parts[parts.length - 1] : text;
+    }
+    return text || source;
+  };
+  const sourceDisplayParts = (source) => {
+    const platform = detectSourcePlatform(source) || "youtube";
+    return {
+      platform,
+      label: sourcePlatformLabels[platform] || "Source",
+      icon: sourcePlatformIcons[platform] || "S",
+      name: sourceNameFromValue(source, platform),
+      source,
+    };
+  };
+  const renderSourceList = (sources) => {
+    sources = sources || [];
+    if (!sources.length) return '<div class="source-list-empty">No sources added yet.</div>';
+    return sources.map((source) => {
+      const info = sourceDisplayParts(source);
+      return `<div class="source-list-row" data-source-value="${escapeAttr(source)}">
+        <span class="source-platform-icon ${escapeAttr(info.platform)}" title="${escapeAttr(info.label)}" aria-hidden="true">${escapeHtml(info.icon)}</span>
+        <div class="source-list-main">
+          <div class="source-list-name">${escapeHtml(info.name)}</div>
+          <div class="source-list-meta">${escapeHtml(info.label)} - ${escapeHtml(source)}</div>
+        </div>
+        <button class="download action-button" type="button" data-remove-source="${escapeAttr(source)}">Remove</button>
+      </div>`;
+    }).join("");
+  };
+  const syncSourceList = (form) => {
+    if (!form) return;
+    const textarea = form.querySelector('[data-sources-value]');
+    const list = form.querySelector('[data-source-list]');
+    if (!textarea || !list) return;
+    list.innerHTML = renderSourceList(sourceRowsFromText(textarea.value));
+  };
+  const normalizeSourceValue = (platform, value) => {
+    const text = String(value || "").trim();
+    if (!text) return "";
+    const detected = detectSourcePlatform(text);
+    const url = parseUrlLikeSource(text);
+    if (/^https?:\\/\\//i.test(text)) return text;
+    if (url && detected) return url.href.replace(/\\/$/, "");
+    if (detected && new RegExp(`^${detected}:`, "i").test(text)) return text;
+    platform = platform && platform !== "auto" ? platform : detected || "youtube";
+    let channel = text.replace(/^@+/, "").replace(/^\\/+|\\/+$/g, "");
+    if (platform === "youtube") return text.startsWith("@") ? text : `@${channel}`;
+    if (platform === "twitch") return `twitch:${channel}`;
+    if (platform === "kick") return `kick:${channel}`;
+    if (platform === "rumble") {
+      if (!/^(user\\/|c\\/|v)/i.test(channel)) channel = `user/${channel}`;
+      return `rumble:${channel}`;
+    }
+    return text;
+  };
+  const updateSourceDetectionHint = (input) => {
+    const builder = input.closest("[data-source-builder]");
+    if (!builder) return;
+    const select = builder.querySelector("[data-source-platform]");
+    const hint = builder.querySelector("[data-source-detect-hint]");
+    const detected = detectSourcePlatform(input.value);
+    if (detected && select) select.value = detected;
+    if (hint) {
+      hint.textContent = detected
+        ? `Detected ${sourcePlatformLabels[detected]}. Add Source will append a compatible source entry.`
+        : "Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.";
+    }
+  };
+  const addSourceFromBuilder = (button) => {
+    const builder = button.closest("[data-source-builder]");
+    const form = button.closest("form");
+    const textarea = form ? form.querySelector('[data-sources-value]') : null;
+    const select = builder ? builder.querySelector("[data-source-platform]") : null;
+    const input = builder ? builder.querySelector("[data-source-input]") : null;
+    if (!textarea || !input) return;
+    const source = normalizeSourceValue(select ? select.value : "auto", input.value);
+    if (!source) {
+      input.setCustomValidity("Enter a channel name or source URL.");
+      input.reportValidity();
+      return;
+    }
+    input.setCustomValidity("");
+    const existing = sourceRowsFromText(textarea.value);
+    if (!existing.includes(source)) existing.push(source);
+    textarea.value = existing.join("\\n");
+    syncSourceList(form);
+    input.value = "";
+    updateSourceDetectionHint(input);
+    const menu = builder ? builder.querySelector("details") : null;
+    if (menu) menu.removeAttribute("open");
+  };
+
+  const renderSourceAddControl = () => `<div class="source-add-control" data-source-builder>
+    <details class="source-add-menu">
+      <summary class="download action-button">Add Source</summary>
+      <div class="source-add-popover">
+        <label class="settings-field">Website
+          <select data-source-platform>
+            <option value="auto">Auto-detect</option>
+            <option value="youtube">YouTube</option>
+            <option value="twitch">Twitch</option>
+            <option value="kick">Kick</option>
+            <option value="rumble">Rumble</option>
+          </select>
+        </label>
+        <label class="settings-field">Channel or URL
+          <input data-source-input type="text" placeholder="Paste URL or channel name">
+        </label>
+        <div class="source-add-actions">
+          <button class="download action-button" type="button" data-add-source>Add Source</button>
+          <button class="download action-button" type="button" data-close-source-popover>Cancel</button>
+        </div>
+        <div class="file-meta wide" data-source-detect-hint>Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.</div>
+      </div>
+    </details>
+  </div>`;
+
   const renderStreamerForm = (streamer) => {
     const isExisting = Boolean(streamer && streamer.configured);
     const name = isExisting ? String(streamer.name || "") : "";
@@ -5490,9 +5859,11 @@ def dashboard_script() -> str:
     <input name="download_dir_name" value="${escapeAttr(downloadDirName)}">
   </label>
   ${meta}
-  <label class="settings-field wide">Sources
-    <textarea name="sources" rows="3">${escapeHtml(sources)}</textarea>
-  </label>
+  <div class="settings-field wide"><span>Sources</span>
+    <textarea name="sources" data-sources-value hidden>${escapeHtml(sources)}</textarea>
+    <div class="source-list" data-source-list>${renderSourceList(sourceRowsFromText(sources))}</div>
+    ${renderSourceAddControl()}
+  </div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">${saveLabel}</button>
     ${deleteButton}
@@ -5597,13 +5968,14 @@ def dashboard_script() -> str:
       <div class="voice-profile-title"><strong>Edit Voice</strong></div>
       <label>Matching <select name="enabled"><option value="true"${enabled === "true" ? " selected" : ""}>On</option><option value="false"${enabled === "false" ? " selected" : ""}>Off</option></select></label>
       <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" value="${escapeAttr(voice.threshold || "")}" placeholder="default"></label>
-      <label class="wide">Sample files <textarea name="samples" rows="3">${escapeHtml(samples)}</textarea></label>
+      <details class="voice-advanced wide"><summary>Advanced sample paths</summary><label>Sample files <textarea name="samples" rows="3">${escapeHtml(samples)}</textarea></label></details>
       <label class="wide">Notes <textarea name="notes" rows="2">${escapeHtml(voice.notes || "")}</textarea></label>
       <div class="settings-actions"><button class="download action-button" name="action" value="save" type="submit">Save Voice</button><button class="download action-button" name="action" value="delete" type="submit">Delete</button></div>
     </form>
     <form class="voice-profile-form voice-sample-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
       <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
       <input type="hidden" name="voice_name" value="${escapeAttr(voice.name || "")}">
+      <div class="voice-profile-title"><strong>Upload Sample</strong><span class="file-meta">audio or video clip</span></div>
       <label>Sample file <input name="media" type="file" accept="audio/*,video/*" required></label>
       <button class="download action-button" type="submit">Upload Sample</button>
     </form>
@@ -5950,9 +6322,10 @@ def render_streamer_wizard(snapshot: StatusSnapshot) -> str:
         <label class="settings-field">Download Dir Name
           <input id="streamer-wizard-download-dir" name="download_dir_name">
         </label>
-        <label class="settings-field wide">Sources
+        <div class="settings-field wide"><span>Sources</span>
           <textarea id="streamer-wizard-sources" name="sources" rows="4" required></textarea>
-        </label>
+          {render_source_add_control()}
+        </div>
       </div>
     </section>
     <section class="wizard-step" data-wizard-step="1" hidden>
@@ -6149,7 +6522,7 @@ def render_voice_profile_form(streamer_name: str, profile: VoiceProfileStatus) -
       <div class="voice-profile-title"><strong>Edit Voice</strong></div>
       <label>Matching <select name="enabled"><option value="true"{' selected' if enabled == 'true' else ''}>On</option><option value="false"{' selected' if enabled == 'false' else ''}>Off</option></select></label>
       <label>Match threshold <input name="threshold" type="number" step="0.001" min="0" value="{escape(str(profile.threshold or ''), quote=True)}" placeholder="default"></label>
-      <label class="wide">Sample files <textarea name="samples" rows="3">{escape(samples)}</textarea></label>
+      <details class="voice-advanced wide"><summary>Advanced sample paths</summary><label>Sample files <textarea name="samples" rows="3">{escape(samples)}</textarea></label></details>
       <label class="wide">Notes <textarea name="notes" rows="2">{escape(profile.notes)}</textarea></label>
       <div class="settings-actions">
         <button class="download action-button" name="action" value="save" type="submit">Save Voice</button>
@@ -6159,6 +6532,7 @@ def render_voice_profile_form(streamer_name: str, profile: VoiceProfileStatus) -
     <form class="voice-profile-form voice-sample-form" method="post" action="/streamer-voice-samples" enctype="multipart/form-data">
       <input type="hidden" name="streamer_name" value="{escape(streamer_name, quote=True)}">
       <input type="hidden" name="voice_name" value="{escape(profile.name, quote=True)}">
+      <div class="voice-profile-title"><strong>Upload Sample</strong><span class="file-meta">audio or video clip</span></div>
       <label>Sample file <input name="media" type="file" accept="audio/*,video/*" required></label>
       <button class="download action-button" type="submit">Upload Sample</button>
     </form>
@@ -6317,6 +6691,30 @@ def render_source_chips(sources: list[str]) -> str:
     return f'<div class="source-chips">{chips}</div>'
 
 
+def render_source_add_control() -> str:
+    return """<div class="source-add-control" data-source-builder>
+    <details class="source-add-menu">
+      <summary class="download action-button">Add Source</summary>
+      <div class="source-add-popover">
+        <label class="settings-field">Website
+          <select data-source-platform>
+            <option value="auto">Auto-detect</option>
+            <option value="youtube">YouTube</option>
+            <option value="twitch">Twitch</option>
+            <option value="kick">Kick</option>
+            <option value="rumble">Rumble</option>
+          </select>
+        </label>
+        <label class="settings-field">Channel or URL
+          <input data-source-input type="text" placeholder="Paste URL or channel name">
+        </label>
+        <button class="download action-button" type="button" data-add-source>Add Source</button>
+        <div class="file-meta wide" data-source-detect-hint>Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.</div>
+      </div>
+    </details>
+  </div>"""
+
+
 def render_streamer_settings_area(
     streamer: StreamerStatStatus,
     snapshot: StatusSnapshot,
@@ -6404,9 +6802,10 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
     <input name="download_dir_name" value="{escape(download_dir_name, quote=True)}">
   </label>
   {meta}
-  <label class="settings-field wide">Sources
+  <div class="settings-field wide"><span>Sources</span>
     <textarea name="sources" rows="3">{escape(sources)}</textarea>
-  </label>
+    {render_source_add_control()}
+  </div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">{save_label}</button>
     {delete_button}
@@ -6850,6 +7249,8 @@ def render_stream_jobs(jobs: list[JobStatus]) -> str:
 
 def render_stream_card(stream: StreamStatus) -> str:
     title = stream.title or stream.video_id
+    platform = stream.platform or "youtube"
+    source_name = stream.channel or stream.source or "unknown source"
     mixed = "yes" if stream.has_mixed_formats else "no"
     latest_file = format_optional_epoch(stream.latest_file_modified_at)
     latest_age = format_epoch_age(stream.latest_file_modified_at)
@@ -6874,7 +7275,7 @@ def render_stream_card(stream: StreamStatus) -> str:
   <div class="stream-head">
     <div>
       <div class="title">{escape(title)}</div>
-      <div class="file-meta">{escape(stream.channel or "unknown channel")} - <a href="{escape(stream.url, quote=True)}">{escape(stream.video_id)}</a></div>
+      <div class="file-meta"><span class="badge">{escape(platform)}</span> {escape(source_name)} - <a href="{escape(stream.url, quote=True)}">{escape(stream.video_id)}</a></div>
     </div>
     <div class="stream-actions">
       <button class="download stream-toggle" type="button" data-stream-toggle="{escape(stream.video_id, quote=True)}" aria-expanded="{expanded}">{toggle_label}</button>
@@ -6929,7 +7330,7 @@ def render_stream_card(stream: StreamStatus) -> str:
 def render_stream_event_timeline(events: list[StreamEventStatus]) -> str:
     if not events:
         return '<div class="file-meta">No stream log entries yet.</div>'
-    rows = "".join(render_stream_event(event) for event in events)
+    rows = "".join(render_stream_event(event) for event in reversed(events))
     return f'<div class="stream-events">{rows}</div>'
 
 

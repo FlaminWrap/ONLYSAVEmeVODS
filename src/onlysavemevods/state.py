@@ -15,6 +15,8 @@ class StreamRecord:
     title: str
     channel: str
     url: str
+    platform: str
+    source: str
     status: str
     segment_index: int
     first_seen_at: str
@@ -75,6 +77,8 @@ class StateStore:
                 title TEXT NOT NULL DEFAULT '',
                 channel TEXT NOT NULL DEFAULT '',
                 url TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT 'youtube',
+                source TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 segment_index INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TEXT NOT NULL,
@@ -85,6 +89,7 @@ class StateStore:
             )
             """
         )
+        self._ensure_stream_source_columns()
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stream_events (
@@ -131,6 +136,20 @@ class StateStore:
             """
         )
         self.conn.commit()
+
+    def _ensure_stream_source_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(streams)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "platform" not in columns:
+            self.conn.execute(
+                "ALTER TABLE streams "
+                "ADD COLUMN platform TEXT NOT NULL DEFAULT 'youtube'"
+            )
+        if "source" not in columns:
+            self.conn.execute(
+                "ALTER TABLE streams "
+                "ADD COLUMN source TEXT NOT NULL DEFAULT ''"
+            )
 
     def _ensure_watermark_progress_columns(self) -> None:
         rows = self.conn.execute("PRAGMA table_info(watermark_copies)").fetchall()
@@ -197,15 +216,17 @@ class StateStore:
             self.conn.execute(
                 """
                 INSERT INTO streams (
-                    video_id, title, channel, url, status, segment_index,
+                    video_id, title, channel, url, platform, source, status, segment_index,
                     first_seen_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'detected', 1, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, 'detected', 1, ?, ?)
                 """,
                 (
                     stream.video_id,
                     stream.title,
                     stream.channel,
                     stream.url,
+                    stream.platform,
+                    stream.source,
                     now,
                     now,
                 ),
@@ -221,13 +242,15 @@ class StateStore:
             self.conn.execute(
                 """
                 UPDATE streams
-                SET title = ?, channel = ?, url = ?, status = ?, updated_at = ?
+                SET title = ?, channel = ?, url = ?, platform = ?, source = ?, status = ?, updated_at = ?
                 WHERE video_id = ?
                 """,
                 (
                     stream.title,
                     stream.channel,
                     stream.url,
+                    stream.platform,
+                    stream.source,
                     status,
                     now,
                     stream.video_id,
@@ -433,6 +456,7 @@ class StateStore:
         row = self.conn.execute(
             """
             SELECT video_id, title, channel, url, status, segment_index,
+                   platform, source,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE video_id = ?
@@ -447,6 +471,7 @@ class StateStore:
         rows = self.conn.execute(
             """
             SELECT video_id, title, channel, url, status, segment_index,
+                   platform, source,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             ORDER BY updated_at DESC, first_seen_at DESC

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "onlysavemevods"
 version = "0.1.0"
-description = "Watch YouTube channels and automatically record live streams with yt-dlp."
+description = "Watch streamer sources and automatically record live streams with yt-dlp."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

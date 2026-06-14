@@ -152,6 +152,41 @@ class DownloaderCommandTests(unittest.TestCase):
         format_index = command.index("--format")
         self.assertEqual(command[format_index + 1], "bestvideo*+bestaudio/best")
 
+    def test_non_youtube_download_does_not_force_youtube_live_or_chat_flags(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp),
+                record_live_chat=True,
+                render_live_chat_video=True,
+            )
+            stream = LiveStream(
+                video_id="twitch:OUMB3rd",
+                url="https://www.twitch.tv/OUMB3rd",
+                title="Live on Twitch",
+                channel="OUMB3rd",
+                platform="twitch",
+                source="twitch:OUMB3rd",
+            )
+
+            command = build_download_command(config, stream, 1)
+
+        self.assertNotIn("--live-from-start", command)
+        self.assertNotIn("--write-subs", command)
+        self.assertNotIn("live_chat", command)
+        self.assertNotIn("--format", command)
+
+    def test_non_youtube_chat_command_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp), record_live_chat=True)
+            stream = LiveStream(
+                video_id="twitch:OUMB3rd",
+                url="https://www.twitch.tv/OUMB3rd",
+                platform="twitch",
+            )
+
+            with self.assertRaises(ValueError):
+                build_chat_download_command(config, stream, 1)
+
     def test_live_chat_command_downloads_only_chat_sidecar(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(

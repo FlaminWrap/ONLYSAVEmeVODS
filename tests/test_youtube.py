@@ -105,6 +105,8 @@ class YoutubeProbeTests(unittest.TestCase):
         )
 
         self.assertTrue(stream.is_live)
+        self.assertEqual(stream.video_id, "youtube:LIVEVIDEO01")
+        self.assertEqual(stream.platform, "youtube")
         self.assertEqual(stream.channel, "Uploader")
 
     def test_discovers_multiple_live_streams(self) -> None:
@@ -112,7 +114,10 @@ class YoutubeProbeTests(unittest.TestCase):
 
         streams = probe.discover_channel_live_streams("@Example")
 
-        self.assertEqual([stream.video_id for stream in streams], ["LIVEVIDEO01", "LIVEVIDEO02"])
+        self.assertEqual(
+            [stream.video_id for stream in streams],
+            ["youtube:LIVEVIDEO01", "youtube:LIVEVIDEO02"],
+        )
 
     def test_probe_channel_live_stream_uses_live_url_fast_path(self) -> None:
         runner = FakeRunner()
@@ -122,7 +127,7 @@ class YoutubeProbeTests(unittest.TestCase):
 
         self.assertIsNotNone(stream)
         assert stream is not None
-        self.assertEqual(stream.video_id, "LIVEVIDEO01")
+        self.assertEqual(stream.video_id, "youtube:LIVEVIDEO01")
         self.assertEqual(runner.calls[0][-1], "https://www.youtube.com/@Example/live")
 
     def test_ended_streams_are_not_rechecked_on_later_scans(self) -> None:

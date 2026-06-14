@@ -11,7 +11,7 @@ import re
 import shlex
 import subprocess
 
-from .models import LiveStream, video_url
+from .models import LiveStream, qualified_stream_id, video_url
 
 
 LOGGER = logging.getLogger(__name__)
@@ -160,9 +160,10 @@ class YoutubeProbe:
         video_ids = _candidate_video_ids(playlist)
         candidates: list[str] = []
         for candidate in video_ids:
-            if candidate in seen or candidate in self._known_non_live_video_ids:
+            qualified_candidate = qualified_stream_id("youtube", candidate)
+            if qualified_candidate in seen or qualified_candidate in self._known_non_live_video_ids:
                 continue
-            seen.add(candidate)
+            seen.add(qualified_candidate)
             candidates.append(candidate)
 
         LOGGER.debug(
@@ -272,19 +273,21 @@ class YoutubeProbe:
 
 
 def live_stream_from_info(info: dict[str, Any], *, fallback_url: str = "") -> LiveStream:
-    video_id = str(info.get("id") or extract_video_id(fallback_url) or "")
-    if not video_id:
+    raw_video_id = str(info.get("id") or extract_video_id(fallback_url) or "")
+    if not raw_video_id:
         raise YtDlpError("yt-dlp video metadata did not include a video id")
 
     live_status = str(info.get("live_status") or "")
     is_live = bool(info.get("is_live")) or live_status == "is_live"
     return LiveStream(
-        video_id=video_id,
-        url=str(info.get("webpage_url") or video_url(video_id)),
+        video_id=qualified_stream_id("youtube", raw_video_id),
+        url=str(info.get("webpage_url") or video_url(raw_video_id)),
         title=str(info.get("title") or ""),
         channel=str(info.get("channel") or info.get("uploader") or ""),
         live_status=live_status,
         is_live=is_live,
+        platform="youtube",
+        source=fallback_url,
         raw=info,
     )
 

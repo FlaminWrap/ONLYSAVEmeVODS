@@ -163,6 +163,7 @@ CHAT_AUTHOR_COLORS = (
 )
 CHAT_PANEL_FPS = 30
 DEFAULT_CHAT_RENDER_TIMEOUT_SECONDS = 60 * 60
+FFMPEG_OUTPUT_PROGRESS_POLL_SECONDS = 2.0
 KIRKLAND_TIME_ZONE = "America/Los_Angeles"
 CHAT_SYNC_WARNING_THRESHOLD_SECONDS = 10.0
 
@@ -2146,6 +2147,66 @@ def clamp_progress(value: float | None) -> float | None:
     return min(1.0, max(0.0, float(value)))
 
 
+def output_progress_signature(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_size, stat.st_mtime_ns
+
+
+def run_ffmpeg_command_with_output_progress(
+    command: Sequence[str],
+    output_file: Path,
+    timeout_seconds: float | None,
+) -> tuple[subprocess.CompletedProcess[bytes], float]:
+    """Run ffmpeg while treating timeout as output inactivity, not wall time."""
+
+    started_at = time.monotonic()
+    last_progress_at = started_at
+    last_signature = output_progress_signature(output_file)
+    process = subprocess.Popen(
+        list(command),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    poll_seconds = FFMPEG_OUTPUT_PROGRESS_POLL_SECONDS
+    if timeout_seconds is not None:
+        poll_seconds = max(0.1, min(poll_seconds, timeout_seconds))
+
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=poll_seconds)
+            elapsed = time.monotonic() - started_at
+            return (
+                subprocess.CompletedProcess(
+                    list(command),
+                    process.returncode if process.returncode is not None else 0,
+                    stdout,
+                    stderr,
+                ),
+                elapsed,
+            )
+        except subprocess.TimeoutExpired:
+            now = time.monotonic()
+            signature = output_progress_signature(output_file)
+            if signature is not None and signature != last_signature:
+                last_signature = signature
+                last_progress_at = now
+            if timeout_seconds is None:
+                continue
+            if now - last_progress_at < timeout_seconds:
+                continue
+            process.kill()
+            stdout, stderr = process.communicate()
+            raise subprocess.TimeoutExpired(
+                cmd=list(command),
+                timeout=timeout_seconds,
+                output=stdout,
+                stderr=stderr,
+            )
+
+
 def render_chat_video_file(
     media_file: Path,
     chat_file: Path,
@@ -2335,19 +2396,19 @@ def render_chat_video_file(
         emit("Encoding final chat video", 0.78)
         LOGGER.debug("ffmpeg chat render command: %s", shlex.join(command))
         try:
-            ffmpeg_started_at = time.monotonic()
-            result = subprocess.run(
+            result, ffmpeg_elapsed = run_ffmpeg_command_with_output_progress(
                 command,
-                check=False,
-                capture_output=True,
-                timeout=timeout_seconds,
+                temp_output,
+                timeout_seconds,
             )
-            ffmpeg_elapsed = time.monotonic() - ffmpeg_started_at
         except FileNotFoundError as exc:
             raise ChatPanelRenderError(f"ffmpeg not found: {ffmpeg_path}") from exc
         except subprocess.TimeoutExpired as exc:
             temp_output.unlink(missing_ok=True)
-            raise ChatPanelRenderError("ffmpeg timed out while rendering chat video") from exc
+            raise ChatPanelRenderError(
+                "ffmpeg made no output progress for "
+                f"{float(timeout_seconds or 0):g}s while rendering chat video"
+            ) from exc
         except OSError as exc:
             raise ChatPanelRenderError("Unable to start ffmpeg for chat video render") from exc
 

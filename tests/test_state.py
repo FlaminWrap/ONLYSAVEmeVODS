@@ -2,10 +2,32 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
+from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
 
 
 class StateWatermarkTests(unittest.TestCase):
+    def test_stream_records_include_platform_and_source(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            state.upsert_detected(
+                LiveStream(
+                    video_id="twitch:OUMB3rd",
+                    url="https://www.twitch.tv/OUMB3rd",
+                    title="Live on Twitch",
+                    channel="OUMB3rd",
+                    platform="twitch",
+                    source="twitch:OUMB3rd",
+                )
+            )
+            record = state.get_stream("twitch:OUMB3rd")
+            state.close()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.platform, "twitch")
+        self.assertEqual(record.source, "twitch:OUMB3rd")
+
     def test_watermark_copy_lifecycle(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")

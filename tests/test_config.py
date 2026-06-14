@@ -485,6 +485,46 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(streamer.voice_detection.hf_token_env, "PYANNOTE_TOKEN")
         self.assertEqual(streamer.speaker_labels, {"SPEAKER_00": "OUMB3rd"})
 
+    def test_supported_platform_sources_are_validated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'channels = ["twitch:OUMB3rd", "kick:OUMB3rd", "https://rumble.com/vabc-title.html"]\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(
+            monitored_sources(config),
+            ["twitch:OUMB3rd", "kick:OUMB3rd", "https://rumble.com/vabc-title.html"],
+        )
+
+    def test_unsupported_platform_source_fails_config_load(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text('channels = ["trovo:OUMB3rd"]\n', encoding="utf-8")
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
+    def test_prefixed_streamer_source_matches_detected_channel_name(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["twitch:OUMB3rd"]\n'
+                'download_dir_name = "OUMB3rd Shared"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+        self.assertEqual(streamer_display_name_for_channel(config, "OUMB3rd"), "OUMB3rd")
+        self.assertEqual(
+            download_group_name_for_channel(config, "OUMB3rd"),
+            "OUMB3rd Shared",
+        )
+
     def test_streamer_config_update_writes_updates_and_removes_group(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"

@@ -7,6 +7,8 @@ import json
 import re
 import tomllib
 
+from .sources import SourceError, validate_source
+
 
 DEFAULT_POST_EXIT_CHECK_SECONDS = [
     30,
@@ -197,7 +199,7 @@ def load_config(path: str | Path) -> BotConfig:
     streamers = _as_streamers(raw.get("streamers", {}), "streamers")
 
     return BotConfig(
-        channels=_as_str_list(raw.get("channels", []), "channels"),
+        channels=_as_source_list(raw.get("channels", []), "channels"),
         streamers=streamers,
         download_dir=_resolve_path(raw.get("download_dir", "downloads"), base_dir),
         state_dir=_resolve_path(raw.get("state_dir", "state"), base_dir),
@@ -394,6 +396,10 @@ def source_display_name(source: str) -> str:
     target = source.strip().rstrip("/")
     if not target:
         return ""
+    if ":" in target and not target.startswith(("http://", "https://")):
+        prefix, value = target.split(":", 1)
+        if prefix.casefold() in {"youtube", "twitch", "kick", "rumble"}:
+            target = value.strip().rstrip("/")
     if "/" in target:
         target = target.rsplit("/", 1)[-1]
     return target or source.strip()
@@ -1122,7 +1128,7 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
                 f"{name}.{streamer_name} must use either sources or channels, not both"
             )
         source_field = "sources" if "sources" in raw_config else "channels"
-        sources = _as_str_list(
+        sources = _as_source_list(
             raw_config.get(source_field, []),
             f"{name}.{streamer_name}.{source_field}",
         )
@@ -1477,6 +1483,16 @@ def _as_str_list(value: Any, name: str) -> list[str]:
             raise ConfigError(f"{name}[{index}] must be a non-empty string")
         result.append(item.strip())
     return result
+
+
+def _as_source_list(value: Any, name: str) -> list[str]:
+    sources = _as_str_list(value, name)
+    for index, source in enumerate(sources):
+        try:
+            validate_source(source)
+        except SourceError as exc:
+            raise ConfigError(f"{name}[{index}] is not a supported source: {exc}") from exc
+    return sources
 
 
 def _as_extra_yt_dlp_args(value: Any, name: str) -> list[str]:
