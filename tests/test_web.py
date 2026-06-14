@@ -802,11 +802,11 @@ class WebStatusTests(unittest.TestCase):
             )
             html = render_status_html(build_status_snapshot(config))
 
-        self.assertIn('href="/favicon.ico"', html)
-        self.assertIn('href="/favicon-32x32.png"', html)
-        self.assertIn('href="/favicon-16x16.png"', html)
-        self.assertIn('href="/apple-touch-icon.png"', html)
-        self.assertIn('href="/android-chrome-192x192.png"', html)
+        self.assertIn('href="/favicon.ico?v=', html)
+        self.assertIn('href="/favicon-32x32.png?v=', html)
+        self.assertIn('href="/favicon-16x16.png?v=', html)
+        self.assertIn('href="/apple-touch-icon.png?v=', html)
+        self.assertIn('href="/android-chrome-192x192.png?v=', html)
         for filename in FAVICON_ROUTES.values():
             self.assertTrue((PACKAGE_DIR / filename).is_file(), filename)
 

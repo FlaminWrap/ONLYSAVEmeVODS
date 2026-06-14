@@ -65,6 +65,7 @@ from .downloader import (
     segment_part_files,
 )
 from .log_buffer import LogEntry, get_recent_log_entries
+from .sources import SourceError, resolve_source
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
 from .voice_match import (
     create_transcript_voice_sample,
@@ -107,6 +108,30 @@ from .watermark import (
 
 
 LOGGER = logging.getLogger(__name__)
+PACKAGE_DIR = Path(__file__).resolve().parent
+FAVICON_ROUTES = {
+    "/favicon.ico": "favicon.ico",
+    "/favicon-16x16.png": "favicon-16x16.png",
+    "/favicon-32x32.png": "favicon-32x32.png",
+    "/apple-touch-icon.png": "apple-touch-icon.png",
+    "/android-chrome-192x192.png": "android-chrome-192x192.png",
+    "/android-chrome-512x512.png": "android-chrome-512x512.png",
+    "/Favicon.png": "Favicon.png",
+}
+SOURCE_PLATFORM_LABELS = {
+    "youtube": "YouTube",
+    "twitch": "Twitch",
+    "kick": "Kick",
+    "rumble": "Rumble",
+    "unknown": "Unknown",
+}
+SOURCE_PLATFORM_INITIALS = {
+    "youtube": "Y",
+    "twitch": "T",
+    "kick": "K",
+    "rumble": "R",
+    "unknown": "?",
+}
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
@@ -266,6 +291,8 @@ class StreamStatus:
     title: str
     channel: str
     url: str
+    platform: str
+    source: str
     status: str
     segment_index: int
     first_seen_at: str
@@ -553,6 +580,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if path == "/healthz":
                 self._send_text("ok\n", "text/plain; charset=utf-8")
                 return
+            if path in FAVICON_ROUTES:
+                self._send_package_asset(FAVICON_ROUTES[path])
+                return
             if path == "/download":
                 self._send_download(parts.query)
                 return
@@ -613,6 +643,25 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
         def _send_json(self, payload: dict[str, Any]) -> None:
             body = json.dumps(payload, indent=2, sort_keys=True) + "\n"
             self._send_text(body, "application/json; charset=utf-8")
+
+        def _send_package_asset(self, filename: str) -> None:
+            if filename not in FAVICON_ROUTES.values():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            path = PACKAGE_DIR / filename
+            if not path.is_file():
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            stat = path.stat()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(stat.st_size))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            with path.open("rb") as handle:
+                shutil.copyfileobj(handle, self.wfile)
 
         def _send_download(self, query: str) -> None:
             params = parse_qs(query)
@@ -1777,6 +1826,7 @@ def stream_status_from_record(
         record.video_id,
         config.watermark_enabled and bool(watermark_secret(config)),
         watermark_records or [],
+        platform=record.platform,
     )
     total_bytes = sum(file.size_bytes for file in files)
     bytes_by_kind = summarize_bytes_by_kind(files)
@@ -1787,6 +1837,8 @@ def stream_status_from_record(
         title=record.title,
         channel=record.channel,
         url=record.url,
+        platform=record.platform,
+        source=record.source,
         status=record.status,
         segment_index=record.segment_index,
         first_seen_at=record.first_seen_at,
@@ -1841,6 +1893,7 @@ def summarize_files(
     video_id: str,
     watermark_enabled: bool = False,
     watermark_records: list[WatermarkCopyRecord] | None = None,
+    platform: str = "youtube",
 ) -> list[FileStatus]:
     if not directory.exists():
         return []
@@ -1858,11 +1911,16 @@ def summarize_files(
         except OSError:
             continue
         details = file_details(path.name)
+        chat_actions_enabled = platform == "youtube"
         render_chat_url, render_chat_output_url, render_chat_status, render_chat_message = (
             chat_render_action_for_file(directory, video_id, path.name)
+            if chat_actions_enabled
+            else (None, None, None, None)
         )
         refresh_chat_url, refresh_chat_status, refresh_chat_message = (
             chat_refresh_action_for_file(config, directory, video_id, path.name)
+            if chat_actions_enabled
+            else (None, None, None)
         )
         transcription_url, transcription_status, transcription_message = (
             transcription_action_for_file(directory, video_id, path.name)
@@ -4018,6 +4076,11 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="icon" href="/favicon.ico?v={escape(APP_VERSION, quote=True)}" sizes="any">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v={escape(APP_VERSION, quote=True)}">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png?v={escape(APP_VERSION, quote=True)}">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v={escape(APP_VERSION, quote=True)}">
+  <link rel="icon" type="image/png" sizes="192x192" href="/android-chrome-192x192.png?v={escape(APP_VERSION, quote=True)}">
   <title>ONLYSAVEmeVODS Status</title>
   <style>
     :root {{
@@ -4182,6 +4245,95 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       color: var(--muted);
       background: var(--panel-strong);
       overflow-wrap: anywhere;
+    }}
+    .source-builder {{
+      display: grid;
+      gap: 8px;
+    }}
+    .source-list {{
+      display: grid;
+      gap: 7px;
+    }}
+    .source-list-row {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr) max-content max-content;
+      gap: 8px;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      padding: 8px;
+      background: var(--panel);
+    }}
+    .source-list-empty {{
+      border: 1px dashed var(--line);
+      border-radius: 7px;
+      padding: 10px;
+    }}
+    .source-platform-icon {{
+      width: 26px;
+      height: 26px;
+      display: inline-grid;
+      place-items: center;
+      border-radius: 6px;
+      color: white;
+      background: var(--muted);
+      font-size: 12px;
+      font-weight: 750;
+      line-height: 1;
+    }}
+    .source-platform-icon.youtube {{ background: #cc0000; }}
+    .source-platform-icon.twitch {{ background: #6441a5; }}
+    .source-platform-icon.kick {{ background: #15803d; }}
+    .source-platform-icon.rumble {{ background: #2563eb; }}
+    .source-platform-icon.unknown {{ background: var(--muted); }}
+    .source-name {{ font-weight: 650; overflow-wrap: anywhere; }}
+    .source-raw {{ overflow-wrap: anywhere; }}
+    .source-builder-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }}
+    .source-popover {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: var(--panel);
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.12);
+    }}
+    .source-popover[hidden] {{ display: none; }}
+    .source-popover-head {{
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 8px;
+    }}
+    .source-popover-fields {{
+      display: grid;
+      grid-template-columns: minmax(130px, 170px) minmax(220px, 1fr) max-content;
+      gap: 8px;
+      align-items: end;
+    }}
+    .source-popover-fields label {{
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }}
+    .source-popover-fields input,
+    .source-popover-fields select {{
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    @media (max-width: 760px) {{
+      .source-list-row, .source-popover-fields {{ grid-template-columns: 1fr; }}
+      .source-platform-icon {{ justify-self: start; }}
     }}
     .streamer-stat-grid {{
       display: grid;
@@ -4991,6 +5143,114 @@ def dashboard_script() -> str:
     if (Array.isArray(value)) return value.length ? value.map(String).join("\\n") : "-";
     return String(value);
   };
+  const sourcePlatformLabels = {
+    youtube: "YouTube",
+    twitch: "Twitch",
+    kick: "Kick",
+    rumble: "Rumble",
+    unknown: "Unknown",
+  };
+  const sourcePlatformInitials = {
+    youtube: "Y",
+    twitch: "T",
+    kick: "K",
+    rumble: "R",
+    unknown: "?",
+  };
+  const sourcePlatforms = new Set(["youtube", "twitch", "kick", "rumble"]);
+  const splitSourceValues = (value) => String(value || "")
+    .split(/\\r?\\n/)
+    .map((source) => source.trim())
+    .filter(Boolean);
+  const sourcePlatformFromHost = (host) => {
+    host = String(host || "").toLowerCase().replace(/^www\\./, "");
+    if (host === "youtu.be" || host === "youtube.com" || host.endsWith(".youtube.com")) return "youtube";
+    if (host === "twitch.tv" || host.endsWith(".twitch.tv")) return "twitch";
+    if (host === "kick.com" || host.endsWith(".kick.com")) return "kick";
+    if (host === "rumble.com" || host.endsWith(".rumble.com")) return "rumble";
+    return "unknown";
+  };
+  const detectSourcePlatform = (value, selected = "auto") => {
+    selected = String(selected || "auto").toLowerCase();
+    if (selected !== "auto" && sourcePlatforms.has(selected)) return selected;
+    value = String(value || "").trim();
+    const prefix = value.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
+    if (prefix) {
+      const platform = prefix[1].toLowerCase().replaceAll("_", "-");
+      if (sourcePlatforms.has(platform)) return platform;
+    }
+    if (/^https?:\\/\\//i.test(value)) {
+      try { return sourcePlatformFromHost(new URL(value).hostname); } catch (_) { return "unknown"; }
+    }
+    return "youtube";
+  };
+  const sourceDisplayName = (source) => {
+    let value = String(source || "").trim().replace(/\\/+$/, "");
+    if (!value) return "Unknown source";
+    if (/^https?:\\/\\//i.test(value)) {
+      try {
+        const url = new URL(value);
+        const path = url.pathname.replace(/^\\/+|\\/+$/g, "");
+        return path ? path.split("/").pop() : url.hostname.replace(/^www\\./, "");
+      } catch (_) {}
+    }
+    const prefix = value.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
+    if (prefix && sourcePlatforms.has(prefix[1].toLowerCase().replaceAll("_", "-"))) {
+      value = prefix[2].trim().replace(/\\/+$/, "");
+    }
+    if (value.includes("/")) value = value.split("/").filter(Boolean).pop() || value;
+    return value.replace(/^@+/, "") || source;
+  };
+  const normalizeSourceValue = (value, platform = "auto") => {
+    value = String(value || "").trim();
+    if (!value) return "";
+    const detected = detectSourcePlatform(value, platform);
+    if (/^https?:\\/\\//i.test(value)) return value;
+    const prefix = value.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
+    if (prefix && sourcePlatforms.has(prefix[1].toLowerCase().replaceAll("_", "-"))) return value;
+    const clean = value.replace(/^@+/, "").replace(/^\\/+|\\/+$/g, "");
+    if (detected === "youtube") return value.startsWith("@") ? value : `@${clean}`;
+    if (sourcePlatforms.has(detected)) return `${detected}:${clean}`;
+    return value;
+  };
+  const renderSourceList = (sources) => {
+    sources = sources || [];
+    if (!sources.length) return '<div class="source-list" data-source-list><div class="source-list-empty file-meta">No sources configured.</div></div>';
+    const rows = sources.map((source) => {
+      const platform = detectSourcePlatform(source);
+      const label = sourcePlatformLabels[platform] || sourcePlatformLabels.unknown;
+      const initial = sourcePlatformInitials[platform] || sourcePlatformInitials.unknown;
+      return `<div class="source-list-row" data-source-row>
+  <span class="source-platform-icon ${escapeAttr(platform)}" title="${escapeAttr(label)}" aria-label="${escapeAttr(label)}">${escapeHtml(initial)}</span>
+  <div><div class="source-name">${escapeHtml(sourceDisplayName(source))}</div><div class="source-raw file-meta">${escapeHtml(source)}</div></div>
+  <span class="badge">${escapeHtml(label)}</span>
+  <button class="download action-button" type="button" data-remove-source="${escapeAttr(source)}">Remove</button>
+</div>`;
+    }).join("");
+    return `<div class="source-list" data-source-list>${rows}</div>`;
+  };
+  const renderSourceBuilder = (sources) => `<div class="source-builder" data-source-builder>
+  <textarea name="sources" data-source-values hidden>${escapeHtml((sources || []).join("\\n"))}</textarea>
+  ${renderSourceList(sources || [])}
+  <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
+  <div class="source-popover" data-source-popover hidden>
+    <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>
+    <div class="source-popover-fields">
+      <label>Website <select data-source-platform><option value="auto">Auto-detect</option><option value="youtube">YouTube</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="rumble">Rumble</option></select></label>
+      <label>Channel or URL <input data-source-input placeholder="Paste URL or channel name"></label>
+      <button class="download action-button" type="button" data-add-source>Add Source</button>
+    </div>
+    <div class="file-meta">Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.</div>
+  </div>
+</div>`;
+  const sourceValuesForBuilder = (builder) => splitSourceValues((builder.querySelector("[data-source-values]") || {}).value || "");
+  const updateSourceBuilder = (builder, sources) => {
+    sources = [...new Set((sources || []).map((source) => String(source || "").trim()).filter(Boolean))];
+    const values = builder.querySelector("[data-source-values]");
+    if (values) values.value = sources.join("\\n");
+    const list = builder.querySelector("[data-source-list]");
+    if (list) list.outerHTML = renderSourceList(sources);
+  };
   const streamNeedsAttention = (stream) => attentionStatuses.has(stream.status) || Boolean(stream.has_mixed_formats);
   const readLocalStorageValue = (key) => {
     try {
@@ -5090,6 +5350,49 @@ def dashboard_script() -> str:
       if (tab.checked) selectTab(id, true);
     });
   }
+
+  document.addEventListener("click", (event) => {
+    const openSource = event.target.closest("[data-open-source-popover]");
+    if (openSource) {
+      event.preventDefault();
+      const builder = openSource.closest("[data-source-builder]");
+      const popover = builder ? builder.querySelector("[data-source-popover]") : null;
+      if (popover) popover.hidden = false;
+      const input = builder ? builder.querySelector("[data-source-input]") : null;
+      if (input) input.focus();
+      return;
+    }
+    const closeSource = event.target.closest("[data-close-source-popover]");
+    if (closeSource) {
+      event.preventDefault();
+      const popover = closeSource.closest("[data-source-popover]");
+      if (popover) popover.hidden = true;
+      return;
+    }
+    const addSource = event.target.closest("[data-add-source]");
+    if (addSource) {
+      event.preventDefault();
+      const builder = addSource.closest("[data-source-builder]");
+      if (!builder) return;
+      const input = builder.querySelector("[data-source-input]");
+      const select = builder.querySelector("[data-source-platform]");
+      const source = normalizeSourceValue(input ? input.value : "", select ? select.value : "auto");
+      if (!source) return;
+      updateSourceBuilder(builder, [...sourceValuesForBuilder(builder), source]);
+      if (input) input.value = "";
+      const popover = builder.querySelector("[data-source-popover]");
+      if (popover) popover.hidden = true;
+      return;
+    }
+    const removeSource = event.target.closest("[data-remove-source]");
+    if (removeSource) {
+      event.preventDefault();
+      const builder = removeSource.closest("[data-source-builder]");
+      if (!builder) return;
+      const source = removeSource.getAttribute("data-remove-source") || "";
+      updateSourceBuilder(builder, sourceValuesForBuilder(builder).filter((value) => value !== source));
+    }
+  });
 
   const applyStreamerCollapsedState = (root) => {
     for (const card of root.querySelectorAll(".streamer-section[data-streamer-key]")) {
@@ -5349,7 +5652,7 @@ def dashboard_script() -> str:
 
   const renderStreamEvents = (events) => {
     if (!events || !events.length) return '<div class="file-meta">No stream log entries yet.</div>';
-    const rows = events.map((event) => {
+    const rows = [...events].reverse().map((event) => {
       const segment = event.segment_index ? `seg ${String(event.segment_index).padStart(3, "0")}` : "-";
       const rawLevel = String(event.level || "info").toLowerCase();
       const level = ["debug", "info", "warning", "error"].includes(rawLevel) ? rawLevel : "info";
@@ -5542,7 +5845,7 @@ def dashboard_script() -> str:
   const renderStreamerForm = (streamer) => {
     const isExisting = Boolean(streamer && streamer.configured);
     const name = isExisting ? String(streamer.name || "") : "";
-    const sources = isExisting ? (streamer.sources || []).join(String.fromCharCode(10)) : "";
+    const sources = isExisting ? (streamer.sources || []) : [];
     const downloadDirName = isExisting ? String(streamer.download_dir_name || "") : "";
     const readonly = isExisting ? " readonly" : "";
     const deleteButton = isExisting
@@ -5560,9 +5863,7 @@ def dashboard_script() -> str:
     <input name="download_dir_name" value="${escapeAttr(downloadDirName)}">
   </label>
   ${meta}
-  <label class="settings-field wide">Sources
-    <textarea name="sources" rows="3">${escapeHtml(sources)}</textarea>
-  </label>
+  <div class="settings-field wide"><span>Sources</span>${renderSourceBuilder(sources)}</div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">${saveLabel}</button>
     ${deleteButton}
@@ -6389,6 +6690,62 @@ def render_source_chips(sources: list[str]) -> str:
     return f'<div class="source-chips">{chips}</div>'
 
 
+def source_display_details(source: str) -> tuple[str, str, str, str]:
+    try:
+        spec = resolve_source(source)
+        platform = spec.platform
+        name = spec.display_name or channel_display_name(source)
+    except SourceError:
+        platform = "unknown"
+        name = channel_display_name(source)
+    if platform not in SOURCE_PLATFORM_LABELS:
+        platform = "unknown"
+    label = SOURCE_PLATFORM_LABELS[platform]
+    initial = SOURCE_PLATFORM_INITIALS[platform]
+    return platform, label, initial, name
+
+
+def render_source_list_items(sources: list[str]) -> str:
+    if not sources:
+        return '<div class="source-list-empty file-meta">No sources configured.</div>'
+    rows: list[str] = []
+    for source in sources:
+        platform, label, initial, name = source_display_details(source)
+        rows.append(
+            '<div class="source-list-row" data-source-row>'
+            f'<span class="source-platform-icon {escape(platform, quote=True)}" '
+            f'title="{escape(label, quote=True)}" aria-label="{escape(label, quote=True)}">'
+            f'{escape(initial)}</span>'
+            '<div>'
+            f'<div class="source-name">{escape(name)}</div>'
+            f'<div class="source-raw file-meta">{escape(source)}</div>'
+            '</div>'
+            f'<span class="badge">{escape(label)}</span>'
+            '<button class="download action-button" type="button" '
+            f'data-remove-source="{escape(source, quote=True)}">Remove</button>'
+            '</div>'
+        )
+    return "".join(rows)
+
+
+def render_source_editor(sources: list[str]) -> str:
+    values = "\n".join(sources)
+    return f"""<div class="source-builder" data-source-builder>
+  <textarea name="sources" data-source-values hidden>{escape(values)}</textarea>
+  <div class="source-list" data-source-list>{render_source_list_items(sources)}</div>
+  <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
+  <div class="source-popover" data-source-popover hidden>
+    <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>
+    <div class="source-popover-fields">
+      <label>Website <select data-source-platform><option value="auto">Auto-detect</option><option value="youtube">YouTube</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="rumble">Rumble</option></select></label>
+      <label>Channel or URL <input data-source-input placeholder="Paste URL or channel name"></label>
+      <button class="download action-button" type="button" data-add-source>Add Source</button>
+    </div>
+    <div class="file-meta">Paste a YouTube, Twitch, Kick, or Rumble URL to auto-detect the website, or choose one for a plain channel name.</div>
+  </div>
+</div>"""
+
+
 def render_streamer_settings_area(
     streamer: StreamerStatStatus,
     snapshot: StatusSnapshot,
@@ -6476,9 +6833,7 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
     <input name="download_dir_name" value="{escape(download_dir_name, quote=True)}">
   </label>
   {meta}
-  <label class="settings-field wide">Sources
-    <textarea name="sources" rows="3">{escape(sources)}</textarea>
-  </label>
+  <div class="settings-field wide"><span>Sources</span>{render_source_editor(streamer.sources if streamer is not None else [])}</div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">{save_label}</button>
     {delete_button}
@@ -7001,7 +7356,7 @@ def render_stream_card(stream: StreamStatus) -> str:
 def render_stream_event_timeline(events: list[StreamEventStatus]) -> str:
     if not events:
         return '<div class="file-meta">No stream log entries yet.</div>'
-    rows = "".join(render_stream_event(event) for event in events)
+    rows = "".join(render_stream_event(event) for event in reversed(events))
     return f'<div class="stream-events">{rows}</div>'
 
 
