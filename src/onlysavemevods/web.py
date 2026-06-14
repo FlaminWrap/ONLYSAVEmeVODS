@@ -4362,6 +4362,10 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       gap: 8px;
       align-items: center;
     }}
+    .source-unsaved-note {{
+      color: var(--warn);
+      font-weight: 650;
+    }}
     .source-popover {{
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -5274,11 +5278,23 @@ def dashboard_script() -> str:
     if (value.includes("/")) value = value.split("/").filter(Boolean).pop() || value;
     return value.replace(/^@+/, "") || source;
   };
+  const sourceUrlPath = (value) => {
+    try { return new URL(value).pathname.replace(/^\\/+|\\/+$/g, ""); } catch (_) { return ""; }
+  };
   const normalizeSourceValue = (value, platform = "auto") => {
     value = String(value || "").trim();
     if (!value) return "";
     const detected = detectSourcePlatform(value, platform);
-    if (/^https?:\\/\\//i.test(value)) return value;
+    if (/^https?:\\/\\//i.test(value)) {
+      const path = sourceUrlPath(value);
+      if (detected === "youtube" && path.startsWith("@")) return path.split("/")[0];
+      if (["twitch", "kick"].includes(detected)) {
+        const channel = path.split("/").filter(Boolean)[0] || "";
+        return channel ? `${detected}:${channel}` : value;
+      }
+      if (detected === "rumble") return path ? `rumble:${path}` : value;
+      return value;
+    }
     const prefix = value.match(/^([A-Za-z][A-Za-z0-9_-]*):(.+)$/);
     if (prefix && sourcePlatforms.has(prefix[1].toLowerCase().replaceAll("_", "-"))) return value;
     const clean = value.replace(/^@+/, "").replace(/^\\/+|\\/+$/g, "");
@@ -5310,6 +5326,7 @@ def dashboard_script() -> str:
   const renderSourceBuilder = (sources) => `<div class="source-builder" data-source-builder>
   <textarea name="sources" data-source-values hidden>${escapeHtml((sources || []).join("\\n"))}</textarea>
   ${renderSourceList(sources || [])}
+  <div class="source-unsaved-note" data-source-unsaved hidden>Unsaved source changes. Press Save Streamer to keep them.</div>
   <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
   <div class="source-popover" data-source-popover hidden>
     <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>
@@ -5322,12 +5339,28 @@ def dashboard_script() -> str:
   </div>
 </div>`;
   const sourceValuesForBuilder = (builder) => splitSourceValues((builder.querySelector("[data-source-values]") || {}).value || "");
+  const markStreamerFormDirty = (element) => {
+    const form = element ? element.closest("form.streamer-form") : null;
+    if (form) form.setAttribute("data-dirty", "true");
+    const builder = element ? element.closest("[data-source-builder]") : null;
+    const note = builder ? builder.querySelector("[data-source-unsaved]") : null;
+    if (note) note.hidden = false;
+  };
   const updateSourceBuilder = (builder, sources) => {
     sources = [...new Set((sources || []).map((source) => String(source || "").trim()).filter(Boolean))];
     const values = builder.querySelector("[data-source-values]");
     if (values) values.value = sources.join("\\n");
     const list = builder.querySelector("[data-source-list]");
     if (list) list.outerHTML = renderSourceList(sources);
+  };
+  const streamerListIsEditing = (streamerList) => {
+    if (!streamerList) return false;
+    const activeElement = document.activeElement;
+    return Boolean(
+      (activeElement && streamerList.contains(activeElement))
+      || streamerList.querySelector("form.streamer-form[data-dirty='true']")
+      || streamerList.querySelector("[data-source-popover]:not([hidden])")
+    );
   };
   const streamNeedsAttention = (stream) => attentionStatuses.has(stream.status) || Boolean(stream.has_mixed_formats);
   const readLocalStorageValue = (key) => {
@@ -5457,9 +5490,17 @@ def dashboard_script() -> str:
       const source = normalizeSourceValue(input ? input.value : "", select ? select.value : "auto");
       if (!source) return;
       updateSourceBuilder(builder, [...sourceValuesForBuilder(builder), source]);
+      markStreamerFormDirty(builder);
       if (input) input.value = "";
       const popover = builder.querySelector("[data-source-popover]");
       if (popover) popover.hidden = true;
+      const form = builder.closest("form.streamer-form");
+      if (form) {
+        const state = byId("refresh-state");
+        if (state) state.textContent = "Saving source...";
+        if (typeof form.requestSubmit === "function") form.requestSubmit();
+        else form.submit();
+      }
       return;
     }
     const removeSource = event.target.closest("[data-remove-source]");
@@ -5469,6 +5510,21 @@ def dashboard_script() -> str:
       if (!builder) return;
       const source = removeSource.getAttribute("data-remove-source") || "";
       updateSourceBuilder(builder, sourceValuesForBuilder(builder).filter((value) => value !== source));
+      markStreamerFormDirty(builder);
+    }
+  });
+
+  document.addEventListener("input", (event) => {
+    const target = event.target;
+    if (target && target.closest && target.closest("form.streamer-form")) {
+      markStreamerFormDirty(target);
+    }
+  });
+
+  document.addEventListener("change", (event) => {
+    const target = event.target;
+    if (target && target.closest && target.closest("form.streamer-form")) {
+      markStreamerFormDirty(target);
     }
   });
 
@@ -6257,8 +6313,7 @@ def dashboard_script() -> str:
     if (statusCounts) statusCounts.innerHTML = renderStatusCounts(counts);
     const streamerList = byId("streamer-list");
     if (streamerList) {
-      const activeElement = document.activeElement;
-      if (!activeElement || !streamerList.contains(activeElement)) {
+      if (!streamerListIsEditing(streamerList)) {
         streamerList.innerHTML = renderStreamerList(snapshot);
         applyCollapsedState(streamerList);
       }
@@ -6842,6 +6897,7 @@ def render_source_editor(sources: list[str]) -> str:
     return f"""<div class="source-builder" data-source-builder>
   <textarea name="sources" data-source-values hidden>{escape(values)}</textarea>
   <div class="source-list" data-source-list>{render_source_list_items(sources)}</div>
+  <div class="source-unsaved-note" data-source-unsaved hidden>Unsaved source changes. Press Save Streamer to keep them.</div>
   <div class="source-builder-actions"><button class="download action-button" type="button" data-open-source-popover>Add Source</button></div>
   <div class="source-popover" data-source-popover hidden>
     <div class="source-popover-head"><strong>Add Source</strong><button class="download action-button" type="button" data-close-source-popover>Close</button></div>

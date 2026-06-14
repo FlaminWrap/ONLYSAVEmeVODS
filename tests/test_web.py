@@ -786,6 +786,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-add-source', html)
         self.assertIn('data-close-source-popover', html)
         self.assertIn('data-source-list', html)
+        self.assertIn('data-source-unsaved', html)
         self.assertIn('source-platform-icon youtube', html)
         self.assertIn('src="/assets/platforms/youtube.svg?v=', html)
         self.assertIn('data-remove-source="@OUMB3rd"', html)
@@ -793,7 +794,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('<option value="twitch">Twitch</option>', html)
         self.assertIn('detectSourcePlatform', html)
         self.assertIn('normalizeSourceValue', html)
+        self.assertIn('sourceUrlPath', html)
+        self.assertIn('form.requestSubmit', html)
         self.assertIn('renderSourceList', html)
+        self.assertIn('markStreamerFormDirty', html)
+        self.assertIn('streamerListIsEditing(streamerList)', html)
 
     def test_status_html_links_package_favicons(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1465,6 +1470,29 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('action="/streamers"', html)
         self.assertIn("Streamers", html)
         self.assertIn("Save Streamer", html)
+
+    def test_streamer_group_form_accepts_platform_urls(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text("channels = []\n", encoding="utf-8")
+            config = load_config(config_path)
+
+            update_streamer_from_form(
+                config,
+                {
+                    "action": ["save"],
+                    "streamer_name": ["OUMB"],
+                    "sources": ["https://kick.com/oumb\nhttps://rumble.com/user/OUMB2"],
+                    "download_dir_name": [""],
+                },
+            )
+            updated = load_config(config_path)
+
+        self.assertEqual(
+            updated.streamers["OUMB"].sources,
+            ["kick:oumb", "rumble:user/OUMB2"],
+        )
+        self.assertEqual(config.streamers["OUMB"].sources, updated.streamers["OUMB"].sources)
 
     def test_streamer_wizard_form_creates_full_config_and_rewrites_subtitles(self) -> None:
         with TemporaryDirectory() as tmp:

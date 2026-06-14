@@ -7,7 +7,7 @@ import json
 import re
 import tomllib
 
-from .sources import SourceError, validate_source
+from .sources import SourceError, canonical_source, validate_source
 
 
 DEFAULT_POST_EXIT_CHECK_SECONDS = [
@@ -632,7 +632,10 @@ def update_streamer_config(
     streamer_name = streamer_name.strip()
     if not streamer_name:
         raise ConfigError("streamer name is required")
-    normalized_sources = _as_str_list(sources, f"streamers.{streamer_name}.sources")
+    normalized_sources = _as_canonical_source_list(
+        sources,
+        f"streamers.{streamer_name}.sources",
+    )
     if not normalized_sources:
         raise ConfigError(f"streamers.{streamer_name}.sources must not be empty")
     normalized_download_dir_name = _as_optional_str(
@@ -1493,6 +1496,18 @@ def _as_source_list(value: Any, name: str) -> list[str]:
         except SourceError as exc:
             raise ConfigError(f"{name}[{index}] is not a supported source: {exc}") from exc
     return sources
+
+
+def _as_canonical_source_list(value: Any, name: str) -> list[str]:
+    sources = _as_source_list(value, name)
+    canonical_sources: list[str] = []
+    seen: set[str] = set()
+    for source in sources:
+        normalized = canonical_source(source)
+        if normalized not in seen:
+            canonical_sources.append(normalized)
+            seen.add(normalized)
+    return canonical_sources
 
 
 def _as_extra_yt_dlp_args(value: Any, name: str) -> list[str]:

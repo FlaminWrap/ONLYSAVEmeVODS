@@ -1,6 +1,6 @@
 import unittest
 
-from onlysavemevods.sources import SourceError, SourceMonitor, resolve_source
+from onlysavemevods.sources import SourceError, SourceMonitor, canonical_source, resolve_source
 
 
 class FakeRunner:
@@ -34,6 +34,12 @@ class SourceResolutionTests(unittest.TestCase):
         self.assertEqual(resolve_source("https://www.twitch.tv/OUMB3rd").platform, "twitch")
         self.assertEqual(resolve_source("https://kick.com/OUMB3rd").platform, "kick")
         self.assertEqual(resolve_source("https://rumble.com/vabc-title.html").platform, "rumble")
+
+    def test_canonicalizes_supported_url_sources(self) -> None:
+        self.assertEqual(canonical_source("https://kick.com/oumb"), "kick:oumb")
+        self.assertEqual(canonical_source("https://rumble.com/user/OUMB2"), "rumble:user/OUMB2")
+        self.assertEqual(canonical_source("https://www.twitch.tv/OUMB3rd"), "twitch:OUMB3rd")
+        self.assertEqual(canonical_source("https://www.youtube.com/@Example"), "@Example")
 
     def test_rejects_unsupported_prefix_or_url(self) -> None:
         with self.assertRaises(SourceError):

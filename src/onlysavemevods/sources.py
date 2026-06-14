@@ -166,6 +166,26 @@ def validate_source(source: str) -> None:
     resolve_source(source)
 
 
+def canonical_source(source: str, *, default_platform: str | None = None) -> str:
+    spec = resolve_source(source, default_platform=default_platform)
+    raw = source.strip()
+    if not raw.startswith(("http://", "https://")):
+        return spec.raw
+
+    parts = urlsplit(spec.url)
+    path = parts.path.strip("/")
+    if spec.platform == "youtube":
+        if path.startswith("@"):
+            return path.split("/", 1)[0]
+        return raw
+    if spec.platform in {"twitch", "kick"}:
+        channel = path.split("/", 1)[0]
+        return f"{spec.platform}:{channel}" if channel else raw
+    if spec.platform == "rumble":
+        return f"rumble:{path}" if path else raw
+    return raw
+
+
 def stream_with_source(stream: LiveStream, source: str) -> LiveStream:
     return LiveStream(
         video_id=stream.video_id,
