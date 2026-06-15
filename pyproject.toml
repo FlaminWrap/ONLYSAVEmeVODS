@@ -23,6 +23,12 @@ voice-match = [
   "torchaudio~=2.8.0",
   "torchcodec>=0.6.0,<0.8.0; (sys_platform == 'linux' and platform_machine == 'x86_64') or sys_platform == 'darwin' or sys_platform == 'win32'",
 ]
+stream-events = [
+  "transformers>=4.57.0,<5.0",
+  "huggingface-hub>=0.34.0,<1.0",
+  "torch~=2.8.0",
+  "torchaudio~=2.8.0",
+]
 
 [project.scripts]
 onlysavemevods = "onlysavemevods.cli:main"

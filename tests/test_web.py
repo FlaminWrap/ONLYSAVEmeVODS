@@ -29,8 +29,10 @@ from onlysavemevods.web import (
     store_streamer_voice_sample_upload,
     create_streamer_voice_sample_from_transcript_form,
     update_streamer_from_form,
+    update_stream_event_rules_from_form,
     update_voice_detection_from_form,
     resolve_refresh_chat_files,
+    cleanup_stream_fragments,
     resolve_watermark_download_file,
     resolve_transcription_source_file,
     resolve_render_chat_files,
@@ -40,6 +42,8 @@ from onlysavemevods.web import (
     update_render_chat_job,
     run_render_chat_process_job,
     run_transcription_job,
+    event_detection_job_key,
+    run_event_detection_job,
     refresh_chat_job_key,
     RefreshChatJob,
     CHAT_REFRESH_JOBS,
@@ -54,6 +58,9 @@ from onlysavemevods.web import (
     TranscriptionJob,
     TRANSCRIPTION_JOBS,
     TRANSCRIPTION_JOBS_LOCK,
+    EventDetectionJob,
+    EVENT_DETECTION_JOBS,
+    EVENT_DETECTION_JOBS_LOCK,
     StatusWebServer,
     StreamEventStatus,
     render_stream_event_timeline,
@@ -95,6 +102,13 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "voice_match_threshold": "0.35",
         "voice_match_min_margin": "0.05",
         "voice_sample_max_bytes": "104857600",
+        "stream_event_detection_enabled": "false",
+        "stream_event_model": "MIT/ast-finetuned-audioset-10-10-0.4593",
+        "stream_event_device": "auto",
+        "stream_event_window_seconds": "10.0",
+        "stream_event_hop_seconds": "5.0",
+        "stream_event_min_confidence": "0.35",
+        "stream_event_max_events_per_media": "100",
         "web_enabled": "true",
         "web_host": "127.0.0.1",
         "web_port": "8080",
@@ -147,6 +161,28 @@ class WebStatusTests(unittest.TestCase):
                 "final",
                 encoding="utf-8",
             )
+            (segment_dir / "Live Status [LIVEVIDEO01].stream-events.json").write_text(
+                json.dumps(
+                    {
+                        "media": "Live Status [LIVEVIDEO01].mp4",
+                        "events": [
+                            {
+                                "start": 10.0,
+                                "end": 14.0,
+                                "duration": 4.0,
+                                "rule": "Laughter",
+                                "severity": "high",
+                                "score": 0.92,
+                                "loudness_dbfs": -8.2,
+                                "labels": [{"label": "Laughter", "score": 0.92}],
+                                "keywords": ["haha"],
+                                "text": "big laugh",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             (segment_dir / "segment-001.f137.mp4.part-Frag1").write_text(
                 "fragment",
                 encoding="utf-8",
@@ -179,8 +215,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(stream_status.file_kind_counts["final"], 2)
         self.assertEqual(stream_status.file_kind_counts["chat"], 1)
         self.assertEqual(stream_status.file_kind_counts["fragment"], 1)
-        self.assertEqual(stream_status.file_kind_counts["state"], 1)
+        self.assertEqual(stream_status.file_kind_counts["state"], 2)
         self.assertGreater(stream_status.chat_bytes, 0)
+        self.assertEqual(stream_status.content_event_count, 1)
+        self.assertEqual(stream_status.content_events[0].rule, "Laughter")
+        self.assertEqual(stream_status.content_events[0].media_name, "Live Status [LIVEVIDEO01].mp4")
         self.assertIsNotNone(stream_status.latest_file_modified_at)
         self.assertIn("segment-001.f140.mp4.part", [file.name for file in stream_status.files])
         part_file = next(
@@ -355,6 +394,28 @@ class WebStatusTests(unittest.TestCase):
                 "final",
                 encoding="utf-8",
             )
+            (segment_dir / "Live Status [LIVEVIDEO01].stream-events.json").write_text(
+                json.dumps(
+                    {
+                        "media": "Live Status [LIVEVIDEO01].mp4",
+                        "events": [
+                            {
+                                "start": 10.0,
+                                "end": 14.0,
+                                "duration": 4.0,
+                                "rule": "Laughter",
+                                "severity": "high",
+                                "score": 0.92,
+                                "loudness_dbfs": -8.2,
+                                "labels": [{"label": "Laughter", "score": 0.92}],
+                                "keywords": ["haha"],
+                                "text": "big laugh",
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             (segment_dir / "Live Status [LIVEVIDEO01].live_chat.json").write_text(
                 "chat",
                 encoding="utf-8",
@@ -406,6 +467,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Version", html)
         self.assertIn(__version__, html)
         self.assertIn("Current Configuration", html)
+        self.assertIn("Content Event Rules", html)
+        self.assertIn('action="/stream-event-rules"', html)
         self.assertIn("record_live_chat", html)
         self.assertIn("render_live_chat_video", html)
         self.assertIn("tab-config", html)
@@ -433,10 +496,14 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-stream-tab="files"', html)
         self.assertIn('data-stream-tab="log"', html)
         self.assertIn('data-stream-tab="jobs"', html)
+        self.assertIn('data-stream-tab="events"', html)
         self.assertIn("stream-tab-panel stream-tab-files", html)
         self.assertIn("stream-tab-panel stream-tab-log", html)
         self.assertIn("stream-tab-panel stream-tab-jobs", html)
+        self.assertIn("stream-tab-panel stream-tab-events", html)
         self.assertIn("Stream Log", html)
+        self.assertIn("Laughter", html)
+        self.assertIn("big laugh", html)
         stream_tabs = html[html.index('<div class="stream-tab-labels">'):]
         self.assertLess(
             stream_tabs.index('class="stream-tab-jobs-label"'),
@@ -1090,6 +1157,94 @@ class WebStatusTests(unittest.TestCase):
         self.assertIsNone(rejected_format)
         self.assertIsNone(rejected_unknown)
         self.assertIsNone(rejected_traversal)
+
+    def test_cleanup_stream_fragments_removes_only_fragment_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_fragment = segment_dir / "segment-001.f137.mp4.part-Frag1"
+            chat_fragment = segment_dir / "segment-001.live_chat.json.part-Frag2"
+            part_file = segment_dir / "segment-001.f140.mp4.part"
+            state_file = segment_dir / "segment-001.f140.mp4.ytdl"
+            final_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_fragment.write_text("fragment", encoding="utf-8")
+            chat_fragment.write_text("chatfrag", encoding="utf-8")
+            part_file.write_text("part", encoding="utf-8")
+            state_file.write_text("{}", encoding="utf-8")
+            final_file.write_text("final", encoding="utf-8")
+
+            html = render_status_html(build_status_snapshot(config))
+            count, bytes_removed = cleanup_stream_fragments(config, stream.video_id)
+            state = StateStore(config.db_path)
+            try:
+                events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            finally:
+                state.close()
+            media_fragment_exists = media_fragment.exists()
+            chat_fragment_exists = chat_fragment.exists()
+            part_file_exists = part_file.exists()
+            state_file_exists = state_file.exists()
+            final_file_exists = final_file.exists()
+
+        self.assertIn("/cleanup-fragments?video_id=LIVEVIDEO01", html)
+        self.assertIn("Clean fragments (2)", html)
+        self.assertEqual(count, 2)
+        self.assertEqual(bytes_removed, len("fragment") + len("chatfrag"))
+        self.assertFalse(media_fragment_exists)
+        self.assertFalse(chat_fragment_exists)
+        self.assertTrue(part_file_exists)
+        self.assertTrue(state_file_exists)
+        self.assertTrue(final_file_exists)
+        self.assertTrue(
+            any(
+                "Cleaned 2 fragment file(s)" in event.message
+                for event in events[stream.video_id]
+            )
+        )
+
+    def test_cleanup_stream_fragments_rejects_active_download(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            fragment = segment_dir / "segment-001.f137.mp4.part-Frag1"
+            fragment.write_text("fragment", encoding="utf-8")
+
+            html = render_status_html(build_status_snapshot(config))
+            with self.assertRaisesRegex(ConfigError, "may still resume"):
+                cleanup_stream_fragments(config, stream.video_id)
+            fragment_exists = fragment.exists()
+
+        self.assertNotIn("/cleanup-fragments?video_id=LIVEVIDEO01", html)
+        self.assertTrue(fragment_exists)
 
     def test_ended_streams_are_collapsed_by_default(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1761,6 +1916,56 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.mode, "fixed")
         self.assertEqual(updated.streamers["OUMB3rd"].voice_detection.min_speakers, 2)
 
+    def test_stream_event_rules_form_updates_streamer_config(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_stream_event_rules_from_form(
+                config,
+                {
+                    "scope": ["streamer"],
+                    "streamer_name": ["OUMB3rd"],
+                    "event_enabled": ["true"],
+                    "event_model": ["custom/ast"],
+                    "event_device": ["cpu"],
+                    "event_window_seconds": ["8"],
+                    "event_hop_seconds": ["2"],
+                    "event_min_confidence": ["0.6"],
+                    "event_max_events_per_media": ["25"],
+                    "rule_name": ["Hype"],
+                    "rule_enabled": ["true"],
+                    "rule_labels": ["Cheering"],
+                    "rule_keywords": ["lets go"],
+                    "rule_min_loudness_dbfs": ["-30"],
+                    "rule_min_duration_seconds": ["1"],
+                    "rule_max_duration_seconds": ["20"],
+                    "rule_severity": ["warning"],
+                },
+            )
+
+            updated = load_config(config_path)
+
+        streamer = updated.streamers["OUMB3rd"]
+        self.assertIsNotNone(streamer.stream_event_detection)
+        assert streamer.stream_event_detection is not None
+        self.assertTrue(streamer.stream_event_detection.enabled)
+        self.assertEqual(streamer.stream_event_detection.model, "custom/ast")
+        self.assertEqual(streamer.stream_event_detection.device, "cpu")
+        self.assertEqual(streamer.stream_event_detection.window_seconds, 8.0)
+        self.assertEqual(streamer.stream_event_detection.hop_seconds, 2.0)
+        self.assertEqual(streamer.stream_event_detection.min_confidence, 0.6)
+        self.assertEqual(streamer.stream_event_detection.max_events_per_media, 25)
+        self.assertEqual(len(streamer.stream_event_rules), 1)
+        self.assertEqual(streamer.stream_event_rules[0].name, "Hype")
+        self.assertEqual(streamer.stream_event_rules[0].labels, ["Cheering"])
+        self.assertEqual(streamer.stream_event_rules[0].keywords, ["lets go"])
+
     def test_streamer_voice_form_updates_profile_config(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
@@ -2222,6 +2427,92 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(transcribe.await_args.args[0], config)
         self.assertEqual(transcribe.await_args.args[1], media_file)
         self.assertTrue(transcribe.await_args.kwargs["overwrite"])
+
+    def test_event_detection_action_can_redetect_existing_sidecars(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                stream_event_detection_enabled=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".stream-events.json").write_text(
+                json.dumps({"media": media_file.name, "events": []}),
+                encoding="utf-8",
+            )
+
+            snapshot = build_status_snapshot(config)
+
+        media_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == media_file.name
+        )
+        self.assertEqual(media_status.event_detection_status, "detected")
+        self.assertIsNotNone(media_status.event_detection_url)
+        self.assertIn("regenerate=1", media_status.event_detection_url or "")
+        action = render_file_action(media_status)
+        self.assertIn("Redetect events", action)
+        self.assertIn("Run content event detection again", action)
+
+    def test_manual_event_detection_job_passes_regenerate_and_updates_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                stream_event_detection_enabled=True,
+            )
+            media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
+            media_file.parent.mkdir(parents=True)
+            media_file.write_text("media", encoding="utf-8")
+            key = event_detection_job_key("LIVEVIDEO01", media_file.name)
+            with EVENT_DETECTION_JOBS_LOCK:
+                EVENT_DETECTION_JOBS[key] = EventDetectionJob(
+                    video_id="LIVEVIDEO01",
+                    media_name=media_file.name,
+                    status="running",
+                    message="Detecting content events",
+                    started_at=0.0,
+                )
+
+            try:
+                with patch("onlysavemevods.web.detect_content_events_for_media", return_value=True) as detect:
+                    with patch("onlysavemevods.web.load_content_events", return_value=[{"rule": "Laugh"}]):
+                        run_event_detection_job(
+                            config,
+                            key,
+                            media_file,
+                            regenerate=True,
+                            channel="Example Channel",
+                        )
+                with EVENT_DETECTION_JOBS_LOCK:
+                    job = EVENT_DETECTION_JOBS[key]
+            finally:
+                with EVENT_DETECTION_JOBS_LOCK:
+                    EVENT_DETECTION_JOBS.pop(key, None)
+
+        self.assertEqual(job.status, "done")
+        self.assertEqual(job.progress, 1.0)
+        self.assertIn("1 content event", job.message)
+        detect.assert_called_once()
+        self.assertEqual(detect.call_args.args[0], config)
+        self.assertEqual(detect.call_args.args[1], media_file)
+        self.assertTrue(detect.call_args.kwargs["overwrite"])
+        self.assertEqual(detect.call_args.kwargs["channel"], "Example Channel")
 
     def test_watermark_status_and_downloads_are_separate_from_originals(self) -> None:
         with TemporaryDirectory() as tmp:

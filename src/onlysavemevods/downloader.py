@@ -40,6 +40,11 @@ from .chat_timing import (
     utc_now_iso,
 )
 from .config import BotConfig, download_group_name_for_channel
+from .content_events import (
+    ContentEventDetectorUnavailable,
+    detect_content_events_for_media,
+    load_content_events,
+)
 from .models import LiveStream
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
@@ -807,6 +812,8 @@ class DownloadManager:
         self.state.mark_ended(stream.video_id)
         if self.config.transcribe_subtitles:
             await self.transcribe_finalized_media(finalized_files)
+        if self.config.stream_event_detection_enabled:
+            await self.detect_finalized_content_events(stream, finalized_files)
         if self.config.render_live_chat_video and stream.platform == "youtube":
             await self.render_finalized_chat_videos(finalized_files)
 
@@ -963,6 +970,55 @@ class DownloadManager:
                     files.media_file,
                     logger=self.logger,
                     channel=files.channel,
+                )
+
+    async def detect_finalized_content_events(
+        self,
+        stream: LiveStream,
+        finalized_files: list[FinalizedSegmentFiles],
+    ) -> None:
+        for files in finalized_files:
+            if files.media_file is None:
+                continue
+            try:
+                ok = await asyncio.to_thread(
+                    detect_content_events_for_media,
+                    self.config,
+                    files.media_file,
+                    logger=self.logger,
+                    channel=files.channel,
+                )
+            except ContentEventDetectorUnavailable as exc:
+                self.logger.warning(
+                    "Content event detection unavailable for %s: %s",
+                    files.media_file,
+                    exc,
+                )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Content event detection unavailable for {files.media_file.name}: {exc}",
+                    level="warning",
+                    segment_index=files.segment_index,
+                )
+                continue
+            except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                self.logger.exception(
+                    "Content event detection failed for %s",
+                    files.media_file,
+                )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Content event detection failed for {files.media_file.name}: {exc}",
+                    level="error",
+                    segment_index=files.segment_index,
+                )
+                continue
+            if ok:
+                event_count = len(load_content_events(files.media_file))
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Content event detection completed for {files.media_file.name}: {event_count} event(s)",
+                    segment_index=files.segment_index,
                 )
 
     async def render_live_chat_video(

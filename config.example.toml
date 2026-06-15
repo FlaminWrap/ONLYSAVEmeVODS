@@ -116,6 +116,27 @@ voice_match_threshold = 0.35
 voice_match_min_margin = 0.05
 voice_sample_max_bytes = 104857600
 
+# Optional post-finalize content event detection. This uses an optional
+# Hugging Face AudioSet classifier plus transcript keywords to find notable
+# moments after final media is ready. The installer installs the optional
+# stream-events dependency when stream_event_detection_enabled = true.
+stream_event_detection_enabled = false
+stream_event_model = "MIT/ast-finetuned-audioset-10-10-0.4593"
+stream_event_device = "auto"
+stream_event_window_seconds = 10.0
+stream_event_hop_seconds = 5.0
+stream_event_min_confidence = 0.35
+stream_event_max_events_per_media = 100
+
+# [[stream_event_rules]]
+# name = "Hype reaction"
+# labels = ["Laughter", "Cheering", "Applause"]
+# keywords = ["let's go", "no way"]
+# min_loudness_dbfs = -28.0
+# min_duration_seconds = 2.0
+# max_duration_seconds = 45.0
+# severity = "info"
+
 # Optional source-specific override. Use the source/channel name shown in the dashboard.
 # If a streamer also has voice_detection settings, this source-specific table wins.
 # [channel_voice_detection."Example Channel"]

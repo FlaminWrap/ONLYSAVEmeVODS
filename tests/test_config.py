@@ -5,6 +5,8 @@ import unittest
 from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     ConfigError,
+    StreamEventDetectionConfig,
+    StreamEventRuleConfig,
     VoiceDetectionConfig,
     VoiceProfileConfig,
     append_missing_config_values,
@@ -15,9 +17,11 @@ from onlysavemevods.config import (
     update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
     remove_streamer_config,
+    update_global_stream_event_rules_config,
     update_config_values,
     update_streamer_config,
     update_streamer_speaker_labels_config,
+    update_streamer_stream_event_config,
     update_streamer_voice_detection_config,
     update_streamer_voice_profile_config,
     sanitize_voice_sample_filename,
@@ -228,6 +232,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.voice_match_threshold, 0.35)
         self.assertEqual(config.voice_match_min_margin, 0.05)
         self.assertEqual(config.voice_sample_max_bytes, 104_857_600)
+        self.assertFalse(config.stream_event_detection_enabled)
+        self.assertEqual(config.stream_event_model, "MIT/ast-finetuned-audioset-10-10-0.4593")
+        self.assertEqual(config.stream_event_device, "auto")
+        self.assertEqual(config.stream_event_window_seconds, 10.0)
+        self.assertEqual(config.stream_event_hop_seconds, 5.0)
+        self.assertEqual(config.stream_event_min_confidence, 0.35)
+        self.assertEqual(config.stream_event_max_events_per_media, 100)
+        self.assertEqual(config.stream_event_rules, [])
 
     def test_relative_paths_resolve_next_to_config(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -677,6 +689,143 @@ class ConfigTests(unittest.TestCase):
             sanitize_voice_sample_filename("../Host Voice!!.mp3"),
             "Host_Voice.mp3",
         )
+
+    def test_stream_event_settings_and_streamer_overrides_can_be_configured(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'stream_event_detection_enabled = true\n'
+                'stream_event_model = "custom/ast"\n'
+                'stream_event_device = "cpu"\n'
+                'stream_event_window_seconds = 8.0\n'
+                'stream_event_hop_seconds = 2.0\n'
+                'stream_event_min_confidence = 0.55\n'
+                'stream_event_max_events_per_media = 25\n'
+                '[[stream_event_rules]]\n'
+                'name = "Laughter"\n'
+                'labels = ["Laughter", "Giggle"]\n'
+                'keywords = ["haha"]\n'
+                'min_loudness_dbfs = -24.5\n'
+                'min_duration_seconds = 1.5\n'
+                'max_duration_seconds = 30.0\n'
+                'severity = "high"\n'
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '[streamers."OUMB3rd".stream_event_detection]\n'
+                'enabled = false\n'
+                'model = "streamer/ast"\n'
+                'device = "cuda:0"\n'
+                'window_seconds = 12.0\n'
+                'hop_seconds = 6.0\n'
+                'min_confidence = 0.7\n'
+                'max_events_per_media = 5\n'
+                '[[streamers."OUMB3rd".stream_event_rules]]\n'
+                'name = "Hype"\n'
+                'keywords = ["lets go"]\n'
+                'severity = "warning"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.stream_event_detection_enabled)
+        self.assertEqual(config.stream_event_model, "custom/ast")
+        self.assertEqual(config.stream_event_device, "cpu")
+        self.assertEqual(config.stream_event_window_seconds, 8.0)
+        self.assertEqual(config.stream_event_hop_seconds, 2.0)
+        self.assertEqual(config.stream_event_min_confidence, 0.55)
+        self.assertEqual(config.stream_event_max_events_per_media, 25)
+        self.assertEqual(len(config.stream_event_rules), 1)
+        rule = config.stream_event_rules[0]
+        self.assertEqual(rule.name, "Laughter")
+        self.assertEqual(rule.labels, ["Laughter", "Giggle"])
+        self.assertEqual(rule.keywords, ["haha"])
+        self.assertEqual(rule.min_loudness_dbfs, -24.5)
+        self.assertEqual(rule.min_duration_seconds, 1.5)
+        self.assertEqual(rule.max_duration_seconds, 30.0)
+        self.assertEqual(rule.severity, "high")
+        streamer = config.streamers["OUMB3rd"]
+        self.assertIsNotNone(streamer.stream_event_detection)
+        assert streamer.stream_event_detection is not None
+        self.assertFalse(streamer.stream_event_detection.enabled)
+        self.assertEqual(streamer.stream_event_detection.model, "streamer/ast")
+        self.assertEqual(streamer.stream_event_detection.device, "cuda:0")
+        self.assertEqual(streamer.stream_event_detection.window_seconds, 12.0)
+        self.assertEqual(streamer.stream_event_detection.hop_seconds, 6.0)
+        self.assertEqual(streamer.stream_event_detection.min_confidence, 0.7)
+        self.assertEqual(streamer.stream_event_detection.max_events_per_media, 5)
+        self.assertEqual(len(streamer.stream_event_rules), 1)
+        self.assertEqual(streamer.stream_event_rules[0].name, "Hype")
+
+    def test_stream_event_config_update_writes_and_removes_tables(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n',
+                encoding="utf-8",
+            )
+
+            global_changed = update_global_stream_event_rules_config(
+                config_path,
+                [
+                    StreamEventRuleConfig(
+                        name="Laughter",
+                        labels=["Laughter"],
+                        severity="high",
+                    )
+                ],
+            )
+            streamer_changed = update_streamer_stream_event_config(
+                config_path,
+                "OUMB3rd",
+                StreamEventDetectionConfig(enabled=True, min_confidence=0.65),
+                [
+                    StreamEventRuleConfig(
+                        name="Catchphrase",
+                        keywords=["lets go"],
+                    )
+                ],
+            )
+            config = load_config(config_path)
+            removed = update_streamer_stream_event_config(config_path, "OUMB3rd", None, [])
+            config_after_remove = load_config(config_path)
+
+        self.assertTrue(global_changed)
+        self.assertTrue(streamer_changed)
+        self.assertEqual(config.stream_event_rules[0].name, "Laughter")
+        streamer = config.streamers["OUMB3rd"]
+        self.assertIsNotNone(streamer.stream_event_detection)
+        assert streamer.stream_event_detection is not None
+        self.assertTrue(streamer.stream_event_detection.enabled)
+        self.assertEqual(streamer.stream_event_detection.min_confidence, 0.65)
+        self.assertEqual(streamer.stream_event_rules[0].name, "Catchphrase")
+        self.assertTrue(removed)
+        self.assertIsNone(config_after_remove.streamers["OUMB3rd"].stream_event_detection)
+        self.assertEqual(config_after_remove.streamers["OUMB3rd"].stream_event_rules, [])
+
+    def test_stream_event_rules_are_validated(self) -> None:
+        invalid_configs = [
+            '[[stream_event_rules]]\nname = ""\nkeywords = ["hype"]\n',
+            '[[stream_event_rules]]\nname = "Empty"\n',
+            (
+                '[[stream_event_rules]]\n'
+                'name = "Bad duration"\n'
+                'keywords = ["hype"]\n'
+                'min_duration_seconds = 5.0\n'
+                'max_duration_seconds = 2.0\n'
+            ),
+            'stream_event_min_confidence = 1.5\n',
+        ]
+        for body in invalid_configs:
+            with self.subTest(body=body):
+                with TemporaryDirectory() as tmp:
+                    config_path = Path(tmp) / "config.toml"
+                    config_path.write_text(body, encoding="utf-8")
+
+                    with self.assertRaises(ConfigError):
+                        load_config(config_path)
+
 
     def test_channel_voice_detection_overrides_can_be_configured(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -28,6 +28,7 @@ SKIP_DENO="${ONLYSAVEMEVODS_SKIP_DENO:-0}"
 SKIP_NVIDIA_DEPS="${ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS:-0}"
 INSTALL_WHISPERX="${ONLYSAVEMEVODS_INSTALL_WHISPERX:-auto}"
 INSTALL_VOICE_MATCH="${ONLYSAVEMEVODS_INSTALL_VOICE_MATCH:-auto}"
+INSTALL_STREAM_EVENTS="${ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS:-auto}"
 ENABLE_PYTHON_UPDATER="${ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER:-1}"
 PYTHON_UPDATE_CALENDAR="${ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR:-*-*-* 04:15:00}"
 PYTHON_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY:-45m}"
@@ -633,6 +634,19 @@ raise SystemExit(0 if config.voice_match_enabled else 1)
 ' "${CONFIG_FILE}"
 }
 
+config_enables_stream_events() {
+  sudo "${VENV_DIR}/bin/python" -c '
+from onlysavemevods.config import ConfigError, load_config
+import sys
+try:
+    config = load_config(sys.argv[1])
+except ConfigError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(0 if config.stream_event_detection_enabled else 1)
+' "${CONFIG_FILE}"
+}
+
 should_install_whisperx() {
   case "${INSTALL_WHISPERX}" in
     1|true|yes|always)
@@ -719,6 +733,46 @@ install_voice_match_if_needed() {
 
   echo "Installing voice-match dependencies into ${VENV_DIR}..."
   sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --editable "${APP_DIR}[voice-match]"
+  sudo chown -R root:root "${VENV_DIR}"
+  sudo chmod -R a+rX "${VENV_DIR}"
+}
+
+should_install_stream_events() {
+  case "${INSTALL_STREAM_EVENTS}" in
+    1|true|yes|always)
+      return 0
+      ;;
+    0|false|no|never)
+      return 1
+      ;;
+    auto|"")
+      set +e
+      config_enables_stream_events
+      local stream_event_status=$?
+      set -e
+      if [[ "${stream_event_status}" == "2" ]]; then
+        die "Unable to read stream event setting from ${CONFIG_FILE}; fix the config before continuing."
+      fi
+      return "${stream_event_status}"
+      ;;
+    *)
+      die "ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS must be auto, 1, or 0"
+      ;;
+  esac
+}
+
+install_stream_events_if_needed() {
+  if ! should_install_stream_events; then
+    if [[ "${INSTALL_STREAM_EVENTS}" == "auto" || -z "${INSTALL_STREAM_EVENTS}" ]]; then
+      echo "Content event detection disabled; skipping stream-events dependencies"
+    else
+      echo "Skipping stream-events installation because ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS=${INSTALL_STREAM_EVENTS}"
+    fi
+    return 0
+  fi
+
+  echo "Installing stream-events dependencies into ${VENV_DIR}..."
+  sudo "${VENV_DIR}/bin/python" -m pip install --upgrade --editable "${APP_DIR}[stream-events]"
   sudo chown -R root:root "${VENV_DIR}"
   sudo chmod -R a+rX "${VENV_DIR}"
 }
@@ -813,6 +867,7 @@ sudo "${VENV_DIR}/bin/python" -m onlysavemevods update-config \
 ensure_config_file_service_writable
 install_whisperx_if_needed
 install_voice_match_if_needed
+install_stream_events_if_needed
 verify_python_dependencies
 
 sudo tee "${UNIT_FILE}" >/dev/null <<EOF

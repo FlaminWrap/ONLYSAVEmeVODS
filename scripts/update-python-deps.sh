@@ -129,6 +129,23 @@ raise SystemExit(0 if enabled else 1)
   return "${voice_match_status}"
 }
 
+config_enables_stream_events() {
+  set +e
+  "${PYTHON_BIN}" -c '
+from onlysavemevods.config import ConfigError, load_config
+import sys
+try:
+    enabled = load_config(sys.argv[1]).stream_event_detection_enabled
+except ConfigError as exc:
+    print(exc, file=sys.stderr)
+    raise SystemExit(2)
+raise SystemExit(0 if enabled else 1)
+' "${CONFIG_FILE}"
+  local stream_event_status=$?
+  set -e
+  return "${stream_event_status}"
+}
+
 voice_match_dependency_installed() {
   set +e
   "${PYTHON_BIN}" -c '
@@ -138,6 +155,17 @@ raise SystemExit(0 if voice_matcher_status().get("available") else 1)
   local voice_match_installed_status=$?
   set -e
   return "${voice_match_installed_status}"
+}
+
+stream_events_dependency_installed() {
+  set +e
+  "${PYTHON_BIN}" -c '
+from onlysavemevods.content_events import content_event_detector_status
+raise SystemExit(0 if content_event_detector_status().get("available") else 1)
+'
+  local stream_events_installed_status=$?
+  set -e
+  return "${stream_events_installed_status}"
 }
 
 verify_python_dependencies() {
@@ -187,6 +215,21 @@ update_python_dependencies() {
       echo "Could not read voice-match setting from ${CONFIG_FILE}; skipping voice-match dependencies."
     else
       echo "Voice-match dependencies are not installed and voice matching is disabled; skipping them."
+    fi
+  fi
+
+  if stream_events_dependency_installed; then
+    echo "Stream-events dependencies are installed; upgrading them..."
+    "${PYTHON_BIN}" -m pip install --upgrade --editable "${APP_DIR}[stream-events]"
+  elif config_enables_stream_events; then
+    echo "Content event detection is enabled; installing/upgrading stream-events dependencies..."
+    "${PYTHON_BIN}" -m pip install --upgrade --editable "${APP_DIR}[stream-events]"
+  else
+    local stream_event_status=$?
+    if [[ "${stream_event_status}" == "2" ]]; then
+      echo "Could not read stream event setting from ${CONFIG_FILE}; skipping stream-events dependencies."
+    else
+      echo "Stream-events dependencies are not installed and content event detection is disabled; skipping them."
     fi
   fi
 

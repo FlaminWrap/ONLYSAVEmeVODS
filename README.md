@@ -129,7 +129,11 @@ pyannote-backed known-voice matching. That extra pins the shared Torch and
 Hugging Face packages and uses pyannote.audio 4.x to match the WhisperX-compatible
 stack. Set
 `ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1` to force it or
-`ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=0` to skip it. The installer runs
+`ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=0` to skip it.
+If `stream_event_detection_enabled = true`, the installer also installs the
+`onlysavemevods[stream-events]` extra for Hugging Face AudioSet content event
+detection. Set `ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS=1` to force it or
+`ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS=0` to skip it. The installer runs
 `pip check` before restarting the service so resolver conflicts fail loudly.
 
 The installer also enables a nightly root-run Python dependency updater. It
@@ -312,6 +316,10 @@ scripts/uninstall-systemd.sh
   matches to `.srt`/`.vtt`, and leaves weak matches for review. Manual
   `[streamers."Name".speaker_labels]` and `[channel_speaker_labels."Channel Name"]`
   mappings still win because WhisperX `SPEAKER_00` IDs are per transcript.
+- Content event detection can be enabled from the Config tab. It writes
+  `<media>.stream-events.json`, adds an Events tab to each stream, and can match
+  AudioSet labels such as laughter/cheering/applause plus transcript keywords.
+  For manual installs, use `.venv/bin/python -m pip install -e ".[stream-events]"`.
 - The dashboard Config tab also has a Speaker Names section. After WhisperX has
   produced a diarized `.json` sidecar, the dashboard lists detected labels such
   as `SPEAKER_00` and `SPEAKER_01` per streamer first, with source-specific

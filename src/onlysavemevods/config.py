@@ -52,6 +52,11 @@ DEFAULT_VOICE_MATCH_MODEL = "pyannote/embedding"
 DEFAULT_VOICE_MATCH_THRESHOLD = 0.35
 DEFAULT_VOICE_MATCH_MIN_MARGIN = 0.05
 DEFAULT_VOICE_SAMPLE_MAX_BYTES = 104_857_600
+DEFAULT_STREAM_EVENT_MODEL = "MIT/ast-finetuned-audioset-10-10-0.4593"
+DEFAULT_STREAM_EVENT_WINDOW_SECONDS = 10.0
+DEFAULT_STREAM_EVENT_HOP_SECONDS = 5.0
+DEFAULT_STREAM_EVENT_MIN_CONFIDENCE = 0.35
+DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA = 100
 CONFIG_UPDATE_COMMENT = (
     "# Added by ONLYSAVEmeVODS config update. "
     "Existing settings above were left unchanged."
@@ -83,12 +88,37 @@ class VoiceProfileConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class StreamEventRuleConfig:
+    name: str
+    enabled: bool = True
+    labels: list[str] = field(default_factory=list)
+    keywords: list[str] = field(default_factory=list)
+    min_loudness_dbfs: float | None = None
+    min_duration_seconds: float = 0.0
+    max_duration_seconds: float = 0.0
+    severity: str = "info"
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEventDetectionConfig:
+    enabled: bool | None = None
+    model: str = ""
+    device: str = ""
+    window_seconds: float = 0.0
+    hop_seconds: float = 0.0
+    min_confidence: float = -1.0
+    max_events_per_media: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class StreamerConfig:
     sources: list[str] = field(default_factory=list)
     download_dir_name: str = ""
     voice_detection: VoiceDetectionConfig | None = None
     speaker_labels: dict[str, str] = field(default_factory=dict)
     voices: dict[str, VoiceProfileConfig] = field(default_factory=dict)
+    stream_event_detection: StreamEventDetectionConfig | None = None
+    stream_event_rules: list[StreamEventRuleConfig] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -125,6 +155,14 @@ class BotConfig:
     voice_match_threshold: float = DEFAULT_VOICE_MATCH_THRESHOLD
     voice_match_min_margin: float = DEFAULT_VOICE_MATCH_MIN_MARGIN
     voice_sample_max_bytes: int = DEFAULT_VOICE_SAMPLE_MAX_BYTES
+    stream_event_detection_enabled: bool = False
+    stream_event_model: str = DEFAULT_STREAM_EVENT_MODEL
+    stream_event_device: str = "auto"
+    stream_event_window_seconds: float = DEFAULT_STREAM_EVENT_WINDOW_SECONDS
+    stream_event_hop_seconds: float = DEFAULT_STREAM_EVENT_HOP_SECONDS
+    stream_event_min_confidence: float = DEFAULT_STREAM_EVENT_MIN_CONFIDENCE
+    stream_event_max_events_per_media: int = DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA
+    stream_event_rules: list[StreamEventRuleConfig] = field(default_factory=list)
     keep_fragments_for_resume: bool = True
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
@@ -288,6 +326,41 @@ def load_config(path: str | Path) -> BotConfig:
         voice_sample_max_bytes=_as_positive_int(
             raw.get("voice_sample_max_bytes", DEFAULT_VOICE_SAMPLE_MAX_BYTES),
             "voice_sample_max_bytes",
+        ),
+        stream_event_detection_enabled=_as_bool(
+            raw.get("stream_event_detection_enabled", False),
+            "stream_event_detection_enabled",
+        ),
+        stream_event_model=_as_str(
+            raw.get("stream_event_model", DEFAULT_STREAM_EVENT_MODEL),
+            "stream_event_model",
+        ),
+        stream_event_device=_as_str(
+            raw.get("stream_event_device", "auto"),
+            "stream_event_device",
+        ),
+        stream_event_window_seconds=_as_positive_float(
+            raw.get("stream_event_window_seconds", DEFAULT_STREAM_EVENT_WINDOW_SECONDS),
+            "stream_event_window_seconds",
+        ),
+        stream_event_hop_seconds=_as_positive_float(
+            raw.get("stream_event_hop_seconds", DEFAULT_STREAM_EVENT_HOP_SECONDS),
+            "stream_event_hop_seconds",
+        ),
+        stream_event_min_confidence=_as_probability(
+            raw.get("stream_event_min_confidence", DEFAULT_STREAM_EVENT_MIN_CONFIDENCE),
+            "stream_event_min_confidence",
+        ),
+        stream_event_max_events_per_media=_as_positive_int(
+            raw.get(
+                "stream_event_max_events_per_media",
+                DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA,
+            ),
+            "stream_event_max_events_per_media",
+        ),
+        stream_event_rules=_as_stream_event_rules(
+            raw.get("stream_event_rules", []),
+            "stream_event_rules",
         ),
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),
@@ -683,7 +756,7 @@ def remove_streamer_config(
     _require_configured_streamer(current_text, streamer_name, target)
 
     table_key = re.escape(_toml_key(streamer_name))
-    pattern = re.compile(rf"(?ms)^\[streamers\.{table_key}(?:\.[^\]]+)?\]\n.*?(?=^\[|\Z)")
+    pattern = re.compile(rf"(?ms)^\[\[?streamers\.{table_key}(?:\.[^\]]+)?\]\]?\n.*?(?=^\[|\Z)")
     updated_text, count = pattern.subn("", current_text)
     updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
     if count == 0:
@@ -823,6 +896,85 @@ def update_streamer_voice_profile_config(
             prefix = current_text.rstrip()
             updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
 
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_global_stream_event_rules_config(
+    config_path: str | Path,
+    rules: list[StreamEventRuleConfig],
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    normalized = _normalize_stream_event_rules(rules, "stream_event_rules")
+    updated_text = _replace_table_array_blocks(
+        current_text,
+        "stream_event_rules",
+        _stream_event_rules_block("stream_event_rules", normalized),
+        insert_at_root=True,
+    )
+    _validate_generated_config(target, updated_text)
+    try:
+        toml_data = tomllib.loads(updated_text)
+        _as_stream_event_rules(toml_data.get("stream_event_rules", []), "stream_event_rules")
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Generated invalid TOML for {target}: {exc}") from exc
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_streamer_stream_event_config(
+    config_path: str | Path,
+    streamer_name: str,
+    detection: StreamEventDetectionConfig | None,
+    rules: list[StreamEventRuleConfig],
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("stream event settings require a streamer")
+    _require_configured_streamer(current_text, streamer_name, target)
+    normalized_rules = _normalize_stream_event_rules(
+        rules,
+        f"streamers.{streamer_name}.stream_event_rules",
+    )
+    streamer_key = _toml_key(streamer_name)
+    detection_table = f"streamers.{streamer_key}.stream_event_detection"
+    rules_table = f"streamers.{streamer_key}.stream_event_rules"
+    updated_text = _replace_regular_table_block(
+        current_text,
+        detection_table,
+        _streamer_stream_event_detection_block(streamer_name, detection)
+        if detection is not None
+        else "",
+    )
+    updated_text = _replace_table_array_blocks(
+        updated_text,
+        rules_table,
+        _stream_event_rules_block(rules_table, normalized_rules),
+        insert_at_root=False,
+    )
     _validate_generated_config(target, updated_text)
     _validate_generated_streamers(target, updated_text)
     try:
@@ -1055,6 +1207,108 @@ def _streamer_voice_profile_block(
     return "\n".join(lines)
 
 
+def _streamer_stream_event_detection_block(
+    streamer_name: str,
+    detection: StreamEventDetectionConfig,
+) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}.stream_event_detection]"]
+    if detection.enabled is not None:
+        lines.append(f"enabled = {_toml_value(detection.enabled, 'enabled')}")
+    if detection.model:
+        lines.append(f"model = {_toml_value(detection.model, 'model')}")
+    if detection.device:
+        lines.append(f"device = {_toml_value(detection.device, 'device')}")
+    if detection.window_seconds:
+        lines.append(f"window_seconds = {_toml_value(detection.window_seconds, 'window_seconds')}")
+    if detection.hop_seconds:
+        lines.append(f"hop_seconds = {_toml_value(detection.hop_seconds, 'hop_seconds')}")
+    if detection.min_confidence >= 0:
+        lines.append(f"min_confidence = {_toml_value(detection.min_confidence, 'min_confidence')}")
+    if detection.max_events_per_media:
+        lines.append(f"max_events_per_media = {detection.max_events_per_media}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def _stream_event_rules_block(
+    table_name: str,
+    rules: list[StreamEventRuleConfig],
+) -> str:
+    blocks: list[str] = []
+    for rule in rules:
+        lines = [f"[[{table_name}]]"]
+        lines.append(f"name = {_toml_value(rule.name, 'name')}")
+        lines.append(f"enabled = {_toml_value(rule.enabled, 'enabled')}")
+        if rule.labels:
+            lines.append(f"labels = {_toml_value(rule.labels, 'labels')}")
+        if rule.keywords:
+            lines.append(f"keywords = {_toml_value(rule.keywords, 'keywords')}")
+        if rule.min_loudness_dbfs is not None:
+            lines.append(
+                f"min_loudness_dbfs = {_toml_value(rule.min_loudness_dbfs, 'min_loudness_dbfs')}"
+            )
+        if rule.min_duration_seconds:
+            lines.append(
+                f"min_duration_seconds = {_toml_value(rule.min_duration_seconds, 'min_duration_seconds')}"
+            )
+        if rule.max_duration_seconds:
+            lines.append(
+                f"max_duration_seconds = {_toml_value(rule.max_duration_seconds, 'max_duration_seconds')}"
+            )
+        if rule.severity and rule.severity != "info":
+            lines.append(f"severity = {_toml_value(rule.severity, 'severity')}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _replace_regular_table_block(current_text: str, table_name: str, block: str) -> str:
+    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
+    updated_text, _count = pattern.subn("", current_text)
+    updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+    if not block:
+        return updated_text
+    prefix = updated_text.rstrip()
+    return (prefix + "\n\n" if prefix else "") + block + "\n"
+
+
+def _replace_table_array_blocks(
+    current_text: str,
+    table_name: str,
+    block: str,
+    *,
+    insert_at_root: bool,
+) -> str:
+    pattern = re.compile(rf"(?ms)^\[\[{re.escape(table_name)}\]\]\n.*?(?=^\[|\Z)")
+    updated_text, _count = pattern.subn("", current_text)
+    updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
+    if not block:
+        return updated_text
+    if insert_at_root:
+        return _insert_root_config_block(updated_text, ["", *block.splitlines()])
+    prefix = updated_text.rstrip()
+    return (prefix + "\n\n" if prefix else "") + block + "\n"
+
+
+def _normalize_stream_event_rules(
+    rules: list[StreamEventRuleConfig],
+    name: str,
+) -> list[StreamEventRuleConfig]:
+    raw_rules: list[dict[str, Any]] = []
+    for rule in rules:
+        raw: dict[str, Any] = {
+            "name": rule.name,
+            "enabled": rule.enabled,
+            "labels": list(rule.labels),
+            "keywords": list(rule.keywords),
+            "min_duration_seconds": rule.min_duration_seconds,
+            "max_duration_seconds": rule.max_duration_seconds,
+            "severity": rule.severity,
+        }
+        if rule.min_loudness_dbfs is not None:
+            raw["min_loudness_dbfs"] = rule.min_loudness_dbfs
+        raw_rules.append(raw)
+    return _as_stream_event_rules(raw_rules, name)
+
+
 def _channel_voice_detection_block(
     channel: str,
     voice_config: VoiceDetectionConfig,
@@ -1173,6 +1427,22 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             f"{name}.{streamer_name}.voices",
         )
 
+        raw_stream_event_detection = raw_config.get("stream_event_detection")
+        stream_event_detection = None
+        if raw_stream_event_detection is not None:
+            if not isinstance(raw_stream_event_detection, dict):
+                raise ConfigError(
+                    f"{name}.{streamer_name}.stream_event_detection must be a TOML table"
+                )
+            stream_event_detection = _as_stream_event_detection_override(
+                raw_stream_event_detection,
+                f"{name}.{streamer_name}.stream_event_detection",
+            )
+        stream_event_rules = _as_stream_event_rules(
+            raw_config.get("stream_event_rules", []),
+            f"{name}.{streamer_name}.stream_event_rules",
+        )
+
         streamers[streamer_name] = StreamerConfig(
             sources=sources,
             download_dir_name=_as_optional_str(
@@ -1182,6 +1452,8 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             voice_detection=voice_detection,
             speaker_labels=speaker_labels,
             voices=voices,
+            stream_event_detection=stream_event_detection,
+            stream_event_rules=stream_event_rules,
         )
     return streamers
 
@@ -1201,6 +1473,105 @@ def _as_voice_profiles(value: Any, name: str) -> dict[str, VoiceProfileConfig]:
             f"{name}.{voice_name}",
         )
     return profiles
+
+
+def _as_stream_event_detection_override(
+    raw: dict[str, Any],
+    name: str,
+) -> StreamEventDetectionConfig:
+    enabled = None
+    if "enabled" in raw:
+        enabled = _as_bool(raw["enabled"], f"{name}.enabled")
+    window_seconds = 0.0
+    if "window_seconds" in raw:
+        window_seconds = _as_positive_float(
+            raw["window_seconds"],
+            f"{name}.window_seconds",
+        )
+    hop_seconds = 0.0
+    if "hop_seconds" in raw:
+        hop_seconds = _as_positive_float(raw["hop_seconds"], f"{name}.hop_seconds")
+    min_confidence = -1.0
+    if "min_confidence" in raw:
+        min_confidence = _as_probability(
+            raw["min_confidence"],
+            f"{name}.min_confidence",
+        )
+    max_events_per_media = 0
+    if "max_events_per_media" in raw:
+        max_events_per_media = _as_positive_int(
+            raw["max_events_per_media"],
+            f"{name}.max_events_per_media",
+        )
+    return StreamEventDetectionConfig(
+        enabled=enabled,
+        model=_as_optional_str(raw.get("model", ""), f"{name}.model"),
+        device=_as_optional_str(raw.get("device", ""), f"{name}.device"),
+        window_seconds=window_seconds,
+        hop_seconds=hop_seconds,
+        min_confidence=min_confidence,
+        max_events_per_media=max_events_per_media,
+    )
+
+
+def _as_stream_event_rules(value: Any, name: str) -> list[StreamEventRuleConfig]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, list):
+        raise ConfigError(f"{name} must be an array of TOML tables")
+    rules: list[StreamEventRuleConfig] = []
+    seen: set[str] = set()
+    for index, raw_rule in enumerate(value, start=1):
+        rule_name = f"{name}[{index}]"
+        if not isinstance(raw_rule, dict):
+            raise ConfigError(f"{rule_name} must be a TOML table")
+        rule = _as_stream_event_rule(raw_rule, rule_name)
+        key = rule.name.casefold()
+        if key in seen:
+            raise ConfigError(f"{name} duplicates rule name: {rule.name}")
+        seen.add(key)
+        rules.append(rule)
+    return rules
+
+
+def _as_stream_event_rule(raw: dict[str, Any], name: str) -> StreamEventRuleConfig:
+    rule_name = _as_str(raw.get("name", ""), f"{name}.name").strip()
+    if not rule_name:
+        raise ConfigError(f"{name}.name is required")
+    labels = _as_optional_str_list(raw.get("labels", []), f"{name}.labels")
+    keywords = _as_optional_str_list(raw.get("keywords", []), f"{name}.keywords")
+    min_loudness_dbfs = None
+    if "min_loudness_dbfs" in raw:
+        min_loudness_dbfs = _as_float(
+            raw["min_loudness_dbfs"],
+            f"{name}.min_loudness_dbfs",
+        )
+    min_duration_seconds = _as_non_negative_float(
+        raw.get("min_duration_seconds", 0.0),
+        f"{name}.min_duration_seconds",
+    )
+    max_duration_seconds = _as_non_negative_float(
+        raw.get("max_duration_seconds", 0.0),
+        f"{name}.max_duration_seconds",
+    )
+    if max_duration_seconds and min_duration_seconds > max_duration_seconds:
+        raise ConfigError(
+            f"{name}.min_duration_seconds must be less than or equal to max_duration_seconds"
+        )
+    if not labels and not keywords and min_loudness_dbfs is None:
+        raise ConfigError(
+            f"{name} must define labels, keywords, or min_loudness_dbfs"
+        )
+    return StreamEventRuleConfig(
+        name=rule_name,
+        enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
+        labels=labels,
+        keywords=keywords,
+        min_loudness_dbfs=min_loudness_dbfs,
+        min_duration_seconds=min_duration_seconds,
+        max_duration_seconds=max_duration_seconds,
+        severity=_as_optional_str(raw.get("severity", "info"), f"{name}.severity") or "info",
+    )
 
 
 def _as_voice_profile_config(raw: dict[str, Any], name: str) -> VoiceProfileConfig:
@@ -1407,6 +1778,19 @@ def _as_positive_float(value: Any, name: str) -> float:
     return float(value)
 
 
+def _as_float(value: Any, name: str) -> float:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ConfigError(f"{name} must be a number")
+    return float(value)
+
+
+def _as_probability(value: Any, name: str) -> float:
+    parsed = _as_float(value, name)
+    if parsed < 0.0 or parsed > 1.0:
+        raise ConfigError(f"{name} must be between 0 and 1")
+    return parsed
+
+
 def _as_non_negative_int(value: Any, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
         raise ConfigError(f"{name} must be a non-negative integer")
@@ -1486,6 +1870,12 @@ def _as_str_list(value: Any, name: str) -> list[str]:
             raise ConfigError(f"{name}[{index}] must be a non-empty string")
         result.append(item.strip())
     return result
+
+
+def _as_optional_str_list(value: Any, name: str) -> list[str]:
+    if value in (None, ""):
+        return []
+    return _as_str_list(value, name)
 
 
 def _as_source_list(value: Any, name: str) -> list[str]:

@@ -34,9 +34,18 @@ from .chat_render import (
 )
 from .chat_refresh import refresh_chat_sidecar
 from .chat_timing import is_chat_timing_file
+from .content_events import (
+    ContentEventDetectorUnavailable,
+    content_event_detector_status,
+    content_events_exist,
+    detect_content_events_for_media,
+    load_content_events,
+)
 from .config import (
     BotConfig,
     ConfigError,
+    StreamEventDetectionConfig,
+    StreamEventRuleConfig,
     VoiceDetectionConfig,
     VoiceProfileConfig,
     add_voice_sample_to_profile,
@@ -47,8 +56,10 @@ from .config import (
     update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
     update_config_values,
+    update_global_stream_event_rules_config,
     update_streamer_config,
     update_streamer_speaker_labels_config,
+    update_streamer_stream_event_config,
     update_streamer_voice_detection_config,
     update_streamer_voice_profile_config,
     sanitize_voice_sample_filename,
@@ -57,6 +68,7 @@ from .config import (
 )
 from .downloader import (
     command_for_log,
+    cleanup_files,
     is_live_chat_file,
     is_yt_dlp_temporary_file,
     log_process_output,
@@ -215,6 +227,8 @@ CHAT_REFRESH_JOBS: dict[str, RefreshChatJob] = {}
 CHAT_REFRESH_JOBS_LOCK = Lock()
 TRANSCRIPTION_JOBS: dict[str, TranscriptionJob] = {}
 TRANSCRIPTION_JOBS_LOCK = Lock()
+EVENT_DETECTION_JOBS: dict[str, EventDetectionJob] = {}
+EVENT_DETECTION_JOBS_LOCK = Lock()
 WATERMARK_JOB_STATUSES = {
     WATERMARK_STATUS_DONE,
     WATERMARK_STATUS_FAILED,
@@ -252,6 +266,9 @@ class FileStatus:
     transcription_url: str | None
     transcription_status: str | None
     transcription_message: str | None
+    event_detection_url: str | None
+    event_detection_status: str | None
+    event_detection_message: str | None
     watermark_url: str | None
     watermark_copies: list[WatermarkCopyStatus]
 
@@ -317,6 +334,19 @@ class TranscriptionJob:
 
 
 @dataclass(frozen=True, slots=True)
+class EventDetectionJob:
+    video_id: str
+    media_name: str
+    status: str
+    message: str
+    started_at: float
+    finished_at: float | None = None
+    phase: str = ""
+    progress: float | None = None
+    updated_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class JobStatus:
     job_id: str
     kind: str
@@ -339,6 +369,21 @@ class StreamEventStatus:
     message: str
     segment_index: int | None
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class ContentEventStatus:
+    media_name: str
+    start: float
+    end: float
+    duration: float
+    rule: str
+    severity: str
+    score: float
+    loudness_dbfs: float | None
+    labels: list[dict[str, Any]]
+    keywords: list[str]
+    text: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +415,8 @@ class StreamStatus:
     has_part_files: bool
     has_mixed_formats: bool
     events: list[StreamEventStatus]
+    content_event_count: int
+    content_events: list[ContentEventStatus]
     jobs: list[JobStatus]
     files: list[FileStatus]
 
@@ -421,6 +468,8 @@ class StreamerStatus:
     voice_detection: str
     speaker_label_count: int
     voices: list[VoiceProfileStatus]
+    stream_event_detection: dict[str, Any]
+    stream_event_rules: list[dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +482,8 @@ class StreamerStatStatus:
     voice_detection: str
     speaker_label_count: int
     voices: list[VoiceProfileStatus]
+    stream_event_detection: dict[str, Any]
+    stream_event_rules: list[dict[str, Any]]
     stream_count: int
     active_count: int
     checking_count: int
@@ -532,6 +583,13 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("voice_match_threshold", "Transcription", "float", minimum=0),
     ConfigFormField("voice_match_min_margin", "Transcription", "float", minimum=0),
     ConfigFormField("voice_sample_max_bytes", "Transcription", "int", minimum=1),
+    ConfigFormField("stream_event_detection_enabled", "Content Events", "bool"),
+    ConfigFormField("stream_event_model", "Content Events", "text"),
+    ConfigFormField("stream_event_device", "Content Events", "text"),
+    ConfigFormField("stream_event_window_seconds", "Content Events", "float", minimum=0.001),
+    ConfigFormField("stream_event_hop_seconds", "Content Events", "float", minimum=0.001),
+    ConfigFormField("stream_event_min_confidence", "Content Events", "float", minimum=0),
+    ConfigFormField("stream_event_max_events_per_media", "Content Events", "int", minimum=1),
     ConfigFormField("web_enabled", "Web", "bool"),
     ConfigFormField("web_host", "Web", "text"),
     ConfigFormField("web_port", "Web", "int", minimum=1),
@@ -659,8 +717,17 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             if parts.path == "/transcribe":
                 self._start_transcription(parts.query)
                 return
+            if parts.path == "/cleanup-fragments":
+                self._cleanup_fragments(parts.query)
+                return
+            if parts.path == "/detect-events":
+                self._start_event_detection(parts.query)
+                return
             if parts.path == "/voice-detection":
                 self._update_voice_detection()
+                return
+            if parts.path == "/stream-event-rules":
+                self._update_stream_event_rules()
                 return
             if parts.path == "/speaker-labels":
                 self._update_speaker_labels()
@@ -834,6 +901,54 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
+        def _cleanup_fragments(self, query: str) -> None:
+            self._discard_request_body()
+            params = parse_qs(query)
+            video_id = first_query_value(params, "video_id")
+            try:
+                count, bytes_removed = cleanup_stream_fragments(config, video_id)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            LOGGER.info(
+                "Cleaned stream fragments video_id=%s files=%s bytes=%s",
+                video_id,
+                count,
+                bytes_removed,
+            )
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _start_event_detection(self, query: str) -> None:
+            self._discard_request_body()
+            params = parse_qs(query)
+            video_id = first_query_value(params, "video_id")
+            filename = first_query_value(params, "name")
+            regenerate = first_query_value(params, "regenerate").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            ok, message = start_event_detection_job(
+                config,
+                video_id,
+                filename,
+                regenerate=regenerate,
+            )
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
         def _update_voice_detection(self) -> None:
             body = self._read_request_body(32 * 1024)
             if body is None:
@@ -841,6 +956,26 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             try:
                 params = parse_qs(body.decode("utf-8", "replace"))
                 update_voice_detection_from_form(config, params)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#config")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _update_stream_event_rules(self) -> None:
+            body = self._read_request_body(128 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+                update_stream_event_rules_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -1214,6 +1349,8 @@ def build_job_statuses(
         refresh_jobs = list(CHAT_REFRESH_JOBS.values())
     with TRANSCRIPTION_JOBS_LOCK:
         transcription_jobs = list(TRANSCRIPTION_JOBS.values())
+    with EVENT_DETECTION_JOBS_LOCK:
+        event_detection_jobs = list(EVENT_DETECTION_JOBS.values())
 
     for job in render_jobs:
         jobs.append(
@@ -1260,6 +1397,23 @@ def build_job_statuses(
                 video_id=job.video_id,
                 item=job.media_name,
                 detail="WhisperX subtitles",
+                message=job.message,
+                started_at=job.started_at,
+                updated_at=job.updated_at or job.finished_at or job.started_at,
+                finished_at=job.finished_at,
+            )
+        )
+    for job in event_detection_jobs:
+        jobs.append(
+            JobStatus(
+                job_id=f"event-detection:{job.video_id}:{job.media_name}",
+                kind="Event detection",
+                status=job.status,
+                phase=job.phase or job.message,
+                progress=job.progress,
+                video_id=job.video_id,
+                item=job.media_name,
+                detail="Content events",
                 message=job.message,
                 started_at=job.started_at,
                 updated_at=job.updated_at or job.finished_at or job.started_at,
@@ -1382,6 +1536,17 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "voice_sample_max_bytes": config.voice_sample_max_bytes,
             "voice_match_backend": voice_matcher_status(config),
         },
+        "Content Events": {
+            "stream_event_detection_enabled": config.stream_event_detection_enabled,
+            "stream_event_model": config.stream_event_model,
+            "stream_event_device": config.stream_event_device,
+            "stream_event_window_seconds": config.stream_event_window_seconds,
+            "stream_event_hop_seconds": config.stream_event_hop_seconds,
+            "stream_event_min_confidence": config.stream_event_min_confidence,
+            "stream_event_max_events_per_media": config.stream_event_max_events_per_media,
+            "backend": content_event_detector_status(config),
+            "rules": [stream_event_rule_summary(rule) for rule in config.stream_event_rules],
+        },
         "Watermark": {
             "watermark_enabled": config.watermark_enabled,
             "watermark_secret_env": config.watermark_secret_env,
@@ -1416,6 +1581,35 @@ def voice_profile_statuses(voices: dict[str, VoiceProfileConfig]) -> list[VoiceP
     ]
 
 
+def stream_event_rule_summary(rule: StreamEventRuleConfig) -> dict[str, Any]:
+    return {
+        "name": rule.name,
+        "enabled": rule.enabled,
+        "labels": list(rule.labels),
+        "keywords": list(rule.keywords),
+        "min_loudness_dbfs": rule.min_loudness_dbfs,
+        "min_duration_seconds": rule.min_duration_seconds,
+        "max_duration_seconds": rule.max_duration_seconds,
+        "severity": rule.severity,
+    }
+
+
+def stream_event_detection_summary(
+    detection: StreamEventDetectionConfig | None,
+) -> dict[str, Any]:
+    if detection is None:
+        return {}
+    return {
+        "enabled": detection.enabled,
+        "model": detection.model,
+        "device": detection.device,
+        "window_seconds": detection.window_seconds,
+        "hop_seconds": detection.hop_seconds,
+        "min_confidence": detection.min_confidence,
+        "max_events_per_media": detection.max_events_per_media,
+    }
+
+
 def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
     return [
         StreamerStatus(
@@ -1429,6 +1623,13 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
             ),
             speaker_label_count=len(streamer.speaker_labels),
             voices=voice_profile_statuses(streamer.voices),
+            stream_event_detection=stream_event_detection_summary(
+                streamer.stream_event_detection
+            ),
+            stream_event_rules=[
+                stream_event_rule_summary(rule)
+                for rule in streamer.stream_event_rules
+            ],
         )
         for name, streamer in sorted(config.streamers.items())
     ]
@@ -1470,6 +1671,13 @@ def build_streamer_stats(
                 voice_detection=voice_detection,
                 speaker_label_count=len(streamer.speaker_labels),
                 voices=voice_profile_statuses(streamer.voices),
+                stream_event_detection=stream_event_detection_summary(
+                    streamer.stream_event_detection
+                ),
+                stream_event_rules=[
+                    stream_event_rule_summary(rule)
+                    for rule in streamer.stream_event_rules
+                ],
                 jobs=jobs_for_streams(jobs, streamer_streams),
                 streams=streamer_streams,
             )
@@ -1499,6 +1707,8 @@ def build_streamer_stats(
                 voice_detection=voice_detection_summary_for_source_group(config, name, sources),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
                 voices=[],
+                stream_event_detection={},
+                stream_event_rules=[],
                 jobs=jobs_for_streams(jobs, group_streams),
                 streams=group_streams,
             )
@@ -1518,6 +1728,8 @@ def build_streamer_stats(
                 voice_detection=voice_detection_summary_for_source_group(config, name, []),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, []),
                 voices=[],
+                stream_event_detection={},
+                stream_event_rules=[],
                 jobs=jobs_for_streams(jobs, group_streams),
                 streams=group_streams,
             )
@@ -1535,6 +1747,8 @@ def streamer_stat_from_channel_status(
     voice_detection: str,
     speaker_label_count: int,
     voices: list[VoiceProfileStatus],
+    stream_event_detection: dict[str, Any],
+    stream_event_rules: list[dict[str, Any]],
     jobs: list[JobStatus],
     streams: list[StreamStatus],
 ) -> StreamerStatStatus:
@@ -1553,6 +1767,8 @@ def streamer_stat_from_channel_status(
         voice_detection=voice_detection,
         speaker_label_count=speaker_label_count,
         voices=list(voices),
+        stream_event_detection=dict(stream_event_detection),
+        stream_event_rules=list(stream_event_rules),
         stream_count=status.stream_count,
         active_count=status.active_count,
         checking_count=status.checking_count,
@@ -1863,8 +2079,53 @@ def transcript_json_files(directory: Path) -> list[Path]:
         for path in directory.glob("*.json")
         if path.is_file()
         and not path.name.endswith(".voice-attribution.json")
+        and not path.name.endswith(".stream-events.json")
         and not is_live_chat_file(path.name)
         and not is_chat_timing_file(path.name)
+    )
+
+
+def content_event_statuses_for_directory(directory: Path) -> list[ContentEventStatus]:
+    if not directory.is_dir():
+        return []
+    rows: list[ContentEventStatus] = []
+    for sidecar in sorted(directory.glob("*.stream-events.json")):
+        try:
+            raw_payload = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        payload = raw_payload if isinstance(raw_payload, dict) else {}
+        media_name = str(
+            payload.get("media")
+            or sidecar.name.removesuffix(".stream-events.json")
+        )
+        payload_events = [
+            event
+            for event in payload.get("events", [])
+            if isinstance(event, dict)
+        ]
+        for event in payload_events:
+            rows.append(content_event_status(media_name, event))
+    return sorted(rows, key=lambda item: item.start)
+
+
+def content_event_status(media_name: str, event: dict[str, Any]) -> ContentEventStatus:
+    return ContentEventStatus(
+        media_name=media_name,
+        start=float(event.get("start") or 0.0),
+        end=float(event.get("end") or 0.0),
+        duration=float(event.get("duration") or 0.0),
+        rule=str(event.get("rule") or ""),
+        severity=str(event.get("severity") or "info"),
+        score=float(event.get("score") or 0.0),
+        loudness_dbfs=(
+            float(event["loudness_dbfs"])
+            if event.get("loudness_dbfs") is not None
+            else None
+        ),
+        labels=[label for label in event.get("labels", []) if isinstance(label, dict)],
+        keywords=[str(keyword) for keyword in event.get("keywords", [])],
+        text=str(event.get("text") or ""),
     )
 
 
@@ -1888,6 +2149,7 @@ def stream_status_from_record(
     bytes_by_kind = summarize_bytes_by_kind(files)
     counts_by_kind = summarize_counts_by_kind(files)
     latest_file_modified_at = max((file.modified_at for file in files), default=None)
+    content_events = content_event_statuses_for_directory(directory)
     return StreamStatus(
         video_id=record.video_id,
         title=record.title,
@@ -1928,6 +2190,8 @@ def stream_status_from_record(
             record.channel,
         ),
         events=[stream_event_status(event) for event in event_records or []],
+        content_event_count=len(content_events),
+        content_events=content_events,
         jobs=list(job_records or []),
         files=files[:FILE_LIMIT_PER_STREAM],
     )
@@ -1981,6 +2245,9 @@ def summarize_files(
         transcription_url, transcription_status, transcription_message = (
             transcription_action_for_file(directory, video_id, path.name)
         )
+        event_detection_url, event_detection_status, event_detection_message = (
+            event_detection_action_for_file(config, directory, video_id, path.name)
+        )
         watermark_copies = [
             watermark_copy_status(copy)
             for copy in watermarks_by_source.get(path.name, [])
@@ -2008,6 +2275,9 @@ def summarize_files(
                 transcription_url=transcription_url,
                 transcription_status=transcription_status,
                 transcription_message=transcription_message,
+                event_detection_url=event_detection_url,
+                event_detection_status=event_detection_status,
+                event_detection_message=event_detection_message,
                 watermark_url=watermark_url_for(video_id, path.name)
                 if watermark_enabled and is_watermarkable_media_file(path.name)
                 else None,
@@ -2047,6 +2317,18 @@ def transcription_url_for(
     if regenerate:
         params["regenerate"] = "1"
     return "/transcribe?" + urlencode(params)
+
+
+def event_detection_url_for(
+    video_id: str,
+    filename: str,
+    *,
+    regenerate: bool = False,
+) -> str:
+    params = {"video_id": video_id, "name": filename}
+    if regenerate:
+        params["regenerate"] = "1"
+    return "/detect-events?" + urlencode(params)
 
 
 def watermark_url_for(video_id: str, filename: str) -> str:
@@ -2171,6 +2453,68 @@ def resolve_download_file(
     if not candidate_path.is_file() or not is_downloadable_file(candidate_path.name):
         return None
     return candidate_path
+
+
+FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
+    "checking_after_exit",
+    "downloading",
+    "waiting_retry",
+}
+
+
+def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int]:
+    if not video_id:
+        raise ConfigError("Missing stream id")
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+    finally:
+        state.close()
+    if record is None:
+        raise ConfigError("Stream was not found")
+    if record.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
+        raise ConfigError("Cannot clean fragments while the stream may still resume")
+
+    directory = segment_directory(config, record.video_id, record.channel)
+    try:
+        directory_path = directory.resolve(strict=True)
+    except OSError:
+        return 0, 0
+
+    try:
+        candidates = list(directory_path.iterdir())
+    except OSError:
+        return 0, 0
+
+    fragments: list[Path] = []
+    for path in candidates:
+        if path.is_symlink() or not path.is_file() or file_kind(path.name) != "fragment":
+            continue
+        try:
+            candidate = path.resolve(strict=True)
+        except OSError:
+            continue
+        if candidate.parent == directory_path:
+            fragments.append(path)
+
+    bytes_removed = 0
+    for path in fragments:
+        try:
+            bytes_removed += path.stat().st_size
+        except OSError:
+            continue
+    cleanup_files(fragments, LOGGER)
+
+    state = StateStore(config.db_path)
+    try:
+        state.add_stream_event(
+            record.video_id,
+            f"Cleaned {len(fragments)} fragment file(s), freed {format_bytes(bytes_removed)}",
+        )
+    finally:
+        state.close()
+    return len(fragments), bytes_removed
 
 
 def resolve_watermark_download_file(
@@ -2484,6 +2828,41 @@ def transcription_action_for_file(
             None,
         )
     return transcription_url_for(video_id, filename), "ready", None
+
+
+def event_detection_action_for_file(
+    config: BotConfig,
+    directory: Path,
+    video_id: str,
+    filename: str,
+) -> tuple[str | None, str | None, str | None]:
+    if not is_transcribable_media_file(filename):
+        return None, None, None
+    if not config.stream_event_detection_enabled:
+        return None, None, None
+
+    media_file = directory / filename
+    if not media_file.is_file():
+        return None, None, None
+
+    job = event_detection_job_for(video_id, filename)
+    if job is not None and job.status == "running":
+        return None, "running", job.message
+
+    has_outputs = content_events_exist(media_file)
+    if job is not None and job.status == "failed":
+        return (
+            event_detection_url_for(video_id, filename, regenerate=has_outputs),
+            "failed",
+            job.message,
+        )
+    if has_outputs:
+        return (
+            event_detection_url_for(video_id, filename, regenerate=True),
+            "detected",
+            None,
+        )
+    return event_detection_url_for(video_id, filename), "ready", None
 
 
 def record_stream_event(
@@ -3367,6 +3746,143 @@ def update_voice_detection_from_form(
     raise ConfigError("Unknown voice detection scope")
 
 
+def update_stream_event_rules_from_form(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    scope = (first_query_value(params, "scope") or "global").strip().lower()
+    rules = stream_event_rules_from_form(params)
+    if scope == "global":
+        update_global_stream_event_rules_config(config.config_path, rules)
+        reload_running_config(config)
+        return
+    if scope == "streamer":
+        streamer_name = first_query_value(params, "streamer_name").strip()
+        if streamer_name not in config.streamers:
+            raise ConfigError(f"streamer is not configured: {streamer_name}")
+        detection = streamer_event_detection_from_form(params)
+        update_streamer_stream_event_config(
+            config.config_path,
+            streamer_name,
+            detection,
+            rules,
+        )
+        reload_running_config(config)
+        return
+    raise ConfigError("Unknown content event settings scope")
+
+
+def stream_event_rules_from_form(
+    params: dict[str, list[str]],
+) -> list[StreamEventRuleConfig]:
+    names = params.get("rule_name", [])
+    count = max(
+        len(names),
+        len(params.get("rule_enabled", [])),
+        len(params.get("rule_labels", [])),
+        len(params.get("rule_keywords", [])),
+        len(params.get("rule_min_loudness_dbfs", [])),
+        len(params.get("rule_min_duration_seconds", [])),
+        len(params.get("rule_max_duration_seconds", [])),
+        len(params.get("rule_severity", [])),
+    )
+    rules: list[StreamEventRuleConfig] = []
+    for index in range(count):
+        name = form_list_value(params, "rule_name", index).strip()
+        enabled_text = form_list_value(params, "rule_enabled", index) or "true"
+        labels_text = form_list_value(params, "rule_labels", index)
+        keywords_text = form_list_value(params, "rule_keywords", index)
+        loudness_text = form_list_value(params, "rule_min_loudness_dbfs", index)
+        min_duration_text = form_list_value(params, "rule_min_duration_seconds", index)
+        max_duration_text = form_list_value(params, "rule_max_duration_seconds", index)
+        severity = form_list_value(params, "rule_severity", index).strip() or "info"
+        if not any(
+            item.strip()
+            for item in (
+                name,
+                labels_text,
+                keywords_text,
+                loudness_text,
+                min_duration_text,
+                max_duration_text,
+            )
+        ):
+            continue
+        if not name:
+            raise ConfigError("content event rule name is required")
+        rules.append(
+            StreamEventRuleConfig(
+                name=name,
+                enabled=form_bool(enabled_text, "rule enabled"),
+                labels=form_string_list(labels_text, "rule labels"),
+                keywords=form_string_list(keywords_text, "rule keywords"),
+                min_loudness_dbfs=optional_signed_form_float(
+                    loudness_text,
+                    "rule min_loudness_dbfs",
+                ),
+                min_duration_seconds=optional_form_float(
+                    min_duration_text,
+                    "rule min_duration_seconds",
+                ),
+                max_duration_seconds=optional_form_float(
+                    max_duration_text,
+                    "rule max_duration_seconds",
+                ),
+                severity=severity,
+            )
+        )
+    return rules
+
+
+def streamer_event_detection_from_form(
+    params: dict[str, list[str]],
+) -> StreamEventDetectionConfig | None:
+    mode = (first_query_value(params, "event_enabled") or "inherit").strip().lower()
+    if mode not in {"inherit", "true", "false"}:
+        raise ConfigError("event_enabled must be inherit, true, or false")
+    model = first_query_value(params, "event_model").strip()
+    device = first_query_value(params, "event_device").strip()
+    window = optional_form_float(first_query_value(params, "event_window_seconds"), "event_window_seconds")
+    hop = optional_form_float(first_query_value(params, "event_hop_seconds"), "event_hop_seconds")
+    min_confidence = optional_probability_form_float(
+        first_query_value(params, "event_min_confidence"),
+        "event_min_confidence",
+    )
+    max_events = optional_form_int(
+        first_query_value(params, "event_max_events_per_media"),
+        "event_max_events_per_media",
+    )
+    enabled = None if mode == "inherit" else mode == "true"
+    if (
+        enabled is None
+        and not model
+        and not device
+        and not window
+        and not hop
+        and min_confidence < 0
+        and not max_events
+    ):
+        return None
+    return StreamEventDetectionConfig(
+        enabled=enabled,
+        model=model,
+        device=device,
+        window_seconds=window,
+        hop_seconds=hop,
+        min_confidence=min_confidence,
+        max_events_per_media=max_events,
+    )
+
+
+def form_list_value(params: dict[str, list[str]], key: str, index: int) -> str:
+    values = params.get(key, [])
+    if index >= len(values):
+        return ""
+    return values[index]
+
+
 def update_streamer_voice_from_form(
     config: BotConfig,
     params: dict[str, list[str]],
@@ -3437,6 +3953,33 @@ def optional_form_float(value: str, name: str) -> float:
     if parsed < 0:
         raise ConfigError(f"{name} must not be negative")
     return parsed
+
+
+def optional_signed_form_float(value: str, name: str) -> float | None:
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number") from exc
+
+
+def optional_probability_form_float(value: str, name: str) -> float:
+    raw = value.strip()
+    if not raw:
+        return -1.0
+    parsed = form_float(raw, name, minimum=0)
+    if parsed > 1:
+        raise ConfigError(f"{name} must be between 0 and 1")
+    return parsed
+
+
+def optional_form_int(value: str, name: str) -> int:
+    raw = value.strip()
+    if not raw:
+        return 0
+    return form_int(raw, name, minimum=1)
 
 
 def store_streamer_voice_sample_upload(
@@ -3886,6 +4429,182 @@ def update_transcription_job(key: str, **changes: Any) -> None:
         )
 
 
+def start_event_detection_job(
+    config: BotConfig,
+    video_id: str,
+    filename: str,
+    *,
+    regenerate: bool = False,
+) -> tuple[bool, str]:
+    if not config.stream_event_detection_enabled:
+        return False, "Content event detection is disabled in config"
+    resolved = resolve_transcription_source_file(config, video_id, filename)
+    if resolved is None:
+        return False, "No matching finalized media file found"
+
+    record, media_file = resolved
+    if content_events_exist(media_file) and not regenerate:
+        return True, "Content events already detected"
+
+    key = event_detection_job_key(video_id, media_file.name)
+    now = time.time()
+    with EVENT_DETECTION_JOBS_LOCK:
+        existing = EVENT_DETECTION_JOBS.get(key)
+        if existing is not None and existing.status == "running":
+            return True, "Content event detection is already running"
+        EVENT_DETECTION_JOBS[key] = EventDetectionJob(
+            video_id=video_id,
+            media_name=media_file.name,
+            status="running",
+            message=("Redetecting content events" if regenerate else "Detecting content events"),
+            started_at=now,
+            phase="Queued",
+            progress=0.0,
+            updated_at=now,
+        )
+
+    record_stream_event(
+        config,
+        video_id,
+        ("Queued content event redetection" if regenerate else "Queued content event detection")
+        + f" for {media_file.name}",
+        segment_index=record.segment_index,
+    )
+    thread = Thread(
+        target=run_event_detection_job,
+        args=(config, key, media_file, regenerate, record.channel),
+        name=f"onlysavemevods-events-{video_id}",
+        daemon=True,
+    )
+    thread.start()
+    LOGGER.info(
+        "Queued manual content event %s for %s using media=%s",
+        "redetection" if regenerate else "detection",
+        video_id,
+        media_file.name,
+    )
+    return True, "Content event redetection queued" if regenerate else "Content event detection queued"
+
+
+def run_event_detection_job(
+    config: BotConfig,
+    key: str,
+    media_file: Path,
+    regenerate: bool = False,
+    channel: str = "",
+) -> None:
+    def progress(phase: str, value: float | None = None) -> None:
+        update_event_detection_job(
+            key,
+            phase=phase,
+            progress=value,
+            message=phase,
+            updated_at=time.time(),
+        )
+
+    progress("Starting content event detection", 0.02)
+    try:
+        ok = detect_content_events_for_media(
+            config,
+            media_file,
+            overwrite=regenerate,
+            logger=LOGGER,
+            progress_callback=progress,
+            channel=channel,
+        )
+    except ContentEventDetectorUnavailable as exc:
+        message = str(exc) or exc.__class__.__name__
+        update_event_detection_job(
+            key,
+            status="failed",
+            message=message,
+            phase="Unavailable",
+            finished_at=time.time(),
+            updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Content event detection unavailable for {media_file.name}: {message}",
+            level="warning",
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 - background job must capture failures.
+        LOGGER.exception("Content event detection failed for media=%s", media_file)
+        message = str(exc) or exc.__class__.__name__
+        update_event_detection_job(
+            key,
+            status="failed",
+            message=message,
+            phase="Failed",
+            finished_at=time.time(),
+            updated_at=time.time(),
+        )
+        record_stream_event(
+            config,
+            video_id_from_job_key(key),
+            f"Content event detection failed for {media_file.name}: {message}",
+            level="error",
+        )
+        return
+
+    if not ok:
+        message = "Content event detection did not run"
+        update_event_detection_job(
+            key,
+            status="failed",
+            message=message,
+            phase="Skipped",
+            finished_at=time.time(),
+            updated_at=time.time(),
+        )
+        return
+
+    finished = time.time()
+    events = load_content_events(media_file)
+    update_event_detection_job(
+        key,
+        status="done",
+        message=f"Detected {len(events)} content event(s)",
+        phase="Complete",
+        progress=1.0,
+        finished_at=finished,
+        updated_at=finished,
+    )
+    record_stream_event(
+        config,
+        video_id_from_job_key(key),
+        f"Content event detection completed for {media_file.name}: {len(events)} event(s)",
+    )
+
+
+def event_detection_job_key(video_id: str, filename: str) -> str:
+    return f"{video_id}\0{filename}"
+
+
+def event_detection_job_for(video_id: str, filename: str) -> EventDetectionJob | None:
+    with EVENT_DETECTION_JOBS_LOCK:
+        return EVENT_DETECTION_JOBS.get(event_detection_job_key(video_id, filename))
+
+
+def update_event_detection_job(key: str, **changes: Any) -> None:
+    with EVENT_DETECTION_JOBS_LOCK:
+        job = EVENT_DETECTION_JOBS.get(key)
+        if job is None:
+            return
+        EVENT_DETECTION_JOBS[key] = EventDetectionJob(
+            video_id=changes.get("video_id", job.video_id),
+            media_name=changes.get("media_name", job.media_name),
+            status=changes.get("status", job.status),
+            message=changes.get("message", job.message),
+            started_at=changes.get("started_at", job.started_at),
+            finished_at=changes.get("finished_at", job.finished_at),
+            phase=changes.get("phase", job.phase),
+            progress=changes.get("progress", job.progress),
+            updated_at=changes.get("updated_at", job.updated_at),
+        )
+
+
 def start_watermark_job(
     config: BotConfig,
     video_id: str,
@@ -4087,7 +4806,11 @@ def file_kind(name: str) -> str:
         return "part"
     if name.endswith(".ytdl"):
         return "state"
-    if is_chat_timing_file(name) or name.endswith(".voice-attribution.json"):
+    if (
+        is_chat_timing_file(name)
+        or name.endswith(".voice-attribution.json")
+        or name.endswith(".stream-events.json")
+    ):
         return "state"
     if is_live_chat_file(name):
         return "chat"
@@ -4119,6 +4842,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     streamer_cards = render_streamer_dashboard(snapshot)
     job_rows = render_job_rows(snapshot.jobs)
     config_sections = render_config_sections(snapshot.configuration)
+    content_event_rules_panel = render_content_event_rules_panel(snapshot)
     voice_detection_panel = render_voice_detection_panel(snapshot)
     speaker_labels_panel = render_speaker_labels_panel(snapshot)
     app_config_form = render_app_config_form(snapshot)
@@ -4505,6 +5229,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .stream-tab-panel {{ display: none; }}
     .stream-tab-files-toggle:checked ~ .stream-tab-labels .stream-tab-files-label,
+    .stream-tab-events-toggle:checked ~ .stream-tab-labels .stream-tab-events-label,
     .stream-tab-log-toggle:checked ~ .stream-tab-labels .stream-tab-log-label,
     .stream-tab-jobs-toggle:checked ~ .stream-tab-labels .stream-tab-jobs-label {{
       color: var(--text);
@@ -4512,8 +5237,27 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       font-weight: 650;
     }}
     .stream-tab-files-toggle:checked ~ .stream-tab-panels .stream-tab-files,
+    .stream-tab-events-toggle:checked ~ .stream-tab-panels .stream-tab-events,
     .stream-tab-log-toggle:checked ~ .stream-tab-panels .stream-tab-log,
     .stream-tab-jobs-toggle:checked ~ .stream-tab-panels .stream-tab-jobs {{ display: block; }}
+    .content-events {{ display: grid; gap: 8px; }}
+    .content-event {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr) minmax(180px, 0.4fr);
+      gap: 12px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--active);
+      border-radius: 7px;
+      padding: 9px 10px;
+      background: var(--panel-strong);
+    }}
+    .content-event.warning {{ border-left-color: var(--warn); }}
+    .content-event.error {{ border-left-color: var(--bad); }}
+    .content-event-time {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
+    .content-event-main {{ min-width: 0; }}
+    .content-event-main strong {{ margin-right: 8px; }}
+    .content-event-meta {{ display: grid; gap: 4px; color: var(--muted); min-width: 0; }}
     .stream-events {{
       display: grid;
       gap: 8px;
@@ -4968,6 +5712,18 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       align-items: end;
     }}
+    .event-rule-list {{ display: grid; gap: 8px; margin-top: 10px; }}
+    .event-rule-head, .event-rule-row {{
+      display: grid;
+      grid-template-columns: minmax(130px, 1fr) 90px minmax(170px, 1.1fr) minmax(170px, 1.1fr) 100px minmax(150px, 0.8fr) 100px;
+      gap: 8px;
+      align-items: center;
+    }}
+    .event-rule-head {{ color: var(--muted); font-size: 0.82rem; font-weight: 650; }}
+    .event-rule-row input, .event-rule-row select {{ width: 100%; min-width: 0; }}
+    .duration-pair {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
+    .streamer-event-settings {{ margin-top: 12px; }}
+    .compact-grid {{ grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }}
     .voice-profile-form textarea {{
       min-height: 68px;
       resize: vertical;
@@ -5117,6 +5873,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <h2>Current Configuration</h2>
       <div class="file-meta">Sensitive yt-dlp arguments are redacted before display.</div>
       {app_config_form}
+      {content_event_rules_panel}
       {voice_detection_panel}
       {speaker_labels_panel}
       <div class="config-stack" id="config-sections">
@@ -5557,7 +6314,7 @@ def dashboard_script() -> str:
     for (const card of root.querySelectorAll(".stream[data-video-id]")) {
       const videoId = card.getAttribute("data-video-id") || "";
       const selected = selectedStreamTabs[videoId];
-      if (!["files", "log", "jobs"].includes(selected)) continue;
+      if (!["files", "events", "log", "jobs"].includes(selected)) continue;
       const input = card.querySelector(`[data-stream-tab="${selected}"]`);
       if (input) input.checked = true;
     }
@@ -5800,6 +6557,31 @@ def dashboard_script() -> str:
     return `<div class="stream-events">${rows}</div>`;
   };
 
+  const formatEventOffset = (seconds) => {
+    seconds = Math.max(0, Math.trunc(Number(seconds) || 0));
+    const hours = Math.trunc(seconds / 3600);
+    const minutes = Math.trunc((seconds % 3600) / 60);
+    const secs = seconds % 60;
+    if (hours) return `${hours}:${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+    return `${minutes}:${String(secs).padStart(2, "0")}`;
+  };
+
+  const renderContentEvents = (events) => {
+    events = events || [];
+    if (!events.length) return '<div class="file-meta">No content events detected yet.</div>';
+    const rows = events.slice().sort((a, b) => Number(b.score || 0) - Number(a.score || 0)).slice(0, 50).map((event) => {
+      const labels = (event.labels || []).slice(0, 3).map((item) => `${item.label || ""} ${Math.round(Number(item.score || 0) * 100)}%`.trim()).filter(Boolean).join(", ") || "-";
+      const keywords = (event.keywords || []).join(", ") || "-";
+      const loudness = event.loudness_dbfs === null || event.loudness_dbfs === undefined ? "-" : `${Number(event.loudness_dbfs).toFixed(1)} dBFS`;
+      return `<div class="content-event ${escapeAttr(event.severity || "info")}">
+        <div class="content-event-time">${escapeHtml(formatEventOffset(event.start))}</div>
+        <div class="content-event-main"><strong>${escapeHtml(event.rule || "Event")}</strong><span class="file-meta">${escapeHtml(formatDuration(event.duration || 0))} &middot; ${escapeHtml(Math.round(Number(event.score || 0) * 100))}% &middot; ${escapeHtml(loudness)}</span><div>${escapeHtml(event.text || labels)}</div></div>
+        <div class="content-event-meta"><span>${escapeHtml(labels)}</span><span>${escapeHtml(keywords)}</span></div>
+      </div>`;
+    }).join("");
+    return `<div class="content-events">${rows}</div>`;
+  };
+
   const renderFileAction = (file) => {
     const actions = [];
     if (file.download_url) {
@@ -5846,6 +6628,20 @@ def dashboard_script() -> str:
         actions.push(`<span class="action-note" title="${escapeAttr(file.transcription_message)}">Transcript failed</span>`);
       }
     }
+    if (file.event_detection_status === "running") {
+      actions.push('<span class="action-note">Detecting events</span>');
+    } else if (file.event_detection_url) {
+      const label = file.event_detection_status === "failed"
+        ? "Retry events"
+        : (file.event_detection_status === "detected" ? "Redetect events" : "Detect events");
+      const title = file.event_detection_status === "detected"
+        ? ' title="Run content event detection again and replace the sidecar"'
+        : "";
+      actions.push(`<form class="inline-form" method="post" action="${escapeAttr(file.event_detection_url)}"><button class="download action-button" type="submit"${title}>${label}</button></form>`);
+      if (file.event_detection_status === "failed" && file.event_detection_message) {
+        actions.push(`<span class="action-note" title="${escapeAttr(file.event_detection_message)}">Event detection failed</span>`);
+      }
+    }
     if (file.watermark_url) {
       actions.push(`<form class="inline-form watermark-form" method="post" action="${escapeAttr(file.watermark_url)}">
         <input type="hidden" name="video_id" value="${escapeAttr(file.video_id)}">
@@ -5878,6 +6674,18 @@ def dashboard_script() -> str:
       `<td>${action}</td>`,
       "</tr>",
     ].join("");
+  };
+
+  const renderCleanupFragmentsAction = (stream) => {
+    const videoId = String((stream && stream.video_id) || "");
+    const count = Number(((stream && stream.file_kind_counts) || {}).fragment || 0);
+    const blockedStatuses = new Set(["checking_after_exit", "downloading", "waiting_retry"]);
+    if (!videoId || count <= 0 || blockedStatuses.has(String(stream.status || ""))) {
+      return "";
+    }
+    const url = `/cleanup-fragments?video_id=${encodeURIComponent(videoId)}`;
+    const label = count === 1 ? "Clean fragment" : `Clean fragments (${count})`;
+    return `<form class="inline-form" method="post" action="${escapeAttr(url)}"><button class="download action-button" type="submit" title="Remove saved .part-Frag files for this stream">${escapeHtml(label)}</button></form>`;
   };
 
   const renderStreamJobRow = (job) => {
@@ -5927,6 +6735,7 @@ def dashboard_script() -> str:
     const files = (stream.files || []).slice(0, 20).map(renderFileRow).join("")
       || '<tr><td colspan="7" class="file-meta">No files found</td></tr>';
     const filesTabId = `stream-tab-${videoId}-files`;
+    const eventsTabId = `stream-tab-${videoId}-events`;
     const logTabId = `stream-tab-${videoId}-log`;
     const jobsTabId = `stream-tab-${videoId}-jobs`;
     const tabName = `stream-tabs-${videoId}`;
@@ -5940,6 +6749,7 @@ def dashboard_script() -> str:
       </div>
     </div>
     <div class="stream-actions">
+      ${renderCleanupFragmentsAction(stream)}
       <button class="download stream-toggle" type="button" data-stream-toggle="${escapeAttr(videoId)}" aria-expanded="${expanded}">${toggleLabel}</button>
       <span class="badge ${escapeAttr(stream.status)}">${escapeHtml(statusLabel(stream.status))}</span>
     </div>
@@ -5954,6 +6764,7 @@ def dashboard_script() -> str:
       <div>Final size: ${escapeHtml(formatBytes(stream.final_bytes))}</div>
       <div>Chat size: ${escapeHtml(formatBytes(stream.chat_bytes))}</div>
       <div>Fragment size: ${escapeHtml(formatBytes(stream.fragment_bytes))}</div>
+      <div>Content events: ${escapeHtml(stream.content_event_count || 0)}</div>
       <div>Mixed formats: ${mixed}</div>
       <div>Exit code: ${escapeHtml(formatOptionalInt(stream.exit_code))}</div>
       <div>Started: ${escapeHtml(formatIso(stream.last_started_at))}</div>
@@ -5965,10 +6776,12 @@ def dashboard_script() -> str:
     </div>
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(filesTabId)}" data-stream-tab="files" data-video-id="${escapeAttr(videoId)}" checked>
+      <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(eventsTabId)}" data-stream-tab="events" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(jobsTabId)}" data-stream-tab="jobs" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="${escapeAttr(filesTabId)}">Files</label>
+        <label class="stream-tab-events-label" for="${escapeAttr(eventsTabId)}">Events</label>
         <label class="stream-tab-jobs-label" for="${escapeAttr(jobsTabId)}">Jobs</label>
         <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
       </div>
@@ -5981,6 +6794,7 @@ def dashboard_script() -> str:
             </table>
           </div>
         </section>
+        <section class="stream-tab-panel stream-tab-events">${renderContentEvents(stream.content_events || [])}</section>
         <section class="stream-tab-panel stream-tab-jobs">${renderStreamJobs(stream.jobs || [])}</section>
         <section class="stream-tab-panel stream-tab-log">${renderStreamEvents(stream.events || [])}</section>
       </div>
@@ -6031,6 +6845,55 @@ def dashboard_script() -> str:
 </form>`;
   };
 
+  const renderSelect = (name, selected, options) => `<select name="${escapeAttr(name)}">${options.map((option) => `<option value="${escapeAttr(option)}"${String(option) === String(selected) ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select>`;
+
+  const renderEventRuleRow = (rule) => {
+    rule = rule || {};
+    const labels = Array.isArray(rule.labels) ? rule.labels.join(", ") : "";
+    const keywords = Array.isArray(rule.keywords) ? rule.keywords.join(", ") : "";
+    const loudness = rule.min_loudness_dbfs === null || rule.min_loudness_dbfs === undefined ? "" : String(rule.min_loudness_dbfs);
+    const minDuration = rule.min_duration_seconds ? String(rule.min_duration_seconds) : "";
+    const maxDuration = rule.max_duration_seconds ? String(rule.max_duration_seconds) : "";
+    return `<div class="event-rule-row">
+  <input name="rule_name" value="${escapeAttr(rule.name || "")}" placeholder="Hype moment">
+  ${renderSelect("rule_enabled", rule.enabled === false ? "false" : "true", ["true", "false"])}
+  <input name="rule_labels" value="${escapeAttr(labels)}" placeholder="Laughter, Cheering">
+  <input name="rule_keywords" value="${escapeAttr(keywords)}" placeholder="keyword, phrase">
+  <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="${escapeAttr(loudness)}" placeholder="dBFS">
+  <span class="duration-pair"><input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(minDuration)}" placeholder="min"><input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(maxDuration)}" placeholder="max"></span>
+  <input name="rule_severity" value="${escapeAttr(rule.severity || "info")}" placeholder="info">
+</div>`;
+  };
+
+  const renderEventRuleRows = (rules) => `<div class="event-rule-list">
+  <div class="event-rule-head"><span>Name</span><span>On</span><span>Labels</span><span>Keywords</span><span>Loudness</span><span>Duration</span><span>Severity</span></div>
+  ${(rules || []).map(renderEventRuleRow).join("")}${renderEventRuleRow({})}
+</div>`;
+
+  const renderStreamerEventSettings = (streamer) => {
+    const detection = streamer.stream_event_detection || {};
+    const enabled = detection.enabled === null || detection.enabled === undefined ? "inherit" : (detection.enabled ? "true" : "false");
+    const minConfidence = detection.min_confidence === null || detection.min_confidence === undefined || Number(detection.min_confidence) < 0 ? "" : String(detection.min_confidence);
+    return `<details class="streamer-event-settings">
+  <summary class="download action-button">Content Events</summary>
+  <form class="event-rules-form" method="post" action="/stream-event-rules">
+    <input type="hidden" name="scope" value="streamer">
+    <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+    <div class="settings-grid compact-grid">
+      <label class="settings-field">Detection ${renderSelect("event_enabled", enabled, ["inherit", "true", "false"])}</label>
+      <label class="settings-field">Model <input name="event_model" value="${escapeAttr(detection.model || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Device <input name="event_device" value="${escapeAttr(detection.device || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Window <input name="event_window_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.window_seconds || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Hop <input name="event_hop_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.hop_seconds || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Confidence <input name="event_min_confidence" type="number" step="0.001" min="0" max="1" value="${escapeAttr(minConfidence)}" placeholder="inherit"></label>
+      <label class="settings-field">Max events <input name="event_max_events_per_media" type="number" min="1" value="${escapeAttr(detection.max_events_per_media || "")}" placeholder="inherit"></label>
+    </div>
+    ${renderEventRuleRows(streamer.stream_event_rules || [])}
+    <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
+  </form>
+</details>`;
+  };
+
   const renderStreamerSettingsArea = (streamer, snapshot) => {
     if (snapshotConfigPath(snapshot) === "-") {
       return `<div class="streamer-jobs">
@@ -6042,6 +6905,7 @@ def dashboard_script() -> str:
       return `<div class="streamer-settings">
   <h3>Settings</h3>
   ${renderStreamerForm(streamer)}
+  ${renderStreamerEventSettings(streamer)}
 </div>`;
     }
     return `<div class="streamer-jobs">
@@ -6944,6 +7808,7 @@ def render_streamer_settings_area(
         return f"""<div class="streamer-settings">
   <h3>Settings</h3>
   {render_streamer_group_form(streamer)}
+  {render_streamer_event_settings_form(streamer)}
 </div>"""
     return """<div class="streamer-jobs">
   <h3>Settings</h3>
@@ -7075,6 +7940,77 @@ def render_app_config_form(snapshot: StatusSnapshot) -> str:
     </div>
   </form>
 </section>"""
+
+
+def render_content_event_rules_panel(snapshot: StatusSnapshot) -> str:
+    content = snapshot.configuration.get("Content Events", {})
+    backend = content.get("backend", {})
+    backend_message = str(backend.get("message") if isinstance(backend, dict) else "")
+    rules = [rule for rule in content.get("rules", []) if isinstance(rule, dict)]
+    disabled = " disabled" if snapshot_config_path(snapshot) == "-" else ""
+    return f"""<section class="panel content-event-rules-panel">
+  <h3>Content Event Rules</h3>
+  <div class="file-meta">{escape(backend_message)}</div>
+  <form class="event-rules-form" method="post" action="/stream-event-rules">
+    <input type="hidden" name="scope" value="global">
+    {render_stream_event_rule_rows(rules)}
+    <div class="settings-actions"><button class="download action-button" type="submit"{disabled}>Save Event Rules</button></div>
+  </form>
+</section>"""
+
+
+def render_streamer_event_settings_form(streamer: StreamerStatStatus) -> str:
+    detection = streamer.stream_event_detection or {}
+    enabled = detection.get("enabled")
+    enabled_value = "inherit" if enabled is None else ("true" if enabled else "false")
+    min_confidence = detection.get("min_confidence")
+    min_confidence_value = "" if min_confidence in (None, -1.0) else str(min_confidence)
+    return f"""<details class="streamer-event-settings">
+  <summary class="download action-button">Content Events</summary>
+  <form class="event-rules-form" method="post" action="/stream-event-rules">
+    <input type="hidden" name="scope" value="streamer">
+    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    <div class="settings-grid compact-grid">
+      <label class="settings-field">Detection {render_form_select("event_enabled", enabled_value, ("inherit", "true", "false"))}</label>
+      <label class="settings-field">Model <input name="event_model" value="{escape(str(detection.get('model') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Device <input name="event_device" value="{escape(str(detection.get('device') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Window <input name="event_window_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('window_seconds') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Hop <input name="event_hop_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('hop_seconds') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Confidence <input name="event_min_confidence" type="number" step="0.001" min="0" max="1" value="{escape(min_confidence_value, quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Max events <input name="event_max_events_per_media" type="number" min="1" value="{escape(str(detection.get('max_events_per_media') or ''), quote=True)}" placeholder="inherit"></label>
+    </div>
+    {render_stream_event_rule_rows(streamer.stream_event_rules)}
+    <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
+  </form>
+</details>"""
+
+
+def render_stream_event_rule_rows(rules: list[dict[str, Any]]) -> str:
+    rows = "".join(render_stream_event_rule_row(rule) for rule in rules)
+    rows += render_stream_event_rule_row({})
+    return f"""<div class="event-rule-list">
+  <div class="event-rule-head"><span>Name</span><span>On</span><span>Labels</span><span>Keywords</span><span>Loudness</span><span>Duration</span><span>Severity</span></div>
+  {rows}
+</div>"""
+
+
+def render_stream_event_rule_row(rule: dict[str, Any]) -> str:
+    enabled = "true" if rule.get("enabled", True) else "false"
+    labels = ", ".join(str(item) for item in rule.get("labels", []) if str(item).strip())
+    keywords = ", ".join(str(item) for item in rule.get("keywords", []) if str(item).strip())
+    loudness = "" if rule.get("min_loudness_dbfs") is None else str(rule.get("min_loudness_dbfs"))
+    min_duration = "" if not rule.get("min_duration_seconds") else str(rule.get("min_duration_seconds"))
+    max_duration = "" if not rule.get("max_duration_seconds") else str(rule.get("max_duration_seconds"))
+    severity = str(rule.get("severity") or "info")
+    return f"""<div class="event-rule-row">
+  <input name="rule_name" value="{escape(str(rule.get('name') or ''), quote=True)}" placeholder="Hype moment">
+  {render_form_select("rule_enabled", enabled, ("true", "false"))}
+  <input name="rule_labels" value="{escape(labels, quote=True)}" placeholder="Laughter, Cheering">
+  <input name="rule_keywords" value="{escape(keywords, quote=True)}" placeholder="keyword, phrase">
+  <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="{escape(loudness, quote=True)}" placeholder="dBFS">
+  <span class="duration-pair"><input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="{escape(min_duration, quote=True)}" placeholder="min"><input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="{escape(max_duration, quote=True)}" placeholder="max"></span>
+  <input name="rule_severity" value="{escape(severity, quote=True)}" placeholder="info">
+</div>"""
 
 
 def render_app_config_field(snapshot: StatusSnapshot, field: ConfigFormField) -> str:
@@ -7476,6 +8412,53 @@ def render_stream_jobs(jobs: list[JobStatus]) -> str:
     return f'<div class="stream-job-list">{rows}</div>'
 
 
+def render_content_events(events: list[ContentEventStatus]) -> str:
+    if not events:
+        return '<div class="file-meta">No content events detected yet.</div>'
+    ordered = sorted(events, key=lambda event: event.score, reverse=True)[:50]
+    rows = "".join(render_content_event(event) for event in ordered)
+    return f'<div class="content-events">{rows}</div>'
+
+
+def render_content_event(event: ContentEventStatus) -> str:
+    labels = ", ".join(
+        f"{label.get('label', '')} {round(float(label.get('score') or 0.0) * 100)}%".strip()
+        for label in event.labels[:3]
+        if label.get("label")
+    ) or "-"
+    keywords = ", ".join(event.keywords) or "-"
+    loudness = "-" if event.loudness_dbfs is None else f"{event.loudness_dbfs:.1f} dBFS"
+    return (
+        f'<div class="content-event {escape(event.severity or "info", quote=True)}">'
+        f'<div class="content-event-time">{escape(format_event_offset(event.start))}</div>'
+        '<div class="content-event-main">'
+        f'<strong>{escape(event.rule or "Event")}</strong>'
+        f'<span class="file-meta">{escape(format_duration(int(event.duration)))} &middot; '
+        f'{round(event.score * 100)}% &middot; {escape(loudness)}</span>'
+        f'<div>{escape(event.text or labels)}</div>'
+        '</div>'
+        '<div class="content-event-meta">'
+        f'<span>{escape(labels)}</span><span>{escape(keywords)}</span>'
+        '</div></div>'
+    )
+
+
+def render_cleanup_fragments_action(stream: StreamStatus) -> str:
+    count = stream.file_kind_counts.get("fragment", 0)
+    if count <= 0 or stream.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
+        return ""
+    url = f"/cleanup-fragments?{urlencode({'video_id': stream.video_id})}"
+    label = "Clean fragment" if count == 1 else f"Clean fragments ({count})"
+    return (
+        '<form class="inline-form" method="post" '
+        f'action="{escape(url, quote=True)}">'
+        '<button class="download action-button" type="submit" '
+        'title="Remove saved .part-Frag files for this stream">'
+        f"{escape(label)}</button>"
+        "</form>"
+    )
+
+
 def render_stream_card(stream: StreamStatus) -> str:
     title = stream.title or stream.video_id
     platform, platform_label, platform_initial = stream_platform_details(stream)
@@ -7492,9 +8475,11 @@ def render_stream_card(stream: StreamStatus) -> str:
     if not files:
         files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
     events = render_stream_event_timeline(stream.events)
+    content_events = render_content_events(stream.content_events)
     jobs = render_stream_jobs(stream.jobs)
     tab_key = escape(stream.video_id, quote=True)
     files_tab_id = f"stream-tab-{tab_key}-files"
+    content_events_tab_id = f"stream-tab-{tab_key}-events"
     log_tab_id = f"stream-tab-{tab_key}-log"
     jobs_tab_id = f"stream-tab-{tab_key}-jobs"
     tab_name = f"stream-tabs-{tab_key}"
@@ -7509,6 +8494,7 @@ def render_stream_card(stream: StreamStatus) -> str:
       </div>
     </div>
     <div class="stream-actions">
+      {render_cleanup_fragments_action(stream)}
       <button class="download stream-toggle" type="button" data-stream-toggle="{escape(stream.video_id, quote=True)}" aria-expanded="{expanded}">{toggle_label}</button>
       <span class="badge {escape(stream.status)}">{escape(status_label)}</span>
     </div>
@@ -7523,6 +8509,7 @@ def render_stream_card(stream: StreamStatus) -> str:
       <div>Final size: {escape(format_bytes(stream.final_bytes))}</div>
       <div>Chat size: {escape(format_bytes(stream.chat_bytes))}</div>
       <div>Fragment size: {escape(format_bytes(stream.fragment_bytes))}</div>
+      <div>Content events: {stream.content_event_count}</div>
       <div>Mixed formats: {mixed}</div>
       <div>Exit code: {escape(format_optional_int(stream.exit_code))}</div>
       <div>Started: {escape(format_optional_iso(stream.last_started_at))}</div>
@@ -7534,10 +8521,12 @@ def render_stream_card(stream: StreamStatus) -> str:
     </div>
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="{tab_name}" id="{files_tab_id}" data-stream-tab="files" data-video-id="{tab_key}" checked>
+      <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="{tab_name}" id="{content_events_tab_id}" data-stream-tab="events" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="{tab_name}" id="{jobs_tab_id}" data-stream-tab="jobs" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="{files_tab_id}">Files</label>
+        <label class="stream-tab-events-label" for="{content_events_tab_id}">Events</label>
         <label class="stream-tab-jobs-label" for="{jobs_tab_id}">Jobs</label>
         <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
       </div>
@@ -7550,6 +8539,7 @@ def render_stream_card(stream: StreamStatus) -> str:
             </table>
           </div>
         </section>
+        <section class="stream-tab-panel stream-tab-events">{content_events}</section>
         <section class="stream-tab-panel stream-tab-jobs">{jobs}</section>
         <section class="stream-tab-panel stream-tab-log">{events}</section>
       </div>
@@ -7685,6 +8675,33 @@ def render_file_action(file: FileStatus) -> str:
                 '<span class="action-note" '
                 f'title="{escape(file.transcription_message, quote=True)}">'
                 "Transcript failed</span>"
+            )
+    if file.event_detection_status == "running":
+        actions.append('<span class="action-note">Detecting events</span>')
+    elif file.event_detection_url:
+        if file.event_detection_status == "failed":
+            label = "Retry events"
+        elif file.event_detection_status == "detected":
+            label = "Redetect events"
+        else:
+            label = "Detect events"
+        title = (
+            ' title="Run content event detection again and replace the sidecar"'
+            if file.event_detection_status == "detected"
+            else ""
+        )
+        actions.append(
+            '<form class="inline-form" method="post" '
+            f'action="{escape(file.event_detection_url, quote=True)}">'
+            f'<button class="download action-button" type="submit"{title}>'
+            f"{escape(label)}</button>"
+            "</form>"
+        )
+        if file.event_detection_status == "failed" and file.event_detection_message:
+            actions.append(
+                '<span class="action-note" '
+                f'title="{escape(file.event_detection_message, quote=True)}">'
+                "Event detection failed</span>"
             )
     if file.watermark_url:
         actions.append(
@@ -7857,6 +8874,15 @@ def format_duration(seconds: int) -> str:
         return f"{hours}h {minutes:02d}m"
     days, hours = divmod(hours, 24)
     return f"{days}d {hours:02d}h"
+
+
+def format_event_offset(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 def format_kind_counts(counts: dict[str, int]) -> str:
