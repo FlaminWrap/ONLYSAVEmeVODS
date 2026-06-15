@@ -3798,6 +3798,9 @@ def stream_event_rules_from_form(
         min_duration_text = form_list_value(params, "rule_min_duration_seconds", index)
         max_duration_text = form_list_value(params, "rule_max_duration_seconds", index)
         severity = form_list_value(params, "rule_severity", index).strip() or "info"
+        delete_text = first_query_value(params, f"rule_delete_{index}").strip().lower()
+        if delete_text in {"1", "true", "yes", "on", "delete"}:
+            continue
         if not any(
             item.strip()
             for item in (
@@ -5254,10 +5257,18 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .content-event.warning {{ border-left-color: var(--warn); }}
     .content-event.error {{ border-left-color: var(--bad); }}
-    .content-event-time {{ font-weight: 700; font-variant-numeric: tabular-nums; }}
+    .content-event-time {{
+      display: grid;
+      gap: 2px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }}
+    .content-event-end {{ color: var(--muted); font-size: 0.82rem; font-weight: 500; }}
     .content-event-main {{ min-width: 0; }}
     .content-event-main strong {{ margin-right: 8px; }}
     .content-event-meta {{ display: grid; gap: 4px; color: var(--muted); min-width: 0; }}
+    .content-event-meta b {{ color: var(--text); font-weight: 650; }}
     .stream-events {{
       display: grid;
       gap: 8px;
@@ -5296,8 +5307,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       overflow-wrap: anywhere;
     }}
     @media (max-width: 820px) {{
-      .stream-event {{ grid-template-columns: 1fr; }}
-      .stream-event-time, .stream-event-level, .stream-event-segment {{ justify-self: start; }}
+      .stream-event, .content-event {{ grid-template-columns: 1fr; }}
+      .stream-event-time, .stream-event-level, .stream-event-segment, .content-event-time {{ justify-self: start; }}
     }}
     .stream-job-list {{ display: grid; gap: 8px; }}
     .title {{ font-weight: 650; overflow-wrap: anywhere; }}
@@ -5712,18 +5723,95 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
       align-items: end;
     }}
-    .event-rule-list {{ display: grid; gap: 8px; margin-top: 10px; }}
-    .event-rule-head, .event-rule-row {{
+    .event-rules-form {{ display: grid; gap: 12px; margin-top: 10px; }}
+    .event-settings-box {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: var(--panel-strong);
+      min-width: 0;
+    }}
+    .event-settings-box > legend {{ padding: 0 6px; font-weight: 650; }}
+    .event-rule-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 10px;
+    }}
+    .event-rule-list {{ display: grid; gap: 8px; }}
+    .event-rule-card {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      min-width: 0;
+      overflow: hidden;
+    }}
+    .event-rule-card[open] {{ box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }}
+    .event-rule-card > summary {{
       display: grid;
-      grid-template-columns: minmax(130px, 1fr) 90px minmax(170px, 1.1fr) minmax(170px, 1.1fr) 100px minmax(150px, 0.8fr) 100px;
+      grid-template-columns: minmax(160px, 1fr) minmax(0, 1.3fr) max-content;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 10px;
+      cursor: pointer;
+      list-style: none;
+    }}
+    .event-rule-card > summary::-webkit-details-marker {{ display: none; }}
+    .event-rule-title {{ font-weight: 650; min-width: 0; overflow-wrap: anywhere; }}
+    .event-rule-summary {{ color: var(--muted); min-width: 0; overflow-wrap: anywhere; }}
+    .event-rule-action {{ color: var(--active); font-weight: 650; white-space: nowrap; }}
+    .event-rule-card.disabled .event-rule-title {{ color: var(--muted); text-decoration: line-through; }}
+    .event-rule-empty {{ color: var(--muted); padding: 8px 0; }}
+    .event-rule-add {{ border-style: dashed; }}
+    .event-rule-add > summary {{ grid-template-columns: 1fr max-content; }}
+    .event-rule-editor {{ display: grid; gap: 10px; padding: 0 10px 10px; }}
+    .event-rule-primary, .event-rule-criteria {{
+      display: grid;
+      gap: 10px;
+      align-items: end;
+    }}
+    .event-rule-primary {{ grid-template-columns: minmax(220px, 1fr) minmax(95px, 0.35fr) minmax(120px, 0.45fr); }}
+    .event-rule-criteria {{ grid-template-columns: repeat(2, minmax(210px, 1fr)) repeat(3, minmax(115px, 0.45fr)); }}
+    .event-delete-option {{
+      display: flex;
       gap: 8px;
       align-items: center;
+      color: var(--bad);
+      font-weight: 650;
     }}
-    .event-rule-head {{ color: var(--muted); font-size: 0.82rem; font-weight: 650; }}
-    .event-rule-row input, .event-rule-row select {{ width: 100%; min-width: 0; }}
-    .duration-pair {{ display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }}
-    .streamer-event-settings {{ margin-top: 12px; }}
+    .event-rule-card .settings-field input,
+    .event-rule-card .settings-field select,
+    .event-settings-box .settings-field input,
+    .event-settings-box .settings-field select {{ box-sizing: border-box; }}
+    .streamer-settings-tabs {{ display: grid; gap: 0; margin-top: 10px; }}
+    .streamer-settings-tabs > input {{ position: absolute; opacity: 0; pointer-events: none; }}
+    .streamer-settings-tab-labels {{ display: flex; flex-wrap: wrap; gap: 6px; border-bottom: 1px solid var(--line); }}
+    .streamer-settings-tab-labels label {{
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      border-radius: 6px 6px 0 0;
+      padding: 6px 10px;
+      color: var(--muted);
+      background: var(--panel);
+      cursor: pointer;
+    }}
+    .streamer-settings-panel {{ display: none; padding-top: 12px; }}
+    .streamer-settings-main-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-main-label,
+    .streamer-settings-events-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-events-label {{
+      color: var(--text);
+      background: var(--panel-strong);
+      font-weight: 650;
+    }}
+    .streamer-settings-main-toggle:checked ~ .streamer-settings-panels .streamer-settings-main,
+    .streamer-settings-events-toggle:checked ~ .streamer-settings-panels .streamer-settings-events {{ display: block; }}
+    .streamer-event-summary-title {{ font-weight: 650; }}
     .compact-grid {{ grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }}
+    @media (max-width: 980px) {{
+      .event-rule-primary, .event-rule-criteria, .event-rule-card > summary {{ grid-template-columns: 1fr; }}
+      .event-rule-action {{ justify-self: start; }}
+    }}
     .voice-profile-form textarea {{
       min-height: 68px;
       resize: vertical;
@@ -6569,14 +6657,16 @@ def dashboard_script() -> str:
   const renderContentEvents = (events) => {
     events = events || [];
     if (!events.length) return '<div class="file-meta">No content events detected yet.</div>';
-    const rows = events.slice().sort((a, b) => Number(b.score || 0) - Number(a.score || 0)).slice(0, 50).map((event) => {
+    const rows = events.slice().sort((a, b) => Number(a.start || 0) - Number(b.start || 0)).slice(0, 50).map((event) => {
       const labels = (event.labels || []).slice(0, 3).map((item) => `${item.label || ""} ${Math.round(Number(item.score || 0) * 100)}%`.trim()).filter(Boolean).join(", ") || "-";
       const keywords = (event.keywords || []).join(", ") || "-";
       const loudness = event.loudness_dbfs === null || event.loudness_dbfs === undefined ? "-" : `${Number(event.loudness_dbfs).toFixed(1)} dBFS`;
+      const start = formatEventOffset(event.start);
+      const end = formatEventOffset(event.end);
       return `<div class="content-event ${escapeAttr(event.severity || "info")}">
-        <div class="content-event-time">${escapeHtml(formatEventOffset(event.start))}</div>
+        <div class="content-event-time"><span>${escapeHtml(start)}</span><span class="content-event-end">to ${escapeHtml(end)}</span></div>
         <div class="content-event-main"><strong>${escapeHtml(event.rule || "Event")}</strong><span class="file-meta">${escapeHtml(formatDuration(event.duration || 0))} &middot; ${escapeHtml(Math.round(Number(event.score || 0) * 100))}% &middot; ${escapeHtml(loudness)}</span><div>${escapeHtml(event.text || labels)}</div></div>
-        <div class="content-event-meta"><span>${escapeHtml(labels)}</span><span>${escapeHtml(keywords)}</span></div>
+        <div class="content-event-meta"><span><b>Labels</b> ${escapeHtml(labels)}</span><span><b>Keywords</b> ${escapeHtml(keywords)}</span></div>
       </div>`;
     }).join("");
     return `<div class="content-events">${rows}</div>`;
@@ -6781,7 +6871,7 @@ def dashboard_script() -> str:
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="${escapeAttr(filesTabId)}">Files</label>
-        <label class="stream-tab-events-label" for="${escapeAttr(eventsTabId)}">Events</label>
+        <label class="stream-tab-events-label" for="${escapeAttr(eventsTabId)}">Content Events</label>
         <label class="stream-tab-jobs-label" for="${escapeAttr(jobsTabId)}">Jobs</label>
         <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
       </div>
@@ -6847,51 +6937,82 @@ def dashboard_script() -> str:
 
   const renderSelect = (name, selected, options) => `<select name="${escapeAttr(name)}">${options.map((option) => `<option value="${escapeAttr(option)}"${String(option) === String(selected) ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select>`;
 
-  const renderEventRuleRow = (rule) => {
+  const renderEventRuleSummary = (rule) => {
+    rule = rule || {};
+    const parts = [];
+    if (Array.isArray(rule.labels) && rule.labels.length) parts.push(`labels: ${rule.labels.slice(0, 3).join(", ")}`);
+    if (Array.isArray(rule.keywords) && rule.keywords.length) parts.push(`keywords: ${rule.keywords.slice(0, 3).join(", ")}`);
+    if (rule.min_loudness_dbfs !== null && rule.min_loudness_dbfs !== undefined) parts.push(`loudness >= ${rule.min_loudness_dbfs} dBFS`);
+    if (rule.min_duration_seconds || rule.max_duration_seconds) parts.push(`duration ${rule.min_duration_seconds || 0}-${rule.max_duration_seconds || "any"}s`);
+    return parts.length ? parts.join("; ") : "configure labels, keywords, or loudness";
+  };
+
+  const renderEventRuleRow = (rule, index, isNew = false) => {
     rule = rule || {};
     const labels = Array.isArray(rule.labels) ? rule.labels.join(", ") : "";
     const keywords = Array.isArray(rule.keywords) ? rule.keywords.join(", ") : "";
     const loudness = rule.min_loudness_dbfs === null || rule.min_loudness_dbfs === undefined ? "" : String(rule.min_loudness_dbfs);
     const minDuration = rule.min_duration_seconds ? String(rule.min_duration_seconds) : "";
     const maxDuration = rule.max_duration_seconds ? String(rule.max_duration_seconds) : "";
-    return `<div class="event-rule-row">
-  <input name="rule_name" value="${escapeAttr(rule.name || "")}" placeholder="Hype moment">
-  ${renderSelect("rule_enabled", rule.enabled === false ? "false" : "true", ["true", "false"])}
-  <input name="rule_labels" value="${escapeAttr(labels)}" placeholder="Laughter, Cheering">
-  <input name="rule_keywords" value="${escapeAttr(keywords)}" placeholder="keyword, phrase">
-  <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="${escapeAttr(loudness)}" placeholder="dBFS">
-  <span class="duration-pair"><input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(minDuration)}" placeholder="min"><input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(maxDuration)}" placeholder="max"></span>
-  <input name="rule_severity" value="${escapeAttr(rule.severity || "info")}" placeholder="info">
-</div>`;
+    const enabled = rule.enabled === false ? "false" : "true";
+    const title = rule.name || "New content event";
+    const deleteButton = isNew ? "" : `<button class="download action-button" name="rule_delete_${index}" value="true" type="submit">Delete</button>`;
+    return `<details class="event-rule-card${!isNew && enabled === "false" ? " disabled" : ""}${isNew ? " event-rule-add" : ""}">
+  <summary><span class="event-rule-title">${escapeHtml(title)}</span><span class="event-rule-summary">${escapeHtml(renderEventRuleSummary(rule))}</span><span class="event-rule-action">${isNew ? "Add" : "Edit"}</span></summary>
+  <div class="event-rule-editor">
+    <div class="event-rule-primary">
+      <label class="settings-field">Name <input name="rule_name" value="${escapeAttr(rule.name || "")}" placeholder="Hype moment"></label>
+      <label class="settings-field">Enabled ${renderSelect("rule_enabled", enabled, ["true", "false"])}</label>
+      <label class="settings-field">Severity <input name="rule_severity" value="${escapeAttr(rule.severity || "info")}" placeholder="info"></label>
+    </div>
+    <div class="event-rule-criteria">
+      <label class="settings-field">Audio labels <input name="rule_labels" value="${escapeAttr(labels)}" placeholder="Laughter, Cheering"></label>
+      <label class="settings-field">Transcript keywords <input name="rule_keywords" value="${escapeAttr(keywords)}" placeholder="keyword, phrase"></label>
+      <label class="settings-field">Min loudness <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="${escapeAttr(loudness)}" placeholder="dBFS"></label>
+      <label class="settings-field">Min duration <input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(minDuration)}" placeholder="seconds"></label>
+      <label class="settings-field">Max duration <input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="${escapeAttr(maxDuration)}" placeholder="seconds"></label>
+    </div>
+    <div class="settings-actions">${deleteButton}</div>
+  </div>
+</details>`;
   };
 
-  const renderEventRuleRows = (rules) => `<div class="event-rule-list">
-  <div class="event-rule-head"><span>Name</span><span>On</span><span>Labels</span><span>Keywords</span><span>Loudness</span><span>Duration</span><span>Severity</span></div>
-  ${(rules || []).map(renderEventRuleRow).join("")}${renderEventRuleRow({})}
-</div>`;
+  const renderEventRuleRows = (rules) => {
+    rules = rules || [];
+    const existing = rules.length
+      ? rules.map((rule, index) => renderEventRuleRow(rule, index, false)).join("")
+      : '<div class="event-rule-empty">No content events configured yet.</div>';
+    return `<div class="event-rule-list">${existing}${renderEventRuleRow({}, rules.length, true)}</div>`;
+  };
 
   const renderStreamerEventSettings = (streamer) => {
     const detection = streamer.stream_event_detection || {};
     const enabled = detection.enabled === null || detection.enabled === undefined ? "inherit" : (detection.enabled ? "true" : "false");
     const minConfidence = detection.min_confidence === null || detection.min_confidence === undefined || Number(detection.min_confidence) < 0 ? "" : String(detection.min_confidence);
-    return `<details class="streamer-event-settings">
-  <summary class="download action-button">Content Events</summary>
-  <form class="event-rules-form" method="post" action="/stream-event-rules">
-    <input type="hidden" name="scope" value="streamer">
-    <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+    const rules = streamer.stream_event_rules || [];
+    const ruleCount = rules.length;
+    return `<form class="event-rules-form" method="post" action="/stream-event-rules">
+  <input type="hidden" name="scope" value="streamer">
+  <input type="hidden" name="streamer_name" value="${escapeAttr(streamer.name || "")}">
+  <fieldset class="event-settings-box">
+    <legend>Detection</legend>
     <div class="settings-grid compact-grid">
       <label class="settings-field">Detection ${renderSelect("event_enabled", enabled, ["inherit", "true", "false"])}</label>
       <label class="settings-field">Model <input name="event_model" value="${escapeAttr(detection.model || "")}" placeholder="inherit"></label>
       <label class="settings-field">Device <input name="event_device" value="${escapeAttr(detection.device || "")}" placeholder="inherit"></label>
-      <label class="settings-field">Window <input name="event_window_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.window_seconds || "")}" placeholder="inherit"></label>
-      <label class="settings-field">Hop <input name="event_hop_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.hop_seconds || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Window seconds <input name="event_window_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.window_seconds || "")}" placeholder="inherit"></label>
+      <label class="settings-field">Hop seconds <input name="event_hop_seconds" type="number" step="0.001" min="0" value="${escapeAttr(detection.hop_seconds || "")}" placeholder="inherit"></label>
       <label class="settings-field">Confidence <input name="event_min_confidence" type="number" step="0.001" min="0" max="1" value="${escapeAttr(minConfidence)}" placeholder="inherit"></label>
       <label class="settings-field">Max events <input name="event_max_events_per_media" type="number" min="1" value="${escapeAttr(detection.max_events_per_media || "")}" placeholder="inherit"></label>
     </div>
-    ${renderEventRuleRows(streamer.stream_event_rules || [])}
-    <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
-  </form>
-</details>`;
+  </fieldset>
+  <fieldset class="event-settings-box">
+    <legend>Content Events</legend>
+    <div class="event-rule-toolbar"><strong>Current Events</strong><span class="file-meta">${escapeHtml(ruleCount)} configured event${ruleCount === 1 ? "" : "s"}</span></div>
+    ${renderEventRuleRows(rules)}
+  </fieldset>
+  <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
+</form>`;
   };
 
   const renderStreamerSettingsArea = (streamer, snapshot) => {
@@ -6902,10 +7023,25 @@ def dashboard_script() -> str:
 </div>`;
     }
     if (streamer.configured) {
+      const rawKey = String(streamer.name || "streamer");
+      const settingsKey = encodeURIComponent(rawKey).replace(/%/g, "-") || "streamer";
+      const tabName = `streamer-settings-${settingsKey}`;
+      const mainTabId = `${tabName}-main`;
+      const eventsTabId = `${tabName}-events`;
       return `<div class="streamer-settings">
   <h3>Settings</h3>
-  ${renderStreamerForm(streamer)}
-  ${renderStreamerEventSettings(streamer)}
+  <div class="streamer-settings-tabs">
+    <input class="streamer-settings-main-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(mainTabId)}" checked>
+    <input class="streamer-settings-events-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(eventsTabId)}">
+    <div class="streamer-settings-tab-labels">
+      <label class="streamer-settings-main-label" for="${escapeAttr(mainTabId)}">Streamer</label>
+      <label class="streamer-settings-events-label" for="${escapeAttr(eventsTabId)}">Content Events</label>
+    </div>
+    <div class="streamer-settings-panels">
+      <section class="streamer-settings-panel streamer-settings-main">${renderStreamerForm(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-events">${renderStreamerEventSettings(streamer)}</section>
+    </div>
+  </div>
 </div>`;
     }
     return `<div class="streamer-jobs">
@@ -7805,10 +7941,24 @@ def render_streamer_settings_area(
   <div class="file-meta">Config file path is not available.</div>
 </div>"""
     if streamer.configured:
+        tab_key = re.sub(r"[^A-Za-z0-9_-]+", "-", streamer.name).strip("-") or "streamer"
+        main_tab_id = f"streamer-settings-{tab_key}-main"
+        events_tab_id = f"streamer-settings-{tab_key}-events"
+        tab_name = f"streamer-settings-{tab_key}"
         return f"""<div class="streamer-settings">
   <h3>Settings</h3>
-  {render_streamer_group_form(streamer)}
-  {render_streamer_event_settings_form(streamer)}
+  <div class="streamer-settings-tabs">
+    <input class="streamer-settings-main-toggle" type="radio" name="{escape(tab_name, quote=True)}" id="{escape(main_tab_id, quote=True)}" checked>
+    <input class="streamer-settings-events-toggle" type="radio" name="{escape(tab_name, quote=True)}" id="{escape(events_tab_id, quote=True)}">
+    <div class="streamer-settings-tab-labels">
+      <label class="streamer-settings-main-label" for="{escape(main_tab_id, quote=True)}">Streamer</label>
+      <label class="streamer-settings-events-label" for="{escape(events_tab_id, quote=True)}">Content Events</label>
+    </div>
+    <div class="streamer-settings-panels">
+      <section class="streamer-settings-panel streamer-settings-main">{render_streamer_group_form(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-events">{render_streamer_event_settings_form(streamer)}</section>
+    </div>
+  </div>
 </div>"""
     return """<div class="streamer-jobs">
   <h3>Settings</h3>
@@ -7953,7 +8103,11 @@ def render_content_event_rules_panel(snapshot: StatusSnapshot) -> str:
   <div class="file-meta">{escape(backend_message)}</div>
   <form class="event-rules-form" method="post" action="/stream-event-rules">
     <input type="hidden" name="scope" value="global">
-    {render_stream_event_rule_rows(rules)}
+    <fieldset class="event-settings-box">
+      <legend>Content Events</legend>
+      <div class="event-rule-toolbar"><strong>Current Events</strong><span class="file-meta">{len(rules)} configured event{'s' if len(rules) != 1 else ''}</span></div>
+      {render_stream_event_rule_rows(rules)}
+    </fieldset>
     <div class="settings-actions"><button class="download action-button" type="submit"{disabled}>Save Event Rules</button></div>
   </form>
 </section>"""
@@ -7965,36 +8119,53 @@ def render_streamer_event_settings_form(streamer: StreamerStatStatus) -> str:
     enabled_value = "inherit" if enabled is None else ("true" if enabled else "false")
     min_confidence = detection.get("min_confidence")
     min_confidence_value = "" if min_confidence in (None, -1.0) else str(min_confidence)
-    return f"""<details class="streamer-event-settings">
-  <summary class="download action-button">Content Events</summary>
-  <form class="event-rules-form" method="post" action="/stream-event-rules">
-    <input type="hidden" name="scope" value="streamer">
-    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    rule_count = len(streamer.stream_event_rules)
+    rule_label = "event" if rule_count == 1 else "events"
+    return f"""<form class="event-rules-form" method="post" action="/stream-event-rules">
+  <input type="hidden" name="scope" value="streamer">
+  <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+  <fieldset class="event-settings-box">
+    <legend>Detection</legend>
     <div class="settings-grid compact-grid">
       <label class="settings-field">Detection {render_form_select("event_enabled", enabled_value, ("inherit", "true", "false"))}</label>
       <label class="settings-field">Model <input name="event_model" value="{escape(str(detection.get('model') or ''), quote=True)}" placeholder="inherit"></label>
       <label class="settings-field">Device <input name="event_device" value="{escape(str(detection.get('device') or ''), quote=True)}" placeholder="inherit"></label>
-      <label class="settings-field">Window <input name="event_window_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('window_seconds') or ''), quote=True)}" placeholder="inherit"></label>
-      <label class="settings-field">Hop <input name="event_hop_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('hop_seconds') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Window seconds <input name="event_window_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('window_seconds') or ''), quote=True)}" placeholder="inherit"></label>
+      <label class="settings-field">Hop seconds <input name="event_hop_seconds" type="number" step="0.001" min="0" value="{escape(str(detection.get('hop_seconds') or ''), quote=True)}" placeholder="inherit"></label>
       <label class="settings-field">Confidence <input name="event_min_confidence" type="number" step="0.001" min="0" max="1" value="{escape(min_confidence_value, quote=True)}" placeholder="inherit"></label>
       <label class="settings-field">Max events <input name="event_max_events_per_media" type="number" min="1" value="{escape(str(detection.get('max_events_per_media') or ''), quote=True)}" placeholder="inherit"></label>
     </div>
+  </fieldset>
+  <fieldset class="event-settings-box">
+    <legend>Content Events</legend>
+    <div class="event-rule-toolbar"><strong>Current Events</strong><span class="file-meta">{rule_count} configured {rule_label}</span></div>
     {render_stream_event_rule_rows(streamer.stream_event_rules)}
-    <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
-  </form>
-</details>"""
+  </fieldset>
+  <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
+</form>"""
 
 
 def render_stream_event_rule_rows(rules: list[dict[str, Any]]) -> str:
-    rows = "".join(render_stream_event_rule_row(rule) for rule in rules)
-    rows += render_stream_event_rule_row({})
+    existing = "".join(
+        render_stream_event_rule_row(rule, index=index)
+        for index, rule in enumerate(rules)
+    )
+    if not existing:
+        existing = '<div class="event-rule-empty">No content events configured yet.</div>'
+    add_index = len(rules)
+    add = render_stream_event_rule_row({}, index=add_index, is_new=True)
     return f"""<div class="event-rule-list">
-  <div class="event-rule-head"><span>Name</span><span>On</span><span>Labels</span><span>Keywords</span><span>Loudness</span><span>Duration</span><span>Severity</span></div>
-  {rows}
+  {existing}
+  {add}
 </div>"""
 
 
-def render_stream_event_rule_row(rule: dict[str, Any]) -> str:
+def render_stream_event_rule_row(
+    rule: dict[str, Any],
+    *,
+    index: int,
+    is_new: bool = False,
+) -> str:
     enabled = "true" if rule.get("enabled", True) else "false"
     labels = ", ".join(str(item) for item in rule.get("labels", []) if str(item).strip())
     keywords = ", ".join(str(item) for item in rule.get("keywords", []) if str(item).strip())
@@ -8002,15 +8173,54 @@ def render_stream_event_rule_row(rule: dict[str, Any]) -> str:
     min_duration = "" if not rule.get("min_duration_seconds") else str(rule.get("min_duration_seconds"))
     max_duration = "" if not rule.get("max_duration_seconds") else str(rule.get("max_duration_seconds"))
     severity = str(rule.get("severity") or "info")
-    return f"""<div class="event-rule-row">
-  <input name="rule_name" value="{escape(str(rule.get('name') or ''), quote=True)}" placeholder="Hype moment">
-  {render_form_select("rule_enabled", enabled, ("true", "false"))}
-  <input name="rule_labels" value="{escape(labels, quote=True)}" placeholder="Laughter, Cheering">
-  <input name="rule_keywords" value="{escape(keywords, quote=True)}" placeholder="keyword, phrase">
-  <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="{escape(loudness, quote=True)}" placeholder="dBFS">
-  <span class="duration-pair"><input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="{escape(min_duration, quote=True)}" placeholder="min"><input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="{escape(max_duration, quote=True)}" placeholder="max"></span>
-  <input name="rule_severity" value="{escape(severity, quote=True)}" placeholder="info">
-</div>"""
+    title = str(rule.get("name") or "New content event")
+    summary = render_stream_event_rule_summary(rule)
+    disabled_class = " disabled" if not is_new and enabled == "false" else ""
+    add_class = " event-rule-add" if is_new else ""
+    action_label = "Add" if is_new else "Edit"
+    delete_button = ""
+    if not is_new:
+        delete_button = (
+            f'<button class="download action-button" name="rule_delete_{index}" '
+            'value="true" type="submit">Delete</button>'
+        )
+    return f"""<details class="event-rule-card{disabled_class}{add_class}">
+  <summary><span class="event-rule-title">{escape(title)}</span><span class="event-rule-summary">{summary}</span><span class="event-rule-action">{action_label}</span></summary>
+  <div class="event-rule-editor">
+    <div class="event-rule-primary">
+      <label class="settings-field">Name <input name="rule_name" value="{escape(str(rule.get('name') or ''), quote=True)}" placeholder="Hype moment"></label>
+      <label class="settings-field">Enabled {render_form_select("rule_enabled", enabled, ("true", "false"))}</label>
+      <label class="settings-field">Severity <input name="rule_severity" value="{escape(severity, quote=True)}" placeholder="info"></label>
+    </div>
+    <div class="event-rule-criteria">
+      <label class="settings-field">Audio labels <input name="rule_labels" value="{escape(labels, quote=True)}" placeholder="Laughter, Cheering"></label>
+      <label class="settings-field">Transcript keywords <input name="rule_keywords" value="{escape(keywords, quote=True)}" placeholder="keyword, phrase"></label>
+      <label class="settings-field">Min loudness <input name="rule_min_loudness_dbfs" type="number" step="0.1" value="{escape(loudness, quote=True)}" placeholder="dBFS"></label>
+      <label class="settings-field">Min duration <input name="rule_min_duration_seconds" type="number" step="0.1" min="0" value="{escape(min_duration, quote=True)}" placeholder="seconds"></label>
+      <label class="settings-field">Max duration <input name="rule_max_duration_seconds" type="number" step="0.1" min="0" value="{escape(max_duration, quote=True)}" placeholder="seconds"></label>
+    </div>
+    <div class="settings-actions">{delete_button}</div>
+  </div>
+</details>"""
+
+
+def render_stream_event_rule_summary(rule: dict[str, Any]) -> str:
+    labels = [str(item) for item in rule.get("labels", []) if str(item).strip()]
+    keywords = [str(item) for item in rule.get("keywords", []) if str(item).strip()]
+    parts: list[str] = []
+    if labels:
+        parts.append("labels: " + ", ".join(labels[:3]))
+    if keywords:
+        parts.append("keywords: " + ", ".join(keywords[:3]))
+    if rule.get("min_loudness_dbfs") is not None:
+        parts.append(f"loudness >= {rule.get('min_loudness_dbfs')} dBFS")
+    if rule.get("min_duration_seconds") or rule.get("max_duration_seconds"):
+        start = rule.get("min_duration_seconds") or 0
+        end = rule.get("max_duration_seconds") or "any"
+        parts.append(f"duration {start}-{end}s")
+    if not parts:
+        parts.append("configure labels, keywords, or loudness")
+    return escape("; ".join(parts))
 
 
 def render_app_config_field(snapshot: StatusSnapshot, field: ConfigFormField) -> str:
@@ -8415,7 +8625,7 @@ def render_stream_jobs(jobs: list[JobStatus]) -> str:
 def render_content_events(events: list[ContentEventStatus]) -> str:
     if not events:
         return '<div class="file-meta">No content events detected yet.</div>'
-    ordered = sorted(events, key=lambda event: event.score, reverse=True)[:50]
+    ordered = sorted(events, key=lambda event: event.start)[:50]
     rows = "".join(render_content_event(event) for event in ordered)
     return f'<div class="content-events">{rows}</div>'
 
@@ -8428,9 +8638,13 @@ def render_content_event(event: ContentEventStatus) -> str:
     ) or "-"
     keywords = ", ".join(event.keywords) or "-"
     loudness = "-" if event.loudness_dbfs is None else f"{event.loudness_dbfs:.1f} dBFS"
+    start = format_event_offset(event.start)
+    end = format_event_offset(event.end)
     return (
         f'<div class="content-event {escape(event.severity or "info", quote=True)}">'
-        f'<div class="content-event-time">{escape(format_event_offset(event.start))}</div>'
+        '<div class="content-event-time">'
+        f'<span>{escape(start)}</span><span class="content-event-end">to {escape(end)}</span>'
+        '</div>'
         '<div class="content-event-main">'
         f'<strong>{escape(event.rule or "Event")}</strong>'
         f'<span class="file-meta">{escape(format_duration(int(event.duration)))} &middot; '
@@ -8438,7 +8652,7 @@ def render_content_event(event: ContentEventStatus) -> str:
         f'<div>{escape(event.text or labels)}</div>'
         '</div>'
         '<div class="content-event-meta">'
-        f'<span>{escape(labels)}</span><span>{escape(keywords)}</span>'
+        f'<span><b>Labels</b> {escape(labels)}</span><span><b>Keywords</b> {escape(keywords)}</span>'
         '</div></div>'
     )
 
@@ -8526,7 +8740,7 @@ def render_stream_card(stream: StreamStatus) -> str:
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="{files_tab_id}">Files</label>
-        <label class="stream-tab-events-label" for="{content_events_tab_id}">Events</label>
+        <label class="stream-tab-events-label" for="{content_events_tab_id}">Content Events</label>
         <label class="stream-tab-jobs-label" for="{jobs_tab_id}">Jobs</label>
         <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
       </div>

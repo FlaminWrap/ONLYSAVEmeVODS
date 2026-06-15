@@ -469,6 +469,12 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Current Configuration", html)
         self.assertIn("Content Event Rules", html)
         self.assertIn('action="/stream-event-rules"', html)
+        self.assertIn("event-settings-box", html)
+        self.assertIn("event-rule-card", html)
+        self.assertIn("event-rule-add", html)
+        self.assertIn("Current Events", html)
+        self.assertIn("Audio labels", html)
+        self.assertIn("Transcript keywords", html)
         self.assertIn("record_live_chat", html)
         self.assertIn("render_live_chat_video", html)
         self.assertIn("tab-config", html)
@@ -501,9 +507,13 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("stream-tab-panel stream-tab-log", html)
         self.assertIn("stream-tab-panel stream-tab-jobs", html)
         self.assertIn("stream-tab-panel stream-tab-events", html)
+        self.assertIn("Content Events", html)
         self.assertIn("Stream Log", html)
         self.assertIn("Laughter", html)
         self.assertIn("big laugh", html)
+        self.assertIn('class="content-event-time"', html)
+        self.assertIn('class="content-event-end"', html)
+        self.assertIn("to 0:14", html)
         stream_tabs = html[html.index('<div class="stream-tab-labels">'):]
         self.assertLess(
             stream_tabs.index('class="stream-tab-jobs-label"'),
@@ -840,13 +850,25 @@ class WebStatusTests(unittest.TestCase):
                 'download_dir = "downloads"\n'
                 'state_dir = "state"\n'
                 '[streamers."OUMB3rd"]\n'
-                'sources = ["@OUMB3rd"]\n',
+                'sources = ["@OUMB3rd"]\n'
+                '[[streamers."OUMB3rd".stream_event_rules]]\n'
+                'name = "Hype"\n'
+                'keywords = ["lets go"]\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
 
             html = render_status_html(build_status_snapshot(config))
 
+        self.assertIn('streamer-settings-tabs', html)
+        self.assertIn('streamer-settings-main-label', html)
+        self.assertIn('streamer-settings-events-label', html)
+        self.assertIn('streamer-settings-panel streamer-settings-events', html)
+        self.assertIn('Current Events', html)
+        self.assertIn('Hype', html)
+        self.assertIn('keywords: lets go', html)
+        self.assertIn('name="rule_delete_0"', html)
+        self.assertIn('event-rule-add', html)
         self.assertIn('data-source-builder', html)
         self.assertIn('data-source-platform', html)
         self.assertIn('data-source-input', html)
@@ -1965,6 +1987,44 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(streamer.stream_event_rules[0].name, "Hype")
         self.assertEqual(streamer.stream_event_rules[0].labels, ["Cheering"])
         self.assertEqual(streamer.stream_event_rules[0].keywords, ["lets go"])
+
+    def test_stream_event_rules_form_deletes_marked_rule(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["@OUMB3rd"]\n'
+                '[[streamers."OUMB3rd".stream_event_rules]]\n'
+                'name = "Hype"\n'
+                'keywords = ["lets go"]\n'
+                '[[streamers."OUMB3rd".stream_event_rules]]\n'
+                'name = "Laugh"\n'
+                'labels = ["Laughter"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_stream_event_rules_from_form(
+                config,
+                {
+                    "scope": ["streamer"],
+                    "streamer_name": ["OUMB3rd"],
+                    "event_enabled": ["inherit"],
+                    "rule_name": ["Hype", "Laugh"],
+                    "rule_enabled": ["true", "true"],
+                    "rule_labels": ["", "Laughter"],
+                    "rule_keywords": ["lets go", ""],
+                    "rule_min_loudness_dbfs": ["", ""],
+                    "rule_min_duration_seconds": ["", ""],
+                    "rule_max_duration_seconds": ["", ""],
+                    "rule_severity": ["info", "info"],
+                    "rule_delete_0": ["true"],
+                },
+            )
+            updated = load_config(config_path)
+
+        self.assertEqual([rule.name for rule in updated.streamers["OUMB3rd"].stream_event_rules], ["Laugh"])
+        self.assertEqual(updated.streamers["OUMB3rd"].stream_event_rules[0].labels, ["Laughter"])
 
     def test_streamer_voice_form_updates_profile_config(self) -> None:
         with TemporaryDirectory() as tmp:
