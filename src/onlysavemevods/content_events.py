@@ -18,6 +18,7 @@ from .config import (
     streamer_for_channel,
 )
 from .transcription import load_whisperx_subtitle_segments, transcription_output_file
+from .voice_match import voice_attribution_labels_for_media
 
 
 LOGGER = logging.getLogger(__name__)
@@ -65,6 +66,7 @@ class EventCandidate:
     loudness_dbfs: float | None = None
     labels: dict[str, float] = field(default_factory=dict)
     keywords: set[str] = field(default_factory=set)
+    voice: str = ""
     text: str = ""
 
     @property
@@ -232,10 +234,20 @@ def detect_content_events_for_media(
         transcription_output_file(media_file, ".json"),
         logger=logger,
     )
+    voice_labels = voice_attribution_labels_for_media(media_file)
+    if voice_labels:
+        transcript_segments = annotate_transcript_segment_voices(
+            transcript_segments,
+            voice_labels,
+        )
     rules = [rule for rule in settings.rules if rule.enabled]
     warnings: list[str] = []
     if not rules:
         warnings.append("No content event rules are configured.")
+    if any(rule.voice for rule in rules) and not voice_labels:
+        warnings.append(
+            "Voice-filtered content event rules were configured, but no voice attribution JSON was found."
+        )
 
     candidates: list[EventCandidate] = []
     candidates.extend(keyword_only_candidates(rules, transcript_segments))
@@ -306,6 +318,8 @@ def keyword_only_candidates(
         start = float(segment.get("start") or 0.0)
         end = float(segment.get("end") or start)
         for rule in keyword_rules:
+            if rule.voice and not segment_voice_matches(segment, rule.voice):
+                continue
             matched = matched_keywords(text, rule.keywords)
             if not matched:
                 continue
@@ -317,6 +331,7 @@ def keyword_only_candidates(
                     severity=rule.severity,
                     score=1.0,
                     keywords=set(matched),
+                    voice=rule.voice,
                     text=text,
                 )
             )
@@ -353,8 +368,20 @@ def audio_rule_candidates(
                 for row in backend.classify(audio, CONTENT_EVENT_SAMPLE_RATE)
                 if float(row.get("score", 0.0)) >= settings.min_confidence
             ]
-        text = transcript_text_for_window(transcript_segments, start, end)
         for rule in rules:
+            if rule.voice and not transcript_window_has_voice(
+                transcript_segments,
+                start,
+                end,
+                rule.voice,
+            ):
+                continue
+            text = transcript_text_for_window(
+                transcript_segments,
+                start,
+                end,
+                voice=rule.voice,
+            )
             candidate = candidate_for_rule(
                 rule,
                 start,
@@ -496,6 +523,7 @@ def candidate_for_rule(
         loudness_dbfs=loudness,
         labels=matched_label_scores,
         keywords=set(matched),
+        voice=rule.voice,
         text=text,
     )
 
@@ -571,6 +599,7 @@ def candidate_to_dict(candidate: EventCandidate) -> dict[str, Any]:
         ),
         "labels": labels,
         "keywords": sorted(candidate.keywords),
+        "voice": candidate.voice,
         "text": candidate.text[:240],
     }
 
@@ -581,6 +610,7 @@ def rule_summary(rule: StreamEventRuleConfig) -> dict[str, Any]:
         "enabled": rule.enabled,
         "labels": list(rule.labels),
         "keywords": list(rule.keywords),
+        "voice": rule.voice,
         "min_loudness_dbfs": rule.min_loudness_dbfs,
         "min_duration_seconds": rule.min_duration_seconds,
         "max_duration_seconds": rule.max_duration_seconds,
@@ -606,21 +636,77 @@ def matched_keywords(text: str, keywords: list[str]) -> list[str]:
     return [keyword for keyword in keywords if keyword.casefold() in normalized]
 
 
+def annotate_transcript_segment_voices(
+    transcript_segments: list[dict[str, Any]],
+    speaker_to_voice: dict[str, str],
+) -> list[dict[str, Any]]:
+    normalized = {
+        normalize_match_text(speaker): voice
+        for speaker, voice in speaker_to_voice.items()
+        if normalize_match_text(speaker) and voice.strip()
+    }
+    rows: list[dict[str, Any]] = []
+    for segment in transcript_segments:
+        row = dict(segment)
+        speaker = str(row.get("speaker") or "").strip()
+        voice = speaker_to_voice.get(speaker) or normalized.get(normalize_match_text(speaker), "")
+        if voice:
+            row["voice"] = voice
+        rows.append(row)
+    return rows
+
+
+def transcript_window_has_voice(
+    transcript_segments: list[dict[str, Any]],
+    start: float,
+    end: float,
+    voice: str,
+) -> bool:
+    return any(
+        transcript_segment_overlaps(segment, start, end)
+        and segment_voice_matches(segment, voice)
+        for segment in transcript_segments
+    )
+
+
 def transcript_text_for_window(
     transcript_segments: list[dict[str, Any]],
     start: float,
     end: float,
+    *,
+    voice: str = "",
 ) -> str:
     parts: list[str] = []
     for segment in transcript_segments:
-        seg_start = float(segment.get("start") or 0.0)
-        seg_end = float(segment.get("end") or seg_start)
-        if seg_end < start or seg_start > end:
+        if not transcript_segment_overlaps(segment, start, end):
+            continue
+        if voice and not segment_voice_matches(segment, voice):
             continue
         text = str(segment.get("text") or "").strip()
         if text:
             parts.append(text)
     return " ".join(parts)
+
+
+def transcript_segment_overlaps(
+    segment: dict[str, Any],
+    start: float,
+    end: float,
+) -> bool:
+    seg_start = float(segment.get("start") or 0.0)
+    seg_end = float(segment.get("end") or seg_start)
+    return seg_end >= start and seg_start <= end
+
+
+def segment_voice_matches(segment: dict[str, Any], voice: str) -> bool:
+    normalized_voice = normalize_match_text(voice)
+    if not normalized_voice:
+        return True
+    for key in ("voice", "speaker"):
+        value = normalize_match_text(str(segment.get(key) or ""))
+        if value and value == normalized_voice:
+            return True
+    return False
 
 
 def rms_dbfs(audio: np.ndarray) -> float:

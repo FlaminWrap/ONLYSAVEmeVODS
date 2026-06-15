@@ -705,6 +705,7 @@ class ConfigTests(unittest.TestCase):
                 'name = "Laughter"\n'
                 'labels = ["Laughter", "Giggle"]\n'
                 'keywords = ["haha"]\n'
+                'voice = "Host"\n'
                 'min_loudness_dbfs = -24.5\n'
                 'min_duration_seconds = 1.5\n'
                 'max_duration_seconds = 30.0\n'
@@ -722,6 +723,7 @@ class ConfigTests(unittest.TestCase):
                 '[[streamers."OUMB3rd".stream_event_rules]]\n'
                 'name = "Hype"\n'
                 'keywords = ["lets go"]\n'
+                'voice = "Guest"\n'
                 'severity = "warning"\n',
                 encoding="utf-8",
             )
@@ -740,6 +742,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(rule.name, "Laughter")
         self.assertEqual(rule.labels, ["Laughter", "Giggle"])
         self.assertEqual(rule.keywords, ["haha"])
+        self.assertEqual(rule.voice, "Host")
         self.assertEqual(rule.min_loudness_dbfs, -24.5)
         self.assertEqual(rule.min_duration_seconds, 1.5)
         self.assertEqual(rule.max_duration_seconds, 30.0)
@@ -756,6 +759,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(streamer.stream_event_detection.max_events_per_media, 5)
         self.assertEqual(len(streamer.stream_event_rules), 1)
         self.assertEqual(streamer.stream_event_rules[0].name, "Hype")
+        self.assertEqual(streamer.stream_event_rules[0].voice, "Guest")
 
     def test_stream_event_config_update_writes_and_removes_tables(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -772,6 +776,7 @@ class ConfigTests(unittest.TestCase):
                     StreamEventRuleConfig(
                         name="Laughter",
                         labels=["Laughter"],
+                        voice="Host",
                         severity="high",
                     )
                 ],
@@ -784,6 +789,7 @@ class ConfigTests(unittest.TestCase):
                     StreamEventRuleConfig(
                         name="Catchphrase",
                         keywords=["lets go"],
+                        voice="Guest",
                     )
                 ],
             )
@@ -794,12 +800,14 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(global_changed)
         self.assertTrue(streamer_changed)
         self.assertEqual(config.stream_event_rules[0].name, "Laughter")
+        self.assertEqual(config.stream_event_rules[0].voice, "Host")
         streamer = config.streamers["OUMB3rd"]
         self.assertIsNotNone(streamer.stream_event_detection)
         assert streamer.stream_event_detection is not None
         self.assertTrue(streamer.stream_event_detection.enabled)
         self.assertEqual(streamer.stream_event_detection.min_confidence, 0.65)
         self.assertEqual(streamer.stream_event_rules[0].name, "Catchphrase")
+        self.assertEqual(streamer.stream_event_rules[0].voice, "Guest")
         self.assertTrue(removed)
         self.assertIsNone(config_after_remove.streamers["OUMB3rd"].stream_event_detection)
         self.assertEqual(config_after_remove.streamers["OUMB3rd"].stream_event_rules, [])

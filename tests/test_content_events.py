@@ -148,6 +148,128 @@ class ContentEventDetectionTests(unittest.TestCase):
         self.assertEqual(events[0]["keywords"], ["clutch"])
         self.assertIn("huge clutch", events[0]["text"])
 
+    def test_voice_filtered_keyword_rule_uses_voice_attribution_sidecar(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media_file = root / "stream.mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 1.0,
+                                "end": 3.0,
+                                "speaker": "SPEAKER_00",
+                                "text": "that was a huge clutch",
+                            },
+                            {
+                                "start": 4.0,
+                                "end": 6.0,
+                                "speaker": "SPEAKER_01",
+                                "text": "another clutch happened",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".voice-attribution.json").write_text(
+                json.dumps(
+                    {
+                        "matches": {
+                            "SPEAKER_00": {"voice": "Host", "status": "auto"},
+                            "SPEAKER_01": {"voice": "Guest", "status": "approved"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = BotConfig(
+                stream_event_detection_enabled=True,
+                stream_event_rules=[
+                    StreamEventRuleConfig(
+                        name="Host clutch",
+                        keywords=["clutch"],
+                        voice="Host",
+                    )
+                ],
+            )
+
+            detect_content_events_for_media(config, media_file)
+            events = load_content_events(media_file)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["voice"], "Host")
+        self.assertEqual(events[0]["start"], 1.0)
+        self.assertIn("huge clutch", events[0]["text"])
+        self.assertNotIn("another clutch", events[0]["text"])
+
+    def test_voice_filtered_audio_rule_requires_matching_speaker_window(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media_file = root / "stream.mp4"
+            media_file.write_text("media", encoding="utf-8")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {
+                                "start": 0.1,
+                                "end": 0.8,
+                                "speaker": "SPEAKER_00",
+                                "text": "host reacts",
+                            },
+                            {
+                                "start": 1.2,
+                                "end": 1.9,
+                                "speaker": "SPEAKER_01",
+                                "text": "guest reacts",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".voice-attribution.json").write_text(
+                json.dumps(
+                    {
+                        "matches": {
+                            "SPEAKER_00": {"voice": "Host", "status": "auto"},
+                            "SPEAKER_01": {"voice": "Guest", "status": "approved"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config = BotConfig(
+                ffmpeg_path=str(write_fake_ffmpeg(root)),
+                stream_event_detection_enabled=True,
+                stream_event_window_seconds=1.0,
+                stream_event_hop_seconds=1.0,
+                stream_event_min_confidence=0.5,
+                stream_event_rules=[
+                    StreamEventRuleConfig(
+                        name="Host laugh",
+                        labels=["Laughter"],
+                        voice="Host",
+                    )
+                ],
+            )
+
+            detect_content_events_for_media(
+                config,
+                media_file,
+                backend=FakeBackend([{"label": "Laughter", "score": 0.91}]),
+            )
+            events = load_content_events(media_file)
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["voice"], "Host")
+        self.assertEqual(events[0]["start"], 0.0)
+        self.assertIn("host reacts", events[0]["text"])
+        self.assertNotIn("guest reacts", events[0]["text"])
+
     def test_streamer_settings_override_globals_and_replace_rules(self) -> None:
         config = BotConfig(
             stream_event_detection_enabled=True,

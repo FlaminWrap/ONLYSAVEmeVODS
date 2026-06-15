@@ -495,6 +495,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("data-streamer-settings-toggle", html)
         self.assertIn("data-streamer-settings-panel", html)
         self.assertIn("streamer-details", html)
+        self.assertIn(".streamer-settings-tabs .streamer-settings-panel", html)
+        self.assertNotIn("\n    .streamer-settings-panel { display: none", html)
         self.assertIn("applyStreamerCollapsedState", html)
         self.assertIn("applyStreamerSettingsState", html)
         self.assertIn("applyStreamTabState", html)
@@ -851,9 +853,12 @@ class WebStatusTests(unittest.TestCase):
                 'state_dir = "state"\n'
                 '[streamers."OUMB3rd"]\n'
                 'sources = ["@OUMB3rd"]\n'
+                '[streamers."OUMB3rd".voices."Host"]\n'
+                'samples = []\n'
                 '[[streamers."OUMB3rd".stream_event_rules]]\n'
                 'name = "Hype"\n'
-                'keywords = ["lets go"]\n',
+                'keywords = ["lets go"]\n'
+                'voice = "Host"\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -867,6 +872,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('Current Events', html)
         self.assertIn('Hype', html)
         self.assertIn('keywords: lets go', html)
+        self.assertIn('voice: Host', html)
+        self.assertIn('name="rule_voice"', html)
+        self.assertIn('<option value="Host" selected>Host</option>', html)
         self.assertIn('name="rule_delete_0"', html)
         self.assertIn('event-rule-add', html)
         self.assertIn('data-source-builder', html)
@@ -1964,6 +1972,7 @@ class WebStatusTests(unittest.TestCase):
                     "rule_enabled": ["true"],
                     "rule_labels": ["Cheering"],
                     "rule_keywords": ["lets go"],
+                    "rule_voice": ["Host"],
                     "rule_min_loudness_dbfs": ["-30"],
                     "rule_min_duration_seconds": ["1"],
                     "rule_max_duration_seconds": ["20"],
@@ -1987,6 +1996,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(streamer.stream_event_rules[0].name, "Hype")
         self.assertEqual(streamer.stream_event_rules[0].labels, ["Cheering"])
         self.assertEqual(streamer.stream_event_rules[0].keywords, ["lets go"])
+        self.assertEqual(streamer.stream_event_rules[0].voice, "Host")
 
     def test_stream_event_rules_form_deletes_marked_rule(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1997,9 +2007,11 @@ class WebStatusTests(unittest.TestCase):
                 '[[streamers."OUMB3rd".stream_event_rules]]\n'
                 'name = "Hype"\n'
                 'keywords = ["lets go"]\n'
+                'voice = "Host"\n'
                 '[[streamers."OUMB3rd".stream_event_rules]]\n'
                 'name = "Laugh"\n'
-                'labels = ["Laughter"]\n',
+                'labels = ["Laughter"]\n'
+                'voice = "Guest"\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -2014,6 +2026,7 @@ class WebStatusTests(unittest.TestCase):
                     "rule_enabled": ["true", "true"],
                     "rule_labels": ["", "Laughter"],
                     "rule_keywords": ["lets go", ""],
+                    "rule_voice": ["Host", "Guest"],
                     "rule_min_loudness_dbfs": ["", ""],
                     "rule_min_duration_seconds": ["", ""],
                     "rule_max_duration_seconds": ["", ""],
@@ -2025,6 +2038,7 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertEqual([rule.name for rule in updated.streamers["OUMB3rd"].stream_event_rules], ["Laugh"])
         self.assertEqual(updated.streamers["OUMB3rd"].stream_event_rules[0].labels, ["Laughter"])
+        self.assertEqual(updated.streamers["OUMB3rd"].stream_event_rules[0].voice, "Guest")
 
     def test_streamer_voice_form_updates_profile_config(self) -> None:
         with TemporaryDirectory() as tmp:

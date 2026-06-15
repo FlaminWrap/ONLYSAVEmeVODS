@@ -93,6 +93,7 @@ class StreamEventRuleConfig:
     enabled: bool = True
     labels: list[str] = field(default_factory=list)
     keywords: list[str] = field(default_factory=list)
+    voice: str = ""
     min_loudness_dbfs: float | None = None
     min_duration_seconds: float = 0.0
     max_duration_seconds: float = 0.0
@@ -1242,6 +1243,8 @@ def _stream_event_rules_block(
             lines.append(f"labels = {_toml_value(rule.labels, 'labels')}")
         if rule.keywords:
             lines.append(f"keywords = {_toml_value(rule.keywords, 'keywords')}")
+        if rule.voice:
+            lines.append(f"voice = {_toml_value(rule.voice, 'voice')}")
         if rule.min_loudness_dbfs is not None:
             lines.append(
                 f"min_loudness_dbfs = {_toml_value(rule.min_loudness_dbfs, 'min_loudness_dbfs')}"
@@ -1299,6 +1302,7 @@ def _normalize_stream_event_rules(
             "enabled": rule.enabled,
             "labels": list(rule.labels),
             "keywords": list(rule.keywords),
+            "voice": rule.voice,
             "min_duration_seconds": rule.min_duration_seconds,
             "max_duration_seconds": rule.max_duration_seconds,
             "severity": rule.severity,
@@ -1540,6 +1544,7 @@ def _as_stream_event_rule(raw: dict[str, Any], name: str) -> StreamEventRuleConf
         raise ConfigError(f"{name}.name is required")
     labels = _as_optional_str_list(raw.get("labels", []), f"{name}.labels")
     keywords = _as_optional_str_list(raw.get("keywords", []), f"{name}.keywords")
+    voice = _as_optional_str(raw.get("voice", ""), f"{name}.voice").strip()
     min_loudness_dbfs = None
     if "min_loudness_dbfs" in raw:
         min_loudness_dbfs = _as_float(
@@ -1567,6 +1572,7 @@ def _as_stream_event_rule(raw: dict[str, Any], name: str) -> StreamEventRuleConf
         enabled=_as_bool(raw.get("enabled", True), f"{name}.enabled"),
         labels=labels,
         keywords=keywords,
+        voice=voice,
         min_loudness_dbfs=min_loudness_dbfs,
         min_duration_seconds=min_duration_seconds,
         max_duration_seconds=max_duration_seconds,

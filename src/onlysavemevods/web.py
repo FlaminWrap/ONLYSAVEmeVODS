@@ -383,6 +383,7 @@ class ContentEventStatus:
     loudness_dbfs: float | None
     labels: list[dict[str, Any]]
     keywords: list[str]
+    voice: str
     text: str
 
 
@@ -1587,6 +1588,7 @@ def stream_event_rule_summary(rule: StreamEventRuleConfig) -> dict[str, Any]:
         "enabled": rule.enabled,
         "labels": list(rule.labels),
         "keywords": list(rule.keywords),
+        "voice": rule.voice,
         "min_loudness_dbfs": rule.min_loudness_dbfs,
         "min_duration_seconds": rule.min_duration_seconds,
         "max_duration_seconds": rule.max_duration_seconds,
@@ -2125,6 +2127,7 @@ def content_event_status(media_name: str, event: dict[str, Any]) -> ContentEvent
         ),
         labels=[label for label in event.get("labels", []) if isinstance(label, dict)],
         keywords=[str(keyword) for keyword in event.get("keywords", [])],
+        voice=str(event.get("voice") or ""),
         text=str(event.get("text") or ""),
     )
 
@@ -3783,6 +3786,7 @@ def stream_event_rules_from_form(
         len(params.get("rule_enabled", [])),
         len(params.get("rule_labels", [])),
         len(params.get("rule_keywords", [])),
+        len(params.get("rule_voice", [])),
         len(params.get("rule_min_loudness_dbfs", [])),
         len(params.get("rule_min_duration_seconds", [])),
         len(params.get("rule_max_duration_seconds", [])),
@@ -3794,6 +3798,7 @@ def stream_event_rules_from_form(
         enabled_text = form_list_value(params, "rule_enabled", index) or "true"
         labels_text = form_list_value(params, "rule_labels", index)
         keywords_text = form_list_value(params, "rule_keywords", index)
+        voice = form_list_value(params, "rule_voice", index).strip()
         loudness_text = form_list_value(params, "rule_min_loudness_dbfs", index)
         min_duration_text = form_list_value(params, "rule_min_duration_seconds", index)
         max_duration_text = form_list_value(params, "rule_max_duration_seconds", index)
@@ -3807,6 +3812,7 @@ def stream_event_rules_from_form(
                 name,
                 labels_text,
                 keywords_text,
+                voice,
                 loudness_text,
                 min_duration_text,
                 max_duration_text,
@@ -3821,6 +3827,7 @@ def stream_event_rules_from_form(
                 enabled=form_bool(enabled_text, "rule enabled"),
                 labels=form_string_list(labels_text, "rule labels"),
                 keywords=form_string_list(keywords_text, "rule keywords"),
+                voice=voice,
                 min_loudness_dbfs=optional_signed_form_float(
                     loudness_text,
                     "rule min_loudness_dbfs",
@@ -5797,7 +5804,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel);
       cursor: pointer;
     }}
-    .streamer-settings-panel {{ display: none; padding-top: 12px; }}
+    .streamer-settings-tabs .streamer-settings-panel {{ display: none; padding-top: 12px; }}
     .streamer-settings-main-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-main-label,
     .streamer-settings-events-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-events-label {{
       color: var(--text);
@@ -6942,12 +6949,30 @@ def dashboard_script() -> str:
     const parts = [];
     if (Array.isArray(rule.labels) && rule.labels.length) parts.push(`labels: ${rule.labels.slice(0, 3).join(", ")}`);
     if (Array.isArray(rule.keywords) && rule.keywords.length) parts.push(`keywords: ${rule.keywords.slice(0, 3).join(", ")}`);
+    if (rule.voice) parts.push(`voice: ${rule.voice}`);
     if (rule.min_loudness_dbfs !== null && rule.min_loudness_dbfs !== undefined) parts.push(`loudness >= ${rule.min_loudness_dbfs} dBFS`);
     if (rule.min_duration_seconds || rule.max_duration_seconds) parts.push(`duration ${rule.min_duration_seconds || 0}-${rule.max_duration_seconds || "any"}s`);
     return parts.length ? parts.join("; ") : "configure labels, keywords, or loudness";
   };
 
-  const renderEventRuleRow = (rule, index, isNew = false) => {
+  const renderVoiceRuleControl = (selected, voices) => {
+    const value = String(selected || "");
+    const names = (voices || []).map((voice) => String(voice.name || voice || "").trim()).filter(Boolean);
+    if (!names.length) {
+      return `<input name="rule_voice" value="${escapeAttr(value)}" placeholder="Any voice">`;
+    }
+    const known = new Set(names);
+    const options = [`<option value=""${value ? "" : " selected"}>Any voice</option>`];
+    names.forEach((name) => {
+      options.push(`<option value="${escapeAttr(name)}"${name === value ? " selected" : ""}>${escapeHtml(name)}</option>`);
+    });
+    if (value && !known.has(value)) {
+      options.push(`<option value="${escapeAttr(value)}" selected>${escapeHtml(value)}</option>`);
+    }
+    return `<select name="rule_voice">${options.join("")}</select>`;
+  };
+
+  const renderEventRuleRow = (rule, index, isNew = false, voices = []) => {
     rule = rule || {};
     const labels = Array.isArray(rule.labels) ? rule.labels.join(", ") : "";
     const keywords = Array.isArray(rule.keywords) ? rule.keywords.join(", ") : "";
@@ -6963,6 +6988,7 @@ def dashboard_script() -> str:
     <div class="event-rule-primary">
       <label class="settings-field">Name <input name="rule_name" value="${escapeAttr(rule.name || "")}" placeholder="Hype moment"></label>
       <label class="settings-field">Enabled ${renderSelect("rule_enabled", enabled, ["true", "false"])}</label>
+      <label class="settings-field">Voice ${renderVoiceRuleControl(rule.voice || "", voices)}</label>
       <label class="settings-field">Severity <input name="rule_severity" value="${escapeAttr(rule.severity || "info")}" placeholder="info"></label>
     </div>
     <div class="event-rule-criteria">
@@ -6977,12 +7003,12 @@ def dashboard_script() -> str:
 </details>`;
   };
 
-  const renderEventRuleRows = (rules) => {
+  const renderEventRuleRows = (rules, voices = []) => {
     rules = rules || [];
     const existing = rules.length
-      ? rules.map((rule, index) => renderEventRuleRow(rule, index, false)).join("")
+      ? rules.map((rule, index) => renderEventRuleRow(rule, index, false, voices)).join("")
       : '<div class="event-rule-empty">No content events configured yet.</div>';
-    return `<div class="event-rule-list">${existing}${renderEventRuleRow({}, rules.length, true)}</div>`;
+    return `<div class="event-rule-list">${existing}${renderEventRuleRow({}, rules.length, true, voices)}</div>`;
   };
 
   const renderStreamerEventSettings = (streamer) => {
@@ -6990,6 +7016,7 @@ def dashboard_script() -> str:
     const enabled = detection.enabled === null || detection.enabled === undefined ? "inherit" : (detection.enabled ? "true" : "false");
     const minConfidence = detection.min_confidence === null || detection.min_confidence === undefined || Number(detection.min_confidence) < 0 ? "" : String(detection.min_confidence);
     const rules = streamer.stream_event_rules || [];
+    const voices = streamer.voices || [];
     const ruleCount = rules.length;
     return `<form class="event-rules-form" method="post" action="/stream-event-rules">
   <input type="hidden" name="scope" value="streamer">
@@ -7009,7 +7036,7 @@ def dashboard_script() -> str:
   <fieldset class="event-settings-box">
     <legend>Content Events</legend>
     <div class="event-rule-toolbar"><strong>Current Events</strong><span class="file-meta">${escapeHtml(ruleCount)} configured event${ruleCount === 1 ? "" : "s"}</span></div>
-    ${renderEventRuleRows(rules)}
+    ${renderEventRuleRows(rules, voices)}
   </fieldset>
   <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
 </form>`;
@@ -8139,21 +8166,30 @@ def render_streamer_event_settings_form(streamer: StreamerStatStatus) -> str:
   <fieldset class="event-settings-box">
     <legend>Content Events</legend>
     <div class="event-rule-toolbar"><strong>Current Events</strong><span class="file-meta">{rule_count} configured {rule_label}</span></div>
-    {render_stream_event_rule_rows(streamer.stream_event_rules)}
+    {render_stream_event_rule_rows(streamer.stream_event_rules, streamer.voices)}
   </fieldset>
   <div class="settings-actions"><button class="download action-button" type="submit">Save Content Events</button></div>
 </form>"""
 
 
-def render_stream_event_rule_rows(rules: list[dict[str, Any]]) -> str:
+def render_stream_event_rule_rows(
+    rules: list[dict[str, Any]],
+    voices: list[VoiceProfileStatus] | None = None,
+) -> str:
+    voice_options = voices or []
     existing = "".join(
-        render_stream_event_rule_row(rule, index=index)
+        render_stream_event_rule_row(rule, index=index, voices=voice_options)
         for index, rule in enumerate(rules)
     )
     if not existing:
         existing = '<div class="event-rule-empty">No content events configured yet.</div>'
     add_index = len(rules)
-    add = render_stream_event_rule_row({}, index=add_index, is_new=True)
+    add = render_stream_event_rule_row(
+        {},
+        index=add_index,
+        is_new=True,
+        voices=voice_options,
+    )
     return f"""<div class="event-rule-list">
   {existing}
   {add}
@@ -8165,6 +8201,7 @@ def render_stream_event_rule_row(
     *,
     index: int,
     is_new: bool = False,
+    voices: list[VoiceProfileStatus] | None = None,
 ) -> str:
     enabled = "true" if rule.get("enabled", True) else "false"
     labels = ", ".join(str(item) for item in rule.get("labels", []) if str(item).strip())
@@ -8173,6 +8210,7 @@ def render_stream_event_rule_row(
     min_duration = "" if not rule.get("min_duration_seconds") else str(rule.get("min_duration_seconds"))
     max_duration = "" if not rule.get("max_duration_seconds") else str(rule.get("max_duration_seconds"))
     severity = str(rule.get("severity") or "info")
+    voice_control = render_stream_event_voice_control(str(rule.get("voice") or ""), voices or [])
     title = str(rule.get("name") or "New content event")
     summary = render_stream_event_rule_summary(rule)
     disabled_class = " disabled" if not is_new and enabled == "false" else ""
@@ -8190,6 +8228,7 @@ def render_stream_event_rule_row(
     <div class="event-rule-primary">
       <label class="settings-field">Name <input name="rule_name" value="{escape(str(rule.get('name') or ''), quote=True)}" placeholder="Hype moment"></label>
       <label class="settings-field">Enabled {render_form_select("rule_enabled", enabled, ("true", "false"))}</label>
+      <label class="settings-field">Voice {voice_control}</label>
       <label class="settings-field">Severity <input name="rule_severity" value="{escape(severity, quote=True)}" placeholder="info"></label>
     </div>
     <div class="event-rule-criteria">
@@ -8204,6 +8243,35 @@ def render_stream_event_rule_row(
 </details>"""
 
 
+def render_stream_event_voice_control(
+    selected: str,
+    voices: list[VoiceProfileStatus],
+) -> str:
+    value = selected.strip()
+    voice_names = [voice.name for voice in voices if voice.name.strip()]
+    if not voice_names:
+        return (
+            f'<input name="rule_voice" value="{escape(value, quote=True)}" '
+            'placeholder="Any voice">'
+        )
+    options = [
+        '<option value=""' + ('' if value else ' selected') + '>Any voice</option>'
+    ]
+    known = set(voice_names)
+    for voice_name in voice_names:
+        selected_attr = ' selected' if voice_name == value else ''
+        options.append(
+            f'<option value="{escape(voice_name, quote=True)}"{selected_attr}>'
+            f'{escape(voice_name)}</option>'
+        )
+    if value and value not in known:
+        options.append(
+            f'<option value="{escape(value, quote=True)}" selected>'
+            f'{escape(value)}</option>'
+        )
+    return f'<select name="rule_voice">{"".join(options)}</select>'
+
+
 def render_stream_event_rule_summary(rule: dict[str, Any]) -> str:
     labels = [str(item) for item in rule.get("labels", []) if str(item).strip()]
     keywords = [str(item) for item in rule.get("keywords", []) if str(item).strip()]
@@ -8212,6 +8280,8 @@ def render_stream_event_rule_summary(rule: dict[str, Any]) -> str:
         parts.append("labels: " + ", ".join(labels[:3]))
     if keywords:
         parts.append("keywords: " + ", ".join(keywords[:3]))
+    if rule.get("voice"):
+        parts.append("voice: " + str(rule.get("voice")))
     if rule.get("min_loudness_dbfs") is not None:
         parts.append(f"loudness >= {rule.get('min_loudness_dbfs')} dBFS")
     if rule.get("min_duration_seconds") or rule.get("max_duration_seconds"):
@@ -8637,6 +8707,7 @@ def render_content_event(event: ContentEventStatus) -> str:
         if label.get("label")
     ) or "-"
     keywords = ", ".join(event.keywords) or "-"
+    voice = event.voice or "-"
     loudness = "-" if event.loudness_dbfs is None else f"{event.loudness_dbfs:.1f} dBFS"
     start = format_event_offset(event.start)
     end = format_event_offset(event.end)
@@ -8652,7 +8723,7 @@ def render_content_event(event: ContentEventStatus) -> str:
         f'<div>{escape(event.text or labels)}</div>'
         '</div>'
         '<div class="content-event-meta">'
-        f'<span><b>Labels</b> {escape(labels)}</span><span><b>Keywords</b> {escape(keywords)}</span>'
+        f'<span><b>Voice</b> {escape(voice)}</span><span><b>Labels</b> {escape(labels)}</span><span><b>Keywords</b> {escape(keywords)}</span>'
         '</div></div>'
     )
 
