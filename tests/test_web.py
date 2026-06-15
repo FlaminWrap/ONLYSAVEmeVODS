@@ -867,7 +867,9 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertIn('streamer-settings-tabs', html)
         self.assertIn('streamer-settings-main-label', html)
+        self.assertIn('streamer-settings-voices-label', html)
         self.assertIn('streamer-settings-events-label', html)
+        self.assertIn('streamer-settings-panel streamer-settings-voices', html)
         self.assertIn('streamer-settings-panel streamer-settings-events', html)
         self.assertIn('Current Events', html)
         self.assertIn('Hype', html)
@@ -917,7 +919,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/assets/platforms/youtube.svg", PLATFORM_ICON_ROUTES)
         self.assertTrue(Path(PLATFORM_ICON_ROUTES["/assets/platforms/youtube.svg"]).is_file())
 
-    def test_status_html_renders_streamer_voice_manager(self) -> None:
+    def test_status_html_renders_streamer_voice_settings_tab(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             config_path = root / "config.toml"
@@ -979,8 +981,11 @@ class WebStatusTests(unittest.TestCase):
 
             html = render_status_html(build_status_snapshot(config))
 
-        self.assertIn('data-open-voice-manager="voice-manager-OUMB3rd"', html)
-        self.assertIn('id="voice-manager-OUMB3rd"', html)
+        self.assertIn('streamer-settings-voices-label', html)
+        self.assertIn('streamer-settings-panel streamer-settings-voices', html)
+        self.assertIn('id="voice-settings-OUMB3rd-known"', html)
+        self.assertNotIn('data-open-voice-manager', html)
+        self.assertNotIn('id="voice-manager-OUMB3rd"', html)
         self.assertIn("Known Voices", html)
         self.assertIn("Add Voice", html)
         self.assertIn("voice-manager-actions", html)
@@ -1011,6 +1016,8 @@ class WebStatusTests(unittest.TestCase):
         script = dashboard_script()
 
         self.assertIn("join(String.fromCharCode(10))", script)
+        self.assertIn("renderStreamerVoiceSettings", script)
+        self.assertNotIn("data-open-voice-manager", script)
         self.assertNotIn('join("' + "\n" + '")', script)
 
     def test_jobs_tab_shows_dashboard_and_watermark_jobs(self) -> None:

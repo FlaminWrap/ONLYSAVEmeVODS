@@ -5616,6 +5616,15 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .voice-manager-head h2 {{ margin: 0; font-size: 1rem; }}
     .voice-manager-actions {{ display: flex; align-items: center; gap: 8px; }}
     .voice-manager-note {{ padding: 10px 14px 0; }}
+    .voice-settings {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      overflow: visible;
+    }}
+    .voice-settings .voice-manager-head {{ padding: 12px; }}
+    .voice-settings .voice-manager-note {{ padding: 10px 12px 0; }}
+    .voice-settings .voice-tabs {{ padding: 12px; }}
     .voice-add-menu {{ position: relative; }}
     .voice-add-menu > summary {{ list-style: none; cursor: pointer; }}
     .voice-add-menu > summary::-webkit-details-marker {{ display: none; }}
@@ -5806,13 +5815,15 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-settings-tabs .streamer-settings-panel {{ display: none; padding-top: 12px; }}
     .streamer-settings-main-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-main-label,
-    .streamer-settings-events-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-events-label {{
+    .streamer-settings-events-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-events-label,
+    .streamer-settings-voices-toggle:checked ~ .streamer-settings-tab-labels .streamer-settings-voices-label {{
       color: var(--text);
       background: var(--panel-strong);
       font-weight: 650;
     }}
     .streamer-settings-main-toggle:checked ~ .streamer-settings-panels .streamer-settings-main,
-    .streamer-settings-events-toggle:checked ~ .streamer-settings-panels .streamer-settings-events {{ display: block; }}
+    .streamer-settings-events-toggle:checked ~ .streamer-settings-panels .streamer-settings-events,
+    .streamer-settings-voices-toggle:checked ~ .streamer-settings-panels .streamer-settings-voices {{ display: block; }}
     .streamer-event-summary-title {{ font-weight: 650; }}
     .compact-grid {{ grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }}
     @media (max-width: 980px) {{
@@ -6439,26 +6450,6 @@ def dashboard_script() -> str:
   });
 
   document.addEventListener("click", (event) => {
-    const voiceButton = event.target.closest("[data-open-voice-manager]");
-    if (voiceButton) {
-      event.preventDefault();
-      const id = voiceButton.getAttribute("data-open-voice-manager") || "";
-      const dialog = id ? byId(id) : null;
-      if (dialog) {
-        if (typeof dialog.showModal === "function") dialog.showModal();
-        else dialog.setAttribute("open", "");
-      }
-      return;
-    }
-    const closeVoiceButton = event.target.closest("[data-close-voice-manager]");
-    if (closeVoiceButton) {
-      event.preventDefault();
-      const dialog = closeVoiceButton.closest("dialog");
-      if (dialog && typeof dialog.close === "function") dialog.close();
-      else if (dialog) dialog.removeAttribute("open");
-      return;
-    }
-
     const settingsButton = event.target.closest("[data-streamer-settings-toggle]");
     if (settingsButton) {
       const key = settingsButton.getAttribute("data-streamer-settings-toggle") || "";
@@ -6610,13 +6601,6 @@ def dashboard_script() -> str:
       if (event.target === wizard) wizard.close();
     });
   }
-
-  document.addEventListener("click", (event) => {
-    const dialog = event.target.closest ? event.target.closest("dialog.voice-manager") : null;
-    if (dialog && event.target === dialog && typeof dialog.close === "function") {
-      dialog.close();
-    }
-  });
 
   const renderStatusCounts = (counts) => {
     const entries = Object.entries(counts || {}).sort(([a], [b]) => a.localeCompare(b));
@@ -7054,18 +7038,22 @@ def dashboard_script() -> str:
       const settingsKey = encodeURIComponent(rawKey).replace(/%/g, "-") || "streamer";
       const tabName = `streamer-settings-${settingsKey}`;
       const mainTabId = `${tabName}-main`;
+      const voicesTabId = `${tabName}-voices`;
       const eventsTabId = `${tabName}-events`;
       return `<div class="streamer-settings">
   <h3>Settings</h3>
   <div class="streamer-settings-tabs">
     <input class="streamer-settings-main-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(mainTabId)}" checked>
+    <input class="streamer-settings-voices-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(voicesTabId)}">
     <input class="streamer-settings-events-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(eventsTabId)}">
     <div class="streamer-settings-tab-labels">
       <label class="streamer-settings-main-label" for="${escapeAttr(mainTabId)}">Streamer</label>
+      <label class="streamer-settings-voices-label" for="${escapeAttr(voicesTabId)}">Voices</label>
       <label class="streamer-settings-events-label" for="${escapeAttr(eventsTabId)}">Content Events</label>
     </div>
     <div class="streamer-settings-panels">
       <section class="streamer-settings-panel streamer-settings-main">${renderStreamerForm(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-voices">${renderStreamerVoiceSettings(streamer, snapshot)}</section>
       <section class="streamer-settings-panel streamer-settings-events">${renderStreamerEventSettings(streamer)}</section>
     </div>
   </div>
@@ -7115,13 +7103,6 @@ def dashboard_script() -> str:
 
   const streamerDomId = (value) => String(value || "streamer").trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "streamer";
 
-  const renderStreamerVoiceAction = (streamer, snapshot) => {
-    if (!streamer.configured) return "";
-    const disabled = snapshotConfigPath(snapshot) === "-" ? " disabled" : "";
-    const dialogId = `voice-manager-${streamerDomId(streamer.name)}`;
-    return `<button class="download action-button" type="button" data-open-voice-manager="${escapeAttr(dialogId)}"${disabled}>Voices</button>`;
-  };
-
   const renderVoiceAddMenu = (streamer) => {
     return `<details class="voice-add-menu">
   <summary class="download action-button">Add Voice</summary>
@@ -7170,22 +7151,22 @@ def dashboard_script() -> str:
 </details>`;
   };
 
-  const renderVoiceManager = (streamer, snapshot) => {
-    if (!streamer.configured || snapshotConfigPath(snapshot) === "-") return "";
-    const dialogId = `voice-manager-${streamerDomId(streamer.name)}`;
+  const renderStreamerVoiceSettings = (streamer, snapshot) => {
+    if (!streamer.configured) return '<div class="file-meta">Create a streamer entry before adding voices.</div>';
+    const tabId = `voice-settings-${streamerDomId(streamer.name)}`;
     const backend = (((snapshot || {}).configuration || {}).Transcription || {}).voice_match_backend || {};
     const voices = streamer.voices || [];
     const profiles = voices.length ? `<div class="voice-list">${voices.map((voice) => renderVoiceProfileForm(streamer, voice)).join("")}</div>` : '<div class="file-meta">No known voices yet.</div>';
     const addMenu = renderVoiceAddMenu(streamer);
-    return `<dialog class="voice-manager" id="${escapeAttr(dialogId)}">
-  <div class="voice-manager-head"><h2>${escapeHtml(streamer.name || "Streamer")} Voices</h2><div class="voice-manager-actions">${addMenu}<button class="download action-button" type="button" data-close-voice-manager>Close</button></div></div>
+    return `<div class="voice-settings">
+  <div class="voice-manager-head"><h2>${escapeHtml(streamer.name || "Streamer")} Voices</h2><div class="voice-manager-actions">${addMenu}</div></div>
   <div class="voice-manager-note file-meta">${escapeHtml(backend.message || "")}</div>
   <div class="voice-tabs">
-    <input id="${escapeAttr(dialogId)}-known" name="${escapeAttr(dialogId)}-tab" type="radio" checked><label for="${escapeAttr(dialogId)}-known">Known Voices</label><section>${profiles}</section>
-    <input id="${escapeAttr(dialogId)}-detected" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-detected">Detected Speakers</label><section><div class="file-meta">Refresh the page for transcript sample rows.</div></section>
-    <input id="${escapeAttr(dialogId)}-review" name="${escapeAttr(dialogId)}-tab" type="radio"><label for="${escapeAttr(dialogId)}-review">Review Matches</label><section><div class="file-meta">Refresh the page for transcript sample and match review rows.</div></section>
+    <input id="${escapeAttr(tabId)}-known" name="${escapeAttr(tabId)}-tab" type="radio" checked><label for="${escapeAttr(tabId)}-known">Known Voices</label><section>${profiles}</section>
+    <input id="${escapeAttr(tabId)}-detected" name="${escapeAttr(tabId)}-tab" type="radio"><label for="${escapeAttr(tabId)}-detected">Detected Speakers</label><section><div class="file-meta">Refresh the page for transcript sample rows.</div></section>
+    <input id="${escapeAttr(tabId)}-review" name="${escapeAttr(tabId)}-tab" type="radio"><label for="${escapeAttr(tabId)}-review">Review Matches</label><section><div class="file-meta">Refresh the page for transcript sample and match review rows.</div></section>
   </div>
-</dialog>`;
+</div>`;
   };
 
   const streamerActiveJobCount = (streamer) => (streamer && streamer.jobs || [])
@@ -7202,8 +7183,6 @@ def dashboard_script() -> str:
     const needsClass = streamer.needs_grouping ? " needs-grouping" : "";
     const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
     const groupAction = renderStreamerGroupingAction(streamer, snapshot);
-    const voiceAction = renderStreamerVoiceAction(streamer, snapshot);
-    const voiceManager = renderVoiceManager(streamer, snapshot);
     const latestAge = formatEpochAge(streamer.latest_activity_at);
     return `<section class="streamer-section${needsClass}${collapsedClass}" data-streamer-key="${escapeAttr(streamer.name || "")}" data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-active="${escapeAttr(streamer.active_count || 0)}" data-streamer-attention="${escapeAttr(streamer.attention_count || 0)}" data-streamer-active-jobs="${escapeAttr(activeJobs)}" data-streamer-needs-grouping="${streamer.needs_grouping ? "true" : "false"}">
   <div class="streamer-head">
@@ -7218,7 +7197,6 @@ def dashboard_script() -> str:
       <span class="badge">Storage ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
       <span class="badge">Latest ${escapeHtml(latestAge || "-")}</span>
       ${groupAction}
-      ${voiceAction}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="${toggleExpanded}">${toggleLabel}</button>
     </div>
@@ -7249,7 +7227,6 @@ def dashboard_script() -> str:
       ${renderStreamerStreams(streamer.streams || [])}
     </div>
   </div>
-  ${voiceManager}
 </section>`;
   };
 
@@ -7568,8 +7545,6 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
         else ""
     )
     group_action = render_needs_grouping_action(streamer, snapshot)
-    voice_action = render_streamer_voice_action(streamer, snapshot)
-    voice_manager = render_streamer_voice_manager(streamer, snapshot)
     settings = render_streamer_settings_area(streamer, snapshot)
     jobs = render_streamer_jobs_summary(streamer.jobs)
     streams = render_streamer_streams(streamer.streams)
@@ -7589,7 +7564,6 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge">Storage {escape(format_bytes(streamer.total_bytes))}</span>
       <span class="badge">Latest {escape(latest_activity_age or '-')}</span>
       {group_action}
-      {voice_action}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="{streamer_key}" aria-expanded="false">Settings</button>
       <button class="download streamer-toggle" type="button" data-streamer-toggle="{streamer_key}" aria-expanded="{toggle_expanded}">{toggle_label}</button>
     </div>
@@ -7620,7 +7594,6 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       {streams}
     </div>
   </div>
-  {voice_manager}
 </section>"""
 
 
@@ -7629,57 +7602,37 @@ def streamer_dom_id(value: str) -> str:
     return key or "streamer"
 
 
-def render_streamer_voice_action(
+def render_streamer_voice_settings(
     streamer: StreamerStatStatus,
     snapshot: StatusSnapshot,
 ) -> str:
-    if not streamer.configured:
-        return ""
-    disabled = ' disabled' if snapshot_config_path(snapshot) == "-" else ""
-    dialog_id = f"voice-manager-{streamer_dom_id(streamer.name)}"
-    return (
-        f'<button class="download action-button" type="button" '
-        f'data-open-voice-manager="{escape(dialog_id, quote=True)}"{disabled}>Voices</button>'
-    )
-
-
-def render_streamer_voice_manager(
-    streamer: StreamerStatStatus,
-    snapshot: StatusSnapshot,
-) -> str:
-    if not streamer.configured or snapshot_config_path(snapshot) == "-":
-        return ""
-    dialog_id = f"voice-manager-{streamer_dom_id(streamer.name)}"
     backend = snapshot.configuration.get("Transcription", {}).get("voice_match_backend", {})
     backend_message = ""
     if isinstance(backend, dict):
         backend_message = str(backend.get("message") or "")
+    tab_key = f"voice-settings-{streamer_dom_id(streamer.name)}"
     profiles = render_voice_profile_forms(streamer)
     add_menu = render_voice_add_menu(streamer)
     transcript_samples = render_voice_transcript_sample_forms(streamer)
     review_rows = render_voice_review_rows(streamer)
-    return f"""<dialog class="voice-manager" id="{escape(dialog_id, quote=True)}">
+    return f"""<div class="voice-settings">
   <div class="voice-manager-head">
     <h2>{escape(streamer.name)} Voices</h2>
-    <div class="voice-manager-actions">
-      {add_menu}
-      <button class="download action-button" type="button" data-close-voice-manager>Close</button>
-    </div>
+    <div class="voice-manager-actions">{add_menu}</div>
   </div>
   <div class="voice-manager-note file-meta">{escape(backend_message)}</div>
   <div class="voice-tabs">
-    <input id="{escape(dialog_id, quote=True)}-known" name="{escape(dialog_id, quote=True)}-tab" type="radio" checked>
-    <label for="{escape(dialog_id, quote=True)}-known">Known Voices</label>
+    <input id="{escape(tab_key, quote=True)}-known" name="{escape(tab_key, quote=True)}-tab" type="radio" checked>
+    <label for="{escape(tab_key, quote=True)}-known">Known Voices</label>
     <section>{profiles}</section>
-    <input id="{escape(dialog_id, quote=True)}-detected" name="{escape(dialog_id, quote=True)}-tab" type="radio">
-    <label for="{escape(dialog_id, quote=True)}-detected">Detected Speakers</label>
+    <input id="{escape(tab_key, quote=True)}-detected" name="{escape(tab_key, quote=True)}-tab" type="radio">
+    <label for="{escape(tab_key, quote=True)}-detected">Detected Speakers</label>
     <section>{transcript_samples}</section>
-    <input id="{escape(dialog_id, quote=True)}-review" name="{escape(dialog_id, quote=True)}-tab" type="radio">
-    <label for="{escape(dialog_id, quote=True)}-review">Review Matches</label>
+    <input id="{escape(tab_key, quote=True)}-review" name="{escape(tab_key, quote=True)}-tab" type="radio">
+    <label for="{escape(tab_key, quote=True)}-review">Review Matches</label>
     <section>{review_rows}</section>
   </div>
-</dialog>"""
-
+</div>"""
 
 def render_voice_profile_forms(streamer: StreamerStatStatus) -> str:
     if not streamer.voices:
@@ -7970,19 +7923,23 @@ def render_streamer_settings_area(
     if streamer.configured:
         tab_key = re.sub(r"[^A-Za-z0-9_-]+", "-", streamer.name).strip("-") or "streamer"
         main_tab_id = f"streamer-settings-{tab_key}-main"
+        voices_tab_id = f"streamer-settings-{tab_key}-voices"
         events_tab_id = f"streamer-settings-{tab_key}-events"
         tab_name = f"streamer-settings-{tab_key}"
         return f"""<div class="streamer-settings">
   <h3>Settings</h3>
   <div class="streamer-settings-tabs">
     <input class="streamer-settings-main-toggle" type="radio" name="{escape(tab_name, quote=True)}" id="{escape(main_tab_id, quote=True)}" checked>
+    <input class="streamer-settings-voices-toggle" type="radio" name="{escape(tab_name, quote=True)}" id="{escape(voices_tab_id, quote=True)}">
     <input class="streamer-settings-events-toggle" type="radio" name="{escape(tab_name, quote=True)}" id="{escape(events_tab_id, quote=True)}">
     <div class="streamer-settings-tab-labels">
       <label class="streamer-settings-main-label" for="{escape(main_tab_id, quote=True)}">Streamer</label>
+      <label class="streamer-settings-voices-label" for="{escape(voices_tab_id, quote=True)}">Voices</label>
       <label class="streamer-settings-events-label" for="{escape(events_tab_id, quote=True)}">Content Events</label>
     </div>
     <div class="streamer-settings-panels">
       <section class="streamer-settings-panel streamer-settings-main">{render_streamer_group_form(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-voices">{render_streamer_voice_settings(streamer, snapshot)}</section>
       <section class="streamer-settings-panel streamer-settings-events">{render_streamer_event_settings_form(streamer)}</section>
     </div>
   </div>
