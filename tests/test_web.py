@@ -15,9 +15,16 @@ from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     build_config_summary,
     build_status_snapshot,
+    build_lite_status_payload,
+    build_streamer_voice_details_payload,
+    build_stream_voice_speakers_payload,
     dashboard_script,
     chat_media_file_for_chat_file,
     file_kind,
+    summarize_files,
+    FILE_LIMIT_PER_STREAM,
+    FILE_SCAN_CACHE,
+    FILE_SCAN_CACHE_LOCK,
     format_bytes,
     is_watermarkable_media_file,
     render_file_action,
@@ -505,11 +512,14 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-stream-tab="log"', html)
         self.assertIn('data-stream-tab="jobs"', html)
         self.assertIn('data-stream-tab="events"', html)
+        self.assertIn('data-stream-tab="speakers"', html)
         self.assertIn("stream-tab-panel stream-tab-files", html)
         self.assertIn("stream-tab-panel stream-tab-log", html)
         self.assertIn("stream-tab-panel stream-tab-jobs", html)
         self.assertIn("stream-tab-panel stream-tab-events", html)
+        self.assertIn("stream-tab-panel stream-tab-speakers", html)
         self.assertIn("Content Events", html)
+        self.assertIn("Detected Speakers", html)
         self.assertIn("Stream Log", html)
         self.assertIn("Laughter", html)
         self.assertIn("big laugh", html)
@@ -533,7 +543,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("data-stream-toggle", html)
         self.assertIn("stream-body", html)
         self.assertIn("Collapse", html)
-        self.assertIn('fetch("/status.json"', html)
+        self.assertIn('fetch("/status.json?lite=1"', html)
+        self.assertIn('fetch("/status.json?dashboard=1"', html)
+        self.assertIn("lastStreamRevision", html)
         self.assertIn("applySnapshot", html)
         self.assertIn("const rows = [...events].reverse().map", html)
         self.assertIn("window.setInterval(refreshStatus, 15000)", html)
@@ -589,6 +601,95 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/render-chat?", chat_payload["render_chat_url"])
         self.assertEqual(chat_payload["render_chat_status"], "ready")
         json.dumps(payload)
+
+    def test_status_file_scan_caps_detail_rows_but_counts_all_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            for index in range(FILE_LIMIT_PER_STREAM + 5):
+                (segment_dir / f"segment-001.f136.mp4.part-Frag{index}").write_text(
+                    "fragment",
+                    encoding="utf-8",
+                )
+            (segment_dir / "segment-001.f136.mp4.part").write_text("part", encoding="utf-8")
+            (segment_dir / "segment-001.f136.mp4").write_text("final", encoding="utf-8")
+
+            snapshot = build_status_snapshot(config)
+
+        status = snapshot.streams[0]
+        self.assertEqual(status.file_count, FILE_LIMIT_PER_STREAM + 7)
+        self.assertLessEqual(len(status.files), FILE_LIMIT_PER_STREAM)
+        self.assertEqual(status.file_kind_counts["fragment"], FILE_LIMIT_PER_STREAM + 5)
+        self.assertTrue(status.has_part_files)
+        self.assertTrue(status.has_mixed_formats)
+
+    def test_file_scan_cache_reuses_unchanged_directory(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = Path(tmp) / "stream"
+            directory.mkdir()
+            (directory / "video.mp4").write_text("media", encoding="utf-8")
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
+            first = summarize_files(config, directory, "LIVEVIDEO01", cache_ttl_seconds=60.0)
+            with patch(
+                "onlysavemevods.web.scan_directory_uncached",
+                side_effect=AssertionError("cache missed"),
+            ):
+                second = summarize_files(config, directory, "LIVEVIDEO01", cache_ttl_seconds=60.0)
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
+        self.assertEqual(first.file_count, 1)
+        self.assertEqual(second.file_count, 1)
+        self.assertEqual(second.files[0].name, "video.mp4")
+
+    def test_lite_status_payload_avoids_full_stream_payload(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+
+            payload = build_lite_status_payload(config)
+
+        self.assertEqual(payload["detail"], "lite")
+        self.assertEqual(payload["stream_count"], 1)
+        self.assertEqual(payload["counts"]["downloading"], 1)
+        self.assertIn("stream_revision", payload)
+        self.assertIn("jobs", payload)
+        self.assertIn("recent_logs", payload)
+        self.assertNotIn("streams", payload)
+        self.assertNotIn("streamer_stats", payload)
+        self.assertNotIn("configuration", payload)
 
     def test_stream_event_timeline_renders_newest_first(self) -> None:
         html = render_stream_event_timeline(
@@ -980,6 +1081,8 @@ class WebStatusTests(unittest.TestCase):
             )
 
             html = render_status_html(build_status_snapshot(config))
+            details = build_streamer_voice_details_payload(config, "OUMB3rd")
+            speakers = build_stream_voice_speakers_payload(config, "OUMB3rd", "LIVEVIDEO01")
 
         self.assertIn('streamer-settings-voices-label', html)
         self.assertIn('streamer-settings-panel streamer-settings-voices', html)
@@ -1005,18 +1108,39 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Known voices", html)
         self.assertIn('action="/streamer-voices"', html)
         self.assertIn('action="/streamer-voice-samples"', html)
-        self.assertIn('action="/streamer-voice-samples/from-transcript"', html)
-        self.assertIn('action="/streamer-voice-attributions"', html)
-        self.assertIn("SPEAKER_00", html)
-        self.assertIn("Approve", html)
-        self.assertIn("Reject", html)
-        self.assertIn("Match Voices", html)
+        self.assertIn('data-load-voice-details', html)
+        self.assertIn('data-load-stream-speakers', html)
+        self.assertIn('data-stream-speakers', html)
+        self.assertIn('data-voice-review', html)
+        self.assertNotIn('id="voice-settings-OUMB3rd-detected"', html)
+        self.assertNotIn('data-voice-detected', html)
+        self.assertIn("loaded only when requested", html)
+        self.assertNotIn('action="/streamer-voice-samples/from-transcript"', html)
+        self.assertNotIn('action="/streamer-voice-attributions"', html)
+        self.assertNotIn("SPEAKER_00</strong> -> Host", html)
+        self.assertNotIn("distance 0.200", html)
+        self.assertNotIn("Approve", html)
+        self.assertNotIn("Reject", html)
+        self.assertNotIn("Match Voices", html)
+        self.assertEqual("", details["detected"])
+        self.assertIn('action="/streamer-voice-samples/from-transcript"', speakers["speakers"])
+        self.assertIn("SPEAKER_00", speakers["speakers"])
+        self.assertIn('action="/streamer-voice-attributions"', details["review"])
+        self.assertIn("SPEAKER_00</strong> -> Host", details["review"])
+        self.assertIn("distance 0.200", details["review"])
+        self.assertIn("Approve", details["review"])
+        self.assertIn("Reject", details["review"])
+        self.assertIn("Match Voices", details["review"])
 
     def test_dashboard_script_does_not_emit_literal_newlines_in_js_strings(self) -> None:
         script = dashboard_script()
 
         self.assertIn("join(String.fromCharCode(10))", script)
         self.assertIn("renderStreamerVoiceSettings", script)
+        self.assertIn("/streamer-voice-details?streamer=", script)
+        self.assertIn("/stream-voice-speakers?streamer=", script)
+        self.assertIn("data-load-voice-details", script)
+        self.assertIn("data-load-stream-speakers", script)
         self.assertNotIn("data-open-voice-manager", script)
         self.assertNotIn('join("' + "\n" + '")', script)
 
@@ -1367,6 +1491,46 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Regenerate chat video", action)
         self.assertIn("Re-render and replace the existing chat video", action)
         self.assertNotIn("Chat video", action)
+
+    def test_status_chat_actions_do_not_use_single_media_fallback(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+                render_live_chat_video=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_file = segment_dir / "orphan.live_chat.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+
+            fallback_match = chat_media_file_for_chat_file(segment_dir, chat_file.name)
+            snapshot = build_status_snapshot(config)
+
+        self.assertEqual(fallback_match, media_file)
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertIsNone(chat_status.render_chat_url)
+        self.assertIsNone(chat_status.render_chat_status)
+        self.assertIsNone(chat_status.refresh_chat_url)
+        self.assertIsNone(chat_status.refresh_chat_status)
 
     def test_non_youtube_streams_do_not_offer_youtube_chat_actions(self) -> None:
         with TemporaryDirectory() as tmp:
