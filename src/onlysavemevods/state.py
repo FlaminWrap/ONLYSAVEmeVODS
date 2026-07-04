@@ -481,6 +481,30 @@ class StateStore:
         ).fetchall()
         return [_record_from_row(row) for row in rows]
 
+    def list_streams_by_status(
+        self,
+        statuses: list[str],
+        *,
+        limit: int = 1000,
+    ) -> list[StreamRecord]:
+        normalized = [status.strip() for status in statuses if status.strip()]
+        if not normalized:
+            return []
+        placeholders = ", ".join("?" for _status in normalized)
+        rows = self.conn.execute(
+            f"""
+            SELECT video_id, title, channel, url, status, segment_index,
+                   platform, source,
+                   first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
+            FROM streams
+            WHERE status IN ({placeholders})
+            ORDER BY updated_at DESC, first_seen_at DESC
+            LIMIT ?
+            """,
+            (*normalized, limit),
+        ).fetchall()
+        return [_record_from_row(row) for row in rows]
+
     def create_watermark_copy(
         self,
         *,
@@ -572,6 +596,14 @@ class StateStore:
         if row is None:
             return None
         return _watermark_record_from_row(row)
+
+    def delete_watermark_copy(self, copy_id: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM watermark_copies WHERE copy_id = ?",
+            (copy_id,),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
 
     def list_watermark_copies(
         self,

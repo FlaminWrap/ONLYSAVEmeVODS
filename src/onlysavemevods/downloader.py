@@ -45,6 +45,7 @@ from .content_events import (
     detect_content_events_for_media,
     load_content_events,
 )
+from .job_tracker import finish_tracked_job, start_tracked_job, update_tracked_job
 from .models import LiveStream
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
@@ -711,20 +712,90 @@ class DownloadManager:
         )
         await self.handle_post_exit(stream, segment_index)
 
-    async def handle_post_exit(self, stream: LiveStream, segment_index: int) -> None:
-        previous_offset = 0
+    def resume_post_exit_check(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        elapsed_since_exit_seconds: float = 0.0,
+    ) -> None:
+        if self._stopping:
+            return
+        task = asyncio.create_task(
+            self.recover_post_exit_check(
+                stream,
+                segment_index,
+                elapsed_since_exit_seconds=elapsed_since_exit_seconds,
+            )
+        )
+        self._post_exit_tasks.add(task)
+        task.add_done_callback(self._post_exit_tasks.discard)
+
+    async def recover_post_exit_check(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        elapsed_since_exit_seconds: float = 0.0,
+    ) -> None:
+        if not self._stream_status_matches(stream.video_id, "checking_after_exit"):
+            return
+        self.logger.warning(
+            "Recovering post-exit checks after service restart video_id=%s segment=%03d elapsed=%.1fs",
+            stream.video_id,
+            segment_index,
+            max(0.0, elapsed_since_exit_seconds),
+        )
+        self.state.add_stream_event(
+            stream.video_id,
+            "Resuming post-exit checks after service restart",
+            level="warning",
+            segment_index=segment_index,
+        )
+        await self.handle_post_exit(
+            stream,
+            segment_index,
+            elapsed_since_exit_seconds=elapsed_since_exit_seconds,
+            expected_status="checking_after_exit",
+        )
+
+    def _stream_status_matches(self, video_id: str, expected_status: str | None) -> bool:
+        if expected_status is None:
+            return True
+        record = self.state.get_stream(video_id)
+        return record is not None and record.status == expected_status
+
+    async def handle_post_exit(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        elapsed_since_exit_seconds: float = 0.0,
+        expected_status: str | None = None,
+    ) -> None:
+        previous_offset = 0.0
+        elapsed_since_exit_seconds = max(0.0, elapsed_since_exit_seconds)
         self.logger.debug(
-            "Starting post-exit checks for %s segment=%03d schedule=%s",
+            "Starting post-exit checks for %s segment=%03d schedule=%s elapsed=%.1fs",
             stream.video_id,
             segment_index,
             self.config.post_exit_check_seconds,
+            elapsed_since_exit_seconds,
         )
         for offset in self.config.post_exit_check_seconds:
             if self._stopping:
                 return
+            if not self._stream_status_matches(stream.video_id, expected_status):
+                self.logger.info(
+                    "Stopping recovered post-exit checks for %s; stream status changed",
+                    stream.video_id,
+                )
+                return
 
-            delay = max(0, offset - previous_offset)
-            previous_offset = offset
+            delay = 0.0
+            if elapsed_since_exit_seconds < offset:
+                delay = max(0.0, offset - max(previous_offset, elapsed_since_exit_seconds))
+            previous_offset = float(offset)
             if delay:
                 self.logger.debug(
                     "Waiting %ss before post-exit probe for %s at +%ss",
@@ -733,6 +804,14 @@ class DownloadManager:
                     offset,
                 )
                 await self.sleep(delay)
+                if self._stopping:
+                    return
+                if not self._stream_status_matches(stream.video_id, expected_status):
+                    self.logger.info(
+                        "Stopping recovered post-exit checks for %s; stream status changed",
+                        stream.video_id,
+                    )
+                    return
 
             try:
                 self.logger.debug(
@@ -742,7 +821,8 @@ class DownloadManager:
                 )
                 latest = await self.probe_video(stream.url)
             except TerminalVideoUnavailableError as exc:
-                await self._mark_terminal_unavailable(stream, segment_index, exc)
+                if self._stream_status_matches(stream.video_id, expected_status):
+                    await self._mark_terminal_unavailable(stream, segment_index, exc)
                 return
             except Exception as exc:
                 self.logger.warning(
@@ -754,6 +834,8 @@ class DownloadManager:
                 continue
 
             if latest.is_live:
+                if not self._stream_status_matches(stream.video_id, expected_status):
+                    return
                 next_segment = await self.choose_live_restart_segment(
                     latest,
                     segment_index,
@@ -777,6 +859,8 @@ class DownloadManager:
                 offset,
             )
 
+        if not self._stream_status_matches(stream.video_id, expected_status):
+            return
         self.logger.info(
             "Stream %s did not return live during post-exit window; marking ended",
             stream.video_id,
@@ -811,11 +895,11 @@ class DownloadManager:
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
         if self.config.transcribe_subtitles:
-            await self.transcribe_finalized_media(finalized_files)
+            await self.transcribe_finalized_media(stream, finalized_files)
         if self.config.stream_event_detection_enabled:
             await self.detect_finalized_content_events(stream, finalized_files)
         if self.config.render_live_chat_video and stream.platform == "youtube":
-            await self.render_finalized_chat_videos(finalized_files)
+            await self.render_finalized_chat_videos(stream, finalized_files)
 
     def rename_finalized_segments(
         self,
@@ -855,12 +939,14 @@ class DownloadManager:
 
     async def render_finalized_chat_videos(
         self,
+        stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
     ) -> None:
         for files in finalized_files:
             if files.media_file is None or files.chat_file is None:
                 continue
             await self.render_live_chat_video(
+                stream,
                 files.media_file,
                 files.chat_file,
                 files.segment_index,
@@ -959,18 +1045,57 @@ class DownloadManager:
 
     async def transcribe_finalized_media(
         self,
+        stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
     ) -> None:
         for files in finalized_files:
             if files.media_file is None:
                 continue
-            async with self._transcription_semaphore:
-                await transcribe_media_file(
-                    transcription_config_for_channel(self.config, files.channel),
-                    files.media_file,
-                    logger=self.logger,
-                    channel=files.channel,
+            job_id = auto_job_id("transcription", stream.video_id, files.media_file.name)
+            start_tracked_job(
+                job_id,
+                kind="Transcription",
+                video_id=stream.video_id,
+                item=files.media_file.name,
+                detail="Automatic post-finalize transcription",
+                phase="Queued",
+                message="Queued automatic transcription",
+                progress=0.0,
+            )
+            try:
+                async with self._transcription_semaphore:
+                    update_tracked_job(
+                        job_id,
+                        phase="Running WhisperX",
+                        progress=0.1,
+                        message="Running automatic transcription",
+                    )
+                    await transcribe_media_file(
+                        transcription_config_for_channel(self.config, files.channel),
+                        files.media_file,
+                        logger=self.logger,
+                        channel=files.channel,
+                    )
+            except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                self.logger.exception("Automatic transcription failed for %s", files.media_file)
+                finish_tracked_job(
+                    job_id,
+                    status="failed",
+                    phase="Failed",
+                    message=str(exc) or exc.__class__.__name__,
+                    progress=None,
                 )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Transcription failed for {files.media_file.name}: {exc}",
+                    level="error",
+                    segment_index=files.segment_index,
+                )
+                continue
+            finish_tracked_job(
+                job_id,
+                message="Automatic transcription completed",
+            )
 
     async def detect_finalized_content_events(
         self,
@@ -980,7 +1105,24 @@ class DownloadManager:
         for files in finalized_files:
             if files.media_file is None:
                 continue
+            job_id = auto_job_id("content-events", stream.video_id, files.media_file.name)
+            start_tracked_job(
+                job_id,
+                kind="Event detection",
+                video_id=stream.video_id,
+                item=files.media_file.name,
+                detail="Automatic post-finalize content event detection",
+                phase="Queued",
+                message="Queued automatic content event detection",
+                progress=0.0,
+            )
             try:
+                update_tracked_job(
+                    job_id,
+                    phase="Detecting content events",
+                    progress=0.1,
+                    message="Detecting content events",
+                )
                 ok = await asyncio.to_thread(
                     detect_content_events_for_media,
                     self.config,
@@ -994,6 +1136,13 @@ class DownloadManager:
                     files.media_file,
                     exc,
                 )
+                finish_tracked_job(
+                    job_id,
+                    status="failed",
+                    phase="Unavailable",
+                    message=str(exc),
+                    progress=None,
+                )
                 self.state.add_stream_event(
                     stream.video_id,
                     f"Content event detection unavailable for {files.media_file.name}: {exc}",
@@ -1006,6 +1155,13 @@ class DownloadManager:
                     "Content event detection failed for %s",
                     files.media_file,
                 )
+                finish_tracked_job(
+                    job_id,
+                    status="failed",
+                    phase="Failed",
+                    message=str(exc) or exc.__class__.__name__,
+                    progress=None,
+                )
                 self.state.add_stream_event(
                     stream.video_id,
                     f"Content event detection failed for {files.media_file.name}: {exc}",
@@ -1015,14 +1171,26 @@ class DownloadManager:
                 continue
             if ok:
                 event_count = len(load_content_events(files.media_file))
+                finish_tracked_job(
+                    job_id,
+                    message=f"Detected {event_count} content event(s)",
+                )
                 self.state.add_stream_event(
                     stream.video_id,
                     f"Content event detection completed for {files.media_file.name}: {event_count} event(s)",
                     segment_index=files.segment_index,
                 )
+            else:
+                finish_tracked_job(
+                    job_id,
+                    status="done",
+                    phase="Complete",
+                    message="No content events detected",
+                )
 
     async def render_live_chat_video(
         self,
+        stream: LiveStream,
         media_file: Path,
         chat_file: Path,
         segment_index: int,
@@ -1040,6 +1208,25 @@ class DownloadManager:
             )
             return True
 
+        job_id = auto_job_id("chat-render", stream.video_id, chat_file.name)
+        start_tracked_job(
+            job_id,
+            kind="Chat render",
+            video_id=stream.video_id,
+            item=output_file.name,
+            detail=f"{media_file.name} + {chat_file.name}",
+            phase="Queued",
+            message="Queued automatic chat render",
+            progress=0.0,
+        )
+
+        if self.config.config_path is not None:
+            update_tracked_job(
+                job_id,
+                phase="Starting isolated renderer",
+                progress=0.05,
+                message="Starting isolated chat renderer",
+            )
         subprocess_result = await self.render_live_chat_video_process(
             media_file,
             chat_file,
@@ -1047,9 +1234,22 @@ class DownloadManager:
             segment_index,
         )
         if subprocess_result is not None:
+            finish_tracked_job(
+                job_id,
+                status="done" if subprocess_result else "failed",
+                phase="Complete" if subprocess_result else "Failed",
+                message="Automatic chat render completed" if subprocess_result else "Automatic chat render failed",
+                progress=1.0 if subprocess_result else None,
+            )
             return subprocess_result
 
         started_at = time.monotonic()
+        update_tracked_job(
+            job_id,
+            phase="Preparing chat render",
+            progress=0.05,
+            message="Preparing automatic chat render",
+        )
         self.logger.info(
             "Preparing chat render segment=%03d media=%s chat=%s output=%s",
             segment_index,
@@ -1069,12 +1269,26 @@ class DownloadManager:
             )
         try:
             entries = parse_live_chat_file(chat_file)
-        except OSError:
+        except OSError as exc:
             self.logger.exception("Unable to read live chat file %s", chat_file)
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="Failed",
+                message=str(exc) or exc.__class__.__name__,
+                progress=None,
+            )
             return False
 
         if not entries:
             self.logger.info("No live chat messages found in %s", chat_file)
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="No chat messages",
+                message="No live chat messages found",
+                progress=None,
+            )
             return False
         self.logger.info(
             "Parsed live chat for render segment=%03d entries=%d "
@@ -1131,6 +1345,12 @@ class DownloadManager:
                     segment_index,
                     panel_file,
                 )
+                update_tracked_job(
+                    job_id,
+                    phase="Rendering chat panel",
+                    progress=0.35,
+                    message="Rendering chat panel",
+                )
                 await asyncio.to_thread(
                     render_chat_panel_video,
                     entries,
@@ -1158,6 +1378,12 @@ class DownloadManager:
                     media_file,
                     panel_file,
                 )
+                update_tracked_job(
+                    job_id,
+                    phase="Merging chat video",
+                    progress=0.75,
+                    message="Merging rendered chat panel",
+                )
             except ChatPanelRenderError:
                 panel_file.unlink(missing_ok=True)
                 self.logger.exception(
@@ -1165,10 +1391,17 @@ class DownloadManager:
                 )
                 try:
                     write_chat_ass_file(ass_file, entries, layout)
-                except OSError:
+                except OSError as exc:
                     self.logger.exception(
                         "Unable to write live chat subtitle file %s",
                         ass_file,
+                    )
+                    finish_tracked_job(
+                        job_id,
+                        status="failed",
+                        phase="Failed",
+                        message=str(exc) or exc.__class__.__name__,
+                        progress=None,
                     )
                     return False
                 self.logger.info(
@@ -1188,8 +1421,15 @@ class DownloadManager:
         else:
             try:
                 write_chat_ass_file(ass_file, entries, layout)
-            except OSError:
+            except OSError as exc:
                 self.logger.exception("Unable to write live chat subtitle file %s", ass_file)
+                finish_tracked_job(
+                    job_id,
+                    status="failed",
+                    phase="Failed",
+                    message=str(exc) or exc.__class__.__name__,
+                    progress=None,
+                )
                 return False
             self.logger.info(
                 "Using subtitle fallback for chat render segment=%03d ass=%s",
@@ -1213,6 +1453,12 @@ class DownloadManager:
         self.logger.debug("ffmpeg chat render command: %s", command_for_log(command))
 
         try:
+            update_tracked_job(
+                job_id,
+                phase="Rendering chat video",
+                progress=0.8,
+                message="Rendering chat video with ffmpeg",
+            )
             result, ffmpeg_elapsed = await asyncio.to_thread(
                 run_ffmpeg_command_with_output_progress,
                 command,
@@ -1226,11 +1472,25 @@ class DownloadManager:
             )
             ass_file.unlink(missing_ok=True)
             panel_file.unlink(missing_ok=True)
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="Failed",
+                message=f"ffmpeg not found: {self.config.ffmpeg_path}",
+                progress=None,
+            )
             return False
-        except OSError:
+        except OSError as exc:
             self.logger.exception("Unable to start ffmpeg for chat video render")
             ass_file.unlink(missing_ok=True)
             panel_file.unlink(missing_ok=True)
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="Failed",
+                message=str(exc) or exc.__class__.__name__,
+                progress=None,
+            )
             return False
         except subprocess.TimeoutExpired:
             temp_output.unlink(missing_ok=True)
@@ -1238,6 +1498,13 @@ class DownloadManager:
             panel_file.unlink(missing_ok=True)
             self.logger.warning(
                 "ffmpeg made no output progress while rendering chat video"
+            )
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="Timed out",
+                message="ffmpeg made no output progress while rendering chat video",
+                progress=None,
             )
             return False
         finally:
@@ -1248,6 +1515,13 @@ class DownloadManager:
             temp_output.unlink(missing_ok=True)
             message = (result.stderr or result.stdout).decode("utf-8", "replace").strip()
             self.logger.warning("ffmpeg failed while rendering chat video: %s", message)
+            finish_tracked_job(
+                job_id,
+                status="failed",
+                phase="Failed",
+                message=message or f"ffmpeg exited with code {result.returncode}",
+                progress=None,
+            )
             return False
 
         temp_output.rename(output_file)
@@ -1258,6 +1532,10 @@ class DownloadManager:
             output_size,
             time.monotonic() - started_at,
             ffmpeg_elapsed,
+        )
+        finish_tracked_job(
+            job_id,
+            message=f"Rendered chat video {format_byte_count(output_size)}",
         )
         return True
 
@@ -1638,6 +1916,22 @@ class DownloadManager:
         if self._post_exit_tasks:
             await asyncio.gather(*self._post_exit_tasks, return_exceptions=True)
 
+
+
+
+def format_byte_count(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(value)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+def auto_job_id(kind: str, video_id: str, item: str) -> str:
+    return f"auto-{kind}:{video_id}:{item}"
 
 def build_download_command(
     config: BotConfig,

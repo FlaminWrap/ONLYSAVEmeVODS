@@ -77,6 +77,7 @@ from .downloader import (
     log_process_output,
     segment_directory,
 )
+from .job_tracker import list_tracked_jobs
 from .log_buffer import LogEntry, get_recent_log_entries
 from .sources import SourceError, resolve_source
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
@@ -263,6 +264,7 @@ FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
+STREAMER_JOB_PAGE_SIZE = 5
 CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
@@ -329,6 +331,9 @@ class FileStatus:
     event_detection_message: str | None
     watermark_url: str | None
     watermark_copies: list[WatermarkCopyStatus]
+    watermark_copy_id: str | None
+    watermark_recipient_label: str | None
+    watermark_delete_url: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -393,6 +398,7 @@ class WatermarkCopyStatus:
     started_at: str | None
     finished_at: str | None
     download_url: str | None
+    delete_url: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -631,6 +637,7 @@ class ConfigFormField:
 class StatusSnapshot:
     generated_at: float
     stream_revision: str
+    job_revision: str
     app: AppInfo
     download_dir: str
     state_db: str
@@ -878,6 +885,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/watermark":
                     self._start_watermark()
+                    return
+                if path == "/delete-watermark":
+                    self._delete_watermark()
                     return
                 if path == "/detect-watermark":
                     self._detect_watermark_upload()
@@ -1376,6 +1386,27 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
+        def _delete_watermark(self) -> None:
+            body = self._read_request_body(4096)
+            if body is None:
+                return
+            try:
+                params = parse_qs(body.decode("utf-8", "replace"))
+            except UnicodeDecodeError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid form body")
+                return
+            copy_id = first_query_value(params, "copy_id")
+            ok, message = delete_watermark_copy(config, copy_id)
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
         def _detect_watermark_upload(self) -> None:
             length_header = self.headers.get("Content-Length", "0")
             try:
@@ -1532,6 +1563,7 @@ def build_status_snapshot(
     snapshot = StatusSnapshot(
         generated_at=time.time(),
         stream_revision=stream_revision_for_records(records),
+        job_revision=job_revision_for_jobs(jobs),
         app=build_app_info(),
         download_dir=str(config.download_dir),
         state_db=str(config.db_path),
@@ -1585,6 +1617,26 @@ def stream_revision_for_records(records: list[StreamRecord]) -> str:
     return f"{latest}|{len(records)}|{digest}"
 
 
+def job_revision_for_jobs(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        return ""
+    active_bits = [
+        f"{job.job_id}:{job.status}:{job.kind}:{job.video_id}"
+        for job in jobs
+        if job.status in {"queued", "running"}
+    ]
+    if not active_bits:
+        latest = max((job.updated_at or job.finished_at or job.started_at or 0.0 for job in jobs), default=0.0)
+        done_bits = [
+            f"{job.job_id}:{job.status}:{job.kind}:{job.video_id}"
+            for job in jobs[:25]
+        ]
+        digest = hashlib.sha1(";".join(sorted(done_bits)).encode("utf-8")).hexdigest()[:16]
+        return f"done:{latest:.3f}:{len(jobs)}:{digest}"
+    digest = hashlib.sha1(";".join(sorted(active_bits)).encode("utf-8")).hexdigest()[:16]
+    return f"active:{len(active_bits)}:{digest}"
+
+
 def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
     started_at = time.perf_counter()
     steps: list[tuple[str, float]] = []
@@ -1614,6 +1666,7 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
         "detail": "lite",
         "generated_at": time.time(),
         "stream_revision": stream_revision_for_records(records),
+        "job_revision": job_revision_for_jobs(jobs),
         "stream_count": len(records),
         "streamer_count": len(config.streamers),
         "attention_count": attention_count,
@@ -1647,6 +1700,25 @@ def build_job_statuses(
         transcription_jobs = list(TRANSCRIPTION_JOBS.values())
     with EVENT_DETECTION_JOBS_LOCK:
         event_detection_jobs = list(EVENT_DETECTION_JOBS.values())
+    tracked_jobs = list_tracked_jobs(JOB_LIMIT)
+
+    for job in tracked_jobs:
+        jobs.append(
+            JobStatus(
+                job_id=job.job_id,
+                kind=job.kind,
+                status=job.status,
+                phase=job.phase or job.message,
+                progress=job.progress,
+                video_id=job.video_id,
+                item=job.item,
+                detail=job.detail,
+                message=job.message,
+                started_at=job.started_at,
+                updated_at=job.updated_at,
+                finished_at=job.finished_at,
+            )
+        )
 
     for job in render_jobs:
         jobs.append(
@@ -2796,6 +2868,9 @@ def summarize_files(
                 event_detection_message=event_detection_message,
                 watermark_url=watermark_url,
                 watermark_copies=watermark_copies,
+                watermark_copy_id=None,
+                watermark_recipient_label=None,
+                watermark_delete_url=None,
             )
         )
         file_elapsed = perf_elapsed(file_started_at)
@@ -2810,6 +2885,30 @@ def summarize_files(
                 format_perf_steps(file_steps),
             )
 
+    watermark_file_count = 0
+    watermark_total_bytes = 0
+    latest_modified_at = scan_summary.latest_modified_at
+    counts_by_kind = dict(scan_summary.counts_by_kind)
+    bytes_by_kind = dict(scan_summary.bytes_by_kind)
+    for record in watermark_records or []:
+        if record.status != WATERMARK_STATUS_DONE:
+            continue
+        output_file = resolve_watermark_output_file(directory, record.output_name)
+        if output_file is None or not output_file.is_file():
+            continue
+        try:
+            stat = output_file.stat()
+        except OSError:
+            continue
+        watermark_file_count += 1
+        watermark_total_bytes += stat.st_size
+        counts_by_kind["watermark"] = counts_by_kind.get("watermark", 0) + 1
+        bytes_by_kind["watermark"] = bytes_by_kind.get("watermark", 0) + stat.st_size
+        if latest_modified_at is None or stat.st_mtime > latest_modified_at:
+            latest_modified_at = stat.st_mtime
+        files.append(watermark_file_status(video_id, record, stat.st_size, stat.st_mtime))
+
+    files.sort(key=lambda file: file.name.casefold())
     log_perf(
         "file-scan",
         perf_elapsed(started_at),
@@ -2817,15 +2916,61 @@ def summarize_files(
         video_id=video_id,
         directory=directory,
         entries=scan_summary.directory_entry_count,
-        files=scan_summary.file_count,
+        files=scan_summary.file_count + watermark_file_count,
         detailed=len(files),
-        skipped_detail_files=max(0, scan_summary.file_count - len(files)),
+        skipped_detail_files=max(0, scan_summary.file_count + watermark_file_count - len(files)),
         slow_files=slow_files,
         cache=scan_cache_status,
         scan=f"{scan_elapsed:.3f}s",
     )
-    return stream_file_summary_from_scan(scan_summary, files)
+    return StreamFileSummary(
+        file_count=scan_summary.file_count + watermark_file_count,
+        total_bytes=scan_summary.total_bytes + watermark_total_bytes,
+        bytes_by_kind=bytes_by_kind,
+        counts_by_kind=counts_by_kind,
+        latest_modified_at=latest_modified_at,
+        part_segments=scan_summary.part_segments,
+        final_format_segments=scan_summary.final_format_segments,
+        files=files,
+    )
 
+
+def watermark_file_status(
+    video_id: str,
+    record: WatermarkCopyRecord,
+    size_bytes: int,
+    modified_at: float,
+) -> FileStatus:
+    return FileStatus(
+        video_id=video_id,
+        name=record.output_name,
+        size_bytes=size_bytes,
+        modified_at=modified_at,
+        kind="watermark",
+        segment=None,
+        format_id=None,
+        download_url=watermark_download_url_for(record.copy_id),
+        render_chat_url=None,
+        render_chat_output_url=None,
+        render_chat_status=None,
+        render_chat_message=None,
+        refresh_chat_url=None,
+        refresh_chat_status=None,
+        refresh_chat_message=None,
+        transcription_url=None,
+        transcription_status=None,
+        transcription_message=None,
+        event_detection_url=None,
+        event_detection_status=None,
+        event_detection_message=None,
+        watermark_url=None,
+        watermark_copies=[],
+        watermark_copy_id=record.copy_id,
+        watermark_recipient_label=record.recipient_label,
+        watermark_delete_url=watermark_delete_url_for(record.copy_id)
+        if watermark_copy_delete_allowed(record)
+        else None,
+    )
 
 
 def download_url_for(video_id: str, filename: str) -> str:
@@ -2880,6 +3025,14 @@ def watermark_download_url_for(copy_id: str) -> str:
     return "/download-watermark?" + urlencode({"copy_id": copy_id})
 
 
+def watermark_delete_url_for(copy_id: str) -> str:
+    return "/delete-watermark"
+
+
+def watermark_copy_delete_allowed(record: WatermarkCopyRecord) -> bool:
+    return record.status not in {WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING}
+
+
 def watermark_copy_status(record: WatermarkCopyRecord) -> WatermarkCopyStatus:
     return WatermarkCopyStatus(
         copy_id=record.copy_id,
@@ -2897,6 +3050,9 @@ def watermark_copy_status(record: WatermarkCopyRecord) -> WatermarkCopyStatus:
         finished_at=record.finished_at,
         download_url=watermark_download_url_for(record.copy_id)
         if record.status == WATERMARK_STATUS_DONE
+        else None,
+        delete_url=watermark_delete_url_for(record.copy_id)
+        if watermark_copy_delete_allowed(record)
         else None,
     )
 
@@ -3285,13 +3441,19 @@ def is_rendering_temporary_file(name: str) -> bool:
 
 
 def is_watermarkable_media_file(name: str) -> bool:
-    if not is_renderable_media_file(name):
+    if is_live_chat_file(name):
         return False
-    return Path(name).suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"}
+    if is_rendering_temporary_file(name):
+        return False
+    if Path(name).suffix.lower() not in {".mp4", ".mkv", ".mov", ".webm"}:
+        return False
+    return is_downloadable_file(name)
 
 
 def is_transcribable_media_file(name: str) -> bool:
-    return is_watermarkable_media_file(name)
+    if not is_renderable_media_file(name):
+        return False
+    return Path(name).suffix.lower() in {".mp4", ".mkv", ".mov", ".webm"}
 
 
 def chat_render_action_for_file(
@@ -5225,6 +5387,47 @@ def start_watermark_job(
     return True, "Watermark job queued"
 
 
+def delete_watermark_copy(config: BotConfig, copy_id: str) -> tuple[bool, str]:
+    copy_id = copy_id.strip()
+    if not copy_id:
+        return False, "Watermark copy id is required"
+
+    state = StateStore(config.db_path)
+    directory: Path | None = None
+    try:
+        copy = state.get_watermark_copy(copy_id)
+        if copy is None:
+            return False, "Watermark copy not found"
+        if copy.status in {WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING}:
+            return False, "Watermark copy is still running"
+
+        record = state.get_stream(copy.video_id)
+        if record is not None:
+            directory = segment_directory(config, record.video_id, record.channel)
+            output_file = resolve_watermark_output_file(directory, copy.output_name)
+            if output_file is None:
+                return False, "Invalid watermark output path"
+            try:
+                output_file.unlink(missing_ok=True)
+            except OSError as exc:
+                return False, f"Unable to delete watermark file: {exc}"
+        deleted = state.delete_watermark_copy(copy_id)
+        if not deleted:
+            return False, "Watermark copy not found"
+        state.add_stream_event(
+            copy.video_id,
+            f"Deleted watermark copy copy_id={copy_id} recipient={copy.recipient_label!r}",
+        )
+    finally:
+        state.close()
+
+    if directory is not None:
+        with FILE_SCAN_CACHE_LOCK:
+            FILE_SCAN_CACHE.pop(str(directory), None)
+    LOGGER.info("Deleted watermark copy copy_id=%s", copy_id)
+    return True, "Watermark copy deleted"
+
+
 def run_watermark_job(config: BotConfig, copy_id: str) -> None:
     state = StateStore(config.db_path)
     started_at = time.monotonic()
@@ -5722,6 +5925,22 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 12px;
+    }}
+    .streamer-job-page {{ display: grid; }}
+    .streamer-job-page[hidden] {{ display: none; }}
+    .streamer-job-pager {{
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+      padding-top: 4px;
+      border-top: 1px solid var(--line);
+    }}
+    .streamer-job-page-button[aria-current="page"] {{
+      color: var(--text);
+      border-color: color-mix(in srgb, var(--active), transparent 45%);
+      background: var(--panel-strong);
+      font-weight: 650;
     }}
     .streamer-job-row {{
       display: grid;
@@ -6446,7 +6665,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
   </style>
 </head>
-<body data-stream-revision="{escape(snapshot.stream_revision, quote=True)}">
+<body data-stream-revision="{escape(snapshot.stream_revision, quote=True)}" data-job-revision="{escape(snapshot.job_revision, quote=True)}">
   <header>
     <h1>ONLYSAVEmeVODS Status</h1>
     <div class="summary">
@@ -7033,6 +7252,29 @@ def dashboard_script() -> str:
       return;
     }
 
+    const streamerJobPageButton = event.target.closest("[data-streamer-job-page-button]");
+    if (streamerJobPageButton) {
+      event.preventDefault();
+      const jobsRoot = streamerJobPageButton.closest("[data-streamer-jobs]");
+      const page = streamerJobPageButton.getAttribute("data-streamer-job-page-button") || "1";
+      if (!jobsRoot) return;
+      jobsRoot.querySelectorAll("[data-streamer-job-page]").forEach((panel) => {
+        const active = panel.getAttribute("data-streamer-job-page") === page;
+        panel.hidden = !active;
+        panel.classList.toggle("is-active", active);
+      });
+      jobsRoot.querySelectorAll("[data-streamer-job-page-button]").forEach((button) => {
+        const active = button.getAttribute("data-streamer-job-page-button") === page;
+        button.setAttribute("aria-current", active ? "page" : "false");
+      });
+      const state = jobsRoot.querySelector("[data-streamer-job-page-state]");
+      if (state) {
+        const total = jobsRoot.querySelectorAll("[data-streamer-job-page]").length;
+        state.textContent = `Page ${page} of ${total}`;
+      }
+      return;
+    }
+
     const settingsButton = event.target.closest("[data-streamer-settings-toggle]");
     if (settingsButton) {
       const key = settingsButton.getAttribute("data-streamer-settings-toggle") || "";
@@ -7251,6 +7493,16 @@ def dashboard_script() -> str:
     if (file.download_url) {
       actions.push(`<a class="download" href="${escapeAttr(file.download_url)}">Download</a>`);
     }
+    if (file.watermark_copy_id) {
+      const recipient = file.watermark_recipient_label || file.watermark_copy_id;
+      actions.push(`<span class="action-note" title="${escapeAttr(file.watermark_copy_id)}">Watermark: ${escapeHtml(recipient)}</span>`);
+    }
+    if (file.watermark_delete_url && file.watermark_copy_id) {
+      actions.push(`<form class="inline-form" method="post" action="${escapeAttr(file.watermark_delete_url)}">
+        <input type="hidden" name="copy_id" value="${escapeAttr(file.watermark_copy_id)}">
+        <button class="download action-button" type="submit">Delete</button>
+      </form>`);
+    }
     if (file.refresh_chat_status === "running") {
       actions.push('<span class="action-note">Refreshing chat</span>');
     } else if (file.refresh_chat_url) {
@@ -7320,6 +7572,12 @@ def dashboard_script() -> str:
       } else {
         const note = `${copy.recipient_label}: ${copy.status}`;
         actions.push(`<span class="action-note" title="${escapeAttr(copy.error || copy.message || copy.status)}">${escapeHtml(note)}</span>`);
+      }
+      if (copy.delete_url) {
+        actions.push(`<form class="inline-form" method="post" action="${escapeAttr(copy.delete_url)}">
+          <input type="hidden" name="copy_id" value="${escapeAttr(copy.copy_id)}">
+          <button class="download action-button" type="submit">Delete copy</button>
+        </form>`);
       }
     }
     return actions.length ? `<div class="actions">${actions.join("")}</div>` : "-";
@@ -7678,10 +7936,18 @@ def dashboard_script() -> str:
 
   const renderStreamerJobsSummary = (jobs) => {
     jobs = jobs || [];
-    const body = jobs.length
-      ? jobs.slice(0, 8).map(renderStreamerJobRow).join("")
-      : '<div class="file-meta">No active or recent jobs for this streamer.</div>';
-    return `<div class="streamer-jobs">
+    const pageSize = Number(5);
+    let body = '<div class="file-meta">No active or recent jobs for this streamer.</div>';
+    if (jobs.length) {
+      const pages = [];
+      for (let index = 0; index < jobs.length; index += pageSize) pages.push(jobs.slice(index, index + pageSize));
+      const panels = pages.map((pageJobs, index) => `<div class="streamer-job-page${index === 0 ? " is-active" : ""}" data-streamer-job-page="${index + 1}"${index === 0 ? "" : " hidden"}>${pageJobs.map(renderStreamerJobRow).join("")}</div>`).join("");
+      const pager = pages.length > 1
+        ? `<div class="streamer-job-pager"><span class="file-meta" data-streamer-job-page-state>Page 1 of ${pages.length}</span>${pages.map((_page, index) => `<button class="download action-button streamer-job-page-button" type="button" data-streamer-job-page-button="${index + 1}" aria-current="${index === 0 ? "page" : "false"}">${index + 1}</button>`).join("")}</div>`
+        : "";
+      body = `<div class="streamer-job-pages">${panels}</div>${pager}`;
+    }
+    return `<div class="streamer-jobs" data-streamer-jobs>
   <h3>Jobs</h3>
   ${body}
 </div>`;
@@ -7955,6 +8221,7 @@ def dashboard_script() -> str:
   };
 
   let lastStreamRevision = document.body ? String(document.body.getAttribute("data-stream-revision") || "") : "";
+  let lastJobRevision = document.body ? String(document.body.getAttribute("data-job-revision") || "") : "";
   let refreshPollCount = 0;
   const fullRefreshEvery = 8;
 
@@ -7976,6 +8243,7 @@ def dashboard_script() -> str:
 
     if (!isLite) {
       lastStreamRevision = String(snapshot.stream_revision || "");
+      lastJobRevision = String(snapshot.job_revision || "");
       setText("metric-storage", formatBytes(snapshot.total_bytes));
       setText("metric-partial", formatBytes(snapshot.part_bytes));
       setText("storage-final", formatBytes(snapshot.final_bytes));
@@ -8001,6 +8269,9 @@ def dashboard_script() -> str:
       if (configSections) configSections.innerHTML = renderConfigSections(snapshot.configuration || {});
     }
 
+    if (isLite) {
+      lastJobRevision = String(snapshot.job_revision || "");
+    }
     const jobRows = byId("job-rows");
     if (jobRows) jobRows.innerHTML = renderJobRows(snapshot.jobs || []);
     const logRows = byId("log-rows");
@@ -8011,7 +8282,9 @@ def dashboard_script() -> str:
   const shouldFetchFullSnapshot = (liteSnapshot) => {
     refreshPollCount += 1;
     const revision = String(liteSnapshot.stream_revision || "");
+    const jobRevision = String(liteSnapshot.job_revision || "");
     if (lastStreamRevision && revision && revision !== lastStreamRevision) return true;
+    if (lastJobRevision && jobRevision && jobRevision !== lastJobRevision) return true;
     if (refreshPollCount % fullRefreshEvery !== 0) return false;
     const streamerList = byId("streamer-list");
     return !streamerList || !streamerListIsEditing(streamerList);
@@ -8688,8 +8961,31 @@ def render_streamer_jobs_summary(jobs: list[JobStatus]) -> str:
     if not jobs:
         body = '<div class="file-meta">No active or recent jobs for this streamer.</div>'
     else:
-        body = "".join(render_streamer_job_row(job) for job in jobs[:8])
-    return f"""<div class="streamer-jobs">
+        pages = [jobs[index:index + STREAMER_JOB_PAGE_SIZE] for index in range(0, len(jobs), STREAMER_JOB_PAGE_SIZE)]
+        panels = []
+        for index, page_jobs in enumerate(pages, start=1):
+            active = index == 1
+            hidden = "" if active else " hidden"
+            active_class = " is-active" if active else ""
+            rows = "".join(render_streamer_job_row(job) for job in page_jobs)
+            panels.append(
+                f'<div class="streamer-job-page{active_class}" data-streamer-job-page="{index}"{hidden}>{rows}</div>'
+            )
+        pager = ""
+        if len(pages) > 1:
+            buttons = "".join(
+                '<button class="download action-button streamer-job-page-button" type="button" '
+                f'data-streamer-job-page-button="{index}" aria-current="{"page" if index == 1 else "false"}">{index}</button>'
+                for index in range(1, len(pages) + 1)
+            )
+            pager = (
+                '<div class="streamer-job-pager">'
+                f'<span class="file-meta" data-streamer-job-page-state>Page 1 of {len(pages)}</span>'
+                f'{buttons}'
+                '</div>'
+            )
+        body = f'<div class="streamer-job-pages">{"".join(panels)}</div>{pager}'
+    return f"""<div class="streamer-jobs" data-streamer-jobs>
   <h3>Jobs</h3>
   {body}
 </div>"""
@@ -9315,15 +9611,18 @@ def render_watermark_detection_result(result: Any) -> str:
         ("Margin", f"{float(payload.get('margin') or 0.0):.5f}"),
         ("Frames", str(payload.get("frames_analyzed") or 0)),
     ]
-    if payload.get("matched"):
+    if best:
+        prefix = "" if payload.get("matched") else "Best "
         rows.extend(
             [
-                ("Recipient", str(best.get("recipient_label", ""))),
-                ("Copy ID", str(best.get("copy_id", ""))),
-                ("Video ID", str(best.get("video_id", ""))),
-                ("Source", str(best.get("source_name", ""))),
+                (f"{prefix}Recipient", str(best.get("recipient_label", ""))),
+                (f"{prefix}Copy ID", str(best.get("copy_id", ""))),
+                (f"{prefix}Video ID", str(best.get("video_id", ""))),
+                (f"{prefix}Source", str(best.get("source_name", ""))),
             ]
         )
+        if best.get("variant"):
+            rows.append((f"{prefix}Geometry", str(best.get("variant", ""))))
     rendered_rows = "".join(
         f"<tr><td>{escape(name)}</td><td>{escape(value)}</td></tr>"
         for name, value in rows
@@ -9596,6 +9895,21 @@ def render_file_action(file: FileStatus) -> str:
             f'<a class="download" href="{escape(file.download_url, quote=True)}">'
             "Download</a>"
         )
+    if file.watermark_copy_id:
+        recipient = file.watermark_recipient_label or file.watermark_copy_id
+        actions.append(
+            '<span class="action-note" '
+            f'title="{escape(file.watermark_copy_id, quote=True)}">'
+            f"Watermark: {escape(recipient)}</span>"
+        )
+    if file.watermark_delete_url and file.watermark_copy_id:
+        actions.append(
+            '<form class="inline-form" method="post" '
+            f'action="{escape(file.watermark_delete_url, quote=True)}">'
+            f'<input type="hidden" name="copy_id" value="{escape(file.watermark_copy_id, quote=True)}">'
+            '<button class="download action-button" type="submit">Delete</button>'
+            '</form>'
+        )
     if file.refresh_chat_status == "running":
         actions.append('<span class="action-note">Refreshing chat</span>')
     elif file.refresh_chat_url:
@@ -9726,6 +10040,14 @@ def render_file_action(file: FileStatus) -> str:
             actions.append(
                 '<span class="action-note" '
                 f'title="{escape(message, quote=True)}">{escape(label)}</span>'
+            )
+        if copy.delete_url:
+            actions.append(
+                '<form class="inline-form" method="post" '
+                f'action="{escape(copy.delete_url, quote=True)}">'
+                f'<input type="hidden" name="copy_id" value="{escape(copy.copy_id, quote=True)}">'
+                '<button class="download action-button" type="submit">Delete copy</button>'
+                '</form>'
             )
     if not actions:
         return "-"

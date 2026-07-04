@@ -9,6 +9,7 @@ import unittest
 from onlysavemevods import __version__
 from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, VoiceProfileConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.job_tracker import clear_tracked_jobs, start_tracked_job
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
@@ -41,6 +42,8 @@ from onlysavemevods.web import (
     resolve_refresh_chat_files,
     cleanup_stream_fragments,
     resolve_watermark_download_file,
+    resolve_watermark_source_file,
+    delete_watermark_copy,
     resolve_transcription_source_file,
     resolve_render_chat_files,
     resolve_download_file,
@@ -59,6 +62,7 @@ from onlysavemevods.web import (
     CHAT_RENDER_JOBS,
     CHAT_RENDER_JOBS_LOCK,
     FAVICON_ROUTES,
+    JobStatus,
     PLATFORM_ICON_ROUTES,
     snapshot_to_dict,
     transcription_job_key,
@@ -71,6 +75,7 @@ from onlysavemevods.web import (
     StatusWebServer,
     StreamEventStatus,
     render_stream_event_timeline,
+    render_streamer_jobs_summary,
 )
 
 
@@ -132,6 +137,12 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
 
 
 class WebStatusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        clear_tracked_jobs()
+
+    def tearDown(self) -> None:
+        clear_tracked_jobs()
+
     def test_status_snapshot_reads_state_and_download_files(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -546,6 +557,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('fetch("/status.json?lite=1"', html)
         self.assertIn('fetch("/status.json?dashboard=1"', html)
         self.assertIn("lastStreamRevision", html)
+        self.assertIn("lastJobRevision", html)
+        self.assertIn("data-job-revision", html)
         self.assertIn("applySnapshot", html)
         self.assertIn("const rows = [...events].reverse().map", html)
         self.assertIn("window.setInterval(refreshStatus, 15000)", html)
@@ -662,6 +675,36 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(first.file_count, 1)
         self.assertEqual(second.file_count, 1)
         self.assertEqual(second.files[0].name, "video.mp4")
+
+    def test_status_payloads_include_tracked_auto_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            start_tracked_job(
+                "auto-transcription:LIVEVIDEO01:Live.mp4",
+                kind="Transcription",
+                video_id="LIVEVIDEO01",
+                item="Live.mp4",
+                detail="Automatic post-finalize transcription",
+                phase="Running WhisperX",
+                message="Running automatic transcription",
+                progress=0.25,
+            )
+
+            snapshot = build_status_snapshot(config)
+            lite = build_lite_status_payload(config)
+            html = render_status_html(snapshot)
+
+        self.assertEqual(snapshot.jobs[0].kind, "Transcription")
+        self.assertEqual(snapshot.jobs[0].progress, 0.25)
+        self.assertTrue(snapshot.job_revision.startswith("active:"))
+        self.assertEqual(lite["jobs"][0]["kind"], "Transcription")
+        self.assertEqual(lite["jobs"][0]["progress"], 0.25)
+        self.assertEqual(lite["job_revision"], snapshot.job_revision)
+        self.assertIn('data-job-revision="active:', html)
+        self.assertIn("Running automatic transcription", html)
 
     def test_lite_status_payload_avoids_full_stream_payload(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1141,6 +1184,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("/stream-voice-speakers?streamer=", script)
         self.assertIn("data-load-voice-details", script)
         self.assertIn("data-load-stream-speakers", script)
+        self.assertIn("data-streamer-job-page-button", script)
+        self.assertIn("data-streamer-job-page-state", script)
         self.assertNotIn("data-open-voice-manager", script)
         self.assertNotIn('join("' + "\n" + '")', script)
 
@@ -1253,6 +1298,35 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(payload_streamer["jobs"][0]["kind"], "Chat render")
         self.assertEqual(payload_streamer["jobs"][0]["video_id"], "LIVEVIDEO01")
+
+    def test_streamer_jobs_summary_paginates_many_jobs(self) -> None:
+        jobs = [
+            JobStatus(
+                job_id=f"job-{index}",
+                kind="Chat render",
+                status="running",
+                phase=f"Part {index}",
+                progress=0.1 * index,
+                video_id="LIVEVIDEO01",
+                item=f"part-{index}.live_chat.json",
+                detail="",
+                message="Rendering",
+                started_at=float(index),
+                updated_at=float(index),
+                finished_at=None,
+            )
+            for index in range(1, 7)
+        ]
+
+        html = render_streamer_jobs_summary(jobs)
+
+        self.assertIn('data-streamer-jobs', html)
+        self.assertIn('data-streamer-job-page="1"', html)
+        self.assertIn('data-streamer-job-page="2" hidden', html)
+        self.assertIn('data-streamer-job-page-button="2"', html)
+        self.assertIn('data-streamer-job-page-state>Page 1 of 2', html)
+        self.assertIn('part-1.live_chat.json', html)
+        self.assertIn('part-6.live_chat.json', html)
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2779,9 +2853,11 @@ class WebStatusTests(unittest.TestCase):
             watermark_dir = segment_dir / ".watermarks"
             watermark_dir.mkdir(parents=True)
             media_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            chat_video_file = segment_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
             output_name = ".watermarks/Live Status [LIVEVIDEO01] - wm-copy001.mp4"
             output_file = segment_dir / output_name
             media_file.write_text("media", encoding="utf-8")
+            chat_video_file.write_text("chat video", encoding="utf-8")
             output_file.write_text("watermarked", encoding="utf-8")
             state.create_watermark_copy(
                 copy_id="wm_copy001",
@@ -2802,19 +2878,87 @@ class WebStatusTests(unittest.TestCase):
                 snapshot = build_status_snapshot(config)
                 html = render_status_html(snapshot)
             resolved = resolve_watermark_download_file(config, "wm_copy001")
+            resolved_chat_source = resolve_watermark_source_file(
+                config,
+                stream.video_id,
+                chat_video_file.name,
+            )
 
         self.assertTrue(is_watermarkable_media_file(media_file.name))
+        self.assertTrue(is_watermarkable_media_file(chat_video_file.name))
         self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01].live_chat.json"))
         self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01] - chat.rendering.mp4"))
         stream_status = snapshot.streams[0]
         final_file = next(file for file in stream_status.files if file.name == media_file.name)
+        chat_video_status = next(file for file in stream_status.files if file.name == chat_video_file.name)
+        watermark_file = next(file for file in stream_status.files if file.name == output_name)
         self.assertIsNotNone(final_file.watermark_url)
+        self.assertIsNotNone(chat_video_status.watermark_url)
+        self.assertIsNone(chat_video_status.transcription_url)
+        self.assertIsNotNone(resolved_chat_source)
+        assert resolved_chat_source is not None
+        self.assertEqual(resolved_chat_source[1], chat_video_file.resolve())
         self.assertEqual(final_file.watermark_copies[0].recipient_label, "Recipient A")
         self.assertIn("/download-watermark?", final_file.watermark_copies[0].download_url or "")
+        self.assertEqual(final_file.watermark_copies[0].delete_url, "/delete-watermark")
+        self.assertEqual(watermark_file.kind, "watermark")
+        self.assertEqual(watermark_file.watermark_copy_id, "wm_copy001")
+        self.assertEqual(watermark_file.watermark_recipient_label, "Recipient A")
+        self.assertIn("/download-watermark?", watermark_file.download_url or "")
+        self.assertEqual(watermark_file.watermark_delete_url, "/delete-watermark")
         self.assertEqual(resolved, output_file.resolve())
         self.assertIn("Watermark", html)
         self.assertIn("Recipient A", html)
         self.assertIn("/download-watermark?", html)
+        self.assertIn("/delete-watermark", html)
+
+    def test_delete_watermark_copy_removes_file_and_record(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                watermark_enabled=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            watermark_dir = segment_dir / ".watermarks"
+            watermark_dir.mkdir(parents=True)
+            output_name = ".watermarks/Live Status [LIVEVIDEO01] - wm-copy001.mp4"
+            output_file = segment_dir / output_name
+            output_file.write_text("watermarked", encoding="utf-8")
+            state.create_watermark_copy(
+                copy_id="wm_copy001",
+                video_id=stream.video_id,
+                source_name="Live Status [LIVEVIDEO01].mp4",
+                output_name=output_name,
+                recipient_label="Recipient A",
+            )
+            state.update_watermark_copy(
+                "wm_copy001",
+                status="done",
+                message="Completed",
+                finished=True,
+            )
+            state.close()
+
+            ok, message = delete_watermark_copy(config, "wm_copy001")
+            state = StateStore(config.db_path)
+            fetched = state.get_watermark_copy("wm_copy001")
+            events = state.list_stream_events([stream.video_id])[stream.video_id]
+            state.close()
+
+        self.assertTrue(ok, message)
+        self.assertFalse(output_file.exists())
+        self.assertIsNone(fetched)
+        self.assertTrue(any("Deleted watermark copy" in event.message for event in events))
 
     def test_file_kind_and_byte_formatting(self) -> None:
         self.assertEqual(file_kind("segment-001.mp4"), "final")

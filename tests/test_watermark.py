@@ -7,6 +7,7 @@ from onlysavemevods.state import WatermarkCopyRecord
 from onlysavemevods.watermark import (
     build_audio_mux_command,
     derive_pattern,
+    score_watermark_frame_groups,
     score_watermark_records,
     validate_recipient_label,
     watermark_secret,
@@ -95,6 +96,23 @@ class WatermarkTests(unittest.TestCase):
         self.assertIn("1:a?", command)
         self.assertIn("libx264", command)
         self.assertIn("aac", command)
+
+    def test_grouped_scoring_does_not_dilute_full_frame_match_with_crop_variants(self) -> None:
+        matching = copy_record("wm_copy001", "Recipient A")
+        other = copy_record("wm_copy002", "Recipient B")
+        pattern = derive_pattern(
+            "secret-a",
+            matching.copy_id,
+            matching.video_id,
+            matching.source_name,
+        )
+        groups = [[("full", pattern), ("crop-3pct", -pattern)] for _index in range(12)]
+
+        candidates = score_watermark_frame_groups(groups, [other, matching], "secret-a")
+
+        self.assertEqual(candidates[0].copy_id, matching.copy_id)
+        self.assertEqual(candidates[0].variant, "full")
+        self.assertGreater(candidates[0].score, 0.5)
 
     def test_scoring_prefers_matching_copy_pattern(self) -> None:
         matching = copy_record("wm_copy001", "Recipient A")

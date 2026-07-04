@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from .chat_render import log_nvenc_environment
 from .config import BotConfig, ensure_config_dirs, monitored_sources
 from .downloader import DownloadManager
 from .models import LiveStream
 from .sources import SourceMonitor
-from .state import StateStore
+from .state import StateStore, StreamRecord
 from .web import StatusWebServer
 from .youtube import YtDlpRunner
 
@@ -31,6 +32,7 @@ class OnlySaveMeVodsDaemon:
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
+        stale_post_exit_records = self.state.list_streams_by_status(["checking_after_exit"])
         self.state.mark_stale_downloads_interrupted()
         self.state.mark_stale_watermarks_interrupted()
         sources = monitored_sources(self.config)
@@ -86,6 +88,7 @@ class OnlySaveMeVodsDaemon:
             LOGGER.info("Status web interface disabled by config")
         if not monitored_sources(self.config):
             LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
+        self.resume_stale_post_exit_checks(stale_post_exit_records)
 
         try:
             while not self._stop_event.is_set():
@@ -106,6 +109,20 @@ class OnlySaveMeVodsDaemon:
 
     def stop(self) -> None:
         self._stop_event.set()
+
+    def resume_stale_post_exit_checks(self, records: list[StreamRecord]) -> None:
+        if not records:
+            return
+        LOGGER.warning(
+            "Resuming %s interrupted post-exit check(s) after service restart",
+            len(records),
+        )
+        for record in records:
+            self.downloads.resume_post_exit_check(
+                stream_from_record(record),
+                record.segment_index,
+                elapsed_since_exit_seconds=seconds_since_iso(record.last_exit_at),
+            )
 
     async def poll_once(self) -> None:
         for source in monitored_sources(self.config):
@@ -136,3 +153,27 @@ class OnlySaveMeVodsDaemon:
     async def _start_stream(self, stream: LiveStream) -> None:
         self.state.upsert_detected(stream)
         await self.downloads.start_stream(stream)
+
+
+def stream_from_record(record: StreamRecord) -> LiveStream:
+    return LiveStream(
+        video_id=record.video_id,
+        url=record.url,
+        title=record.title,
+        channel=record.channel,
+        is_live=False,
+        platform=record.platform,
+        source=record.source,
+    )
+
+
+def seconds_since_iso(value: str | None) -> float:
+    if not value:
+        return 0.0
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError:
+        return 0.0
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - timestamp).total_seconds())

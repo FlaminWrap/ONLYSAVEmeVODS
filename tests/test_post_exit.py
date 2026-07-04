@@ -398,6 +398,55 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.status, "ended")
         self.assertEqual(manager.started, [])
 
+    async def test_recovered_post_exit_skips_elapsed_delays(self) -> None:
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[30, 60, 90],
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            non_live = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            probe = SequenceProbe([non_live, non_live, non_live])
+            manager = RecordingDownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=fake_sleep,
+                probe_video_func=probe.probe_video_async,
+                logger=NULL_LOGGER,
+            )
+
+            await manager.handle_post_exit(
+                stream,
+                1,
+                elapsed_since_exit_seconds=45,
+                expected_status="checking_after_exit",
+            )
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertEqual(probe.calls, 3)
+        self.assertEqual(sleeps, [15, 30])
+        self.assertIsNotNone(record)
+        self.assertEqual(record.status, "ended")
+
     async def test_restarts_if_any_post_exit_check_says_live(self) -> None:
         async def fake_sleep(delay: float) -> None:
             await asyncio.sleep(0)

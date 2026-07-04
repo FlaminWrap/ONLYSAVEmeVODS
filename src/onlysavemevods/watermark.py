@@ -47,6 +47,7 @@ class DetectionCandidate:
     output_name: str
     recipient_label: str
     score: float
+    variant: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,13 +332,13 @@ def detect_watermark(
     max_frames: int = MAX_DETECT_FRAMES,
     sample_interval_seconds: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
 ) -> DetectionResult:
-    frames = sample_detection_frames(
+    frame_groups = sample_detection_frame_groups(
         media_file,
         max_frames=max_frames,
         sample_interval_seconds=sample_interval_seconds,
     )
-    candidates = score_watermark_records(frames, records, secret)
-    if not frames:
+    candidates = score_watermark_frame_groups(frame_groups, records, secret)
+    if not frame_groups:
         return DetectionResult(
             matched=False,
             confidence="none",
@@ -355,7 +356,7 @@ def detect_watermark(
             confidence="none",
             score=0.0,
             margin=0.0,
-            frames_analyzed=len(frames),
+            frames_analyzed=len(frame_groups),
             best=None,
             runner_up=None,
             candidates=[],
@@ -383,7 +384,7 @@ def detect_watermark(
         confidence=confidence,
         score=best.score,
         margin=margin,
-        frames_analyzed=len(frames),
+        frames_analyzed=len(frame_groups),
         best=best,
         runner_up=runner_up,
         candidates=candidates[:10],
@@ -391,13 +392,13 @@ def detect_watermark(
     )
 
 
-def score_watermark_records(
-    frames: Sequence[Any],
+def score_watermark_frame_groups(
+    frame_groups: Sequence[Sequence[tuple[str, Any]]],
     records: Sequence[WatermarkCopyRecord],
     secret: str,
 ) -> list[DetectionCandidate]:
     candidates: list[DetectionCandidate] = []
-    if not frames:
+    if not frame_groups:
         return candidates
     for record in records:
         pattern = derive_pattern(
@@ -407,8 +408,21 @@ def score_watermark_records(
             record.source_name,
         )
         pattern = normalize_array(pattern)
-        scores = [float((frame * pattern).mean()) for frame in frames]
-        score = robust_average(scores)
+        scores_by_variant: dict[str, list[float]] = {}
+        for variants in frame_groups:
+            for variant_name, frame in variants:
+                scores_by_variant.setdefault(variant_name, []).append(
+                    float((frame * pattern).mean())
+                )
+        best_variant = ""
+        score = 0.0
+        for variant_name, scores in scores_by_variant.items():
+            if not scores:
+                continue
+            variant_score = robust_average(scores)
+            if not best_variant or variant_score > score:
+                best_variant = variant_name
+                score = variant_score
         candidates.append(
             DetectionCandidate(
                 copy_id=record.copy_id,
@@ -417,9 +431,19 @@ def score_watermark_records(
                 output_name=record.output_name,
                 recipient_label=record.recipient_label,
                 score=score,
+                variant=best_variant,
             )
         )
     return sorted(candidates, key=lambda item: item.score, reverse=True)
+
+
+def score_watermark_records(
+    frames: Sequence[Any],
+    records: Sequence[WatermarkCopyRecord],
+    secret: str,
+) -> list[DetectionCandidate]:
+    frame_groups = [[("single", frame)] for frame in frames]
+    return score_watermark_frame_groups(frame_groups, records, secret)
 
 
 def sample_detection_frames(
@@ -428,6 +452,20 @@ def sample_detection_frames(
     max_frames: int = MAX_DETECT_FRAMES,
     sample_interval_seconds: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
 ) -> list[Any]:
+    frame_groups = sample_detection_frame_groups(
+        media_file,
+        max_frames=max_frames,
+        sample_interval_seconds=sample_interval_seconds,
+    )
+    return [frame for variants in frame_groups for _variant_name, frame in variants][:max_frames]
+
+
+def sample_detection_frame_groups(
+    media_file: Path,
+    *,
+    max_frames: int = MAX_DETECT_FRAMES,
+    sample_interval_seconds: float = DEFAULT_SAMPLE_INTERVAL_SECONDS,
+) -> list[list[tuple[str, Any]]]:
     np, cv2 = optional_cv_dependencies()
     cap = cv2.VideoCapture(str(media_file))
     if not cap.isOpened():
@@ -436,45 +474,44 @@ def sample_detection_frames(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     if fps <= 0 or fps != fps:
         fps = 30.0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    duration = frame_count / fps if frame_count > 0 else 0.0
+    duration = total_frames / fps if total_frames > 0 else 0.0
     if duration > 0:
         step = max(sample_interval_seconds, duration / max_frames)
         timestamps = [index * step for index in range(max_frames) if index * step < duration]
     else:
         timestamps = [index * sample_interval_seconds for index in range(max_frames)]
 
-    frames: list[Any] = []
+    frame_groups: list[list[tuple[str, Any]]] = []
     try:
         for timestamp in timestamps:
             cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
             ok, frame = cap.read()
             if not ok:
                 continue
-            normalized = detection_frame_variants(frame, np, cv2)
-            if normalized:
-                frames.extend(normalized)
+            variants = detection_frame_variants(frame, np, cv2)
+            if variants:
+                frame_groups.append(variants)
     finally:
         cap.release()
-    return frames[:max_frames]
+    return frame_groups[:max_frames]
 
 
-def detection_frame_variants(frame: Any, np: Any, cv2: Any) -> list[Any]:
+def detection_frame_variants(frame: Any, np: Any, cv2: Any) -> list[tuple[str, Any]]:
     y = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)[:, :, 0].astype(np.float32)
-    crops = [y]
+    crops: list[tuple[str, Any]] = [("full", y)]
     content_crop = crop_letterbox(y, np)
     if content_crop is not y:
-        crops.append(content_crop)
+        crops.append(("letterbox", content_crop))
     height, width = y.shape[:2]
     for crop_ratio in (0.03, 0.06):
         dx = int(width * crop_ratio)
         dy = int(height * crop_ratio)
         if dx > 0 and dy > 0 and width - (2 * dx) >= 32 and height - (2 * dy) >= 18:
-            crops.append(y[dy : height - dy, dx : width - dx])
+            crops.append((f"crop-{int(crop_ratio * 100)}pct", y[dy : height - dy, dx : width - dx]))
 
-    variants: list[Any] = []
+    variants: list[tuple[str, Any]] = []
     seen_shapes: set[tuple[int, int]] = set()
-    for crop in crops:
+    for name, crop in crops:
         if crop.size == 0:
             continue
         key = crop.shape[:2]
@@ -488,7 +525,7 @@ def detection_frame_variants(frame: Any, np: Any, cv2: Any) -> list[Any]:
         )
         if float(small.std()) < 3.0:
             continue
-        variants.append(normalize_array(small))
+        variants.append((name, normalize_array(small)))
     return variants
 
 
@@ -549,6 +586,7 @@ def candidate_to_dict(candidate: DetectionCandidate | None) -> dict[str, Any] | 
         "output_name": candidate.output_name,
         "recipient_label": candidate.recipient_label,
         "score": candidate.score,
+        "variant": candidate.variant,
     }
 
 
@@ -591,7 +629,7 @@ def format_detection_text(result: DetectionResult) -> str:
         f"margin={result.margin:.5f}",
         f"frames={result.frames_analyzed}",
     ]
-    if result.matched:
+    if result.best:
         parts.extend(
             [
                 f"copy_id={result.best.copy_id}",
@@ -600,6 +638,8 @@ def format_detection_text(result: DetectionResult) -> str:
                 f"source={result.best.source_name}",
             ]
         )
+        if result.best.variant:
+            parts.append(f"geometry={result.best.variant}")
     return "\n".join(parts)
 
 

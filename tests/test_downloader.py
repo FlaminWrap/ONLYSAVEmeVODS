@@ -6,6 +6,7 @@ import json
 import unittest
 
 from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
+from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.chat_timing import read_chat_timing
 from onlysavemevods.downloader import (
@@ -732,6 +733,12 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        clear_tracked_jobs()
+
+    def tearDown(self) -> None:
+        clear_tracked_jobs()
+
     async def test_segment_timing_sidecar_records_capture_anchors(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -842,6 +849,41 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1], chat_file)
         self.assertIsNotNone(calls[0][2])
         self.assertEqual(calls[0][3], timing_file)
+
+    async def test_automatic_transcription_is_tracked_as_dashboard_job(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            transcribe = AsyncMock(return_value=True)
+
+            try:
+                with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
+                    await manager.finish_ended_stream(stream, 1)
+                jobs = list_tracked_jobs()
+            finally:
+                state.close()
+
+        self.assertTrue(any(job.kind == "Transcription" for job in jobs))
+        job = next(job for job in jobs if job.kind == "Transcription")
+        self.assertEqual(job.video_id, "LIVEVIDEO01")
+        self.assertEqual(job.status, "done")
+        self.assertEqual(job.progress, 1.0)
+        self.assertIn("Late Night Stream", job.item)
 
     async def test_finish_ended_stream_transcribes_named_media_file(self) -> None:
         with TemporaryDirectory() as tmp:

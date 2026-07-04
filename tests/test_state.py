@@ -60,6 +60,8 @@ class StateWatermarkTests(unittest.TestCase):
                 video_id="LIVEVIDEO01",
                 statuses=["done"],
             )
+            deleted = state.delete_watermark_copy("wm_copy001")
+            after_delete = state.get_watermark_copy("wm_copy001")
             state.close()
 
         self.assertEqual(created.status, "queued")
@@ -72,6 +74,8 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertIsNotNone(fetched.started_at)
         self.assertIsNotNone(fetched.finished_at)
         self.assertEqual([record.copy_id for record in listed], ["wm_copy001"])
+        self.assertTrue(deleted)
+        self.assertIsNone(after_delete)
 
     def test_stream_events_are_listed_oldest_first_and_capped(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -109,6 +113,40 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertEqual(events["LIVEVIDEO01"][-1].level, "warning")
         self.assertEqual(events["LIVEVIDEO01"][-1].segment_index, 204)
 
+
+    def test_streams_can_be_listed_by_status(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            checking = LiveStream(
+                video_id="CHECKING01",
+                url="https://www.youtube.com/watch?v=CHECKING01",
+                title="Checking",
+            )
+            downloading = LiveStream(
+                video_id="DOWNLOADING01",
+                url="https://www.youtube.com/watch?v=DOWNLOADING01",
+                title="Downloading",
+            )
+            ended = LiveStream(
+                video_id="ENDED01",
+                url="https://www.youtube.com/watch?v=ENDED01",
+                title="Ended",
+            )
+            state.upsert_detected(checking)
+            state.mark_exited(checking.video_id, 0)
+            state.mark_downloading(downloading, 1)
+            state.upsert_detected(ended)
+            state.mark_ended(ended.video_id)
+
+            records = state.list_streams_by_status(["checking_after_exit", "downloading"])
+            empty = state.list_streams_by_status([])
+            state.close()
+
+        self.assertEqual(empty, [])
+        self.assertEqual(
+            {record.video_id for record in records},
+            {"CHECKING01", "DOWNLOADING01"},
+        )
 
     def test_stale_watermark_jobs_are_marked_interrupted(self) -> None:
         with TemporaryDirectory() as tmp:
