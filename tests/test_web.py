@@ -60,6 +60,7 @@ from onlysavemevods.web import (
     update_render_chat_job,
     run_render_chat_process_job,
     run_vod_download_job,
+    queue_vod_post_processing_jobs,
     run_transcription_job,
     event_detection_job_key,
     run_event_detection_job,
@@ -369,6 +370,137 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Kick VOD chat replay downloaded", event_text)
         self.assertTrue(any(job.job_id == job_id and job.status == "done" for job in jobs))
         self.assertTrue(any("Kick chat replay" in job.message for job in jobs))
+
+    def test_vod_download_queues_enabled_post_processing_jobs(self) -> None:
+        class FakeProcess:
+            def __init__(self, lines: list[str], return_code: int, output: Path) -> None:
+                self.stdout = iter(lines)
+                self.return_code = return_code
+                self.output = output
+
+            def wait(self) -> int:
+                self.output.write_text("media", encoding="utf-8")
+                return self.return_code
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=True,
+                stream_event_detection_enabled=True,
+            )
+            stream = LiveStream(
+                video_id="rumble:vod-123",
+                url="https://rumble.com/vod-123.html",
+                title="Rumble VOD",
+                channel="OUMB3rd",
+                platform="rumble",
+                source="rumble:user/OUMB3rd",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.close()
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            media_file = output_template.with_name(output_template.name.replace("%(ext)s", "mp4"))
+            job_id = "vod-download:rumble:test"
+            start_tracked_job(
+                job_id,
+                kind="VOD download",
+                video_id=stream.video_id,
+                item="Rumble VOD.media",
+                detail=stream.url,
+                phase="Queued",
+                message="Queued VOD download",
+                progress=0.0,
+            )
+
+            with (
+                patch(
+                    "onlysavemevods.web.subprocess.Popen",
+                    return_value=FakeProcess(["[download] 100.0%"], 0, media_file),
+                ),
+                patch("onlysavemevods.web.Thread") as thread_cls,
+            ):
+                run_vod_download_job(
+                    config,
+                    job_id,
+                    stream,
+                    stream.url,
+                    output_template,
+                    previous_status="ended",
+                )
+
+            jobs = list_tracked_jobs(limit=20)
+            with TRANSCRIPTION_JOBS_LOCK:
+                transcription_jobs = list(TRANSCRIPTION_JOBS.values())
+                TRANSCRIPTION_JOBS.clear()
+            with EVENT_DETECTION_JOBS_LOCK:
+                event_jobs = list(EVENT_DETECTION_JOBS.values())
+                EVENT_DETECTION_JOBS.clear()
+
+        self.assertTrue(thread_cls.return_value.start.called)
+        self.assertTrue(any(job.kind == "VOD download" and job.status == "done" for job in jobs))
+        self.assertTrue(any(job.status == "running" for job in transcription_jobs))
+        self.assertTrue(any(job.status == "running" for job in event_jobs))
+
+    def test_vod_post_processing_queues_chat_render_and_twitch_ad_repair(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                render_live_chat_video=True,
+                twitch_ad_repair_enabled=True,
+            )
+            kick_stream = LiveStream(
+                video_id="kick:Hungover 2026-07-05 06:18",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Hungover 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+                is_live=False,
+            )
+            twitch_stream = LiveStream(
+                video_id="twitch:Live 2026-07-05 06:18",
+                url="https://www.twitch.tv/videos/123",
+                title="Live 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="twitch",
+                source="twitch:oumb",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            for stream in (kick_stream, twitch_stream):
+                state.mark_vod_downloading(stream, message="Started VOD download")
+                state.mark_vod_download_finished(stream.video_id)
+            state.close()
+
+            kick_template = vod_output_template_for(config, kick_stream, force_copy=False)
+            kick_template.parent.mkdir(parents=True, exist_ok=True)
+            kick_media = kick_template.with_name(kick_template.name.replace("%(ext)s", "mp4"))
+            kick_chat = kick_template.with_name(kick_template.name.replace("%(ext)s", "live_chat.json"))
+            kick_media.write_text("media", encoding="utf-8")
+            kick_chat.write_text(json.dumps({"platform": "kick", "messages": []}), encoding="utf-8")
+
+            twitch_template = vod_output_template_for(config, twitch_stream, force_copy=False)
+            twitch_template.parent.mkdir(parents=True, exist_ok=True)
+            twitch_media = twitch_template.with_name(twitch_template.name.replace("%(ext)s", "mp4"))
+            twitch_media.write_text("media", encoding="utf-8")
+
+            with patch("onlysavemevods.web.Thread") as thread_cls:
+                queue_vod_post_processing_jobs(config, kick_stream, kick_template)
+                queue_vod_post_processing_jobs(config, twitch_stream, twitch_template)
+
+            jobs = list_tracked_jobs(limit=20)
+            with CHAT_RENDER_JOBS_LOCK:
+                render_jobs = list(CHAT_RENDER_JOBS.values())
+                CHAT_RENDER_JOBS.clear()
+
+        self.assertGreaterEqual(thread_cls.return_value.start.call_count, 2)
+        self.assertTrue(any(job.status == "running" for job in render_jobs))
+        self.assertTrue(any(job.kind == "Twitch ad repair" for job in jobs))
 
     def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
         with TemporaryDirectory() as tmp:

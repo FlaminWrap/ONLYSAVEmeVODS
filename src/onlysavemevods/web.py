@@ -110,6 +110,7 @@ from .transcription import (
     voice_detection_mode,
     voice_detection_speaker_summary,
 )
+from .twitch_ad_repair import repair_twitch_ads_for_media
 from .watermark import (
     WATERMARK_STATUS_DONE,
     WATERMARK_STATUS_FAILED,
@@ -3699,7 +3700,176 @@ def run_vod_download_job(
         state.close()
     with FILE_SCAN_CACHE_LOCK:
         FILE_SCAN_CACHE.pop(str(output_template.parent), None)
+    queue_vod_post_processing_jobs(config, stream, output_template)
     LOGGER.info("VOD download completed video_id=%s output=%s", stream.video_id, output_template)
+
+
+def queue_vod_post_processing_jobs(
+    config: BotConfig,
+    stream: LiveStream,
+    output_template: Path,
+) -> None:
+    media_file = vod_media_file_for_output_template(output_template)
+    if media_file is None:
+        record_stream_event(
+            config,
+            stream.video_id,
+            "VOD post-processing skipped: downloaded media file was not found",
+            level="warning",
+            segment_index=1,
+        )
+        return
+
+    if config.twitch_ad_repair_enabled and stream.platform == "twitch":
+        start_vod_twitch_ad_repair_job(config, stream, media_file)
+    if config.transcribe_subtitles:
+        ok, message = start_transcription_job(config, stream.video_id, media_file.name)
+        if not ok:
+            record_stream_event(
+                config,
+                stream.video_id,
+                f"VOD transcription was not queued for {media_file.name}: {message}",
+                level="warning",
+                segment_index=1,
+            )
+    if config.stream_event_detection_enabled:
+        ok, message = start_event_detection_job(config, stream.video_id, media_file.name)
+        if not ok:
+            record_stream_event(
+                config,
+                stream.video_id,
+                f"VOD content event detection was not queued for {media_file.name}: {message}",
+                level="warning",
+                segment_index=1,
+            )
+    if config.render_live_chat_video and stream.platform in {"youtube", "kick"}:
+        chat_file = vod_chat_sidecar_for_media_file(media_file)
+        if chat_file.is_file():
+            ok, message = start_render_chat_job(config, stream.video_id, chat_file.name)
+            if not ok:
+                record_stream_event(
+                    config,
+                    stream.video_id,
+                    f"VOD chat render was not queued for {chat_file.name}: {message}",
+                    level="warning",
+                    segment_index=1,
+                )
+
+
+def vod_media_file_for_output_template(output_template: Path) -> Path | None:
+    template_name = output_template.name
+    if "%(ext)s" in template_name:
+        prefix, _placeholder, suffix = template_name.partition("%(ext)s")
+        candidates = [
+            path
+            for path in output_template.parent.iterdir()
+            if path.is_file()
+            and path.name.startswith(prefix)
+            and path.name.endswith(suffix)
+            and is_renderable_media_file(path.name)
+            and not is_live_chat_file(path.name)
+        ]
+    else:
+        candidates = [output_template] if output_template.is_file() else []
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def vod_chat_sidecar_for_media_file(media_file: Path) -> Path:
+    return media_file.with_name(f"{media_file.stem}.live_chat.json")
+
+
+def start_vod_twitch_ad_repair_job(
+    config: BotConfig,
+    stream: LiveStream,
+    media_file: Path,
+) -> tuple[bool, str]:
+    job_id = f"twitch-ad-repair:{stream.video_id}:{media_file.name}"
+    if tracked_job_is_running(job_id):
+        return True, "Twitch ad repair is already running"
+    start_tracked_job(
+        job_id,
+        kind="Twitch ad repair",
+        video_id=stream.video_id,
+        item=media_file.name,
+        detail="Automatic post-VOD Twitch commercial break detection and repair",
+        phase="Queued",
+        message="Queued Twitch ad repair",
+        progress=0.0,
+    )
+    record_stream_event(
+        config,
+        stream.video_id,
+        f"Queued Twitch ad repair for {media_file.name}",
+        segment_index=1,
+    )
+    thread = Thread(
+        target=run_vod_twitch_ad_repair_job,
+        args=(config, job_id, stream, media_file),
+        name=f"onlysavemevods-vod-twitch-ad-repair-{stream.video_id}",
+        daemon=True,
+    )
+    thread.start()
+    return True, "Twitch ad repair queued"
+
+
+def run_vod_twitch_ad_repair_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    media_file: Path,
+) -> None:
+    def report_progress(phase: str, value: float | None) -> None:
+        update_tracked_job(job_id, phase=phase, progress=value, message=phase)
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(stream.video_id)
+    finally:
+        state.close()
+    started_at = record.last_started_at if record else None
+    try:
+        result = repair_twitch_ads_for_media(
+            config,
+            stream,
+            media_file,
+            started_at=started_at,
+            progress_callback=report_progress,
+            logger=LOGGER,
+        )
+    except Exception as exc:  # noqa: BLE001 - background job must capture failures.
+        LOGGER.exception("VOD Twitch ad repair failed for media=%s", media_file)
+        message = str(exc) or exc.__class__.__name__
+        finish_tracked_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            message=message,
+            progress=None,
+        )
+        record_stream_event(
+            config,
+            stream.video_id,
+            f"Twitch ad repair failed for {media_file.name}: {message}",
+            level="error",
+            segment_index=1,
+        )
+        return
+
+    finish_tracked_job(
+        job_id,
+        status="done",
+        phase="Complete",
+        message=result.message,
+        progress=1.0,
+    )
+    record_stream_event(
+        config,
+        stream.video_id,
+        f"Twitch ad repair {'completed' if result.repaired else 'skipped'} for {media_file.name}: {result.message}",
+        segment_index=1,
+    )
 
 
 def run_youtube_vod_chat_download_job(
