@@ -17,6 +17,7 @@ from onlysavemevods.chat_render import (
     CHAT_AUTHOR_COLORS,
     CHAT_PANEL_EMOJI_SIZE,
     CHAT_PANEL_FPS,
+    CHAT_PANEL_TEXT_SIZE,
     choose_chat_render_nvenc_device,
     detect_nvidia_devices,
     EmojiImageCache,
@@ -37,6 +38,7 @@ from onlysavemevods.chat_render import (
     panel_emoji_size,
     panel_emoji_y,
     panel_line_height,
+    panel_text_y,
     parse_live_chat_file,
     render_chat_panel_video,
     render_chat_panel_frame,
@@ -701,9 +703,14 @@ class ChatRenderTests(unittest.TestCase):
         fonts = load_chat_panel_fonts(layout)
         y = 120
 
+        self.assertEqual(layout.font_size, CHAT_PANEL_TEXT_SIZE)
         self.assertEqual(panel_emoji_size(layout), CHAT_PANEL_EMOJI_SIZE)
         self.assertEqual(panel_line_height(layout), CHAT_PANEL_EMOJI_SIZE + 2)
-        self.assertEqual(panel_emoji_y(y, layout, fonts), y)
+        self.assertEqual(panel_emoji_y(y, layout, fonts), y + 1)
+        _left, text_top, _right, text_bottom = fonts.regular.getbbox("Ag")
+        text_midpoint = panel_text_y(y, layout, fonts.regular) + text_top + (text_bottom - text_top) / 2
+        emoji_midpoint = panel_emoji_y(y, layout, fonts) + CHAT_PANEL_EMOJI_SIZE / 2
+        self.assertLessEqual(abs(text_midpoint - emoji_midpoint), 1)
 
     def test_render_chat_panel_allows_long_messages_more_than_two_lines(self) -> None:
         layout = chat_layout_for_video(1280, 720)

@@ -35,6 +35,7 @@ CHAT_FINAL_EVENT_PADDING_SECONDS = 7 * 24 * 60 * 60
 CHAT_WRAP_WIDTH = 34
 CHAT_MAX_MESSAGE_LENGTH = 280
 CHAT_MESSAGE_MAX_LINES = 6
+CHAT_PANEL_TEXT_SIZE = 26
 CHAT_PANEL_EMOJI_SIZE = 30
 CHAT_PANEL_FPS = 60
 CHAT_ANIMATION_FRAME_SECONDS = 1 / CHAT_PANEL_FPS
@@ -391,7 +392,7 @@ def default_chat_layout() -> ChatLayout:
         row_top=CHAT_ROW_TOP,
         row_height=CHAT_ROW_HEIGHT,
         row_count=CHAT_ROW_COUNT,
-        font_size=22,
+        font_size=CHAT_PANEL_TEXT_SIZE,
         wrap_width=CHAT_WRAP_WIDTH,
     )
 
@@ -408,7 +409,7 @@ def chat_layout_for_video(
     padding_x = max(14, round(20 * scale))
     title_y = max(14, round(20 * scale))
     title_font_size = max(22, round(32 * scale))
-    font_size = max(16, round(22 * scale))
+    font_size = max(CHAT_PANEL_TEXT_SIZE, round(CHAT_PANEL_TEXT_SIZE * scale))
     row_top = max(
         title_y + title_font_size + max(22, round(26 * scale)),
         round(CHAT_ROW_TOP * scale),
@@ -1594,7 +1595,7 @@ def draw_chat_entry(
 ) -> None:
     line_height = panel_line_height(layout)
     draw.text(
-        (x, y),
+        (x, panel_text_y(y, layout, fonts.bold)),
         entry.author,
         font=fonts.bold,
         fill=chat_author_color(entry.author),
@@ -1644,7 +1645,12 @@ def draw_panel_line(
                 continue
 
         if item.text:
-            draw.text((current_x, y), item.text, font=fonts.regular, fill=CHAT_TEXT_FILL)
+            draw.text(
+                (current_x, panel_text_y(y, layout, fonts.regular)),
+                item.text,
+                font=fonts.regular,
+                fill=CHAT_TEXT_FILL,
+            )
             current_x += text_width(draw, fonts.regular, item.text)
 
 
@@ -1792,8 +1798,16 @@ def panel_line_height(layout: ChatLayout) -> int:
 
 
 def panel_emoji_y(y: int, layout: ChatLayout, fonts: ChatPanelFonts) -> int:
-    _left, _top, _right, text_bottom = fonts.regular.getbbox("Ag")
-    return y + max(0, text_bottom - panel_emoji_size(layout))
+    return y + max(0, (panel_line_height(layout) - panel_emoji_size(layout)) // 2)
+
+
+def panel_text_y(y: int, layout: ChatLayout, font: Any) -> int:
+    try:
+        _left, top, _right, bottom = font.getbbox("Ag")
+    except AttributeError:
+        return y
+    text_height = max(1, bottom - top)
+    return y + max(0, (panel_line_height(layout) - text_height) // 2) - top
 
 
 def panel_emoji_size(layout: ChatLayout) -> int:
