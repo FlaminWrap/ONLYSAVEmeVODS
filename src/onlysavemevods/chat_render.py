@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
@@ -407,6 +407,10 @@ def make_even(value: int) -> int:
 
 
 def parse_live_chat_file(path: Path) -> list[ChatEntry]:
+    normalized_entries = parse_normalized_live_chat_file(path)
+    if normalized_entries is not None:
+        return normalized_entries
+
     raw_entries: list[RawChatEntry] = []
     for item in iter_live_chat_json_objects(path):
         collect_chat_entries(item, raw_entries)
@@ -448,6 +452,62 @@ def parse_live_chat_file(path: Path) -> list[ChatEntry]:
         )
 
     return sorted(entries, key=lambda entry: entry.offset_seconds)
+
+
+def parse_normalized_live_chat_file(path: Path) -> list[ChatEntry] | None:
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not content.strip():
+        return None
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        return None
+    if str(payload.get("platform") or "").casefold() not in {"kick"}:
+        return None
+
+    entries: list[ChatEntry] = []
+    seen: set[tuple[int, str, str]] = set()
+    for message in payload["messages"]:
+        if not isinstance(message, dict):
+            continue
+        offset_ms = coerce_int(message.get("offset_ms"), None)
+        created_at = parse_chat_iso_timestamp_us(message.get("created_at"))
+        author = clean_chat_text(str(message.get("author") or "Unknown")) or "Unknown"
+        text = clean_chat_text(str(message.get("message") or ""))
+        if not text:
+            continue
+        offset_seconds = max(0.0, (offset_ms or 0) / 1000)
+        key = (round(offset_seconds * 100), author, text)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(
+            ChatEntry(
+                offset_seconds=offset_seconds,
+                author=author,
+                message=text,
+                tokens=(ChatToken(text),),
+                timestamp_us=created_at,
+            )
+        )
+    return sorted(entries, key=lambda entry: entry.offset_seconds)
+
+
+def parse_chat_iso_timestamp_us(value: Any) -> int | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000_000)
 
 
 def iter_live_chat_json_objects(path: Path) -> Iterator[Any]:

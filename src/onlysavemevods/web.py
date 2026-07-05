@@ -35,7 +35,7 @@ from .chat_render import (
     detect_nvidia_devices,
     render_chat_video_file,
 )
-from .chat_refresh import refresh_chat_sidecar
+from .chat_refresh import ChatRefreshResult, refresh_chat_sidecar
 from .chat_timing import is_chat_timing_file
 from .content_events import (
     ContentEventDetectorUnavailable,
@@ -84,6 +84,7 @@ from .job_tracker import (
     start_tracked_job,
     update_tracked_job,
 )
+from .kick_chat import download_kick_vod_chat_replay
 from .log_buffer import LogEntry, get_recent_log_entries
 from .models import LiveStream
 from .sources import SourceError, live_stream_from_generic_info, resolve_source
@@ -2876,7 +2877,7 @@ def summarize_files(
     for entry in scan_summary.visible_entries:
         file_started_at = time.perf_counter()
         file_steps: list[tuple[str, float]] = []
-        chat_actions_enabled = platform == "youtube"
+        chat_actions_enabled = platform in {"youtube", "kick"}
 
         action_started_at = time.perf_counter()
         render_chat_url, render_chat_output_url, render_chat_status, render_chat_message = (
@@ -2903,6 +2904,10 @@ def summarize_files(
             if chat_actions_enabled
             else (None, None, None)
         )
+        if platform == "kick" and refresh_chat_url is None:
+            refresh_chat_url, refresh_chat_status, refresh_chat_message = (
+                kick_chat_download_action_for_file(directory, video_id, entry.name)
+            )
         perf_step(file_steps, "chat_refresh", action_started_at)
 
         action_started_at = time.perf_counter()
@@ -3655,6 +3660,27 @@ def run_vod_download_job(
                 level="warning",
                 segment_index=1,
             )
+    elif stream.platform == "kick":
+        chat_ok, chat_message = run_kick_vod_chat_download_job(
+            config,
+            job_id,
+            stream,
+            output_template,
+        )
+        if chat_ok:
+            job_message = "VOD download completed with Kick chat replay"
+            stream_message = f"VOD download completed with Kick chat replay from {vod_url}"
+        else:
+            reason = chat_message or "Kick chat replay was not available"
+            job_message = "VOD download completed; Kick chat replay unavailable"
+            stream_message = f"VOD download completed from {vod_url}; Kick chat replay unavailable"
+            record_stream_event(
+                config,
+                stream.video_id,
+                f"Kick VOD chat replay unavailable: {reason}",
+                level="warning",
+                segment_index=1,
+            )
 
     finish_tracked_job(
         job_id,
@@ -3741,6 +3767,40 @@ def run_youtube_vod_chat_download_job(
     return True, f"Live chat replay downloaded: {chat_file.name}"
 
 
+def run_kick_vod_chat_download_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    output_template: Path,
+) -> tuple[bool, str]:
+    update_tracked_job(
+        job_id,
+        phase="Downloading Kick chat replay",
+        message="Trying Kick chat replay",
+        progress=0.99,
+    )
+    result = download_kick_vod_chat_replay(
+        stream,
+        output_template,
+        progress=lambda phase, value: update_tracked_job(
+            job_id,
+            phase=phase,
+            message=phase,
+            progress=0.99 if value is None else min(0.99, max(0.02, value)),
+        ),
+    )
+    if not result.ok:
+        return False, result.message
+    if result.chat_file is not None:
+        record_stream_event(
+            config,
+            stream.video_id,
+            f"Kick VOD chat replay downloaded: {result.chat_file.name}",
+            segment_index=1,
+        )
+    return True, result.message
+
+
 def finish_failed_vod_download(
     config: BotConfig,
     job_id: str,
@@ -3821,6 +3881,10 @@ def vod_chat_sidecar_for_output_template(output_template: Path) -> Path:
     if "%(ext)s" in template:
         return Path(template.replace("%(ext)s", "live_chat.json"))
     return output_template.with_suffix(".live_chat.json")
+
+
+def output_template_for_media_file(media_file: Path) -> Path:
+    return media_file.with_name(f"{media_file.stem}.%(ext)s")
 
 
 def vod_download_progress_from_line(line: str) -> float | None:
@@ -4050,6 +4114,45 @@ def resolve_refresh_chat_files(
     return record, media_file, chat_path
 
 
+def resolve_kick_chat_replay_files(
+    config: BotConfig,
+    video_id: str,
+    chat_filename: str,
+) -> tuple[StreamRecord, Path, Path] | None:
+    if not video_id or not chat_filename:
+        return None
+    if Path(chat_filename).name != chat_filename or "/" in chat_filename or "\\" in chat_filename:
+        return None
+    if not is_live_chat_file(chat_filename):
+        return None
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+    finally:
+        state.close()
+    if record is None or record.platform != "kick" or record.status != "ended":
+        return None
+
+    directory = segment_directory(config, record.video_id, record.channel)
+    chat_file = directory / chat_filename
+    try:
+        directory_path = directory.resolve(strict=True)
+    except OSError:
+        return None
+    try:
+        chat_path = chat_file.resolve(strict=False)
+    except OSError:
+        return None
+    if chat_path.parent != directory_path:
+        return None
+
+    media_file = chat_media_file_for_missing_chat_file(directory_path, chat_filename)
+    if media_file is None:
+        return None
+    return record, media_file, chat_path
+
+
 def resolve_chat_sidecar_files(
     config: BotConfig,
     video_id: str,
@@ -4091,6 +4194,20 @@ def resolve_chat_sidecar_files(
     if media_file is None:
         return None
     return record, media_file, chat_path
+
+
+def chat_media_file_for_missing_chat_file(
+    directory: Path,
+    chat_filename: str,
+) -> Path | None:
+    if not is_live_chat_file(chat_filename):
+        return None
+    stem = chat_filename.removesuffix(LIVE_CHAT_SUFFIX)
+    for suffix in CHAT_RENDER_MEDIA_SUFFIXES:
+        candidate = directory / f"{stem}{suffix}"
+        if candidate.is_file() and is_renderable_media_file(candidate.name):
+            return candidate
+    return None
 
 
 def chat_media_file_for_chat_file(
@@ -4214,6 +4331,28 @@ def chat_refresh_action_for_file(
     if job is not None and job.status == "failed":
         return refresh_chat_url_for(video_id, filename), "failed", job.message
     return refresh_chat_url_for(video_id, filename), "ready", None
+
+
+def kick_chat_download_action_for_file(
+    directory: Path,
+    video_id: str,
+    filename: str,
+) -> tuple[str | None, str | None, str | None]:
+    if not is_renderable_media_file(filename):
+        return None, None, None
+    media_file = directory / filename
+    if not media_file.is_file():
+        return None, None, None
+    chat_filename = f"{media_file.stem}{LIVE_CHAT_SUFFIX}"
+    if (directory / chat_filename).is_file():
+        return None, None, None
+
+    job = refresh_chat_job_for(video_id, chat_filename)
+    if job is not None and job.status == "running":
+        return None, "running", job.message
+    if job is not None and job.status == "failed":
+        return refresh_chat_url_for(video_id, chat_filename), "failed", job.message
+    return refresh_chat_url_for(video_id, chat_filename), "download", None
 
 
 def transcription_action_for_file(
@@ -4385,6 +4524,8 @@ def start_refresh_chat_job(
 ) -> tuple[bool, str]:
     resolved = resolve_refresh_chat_files(config, video_id, chat_filename)
     if resolved is None:
+        resolved = resolve_kick_chat_replay_files(config, video_id, chat_filename)
+    if resolved is None:
         return False, "No matching finalized video and live chat file found"
 
     record, media_file, chat_file = resolved
@@ -4399,7 +4540,11 @@ def start_refresh_chat_job(
             chat_name=chat_file.name,
             media_name=media_file.name,
             status="running",
-            message="Refreshing chat",
+            message=(
+                "Downloading Kick chat replay"
+                if record.platform == "kick" and not chat_file.exists()
+                else "Refreshing chat"
+            ),
             started_at=now,
             phase="Queued",
             progress=0.0,
@@ -4437,20 +4582,39 @@ def run_refresh_chat_job(
 ) -> None:
     update_refresh_chat_job(
         key,
-        phase="Refreshing chat replay",
+        phase="Downloading Kick chat replay" if record.platform == "kick" else "Refreshing chat replay",
         progress=0.2,
-        message="Refreshing chat replay",
+        message="Downloading Kick chat replay" if record.platform == "kick" else "Refreshing chat replay",
         updated_at=time.time(),
     )
     try:
-        result = refresh_chat_sidecar(
-            config,
-            video_url=record.url,
-            media_file=media_file,
-            chat_file=chat_file,
-            last_exit_at=record.last_exit_at,
-            logger=LOGGER,
-        )
+        if record.platform == "kick":
+            kick_result = download_kick_vod_chat_replay(
+                stream_from_record(record, url=record.url, is_live=False),
+                output_template_for_media_file(media_file),
+                progress=lambda phase, value: update_refresh_chat_job(
+                    key,
+                    phase=phase,
+                    progress=value,
+                    message=phase,
+                    updated_at=time.time(),
+                ),
+            )
+            result = ChatRefreshResult(
+                ok=kick_result.ok,
+                changed=kick_result.ok,
+                source="kick-replay",
+                message=kick_result.message,
+            )
+        else:
+            result = refresh_chat_sidecar(
+                config,
+                video_url=record.url,
+                media_file=media_file,
+                chat_file=chat_file,
+                last_exit_at=record.last_exit_at,
+                logger=LOGGER,
+            )
     except Exception as exc:  # noqa: BLE001 - web job should capture refresh failures.
         LOGGER.exception(
             "Manual chat refresh failed for media=%s chat=%s",
@@ -8230,7 +8394,9 @@ def dashboard_script() -> str:
     if (file.refresh_chat_status === "running") {
       actions.push('<span class="action-note">Refreshing chat</span>');
     } else if (file.refresh_chat_url) {
-      const label = file.refresh_chat_status === "failed" ? "Retry refresh" : "Refresh chat";
+      const label = file.refresh_chat_status === "failed"
+        ? "Retry refresh"
+        : (file.refresh_chat_status === "download" ? "Download chat replay" : "Refresh chat");
       actions.push(`<form class="inline-form" method="post" action="${escapeAttr(file.refresh_chat_url)}"><button class="download action-button" type="submit" title="Redownload chat replay or sync the recorded chat sidecar">${label}</button></form>`);
       if (file.refresh_chat_status === "failed" && file.refresh_chat_message) {
         actions.push(`<span class="action-note" title="${escapeAttr(file.refresh_chat_message)}">Refresh failed</span>`);
@@ -10736,7 +10902,12 @@ def render_file_action(file: FileStatus) -> str:
     if file.refresh_chat_status == "running":
         actions.append('<span class="action-note">Refreshing chat</span>')
     elif file.refresh_chat_url:
-        label = "Retry refresh" if file.refresh_chat_status == "failed" else "Refresh chat"
+        if file.refresh_chat_status == "failed":
+            label = "Retry refresh"
+        elif file.refresh_chat_status == "download":
+            label = "Download chat replay"
+        else:
+            label = "Refresh chat"
         title = ' title="Redownload chat replay or sync the recorded chat sidecar"'
         actions.append(
             '<form class="inline-form" method="post" '

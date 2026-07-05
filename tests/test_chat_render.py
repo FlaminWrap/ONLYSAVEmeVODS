@@ -131,6 +131,49 @@ class ChatRenderTests(unittest.TestCase):
         self.assertEqual(entries[0].message, "Hello 👋")
         self.assertEqual(entries[1].message, "$5.00 Nice stream")
 
+    def test_parse_normalized_kick_live_chat_json(self) -> None:
+        with TemporaryDirectory() as tmp:
+            chat_file = Path(tmp) / "Kick [kick].live_chat.json"
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "platform": "kick",
+                        "source": "kick:oumb",
+                        "video_id": "kick:vod",
+                        "messages": [
+                            {
+                                "id": "m1",
+                                "created_at": "2026-07-05T02:18:24Z",
+                                "offset_ms": 2000,
+                                "author": "Alice",
+                                "message": "hello Kick",
+                                "badges": [],
+                                "emotes": [],
+                            },
+                            {
+                                "id": "m2",
+                                "created_at": "2026-07-05T02:18:27Z",
+                                "offset_ms": 5000,
+                                "author": "Bob",
+                                "message": "second",
+                                "badges": [],
+                                "emotes": [],
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            entries = parse_live_chat_file(chat_file)
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0].offset_seconds, 2.0)
+        self.assertEqual(entries[0].timestamp_us, 1783217904000000)
+        self.assertEqual(entries[0].author, "Alice")
+        self.assertEqual(entries[0].message, "hello Kick")
+        self.assertEqual(entries[0].tokens[0].text, "hello Kick")
+
     def test_parse_live_chat_resolves_youtube_emoji_shortcodes(self) -> None:
         with TemporaryDirectory() as tmp:
             chat_file = Path(tmp) / "segment-001.live_chat.json"

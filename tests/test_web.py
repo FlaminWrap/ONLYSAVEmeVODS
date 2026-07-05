@@ -9,6 +9,7 @@ import unittest
 from onlysavemevods import __version__
 from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, VoiceProfileConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.kick_chat import KickChatReplayResult
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs, start_tracked_job
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
@@ -42,6 +43,7 @@ from onlysavemevods.web import (
     update_stream_event_rules_from_form,
     update_voice_detection_from_form,
     resolve_refresh_chat_files,
+    resolve_kick_chat_replay_files,
     cleanup_stream_fragments,
     delete_stream,
     resolve_watermark_download_file,
@@ -287,6 +289,86 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("VOD download completed from", event_text)
         self.assertTrue(any(job.job_id == job_id and job.status == "done" for job in jobs))
         self.assertTrue(any("live chat replay unavailable" in job.message for job in jobs))
+
+    def test_kick_vod_download_attempts_chat_replay_after_media_download(self) -> None:
+        class FakeProcess:
+            def __init__(self, lines: list[str], return_code: int) -> None:
+                self.stdout = iter(lines)
+                self.return_code = return_code
+
+            def wait(self) -> int:
+                return self.return_code
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                yt_dlp_path="yt-dlp",
+            )
+            stream = LiveStream(
+                video_id="kick:Hungover 2026-07-05 06:18",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Hungover 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.close()
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            chat_file = output_template.with_name(
+                output_template.name.replace("%(ext)s", "live_chat.json")
+            )
+            job_id = "vod-download:kick:test"
+            start_tracked_job(
+                job_id,
+                kind="VOD download",
+                video_id=stream.video_id,
+                item="Hungover.media",
+                detail=stream.url,
+                phase="Queued",
+                message="Queued VOD download",
+                progress=0.0,
+            )
+
+            with (
+                patch("onlysavemevods.web.subprocess.Popen", return_value=FakeProcess(["[download] 100.0%"], 0)),
+                patch(
+                    "onlysavemevods.web.download_kick_vod_chat_replay",
+                    return_value=KickChatReplayResult(
+                        True,
+                        "Kick chat replay downloaded",
+                        chat_file=chat_file,
+                        messages=3,
+                    ),
+                ) as replay,
+            ):
+                run_vod_download_job(
+                    config,
+                    job_id,
+                    stream,
+                    stream.url,
+                    output_template,
+                    previous_status="ended",
+                )
+
+            state = StateStore(config.db_path)
+            record = state.get_stream(stream.video_id)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            state.close()
+            jobs = list_tracked_jobs()
+
+        replay.assert_called_once()
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "ended")
+        event_text = "\n".join(event.message for event in events[stream.video_id])
+        self.assertIn("Kick VOD chat replay downloaded", event_text)
+        self.assertTrue(any(job.job_id == job_id and job.status == "done" for job in jobs))
+        self.assertTrue(any("Kick chat replay" in job.message for job in jobs))
 
     def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1995,6 +2077,98 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('source-platform-icon twitch', html)
         self.assertIn('twitch:OUMB3rd', html)
         self.assertIn('renderStreamSourceMeta', html)
+
+    def test_kick_media_offers_chat_replay_download_when_sidecar_is_missing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+                render_live_chat_video=True,
+            )
+            stream = LiveStream(
+                video_id="kick:Hungover 2026-07-05 06:18",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Hungover 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            media_file = output_template.with_name(
+                output_template.name.replace("%(ext)s", "mp4")
+            )
+            media_file.write_text("media", encoding="utf-8")
+            chat_name = f"{media_file.stem}.live_chat.json"
+
+            snapshot = build_status_snapshot(config)
+            resolved = resolve_kick_chat_replay_files(config, stream.video_id, chat_name)
+
+        media_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == media_file.name
+        )
+        self.assertEqual(resolved[1], media_file.resolve() if resolved else None)
+        self.assertEqual(media_status.refresh_chat_status, "download")
+        self.assertIn("/refresh-chat?", media_status.refresh_chat_url or "")
+        self.assertIn("Download chat replay", render_file_action(media_status))
+
+    def test_kick_chat_sidecar_offers_render_and_refresh_actions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+                render_live_chat_video=True,
+            )
+            stream = LiveStream(
+                video_id="kick:Hungover 2026-07-05 06:18",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Hungover 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            media_file = output_template.with_name(
+                output_template.name.replace("%(ext)s", "mp4")
+            )
+            chat_file = output_template.with_name(
+                output_template.name.replace("%(ext)s", "live_chat.json")
+            )
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text(
+                json.dumps({"platform": "kick", "messages": []}),
+                encoding="utf-8",
+            )
+
+            snapshot = build_status_snapshot(config)
+
+        chat_status = next(
+            file
+            for file in snapshot.streams[0].files
+            if file.name == chat_file.name
+        )
+        self.assertIsNotNone(chat_status.render_chat_url)
+        self.assertIsNotNone(chat_status.refresh_chat_url)
+        action = render_file_action(chat_status)
+        self.assertIn("Render chat", action)
+        self.assertIn("Refresh chat", action)
 
     def test_chat_refresh_action_is_available_for_finalized_chat(self) -> None:
         with TemporaryDirectory() as tmp:
