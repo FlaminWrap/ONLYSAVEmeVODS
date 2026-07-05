@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -13,6 +14,7 @@ from .youtube import YoutubeProbe, YtDlpError, YtDlpRunner, live_stream_from_inf
 LOGGER = logging.getLogger(__name__)
 SUPPORTED_PLATFORMS = {"youtube", "twitch", "kick", "rumble"}
 PREFIX_RE = re.compile(r"^(?P<platform>[A-Za-z][A-Za-z0-9_-]*):(?P<value>.+)$")
+SESSION_TITLE_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 
 
 class SourceError(ValueError):
@@ -282,6 +284,84 @@ def stream_with_source(stream: LiveStream, source: str) -> LiveStream:
     )
 
 
+def session_stream_raw_id(
+    info: dict[str, Any],
+    *,
+    source: str,
+    fallback_url: str,
+) -> str:
+    title = str(info.get("title") or "").strip()
+    start_time = format_stream_start_time(info)
+    if title:
+        if start_time and not SESSION_TITLE_DATE_RE.search(title):
+            return f"{title} {start_time}"
+        return title
+
+    fallback_values = (
+        info.get("id"),
+        info.get("display_id"),
+        info.get("uploader_id"),
+        info.get("channel_id"),
+        source_display_name(source or fallback_url),
+    )
+    for value in fallback_values:
+        raw = str(value or "").strip()
+        if raw:
+            if start_time and not SESSION_TITLE_DATE_RE.search(raw):
+                return f"{raw} {start_time}"
+            return raw
+    return ""
+
+
+def format_stream_start_time(info: dict[str, Any]) -> str:
+    timestamp = stream_start_timestamp(info)
+    if timestamp is None:
+        return ""
+    return (
+        datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        .astimezone()
+        .strftime("%Y-%m-%d %H:%M")
+    )
+
+
+def stream_start_timestamp(info: dict[str, Any]) -> float | None:
+    for key in (
+        "actual_start_timestamp",
+        "start_timestamp",
+        "live_start_timestamp",
+        "timestamp",
+        "release_timestamp",
+    ):
+        timestamp = parse_timestamp_value(info.get(key))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def parse_timestamp_value(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if value > 0 else None
+    if not isinstance(value, str):
+        return None
+
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", stripped):
+        parsed = float(stripped)
+        return parsed if parsed > 0 else None
+
+    try:
+        parsed_datetime = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed_datetime.tzinfo is None:
+        parsed_datetime = parsed_datetime.replace(tzinfo=timezone.utc)
+    return parsed_datetime.timestamp()
+
+
 def live_stream_from_generic_info(
     info: dict[str, Any],
     *,
@@ -289,13 +369,8 @@ def live_stream_from_generic_info(
     fallback_url: str,
     source: str = "",
 ) -> LiveStream:
-    if platform in {"twitch", "kick"}:
-        raw_id = str(
-            source_display_name(source or fallback_url)
-            or info.get("uploader_id")
-            or info.get("channel_id")
-            or info.get("id")
-        ).strip()
+    if platform in {"kick", "twitch", "rumble"}:
+        raw_id = session_stream_raw_id(info, source=source, fallback_url=fallback_url)
     else:
         raw_id = str(
             info.get("id")

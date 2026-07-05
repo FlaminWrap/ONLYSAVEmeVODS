@@ -77,6 +77,38 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertTrue(deleted)
         self.assertIsNone(after_delete)
 
+    def test_delete_stream_removes_record_events_and_watermark_copies(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                title="Live",
+            )
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.add_stream_event(stream.video_id, "custom event")
+            state.create_watermark_copy(
+                copy_id="wm_copy001",
+                video_id=stream.video_id,
+                source_name="Live [LIVEVIDEO01].mp4",
+                output_name=".watermarks/Live [LIVEVIDEO01] - wm-copy001.mp4",
+                recipient_label="Recipient A",
+            )
+
+            deleted = state.delete_stream(stream.video_id)
+            record = state.get_stream(stream.video_id)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            watermarks = state.list_watermark_copies(video_id=stream.video_id)
+            missing = state.delete_stream("MISSING")
+            state.close()
+
+        self.assertTrue(deleted)
+        self.assertIsNone(record)
+        self.assertEqual(events[stream.video_id], [])
+        self.assertEqual(watermarks, [])
+        self.assertFalse(missing)
+
     def test_stream_events_are_listed_oldest_first_and_capped(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")

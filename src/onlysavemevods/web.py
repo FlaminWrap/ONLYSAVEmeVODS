@@ -859,6 +859,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 if path == "/cleanup-fragments":
                     self._cleanup_fragments(parts.query)
                     return
+                if path == "/delete-stream":
+                    self._delete_stream()
+                    return
                 if path == "/detect-events":
                     self._start_event_detection(parts.query)
                     return
@@ -1126,6 +1129,28 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 count,
                 bytes_removed,
             )
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _delete_stream(self) -> None:
+            body = self._read_request_body(4096)
+            if body is None:
+                return
+            try:
+                params = parse_qs(body.decode("utf-8", "replace"))
+            except UnicodeDecodeError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid form body")
+                return
+            video_id = first_query_value(params, "video_id")
+            confirm_delete = first_query_value(params, "confirm_delete")
+            ok, message = delete_stream(config, video_id, confirm_delete)
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", "/#streamers")
             self.send_header("Cache-Control", "no-store")
@@ -3176,6 +3201,13 @@ FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
     "downloading",
     "waiting_retry",
 }
+STREAM_DELETE_BLOCKED_STATUSES = {
+    "checking_after_exit",
+    "detected",
+    "downloading",
+    "waiting_retry",
+}
+STREAM_DELETE_CONFIRM_VALUE = "delete_stream"
 
 
 def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int]:
@@ -3231,6 +3263,112 @@ def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int
     finally:
         state.close()
     return len(fragments), bytes_removed
+
+
+def delete_stream(
+    config: BotConfig,
+    video_id: str,
+    confirm_delete: str = "",
+) -> tuple[bool, str]:
+    video_id = video_id.strip()
+    if not video_id:
+        return False, "Stream id is required"
+    if confirm_delete != STREAM_DELETE_CONFIRM_VALUE:
+        return False, "Stream deletion was not confirmed"
+
+    active_jobs = [
+        job
+        for job in list_tracked_jobs(limit=1000)
+        if job.video_id == video_id and job.status in {"queued", "running"}
+    ]
+    if active_jobs:
+        return False, "Cannot delete a stream while dashboard jobs are still running"
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+        if record is None:
+            return False, "Stream was not found"
+        if record.status in STREAM_DELETE_BLOCKED_STATUSES:
+            return False, "Cannot delete a stream while it may still be active or resume"
+        active_watermarks = state.list_watermark_copies(
+            video_id=video_id,
+            statuses=[WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING],
+            limit=1,
+        )
+        if active_watermarks:
+            return False, "Cannot delete a stream while watermark jobs are still running"
+    finally:
+        state.close()
+
+    directory = segment_directory(config, record.video_id, record.channel)
+    bytes_removed = 0
+    files_removed = 0
+    removed_directory = False
+    if directory.exists():
+        try:
+            directory_path = safe_stream_directory_for_delete(config, directory)
+            files_removed, bytes_removed = directory_file_totals(directory_path)
+            shutil.rmtree(directory_path)
+            removed_directory = True
+        except OSError as exc:
+            return False, f"Unable to delete stream files: {exc}"
+        except ConfigError as exc:
+            return False, str(exc)
+
+    state = StateStore(config.db_path)
+    try:
+        deleted = state.delete_stream(video_id)
+    finally:
+        state.close()
+    if not deleted:
+        return False, "Stream was not found"
+
+    with FILE_SCAN_CACHE_LOCK:
+        FILE_SCAN_CACHE.pop(str(directory), None)
+        if directory.exists():
+            FILE_SCAN_CACHE.pop(str(directory.resolve()), None)
+
+    LOGGER.info(
+        "Deleted stream video_id=%s files=%s bytes=%s directory_removed=%s",
+        video_id,
+        files_removed,
+        bytes_removed,
+        removed_directory,
+    )
+    detail = f", removed {files_removed} file(s) / {format_bytes(bytes_removed)}" if removed_directory else ""
+    return True, f"Stream deleted{detail}"
+
+
+def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path:
+    if directory.is_symlink():
+        raise ConfigError("Refusing to delete a symlinked stream directory")
+    if not directory.is_dir():
+        raise ConfigError("Stream path is not a directory")
+    try:
+        root_path = config.download_dir.resolve(strict=True)
+        directory_path = directory.resolve(strict=True)
+    except OSError as exc:
+        raise ConfigError(f"Unable to resolve stream directory: {exc}") from exc
+    try:
+        directory_path.relative_to(root_path)
+    except ValueError as exc:
+        raise ConfigError("Refusing to delete a stream directory outside download_dir") from exc
+    return directory_path
+
+
+def directory_file_totals(directory: Path) -> tuple[int, int]:
+    file_count = 0
+    byte_count = 0
+    for path in directory.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        file_count += 1
+        try:
+            byte_count += path.stat().st_size
+        except OSError:
+            continue
+    return file_count, byte_count
 
 
 def resolve_watermark_download_file(
@@ -6208,6 +6346,11 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       cursor: pointer;
       font: inherit;
     }}
+    .danger-action {{
+      border-color: #fecaca;
+      color: #991b1b;
+      background: #fff5f5;
+    }}
     .watermark-form {{
       display: inline-flex;
       align-items: center;
@@ -7624,6 +7767,19 @@ def dashboard_script() -> str:
     return `<form class="inline-form" method="post" action="${escapeAttr(url)}"><button class="download action-button" type="submit" title="Remove saved .part-Frag files for this stream">${escapeHtml(label)}</button></form>`;
   };
 
+  const renderDeleteStreamAction = (stream) => {
+    const videoId = String((stream && stream.video_id) || "");
+    const blockedStatuses = new Set(["checking_after_exit", "detected", "downloading", "waiting_retry"]);
+    if (!videoId || blockedStatuses.has(String(stream.status || ""))) {
+      return "";
+    }
+    return `<form class="inline-form stream-delete-form" method="post" action="/delete-stream" onsubmit="return confirm('Delete this stream and all downloaded files? This cannot be undone.');">
+      <input type="hidden" name="video_id" value="${escapeAttr(videoId)}">
+      <input type="hidden" name="confirm_delete" value="delete_stream">
+      <button class="download action-button danger-action" type="submit" title="Delete this stream record and its downloaded files">Delete stream</button>
+    </form>`;
+  };
+
   const renderStreamJobRow = (job) => {
     const detail = job.item || job.detail || job.video_id || "-";
     return `<div class="streamer-job-row">
@@ -7699,6 +7855,7 @@ def dashboard_script() -> str:
     </div>
     <div class="stream-actions">
       ${renderCleanupFragmentsAction(stream)}
+      ${renderDeleteStreamAction(stream)}
       <button class="download stream-toggle" type="button" data-stream-toggle="${escapeAttr(videoId)}" aria-expanded="${expanded}">${toggleLabel}</button>
       <span class="badge ${escapeAttr(stream.status)}">${escapeHtml(statusLabel(stream.status))}</span>
     </div>
@@ -9748,6 +9905,20 @@ def render_cleanup_fragments_action(stream: StreamStatus) -> str:
     )
 
 
+def render_delete_stream_action(stream: StreamStatus) -> str:
+    if stream.status in STREAM_DELETE_BLOCKED_STATUSES:
+        return ""
+    return (
+        '<form class="inline-form stream-delete-form" method="post" action="/delete-stream" '
+        'onsubmit="return confirm(\'Delete this stream and all downloaded files? This cannot be undone.\');">'
+        f'<input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">'
+        f'<input type="hidden" name="confirm_delete" value="{STREAM_DELETE_CONFIRM_VALUE}">'
+        '<button class="download action-button danger-action" type="submit" '
+        'title="Delete this stream record and its downloaded files">Delete stream</button>'
+        '</form>'
+    )
+
+
 def render_stream_speakers_panel(
     streamer: StreamerStatStatus | None,
     stream: StreamStatus,
@@ -9804,6 +9975,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     </div>
     <div class="stream-actions">
       {render_cleanup_fragments_action(stream)}
+      {render_delete_stream_action(stream)}
       <button class="download stream-toggle" type="button" data-stream-toggle="{escape(stream.video_id, quote=True)}" aria-expanded="{expanded}">{toggle_label}</button>
       <span class="badge {escape(stream.status)}">{escape(status_label)}</span>
     </div>

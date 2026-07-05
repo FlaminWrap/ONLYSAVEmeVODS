@@ -275,6 +275,89 @@ class DownloaderCommandTests(unittest.TestCase):
             Path(tmp) / "Example_Channel" / "LIVEVIDEO01" / "segment-002.%(ext)s",
         )
 
+    def test_kick_output_template_uses_stream_title_directory(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            stream = LiveStream(
+                video_id="kick:Hungover 4th of July $3 tts no toxicity 2026-07-05 06:18",
+                url="https://kick.com/oumb",
+                title="Hungover 4th of July $3 tts no toxicity 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+            )
+
+            template = output_template_for(config, stream, 1)
+
+        self.assertEqual(
+            template,
+            Path(tmp)
+            / "OUMB3rd"
+            / "kick_Hungover 4th of July $3 tts no toxicity 2026-07-05 06_18"
+            / "segment-001.%(ext)s",
+        )
+
+    def test_existing_prefixed_kick_folder_is_reused_for_resume(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            legacy_directory = Path(tmp) / "OUMB3rd" / "kick_oumb"
+            legacy_directory.mkdir(parents=True)
+            stream = LiveStream(
+                video_id="kick:oumb",
+                url="https://kick.com/oumb",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+            )
+
+            template = output_template_for(config, stream, 1)
+
+        self.assertEqual(template, legacy_directory / "segment-001.%(ext)s")
+
+    def test_twitch_output_template_uses_stream_title_directory(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            stream = LiveStream(
+                video_id="twitch:Live on Twitch 2026-07-05 09:30",
+                url="https://www.twitch.tv/oumb",
+                title="Live on Twitch 2026-07-05 09:30",
+                channel="OUMB3rd",
+                platform="twitch",
+                source="twitch:oumb",
+            )
+
+            template = output_template_for(config, stream, 1)
+
+        self.assertEqual(
+            template,
+            Path(tmp)
+            / "OUMB3rd"
+            / "twitch_Live on Twitch 2026-07-05 09_30"
+            / "segment-001.%(ext)s",
+        )
+
+    def test_rumble_output_template_uses_stream_title_directory(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            stream = LiveStream(
+                video_id="rumble:Live on Rumble 2026-07-05 11:45",
+                url="https://rumble.com/vabc-title.html",
+                title="Live on Rumble 2026-07-05 11:45",
+                channel="OUMB3rd",
+                platform="rumble",
+                source="rumble:user/OUMB3rd",
+            )
+
+            template = output_template_for(config, stream, 1)
+
+        self.assertEqual(
+            template,
+            Path(tmp)
+            / "OUMB3rd"
+            / "rumble_Live on Rumble 2026-07-05 11_45"
+            / "segment-001.%(ext)s",
+        )
+
     def test_finalized_segment_is_renamed_to_title_and_video_id(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(download_dir=Path(tmp))
@@ -297,6 +380,38 @@ class DownloaderCommandTests(unittest.TestCase):
             )
 
             target = segment_dir / 'Late_Night_ _Stream [LIVEVIDEO01].mp4'
+            self.assertEqual(renamed, target)
+            self.assertFalse(source.exists())
+            self.assertEqual(target.read_text(encoding="utf-8"), "media")
+
+    def test_kick_finalized_segment_uses_safe_short_platform_label(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            stream = LiveStream(
+                video_id="kick:Hungover/Chill 2026-07-05 06:18",
+                url="https://kick.com/oumb",
+                title="Hungover/Chill 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+            )
+            segment_dir = (
+                Path(tmp)
+                / "OUMB3rd"
+                / "kick_Hungover_Chill 2026-07-05 06_18"
+            )
+            segment_dir.mkdir(parents=True)
+            source = segment_dir / "segment-001.mp4"
+            source.write_text("media", encoding="utf-8")
+
+            renamed = rename_finalized_segment_file(
+                config,
+                stream,
+                1,
+                NULL_LOGGER,
+            )
+
+            target = segment_dir / "Hungover_Chill 2026-07-05 06_18 [kick].mp4"
             self.assertEqual(renamed, target)
             self.assertFalse(source.exists())
             self.assertEqual(target.read_text(encoding="utf-8"), "media")

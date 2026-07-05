@@ -2671,25 +2671,52 @@ def discard_task_exception(task: asyncio.Task[None]) -> None:
 
 def segment_directory(config: BotConfig, video_id: str, channel: str = "") -> Path:
     legacy_directory = config.download_dir / safe_path_component(video_id)
+    directory_component = stream_directory_component(video_id)
     group_name = download_group_name_for_channel(config, channel)
     if not group_name:
-        return legacy_directory
+        stream_directory = config.download_dir / directory_component
+        if legacy_directory.exists() and not stream_directory.exists():
+            return legacy_directory
+        return stream_directory
 
-    channel_directory = (
-        config.download_dir
-        / safe_path_component(group_name)
-        / safe_path_component(video_id)
-    )
+    group_directory = config.download_dir / safe_path_component(group_name)
+    channel_directory = group_directory / directory_component
+    legacy_channel_directory = group_directory / safe_path_component(video_id)
     if legacy_directory.exists() and not channel_directory.exists():
         return legacy_directory
+    if (
+        legacy_channel_directory != channel_directory
+        and legacy_channel_directory.exists()
+        and not channel_directory.exists()
+    ):
+        return legacy_channel_directory
     return channel_directory
 
 
+def stream_directory_component(video_id: str) -> str:
+    platform, separator, raw_id = video_id.partition(":")
+    if separator and platform in {"kick", "twitch", "rumble"}:
+        return safe_filename_stem(f"{platform}_{raw_id}")
+    return safe_path_component(video_id)
+
+
 def named_segment_file_stem(title: str, video_id: str, segment_index: int) -> str:
-    stem = f"{safe_filename_stem(title)} [{video_id}]"
+    title_stem = safe_filename_stem(title)
+    id_label = video_id_filename_label(video_id, title_stem)
+    stem = f"{title_stem} [{id_label}]"
     if segment_index > 1:
         stem = f"{stem} - part {segment_index:03d}"
     return stem
+
+
+def video_id_filename_label(video_id: str, title_stem: str) -> str:
+    platform, separator, raw_id = video_id.partition(":")
+    if separator and platform in {"kick", "twitch", "rumble"}:
+        raw_label = safe_filename_stem(raw_id)
+        if raw_label == title_stem:
+            return platform
+        return safe_filename_stem(video_id)
+    return video_id
 
 
 def segment_file_stem(segment_index: int) -> str:

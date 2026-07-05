@@ -41,6 +41,7 @@ from onlysavemevods.web import (
     update_voice_detection_from_form,
     resolve_refresh_chat_files,
     cleanup_stream_fragments,
+    delete_stream,
     resolve_watermark_download_file,
     resolve_watermark_source_file,
     delete_watermark_copy,
@@ -76,6 +77,7 @@ from onlysavemevods.web import (
     StreamEventStatus,
     render_stream_event_timeline,
     render_streamer_jobs_summary,
+    STREAM_DELETE_CONFIRM_VALUE,
 )
 
 
@@ -1486,6 +1488,140 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertNotIn("/cleanup-fragments?video_id=LIVEVIDEO01", html)
         self.assertTrue(fragment_exists)
+
+    def test_delete_stream_removes_directory_and_state_after_confirmation(self) -> None:
+        clear_tracked_jobs()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.create_watermark_copy(
+                copy_id="wm_copy001",
+                video_id=stream.video_id,
+                source_name="Live Status [LIVEVIDEO01].mp4",
+                output_name=".watermarks/Live Status [LIVEVIDEO01] - wm-copy001.mp4",
+                recipient_label="Recipient A",
+            )
+            state.update_watermark_copy("wm_copy001", status="done", finished=True)
+            state.close()
+
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            watermark_dir = segment_dir / ".watermarks"
+            watermark_dir.mkdir(parents=True)
+            final_file = segment_dir / "Live Status [LIVEVIDEO01].mp4"
+            watermark_file = watermark_dir / "Live Status [LIVEVIDEO01] - wm-copy001.mp4"
+            final_file.write_text("final", encoding="utf-8")
+            watermark_file.write_text("watermark", encoding="utf-8")
+
+            html = render_status_html(build_status_snapshot(config))
+            rendered_body = html.split("<script>", 1)[0]
+            ok, message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
+            state = StateStore(config.db_path)
+            try:
+                record = state.get_stream(stream.video_id)
+                events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+                watermarks = state.list_watermark_copies(video_id=stream.video_id)
+            finally:
+                state.close()
+            directory_exists = segment_dir.exists()
+
+        self.assertIn('/delete-stream', rendered_body)
+        self.assertIn('Delete stream', rendered_body)
+        self.assertIn('return confirm', rendered_body)
+        self.assertTrue(ok, message)
+        self.assertIn("Stream deleted", message)
+        self.assertFalse(directory_exists)
+        self.assertIsNone(record)
+        self.assertEqual(events[stream.video_id], [])
+        self.assertEqual(watermarks, [])
+
+    def test_delete_stream_requires_confirmation(self) -> None:
+        clear_tracked_jobs()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "Live Status [LIVEVIDEO01].mp4").write_text("final", encoding="utf-8")
+
+            ok, message = delete_stream(config, stream.video_id, "")
+            state = StateStore(config.db_path)
+            try:
+                record = state.get_stream(stream.video_id)
+            finally:
+                state.close()
+            directory_exists = segment_dir.exists()
+
+        self.assertFalse(ok)
+        self.assertIn("not confirmed", message)
+        self.assertTrue(directory_exists)
+        self.assertIsNotNone(record)
+
+    def test_delete_stream_rejects_active_download(self) -> None:
+        clear_tracked_jobs()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4.part").write_text("part", encoding="utf-8")
+
+            html = render_status_html(build_status_snapshot(config))
+            rendered_body = html.split("<script>", 1)[0]
+            ok, message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
+            state = StateStore(config.db_path)
+            try:
+                record = state.get_stream(stream.video_id)
+            finally:
+                state.close()
+            directory_exists = segment_dir.exists()
+
+        self.assertNotIn('/delete-stream', rendered_body)
+        self.assertFalse(ok)
+        self.assertIn("may still be active", message)
+        self.assertTrue(directory_exists)
+        self.assertIsNotNone(record)
 
     def test_ended_streams_are_collapsed_by_default(self) -> None:
         with TemporaryDirectory() as tmp:

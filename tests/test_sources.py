@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import unittest
 
 from onlysavemevods.sources import (
@@ -62,6 +63,12 @@ class SourceResolutionTests(unittest.TestCase):
 
 class SourceMonitorTests(unittest.TestCase):
     def test_twitch_live_source_produces_platform_stream(self) -> None:
+        start_timestamp = datetime(2026, 7, 5, 8, 30, tzinfo=timezone.utc).timestamp()
+        expected_start = (
+            datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
         runner = FakeRunner(
             {
                 "https://www.twitch.tv/OUMB3rd": {
@@ -70,6 +77,7 @@ class SourceMonitorTests(unittest.TestCase):
                     "uploader": "OUMB3rd",
                     "webpage_url": "https://www.twitch.tv/OUMB3rd",
                     "live_status": "is_live",
+                    "timestamp": start_timestamp,
                 }
             }
         )
@@ -80,7 +88,7 @@ class SourceMonitorTests(unittest.TestCase):
         self.assertEqual(len(streams), 1)
         self.assertEqual(streams[0].platform, "twitch")
         self.assertEqual(streams[0].source, "twitch:OUMB3rd")
-        self.assertEqual(streams[0].video_id, "twitch:OUMB3rd")
+        self.assertEqual(streams[0].video_id, f"twitch:Live on Twitch {expected_start}")
 
     def test_kick_offline_source_returns_no_streams(self) -> None:
         runner = FakeRunner(
@@ -98,7 +106,44 @@ class SourceMonitorTests(unittest.TestCase):
 
         self.assertEqual(monitor.discover_live_streams("kick:OUMB3rd"), [])
 
+    def test_kick_live_source_uses_title_and_start_time_stream_id(self) -> None:
+        start_timestamp = datetime(2026, 7, 5, 5, 18, tzinfo=timezone.utc).timestamp()
+        expected_start = (
+            datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
+        runner = FakeRunner(
+            {
+                "https://kick.com/OUMB3rd": {
+                    "id": "OUMB3rd",
+                    "title": "Hungover 4th of July $3 tts no toxicity",
+                    "uploader": "OUMB3rd",
+                    "webpage_url": "https://kick.com/OUMB3rd",
+                    "live_status": "is_live",
+                    "timestamp": start_timestamp,
+                }
+            }
+        )
+        monitor = SourceMonitor(runner)
+
+        streams = monitor.discover_live_streams("kick:OUMB3rd")
+
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].platform, "kick")
+        self.assertEqual(streams[0].source, "kick:OUMB3rd")
+        self.assertEqual(
+            streams[0].video_id,
+            f"kick:Hungover 4th of July $3 tts no toxicity {expected_start}",
+        )
+
     def test_rumble_live_url_produces_platform_stream(self) -> None:
+        start_timestamp = datetime(2026, 7, 5, 10, 45, tzinfo=timezone.utc).timestamp()
+        expected_start = (
+            datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
         runner = FakeRunner(
             {
                 "https://rumble.com/vabc-title.html": {
@@ -107,6 +152,7 @@ class SourceMonitorTests(unittest.TestCase):
                     "uploader": "OUMB3rd",
                     "webpage_url": "https://rumble.com/vabc-title.html",
                     "is_live": True,
+                    "timestamp": start_timestamp,
                 }
             }
         )
@@ -116,7 +162,7 @@ class SourceMonitorTests(unittest.TestCase):
 
         self.assertEqual(len(streams), 1)
         self.assertEqual(streams[0].platform, "rumble")
-        self.assertEqual(streams[0].video_id, "rumble:vabc")
+        self.assertEqual(streams[0].video_id, f"rumble:Live on Rumble {expected_start}")
 
     def test_empty_non_youtube_probe_output_returns_no_streams(self) -> None:
         runner = FakeRunner(
@@ -130,6 +176,12 @@ class SourceMonitorTests(unittest.TestCase):
         self.assertTrue(any("--dump-single-json" in call for call in runner.calls))
 
     def test_rumble_user_playlist_fallback_finds_live_video(self) -> None:
+        start_timestamp = datetime(2026, 7, 5, 10, 45, tzinfo=timezone.utc).timestamp()
+        expected_start = (
+            datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
         runner = FakeRunner(
             {
                 "https://rumble.com/user/OUMB2": [
@@ -146,6 +198,7 @@ class SourceMonitorTests(unittest.TestCase):
                     "uploader": "OUMB2",
                     "webpage_url": "https://rumble.com/vabc-title.html",
                     "is_live": True,
+                    "timestamp": start_timestamp,
                 },
             }
         )
@@ -154,7 +207,7 @@ class SourceMonitorTests(unittest.TestCase):
         streams = monitor.discover_live_streams("rumble:user/OUMB2")
 
         self.assertEqual(len(streams), 1)
-        self.assertEqual(streams[0].video_id, "rumble:vabc")
+        self.assertEqual(streams[0].video_id, f"rumble:Live on Rumble {expected_start}")
         self.assertEqual(streams[0].source, "rumble:user/OUMB2")
 
     def test_rumble_playlist_candidates_resolve_at_site_root(self) -> None:

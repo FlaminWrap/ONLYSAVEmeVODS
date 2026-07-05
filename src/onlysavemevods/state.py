@@ -505,6 +505,23 @@ class StateStore:
         ).fetchall()
         return [_record_from_row(row) for row in rows]
 
+    def delete_stream(self, video_id: str) -> bool:
+        cursor = self.conn.execute(
+            "DELETE FROM streams WHERE video_id = ?",
+            (video_id,),
+        )
+        if cursor.rowcount:
+            self.conn.execute(
+                "DELETE FROM stream_events WHERE video_id = ?",
+                (video_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM watermark_copies WHERE video_id = ?",
+                (video_id,),
+            )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
     def create_watermark_copy(
         self,
         *,
