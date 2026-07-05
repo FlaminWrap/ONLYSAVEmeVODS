@@ -57,6 +57,10 @@ DEFAULT_STREAM_EVENT_WINDOW_SECONDS = 10.0
 DEFAULT_STREAM_EVENT_HOP_SECONDS = 5.0
 DEFAULT_STREAM_EVENT_MIN_CONFIDENCE = 0.35
 DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA = 100
+DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS = 300
+DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS = 2
+DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS = 180
+DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT = 5
 CONFIG_UPDATE_COMMENT = (
     "# Added by ONLYSAVEmeVODS config update. "
     "Existing settings above were left unchanged."
@@ -164,6 +168,12 @@ class BotConfig:
     stream_event_min_confidence: float = DEFAULT_STREAM_EVENT_MIN_CONFIDENCE
     stream_event_max_events_per_media: int = DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA
     stream_event_rules: list[StreamEventRuleConfig] = field(default_factory=list)
+    twitch_ad_repair_enabled: bool = True
+    twitch_ad_repair_tesseract_path: str = "tesseract"
+    twitch_ad_repair_scan_seconds: int = DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS
+    twitch_ad_repair_sample_seconds: int = DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS
+    twitch_ad_repair_max_seconds: int = DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS
+    twitch_ad_repair_vod_search_limit: int = DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT
     keep_fragments_for_resume: bool = True
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
@@ -362,6 +372,42 @@ def load_config(path: str | Path) -> BotConfig:
         stream_event_rules=_as_stream_event_rules(
             raw.get("stream_event_rules", []),
             "stream_event_rules",
+        ),
+        twitch_ad_repair_enabled=_as_bool(
+            raw.get("twitch_ad_repair_enabled", True),
+            "twitch_ad_repair_enabled",
+        ),
+        twitch_ad_repair_tesseract_path=_as_str(
+            raw.get("twitch_ad_repair_tesseract_path", "tesseract"),
+            "twitch_ad_repair_tesseract_path",
+        ),
+        twitch_ad_repair_scan_seconds=_as_non_negative_int(
+            raw.get(
+                "twitch_ad_repair_scan_seconds",
+                DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS,
+            ),
+            "twitch_ad_repair_scan_seconds",
+        ),
+        twitch_ad_repair_sample_seconds=_as_positive_int(
+            raw.get(
+                "twitch_ad_repair_sample_seconds",
+                DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS,
+            ),
+            "twitch_ad_repair_sample_seconds",
+        ),
+        twitch_ad_repair_max_seconds=_as_positive_int(
+            raw.get(
+                "twitch_ad_repair_max_seconds",
+                DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS,
+            ),
+            "twitch_ad_repair_max_seconds",
+        ),
+        twitch_ad_repair_vod_search_limit=_as_positive_int(
+            raw.get(
+                "twitch_ad_repair_vod_search_limit",
+                DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT,
+            ),
+            "twitch_ad_repair_vod_search_limit",
         ),
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),

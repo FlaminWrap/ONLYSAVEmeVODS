@@ -77,6 +77,18 @@ chat_render_timeout_seconds = 3600
 chat_render_use_nvenc = false
 chat_render_nvenc_devices = []
 
+# Twitch sometimes records a local "Commercial break in progress" slate instead of
+# the streamer's video. When enabled, finalized Twitch videos are OCR-scanned for
+# that slate, the matching moment is pulled from the channel's recent Twitch VOD,
+# and a separate .repaired.mp4 copy is written beside the original. This needs
+# tesseract in PATH and a Twitch VOD covering the captured time.
+twitch_ad_repair_enabled = true
+twitch_ad_repair_tesseract_path = "tesseract"
+twitch_ad_repair_scan_seconds = 300
+twitch_ad_repair_sample_seconds = 2
+twitch_ad_repair_max_seconds = 180
+twitch_ad_repair_vod_search_limit = 5
+
 # Automatically create speech subtitles after a stream is finalized. WhisperX
 # writes .srt, .vtt, .txt, .tsv, and .json sidecars next to the media file.
 transcribe_subtitles = false

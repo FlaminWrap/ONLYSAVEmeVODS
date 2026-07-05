@@ -492,6 +492,13 @@ install_dnf_os_dependencies() {
     dnf_install ffmpeg
   fi
 
+  if ! command -v tesseract >/dev/null 2>&1; then
+    enable_almalinux_extra_repos 0
+    if ! try_dnf_install tesseract; then
+      echo "WARNING: Could not install tesseract; Twitch ad repair will be unavailable until tesseract is installed" >&2
+    fi
+  fi
+
   install_nvidia_dependencies_if_detected
 }
 
@@ -552,6 +559,12 @@ install_apt_os_dependencies() {
   if ! command -v ffmpeg >/dev/null 2>&1; then
     enable_ubuntu_universe_if_available
     apt_install ffmpeg
+  fi
+
+  if ! command -v tesseract >/dev/null 2>&1; then
+    if ! try_apt_install tesseract-ocr; then
+      echo "WARNING: Could not install tesseract-ocr; Twitch ad repair will be unavailable until tesseract is installed" >&2
+    fi
   fi
 
   install_nvidia_dependencies_if_detected_apt

@@ -49,6 +49,7 @@ from .job_tracker import finish_tracked_job, start_tracked_job, update_tracked_j
 from .models import LiveStream
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
+from .twitch_ad_repair import repair_twitch_ads_for_media
 from .youtube import TerminalVideoUnavailableError
 
 
@@ -77,6 +78,14 @@ FRAGMENT_PROGRESS_RE = re.compile(
     r"\(frag\s+(?P<fragment>\d+)\s*/\s*(?P<count>\d+)\)"
 )
 KEPT_FRAGMENT_RE = re.compile(r"-Frag(?P<fragment>\d+)$")
+CHANNEL_SOURCE_POST_EXIT_PLATFORMS = {"kick", "twitch"}
+
+
+def post_exit_probe_target(stream: LiveStream) -> str:
+    platform = stream.platform.strip().casefold()
+    if platform in CHANNEL_SOURCE_POST_EXIT_PLATFORMS and stream.source:
+        return stream.source
+    return stream.url
 
 
 SleepFunc = Callable[[float], Awaitable[None]]
@@ -676,7 +685,7 @@ class DownloadManager:
         segment_index: int,
     ) -> None:
         try:
-            latest = await self.probe_video(stream.url)
+            latest = await self.probe_video(post_exit_probe_target(stream))
         except TerminalVideoUnavailableError as exc:
             await self._mark_terminal_unavailable(stream, segment_index, exc)
             return
@@ -819,7 +828,7 @@ class DownloadManager:
                     stream.video_id,
                     offset,
                 )
-                latest = await self.probe_video(stream.url)
+                latest = await self.probe_video(post_exit_probe_target(stream))
             except TerminalVideoUnavailableError as exc:
                 if self._stream_status_matches(stream.video_id, expected_status):
                     await self._mark_terminal_unavailable(stream, segment_index, exc)
@@ -894,6 +903,8 @@ class DownloadManager:
         if should_record_chat_for_stream(self.config, stream):
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
+        if self.config.twitch_ad_repair_enabled and stream.platform == "twitch":
+            await self.repair_finalized_twitch_ads(stream, finalized_files)
         if self.config.transcribe_subtitles:
             await self.transcribe_finalized_media(stream, finalized_files)
         if self.config.stream_event_detection_enabled:
@@ -1095,6 +1106,89 @@ class DownloadManager:
             finish_tracked_job(
                 job_id,
                 message="Automatic transcription completed",
+            )
+
+    async def repair_finalized_twitch_ads(
+        self,
+        stream: LiveStream,
+        finalized_files: list[FinalizedSegmentFiles],
+    ) -> None:
+        record = self.state.get_stream(stream.video_id)
+        started_at = record.last_started_at if record else None
+        for files in finalized_files:
+            if files.media_file is None:
+                continue
+            job_id = auto_job_id("twitch-ad-repair", stream.video_id, files.media_file.name)
+            start_tracked_job(
+                job_id,
+                kind="Twitch ad repair",
+                video_id=stream.video_id,
+                item=files.media_file.name,
+                detail="Automatic Twitch commercial break detection and repair",
+                phase="Queued",
+                message="Queued Twitch ad repair",
+                progress=0.0,
+            )
+
+            def report_progress(phase: str, value: float | None) -> None:
+                update_tracked_job(
+                    job_id,
+                    phase=phase,
+                    progress=value,
+                    message=phase,
+                )
+
+            try:
+                result = await asyncio.to_thread(
+                    repair_twitch_ads_for_media,
+                    self.config,
+                    stream,
+                    files.media_file,
+                    started_at=started_at,
+                    progress_callback=report_progress,
+                    logger=self.logger,
+                )
+            except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                self.logger.exception("Twitch ad repair failed for %s", files.media_file)
+                finish_tracked_job(
+                    job_id,
+                    status="failed",
+                    phase="Failed",
+                    message=str(exc) or exc.__class__.__name__,
+                    progress=None,
+                )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Twitch ad repair failed for {files.media_file.name}: {exc}",
+                    level="error",
+                    segment_index=files.segment_index,
+                )
+                continue
+
+            if result.repaired and result.output_file:
+                files.media_file = Path(result.output_file)
+                finish_tracked_job(
+                    job_id,
+                    message=result.message,
+                )
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Twitch ad repair completed for {files.media_file.name}: {result.message}",
+                    segment_index=files.segment_index,
+                )
+                continue
+
+            finish_tracked_job(
+                job_id,
+                status="done",
+                phase="Complete",
+                message=result.message,
+            )
+            self.state.add_stream_event(
+                stream.video_id,
+                f"Twitch ad repair skipped for {files.media_file.name}: {result.message}",
+                level="info",
+                segment_index=files.segment_index,
             )
 
     async def detect_finalized_content_events(
@@ -1868,7 +1962,7 @@ class DownloadManager:
         self.logger.info("Retrying start for %s in %ss", stream.video_id, delay)
         await self.sleep(delay)
         try:
-            latest = await self.probe_video(stream.url)
+            latest = await self.probe_video(post_exit_probe_target(stream))
         except TerminalVideoUnavailableError as exc:
             self.logger.info(
                 "Retry probe found %s terminally unavailable: %s",

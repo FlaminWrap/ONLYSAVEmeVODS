@@ -20,9 +20,11 @@ class SequenceProbe:
     def __init__(self, streams: list[LiveStream | Exception]) -> None:
         self.streams = streams
         self.calls = 0
+        self.urls: list[str] = []
 
     def probe_video(self, url: str) -> LiveStream:
         self.calls += 1
+        self.urls.append(url)
         result = self.streams.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -492,6 +494,57 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.calls, 2)
         self.assertEqual(len(manager.started), 1)
         self.assertEqual(manager.started[0][0].video_id, "LIVEVIDEO01")
+        self.assertIsNotNone(record)
+        self.assertNotEqual(record.status, "ended")
+
+    async def test_kick_post_exit_probes_configured_source_for_restarts(self) -> None:
+        async def fake_sleep(delay: float) -> None:
+            await asyncio.sleep(0)
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0],
+            )
+            original = LiveStream(
+                video_id="kick:oumb",
+                url="https://kick.com/oumb/videos/temporary-extracted-url",
+                title="Kick Stream",
+                channel="oumb",
+                platform="kick",
+                source="kick:oumb",
+                is_live=True,
+            )
+            live_again = LiveStream(
+                video_id="kick:oumb",
+                url="https://kick.com/oumb",
+                title="Kick Stream",
+                channel="oumb",
+                platform="kick",
+                source="kick:oumb",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(original)
+            state.mark_exited(original.video_id, 0)
+            probe = SequenceProbe([live_again])
+            manager = RecordingDownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=fake_sleep,
+                probe_video_func=probe.probe_video_async,
+                logger=NULL_LOGGER,
+            )
+
+            await manager.handle_post_exit(original, 1)
+            record = state.get_stream(original.video_id)
+            state.close()
+
+        self.assertEqual(probe.urls, ["kick:oumb"])
+        self.assertEqual(len(manager.started), 1)
+        self.assertEqual(manager.started[0][0].video_id, "kick:oumb")
         self.assertIsNotNone(record)
         self.assertNotEqual(record.status, "ended")
 

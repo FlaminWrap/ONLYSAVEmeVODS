@@ -121,6 +121,12 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "stream_event_hop_seconds": "5.0",
         "stream_event_min_confidence": "0.35",
         "stream_event_max_events_per_media": "100",
+        "twitch_ad_repair_enabled": "true",
+        "twitch_ad_repair_tesseract_path": "tesseract",
+        "twitch_ad_repair_scan_seconds": "300",
+        "twitch_ad_repair_sample_seconds": "2",
+        "twitch_ad_repair_max_seconds": "180",
+        "twitch_ad_repair_vod_search_limit": "5",
         "web_enabled": "true",
         "web_host": "127.0.0.1",
         "web_port": "8080",
@@ -1864,6 +1870,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('name="channels"', html)
         self.assertIn('name="download_dir"', html)
         self.assertIn('name="web_port"', html)
+        self.assertIn('name="twitch_ad_repair_enabled"', html)
         self.assertIn('name="chat_render_timeout_seconds"', html)
         self.assertIn('name="watermark_strength"', html)
         self.assertIn('name="whisperx_language" type="text" value=""', html)
@@ -2029,6 +2036,12 @@ class WebStatusTests(unittest.TestCase):
                     watermark_secret_env="TEST_WATERMARK_SECRET",
                     watermark_strength="balanced",
                     watermark_detect_upload_max_bytes="123456",
+                    twitch_ad_repair_enabled="false",
+                    twitch_ad_repair_tesseract_path="/usr/bin/tesseract",
+                    twitch_ad_repair_scan_seconds="0",
+                    twitch_ad_repair_sample_seconds="5",
+                    twitch_ad_repair_max_seconds="120",
+                    twitch_ad_repair_vod_search_limit="3",
                     extra_yt_dlp_args_mode="keep",
                 ),
             )
@@ -2050,6 +2063,12 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(updated.watermark_secret_env, "TEST_WATERMARK_SECRET")
         self.assertEqual(updated.watermark_strength, "balanced")
         self.assertEqual(updated.watermark_detect_upload_max_bytes, 123456)
+        self.assertFalse(updated.twitch_ad_repair_enabled)
+        self.assertEqual(updated.twitch_ad_repair_tesseract_path, "/usr/bin/tesseract")
+        self.assertEqual(updated.twitch_ad_repair_scan_seconds, 0)
+        self.assertEqual(updated.twitch_ad_repair_sample_seconds, 5)
+        self.assertEqual(updated.twitch_ad_repair_max_seconds, 120)
+        self.assertEqual(updated.twitch_ad_repair_vod_search_limit, 3)
         self.assertEqual(updated.extra_yt_dlp_args, ["--cookies", "/secret/cookies.txt"])
         self.assertEqual(config.channels, ["@New", "@Second"])
         self.assertEqual(config.web_port, 9090)

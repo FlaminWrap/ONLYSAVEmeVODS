@@ -105,10 +105,11 @@ service user so the web UI can save settings without making app code writable.
 
 The generic installer auto-detects `dnf` or `apt-get` for OS dependencies. On
 Debian/Ubuntu systems, it uses `apt-get` to install systemd, curl, certificates,
-unzip, DejaVu fonts, Python 3.11+ with venv support, and FFmpeg; the Ubuntu
-script also enables the `universe` repository when available for FFmpeg. On
+unzip, DejaVu fonts, Python 3.11+ with venv support, FFmpeg, and
+Tesseract OCR for Twitch ad repair; the Ubuntu script also enables the
+`universe` repository when available for FFmpeg. On
 AlmaLinux/RHEL-like systems, the installer uses `dnf` where possible, including
-Python 3.11+, FFmpeg, DejaVu Sans fonts, EPEL, and RPM Fusion.
+Python 3.11+, FFmpeg, Tesseract OCR, DejaVu Sans fonts, EPEL, and RPM Fusion.
 
 For NVIDIA/NVENC, the AlmaLinux/RHEL path can install RPM Fusion NVIDIA
 driver/CUDA runtime packages (`akmod-nvidia` and
@@ -255,6 +256,14 @@ scripts/uninstall-systemd.sh
   Chat recording, refresh, and rendered chat videos are currently YouTube-only;
   non-YouTube sources are recorded as video/audio only in this first adapter
   pass.
+- Twitch ad repair is enabled by default with `twitch_ad_repair_enabled = true`.
+  After a Twitch stream is finalized, the bot OCR-scans the configured early
+  window for Twitch's "Commercial break in progress" slate. If it can find a
+  recent Twitch VOD covering that time, it downloads the matching slice, aligns
+  it against the captured video, and writes a separate `.repaired.mp4` copy plus
+  a `.twitch-ad-repair.json` sidecar. Originals are left untouched. Set
+  `twitch_ad_repair_scan_seconds = 0` to scan the whole file, or set
+  `twitch_ad_repair_enabled = false` to disable the automatic job.
 - Set `render_live_chat_video = true` to also create a separate
   `Title [VIDEOID] - chat.mp4` after the stream ends. The original finalized
   media file is left untouched; the chat version is re-encoded with the video on

@@ -17,6 +17,7 @@ from onlysavemevods.downloader import (
     CatchupTracker,
     command_for_log,
     output_template_for,
+    post_exit_probe_target,
     prepare_finalize_plan,
     rename_finalized_segment_file,
     rename_segment_chat_file,
@@ -25,9 +26,11 @@ from onlysavemevods.downloader import (
     segment_has_final_files,
     segment_part_files,
     segment_timing_file,
+    segment_directory,
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
+from onlysavemevods.twitch_ad_repair import TwitchAdRepairResult
 
 
 class NullLogger:
@@ -187,6 +190,36 @@ class DownloaderCommandTests(unittest.TestCase):
 
             with self.assertRaises(ValueError):
                 build_chat_download_command(config, stream, 1)
+
+    def test_kick_post_exit_probe_uses_configured_source(self) -> None:
+        stream = LiveStream(
+            video_id="kick:oumb",
+            url="https://kick.com/oumb/videos/temporary-extracted-url",
+            platform="kick",
+            source="kick:oumb",
+        )
+
+        self.assertEqual(post_exit_probe_target(stream), "kick:oumb")
+
+    def test_twitch_post_exit_probe_uses_configured_source(self) -> None:
+        stream = LiveStream(
+            video_id="twitch:oumb",
+            url="https://www.twitch.tv/videos/123456",
+            platform="twitch",
+            source="twitch:oumb",
+        )
+
+        self.assertEqual(post_exit_probe_target(stream), "twitch:oumb")
+
+    def test_youtube_post_exit_probe_keeps_video_url(self) -> None:
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+            source="@ExampleChannel",
+        )
+
+        self.assertEqual(post_exit_probe_target(stream), video_url("LIVEVIDEO01"))
 
     def test_live_chat_command_downloads_only_chat_sidecar(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -849,6 +882,68 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1], chat_file)
         self.assertIsNotNone(calls[0][2])
         self.assertEqual(calls[0][3], timing_file)
+
+    async def test_finish_ended_twitch_stream_runs_ad_repair_job(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                twitch_ad_repair_enabled=True,
+            )
+            stream = LiveStream(
+                video_id="twitch:Example",
+                url="https://www.twitch.tv/Example",
+                title="Late Night Stream",
+                channel="Example",
+                platform="twitch",
+                source="twitch:Example",
+            )
+            directory = segment_directory(config, stream.video_id, stream.channel)
+            directory.mkdir(parents=True)
+            (directory / "segment-001.mp4").write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            repaired_file = directory / "Late Night Stream [twitch_Example].repaired.mp4"
+
+            def fake_repair(*_args: object, **_kwargs: object) -> TwitchAdRepairResult:
+                repaired_file.write_text("repaired", encoding="utf-8")
+                return TwitchAdRepairResult(
+                    True,
+                    str(repaired_file),
+                    "Repaired 1 Twitch commercial break(s)",
+                    [],
+                    [],
+                    vod_url="https://www.twitch.tv/videos/1",
+                )
+
+            async def fake_to_thread(func: object, *args: object, **kwargs: object) -> object:
+                assert callable(func)
+                return func(*args, **kwargs)
+
+            try:
+                with (
+                    patch("onlysavemevods.downloader.repair_twitch_ads_for_media", fake_repair),
+                    patch("onlysavemevods.downloader.asyncio.to_thread", fake_to_thread),
+                ):
+                    await manager.finish_ended_stream(stream, 1)
+                jobs = list_tracked_jobs()
+                events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
+                    stream.video_id
+                ]
+                repaired_exists = repaired_file.exists()
+            finally:
+                state.close()
+
+        self.assertTrue(repaired_exists)
+        self.assertTrue(any(job.kind == "Twitch ad repair" for job in jobs))
+        job = next(job for job in jobs if job.kind == "Twitch ad repair")
+        self.assertEqual(job.status, "done")
+        self.assertEqual(job.progress, 1.0)
+        self.assertIn(
+            "Twitch ad repair completed",
+            "\n".join(event.message for event in events),
+        )
 
     async def test_automatic_transcription_is_tracked_as_dashboard_job(self) -> None:
         with TemporaryDirectory() as tmp:
