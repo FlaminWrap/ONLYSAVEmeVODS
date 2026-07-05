@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import insort
 from collections import OrderedDict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -426,6 +426,7 @@ class RenderChatJob:
     phase: str = ""
     progress: float | None = None
     updated_at: float | None = None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -482,6 +483,7 @@ class JobStatus:
     started_at: float | None
     updated_at: float | None
     finished_at: float | None
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1704,7 +1706,8 @@ def job_revision_for_jobs(jobs: list[JobStatus]) -> str:
     if not jobs:
         return ""
     active_bits = [
-        f"{job.job_id}:{job.status}:{job.kind}:{job.video_id}"
+        f"{job.job_id}:{job.status}:{job.kind}:{job.video_id}:"
+        f"{job.phase}:{job.progress}:{job.updated_at or job.started_at or 0.0:.3f}"
         for job in jobs
         if job.status in {"queued", "running"}
     ]
@@ -1818,6 +1821,7 @@ def build_job_statuses(
                 started_at=job.started_at,
                 updated_at=job.updated_at or job.finished_at or job.started_at,
                 finished_at=job.finished_at,
+                details=render_chat_status_details(job),
             )
         )
     for job in refresh_jobs:
@@ -1897,6 +1901,21 @@ def build_job_statuses(
         key=lambda job: job.updated_at or job.started_at or 0.0,
         reverse=True,
     )[:JOB_LIMIT]
+
+
+def render_chat_status_details(job: RenderChatJob) -> dict[str, Any]:
+    details = dict(job.details)
+    details.setdefault("media_name", job.media_name)
+    details.setdefault("chat_name", job.chat_name)
+    details.setdefault("output_name", job.output_name)
+    if job.started_at and "elapsed_seconds" not in details:
+        ended_at = job.finished_at if job.finished_at is not None else time.time()
+        elapsed_seconds = max(0.0, ended_at - job.started_at)
+        details["elapsed_seconds"] = elapsed_seconds
+        details["elapsed"] = format_duration(int(elapsed_seconds))
+    if job.message and "diagnostic" not in details:
+        details["diagnostic"] = job.message
+    return details
 
 
 def iso_to_epoch(value: str | None) -> float | None:
@@ -4662,6 +4681,13 @@ def start_render_chat_job(
             phase="Queued",
             progress=0.0,
             updated_at=now,
+            details=chat_render_job_details(
+                media_file,
+                chat_file,
+                output_file,
+                elapsed_seconds=0.0,
+                diagnostic="Queued",
+            ),
         )
 
     record_stream_event(
@@ -4891,6 +4917,7 @@ def run_render_chat_process_job(
     regenerate: bool = False,
 ) -> None:
     assert config.config_path is not None
+    progress_file = create_isolated_render_progress_file(output_file)
     command = build_render_chat_file_process_command(
         sys.executable,
         config.config_path,
@@ -4898,6 +4925,7 @@ def run_render_chat_process_job(
         chat_file,
         output_file,
         overwrite=regenerate,
+        progress_file=progress_file,
     )
     LOGGER.info(
         "Starting isolated manual chat render process media=%s chat=%s output=%s",
@@ -4913,6 +4941,13 @@ def run_render_chat_process_job(
         progress=0.05,
         message="Starting isolated renderer",
         updated_at=started_at,
+        details=chat_render_job_details(
+            media_file,
+            chat_file,
+            output_file,
+            elapsed_seconds=0.0,
+            diagnostic="Starting isolated renderer",
+        ),
     )
     try:
         process = subprocess.Popen(
@@ -4930,7 +4965,15 @@ def run_render_chat_process_job(
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+            details=chat_render_job_details(
+                media_file,
+                chat_file,
+                output_file,
+                elapsed_seconds=max(0.0, time.time() - started_at),
+                diagnostic=message,
+            ),
         )
+        cleanup_isolated_render_progress_file(progress_file)
         record_stream_event(
             config,
             video_id_from_job_key(key),
@@ -4948,7 +4991,14 @@ def run_render_chat_process_job(
             )
             break
         except subprocess.TimeoutExpired:
-            update_isolated_render_chat_progress(key, output_file, started_at)
+            update_isolated_render_chat_progress(
+                key,
+                output_file,
+                started_at,
+                progress_file=progress_file,
+                media_file=media_file,
+                chat_file=chat_file,
+            )
 
     returncode = process.returncode if process.returncode is not None else 0
     log_process_output(
@@ -4968,7 +5018,16 @@ def run_render_chat_process_job(
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+            details=chat_render_job_details(
+                media_file,
+                chat_file,
+                output_file,
+                elapsed_seconds=max(0.0, time.time() - started_at),
+                progress_payload=read_isolated_render_progress(progress_file),
+                diagnostic=failure_message,
+            ),
         )
+        cleanup_isolated_render_progress_file(progress_file)
         record_stream_event(
             config,
             video_id_from_job_key(key),
@@ -4986,7 +5045,16 @@ def run_render_chat_process_job(
         progress=1.0,
         finished_at=time.time(),
         updated_at=time.time(),
+        details=chat_render_job_details(
+            media_file,
+            chat_file,
+            output_file,
+            elapsed_seconds=max(0.0, time.time() - started_at),
+            progress_payload=read_isolated_render_progress(progress_file),
+            diagnostic="Rendered chat video",
+        ),
     )
+    cleanup_isolated_render_progress_file(progress_file)
     record_stream_event(
         config,
         video_id_from_job_key(key),
@@ -4998,15 +5066,35 @@ def update_isolated_render_chat_progress(
     key: str,
     output_file: Path,
     started_at: float,
+    *,
+    progress_file: Path | None = None,
+    media_file: Path | None = None,
+    chat_file: Path | None = None,
 ) -> None:
     now = time.time()
-    phase = isolated_render_chat_progress_phase(output_file, now - started_at)
+    elapsed_seconds = max(0.0, now - started_at)
+    payload = read_isolated_render_progress(progress_file)
+    phase = isolated_render_chat_progress_phase(output_file, elapsed_seconds)
+    progress = None
+    if payload is not None:
+        payload_phase = str(payload.get("phase") or "").strip()
+        if payload_phase:
+            phase = payload_phase
+        progress = optional_float(payload.get("progress"))
     update_render_chat_job(
         key,
         phase=phase,
-        progress=None,
+        progress=progress,
         message=phase,
         updated_at=now,
+        details=chat_render_job_details(
+            media_file,
+            chat_file,
+            output_file,
+            elapsed_seconds=elapsed_seconds,
+            progress_payload=payload,
+            diagnostic=phase,
+        ),
     )
 
 
@@ -5020,6 +5108,124 @@ def isolated_render_chat_progress_phase(output_file: Path, elapsed_seconds: floa
         f"Rendering in isolated process; {label} {format_bytes(size_bytes)} "
         f"written to {path.name}; elapsed {elapsed}"
     )
+
+
+def create_isolated_render_progress_file(output_file: Path) -> Path | None:
+    try:
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=output_file.parent,
+            prefix=f".{output_file.stem}.progress.",
+            suffix=".json",
+            delete=False,
+        ) as handle:
+            return Path(handle.name)
+    except OSError as exc:
+        LOGGER.warning(
+            "Unable to create isolated chat render progress file output=%s error=%s",
+            output_file,
+            exc,
+        )
+        return None
+
+
+def cleanup_isolated_render_progress_file(progress_file: Path | None) -> None:
+    if progress_file is None:
+        return
+    try:
+        progress_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def read_isolated_render_progress(progress_file: Path | None) -> dict[str, Any] | None:
+    if progress_file is None:
+        return None
+    try:
+        payload = json.loads(progress_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def chat_render_job_details(
+    media_file: Path | None,
+    chat_file: Path | None,
+    output_file: Path,
+    *,
+    elapsed_seconds: float,
+    progress_payload: dict[str, Any] | None = None,
+    diagnostic: str = "",
+) -> dict[str, Any]:
+    details: dict[str, Any] = {
+        "elapsed_seconds": max(0.0, elapsed_seconds),
+        "elapsed": format_duration(max(0, int(elapsed_seconds))),
+        "output_name": output_file.name,
+    }
+    if media_file is not None:
+        details["media_name"] = media_file.name
+    if chat_file is not None:
+        details["chat_name"] = chat_file.name
+    if diagnostic:
+        details["diagnostic"] = diagnostic
+
+    if progress_payload is not None:
+        for key in ("phase", "progress", "updated_at", "media_name", "chat_name", "output_name"):
+            value = progress_payload.get(key)
+            if value not in (None, ""):
+                details[key] = value
+
+    current = current_render_chat_output_detail(output_file, progress_payload)
+    if current is not None:
+        label, name, size_bytes = current
+        details["current_label"] = label
+        details["current_name"] = name
+        details["current_size_bytes"] = size_bytes
+        details["current_size"] = format_bytes(size_bytes)
+    return details
+
+
+def current_render_chat_output_detail(
+    output_file: Path,
+    progress_payload: dict[str, Any] | None,
+) -> tuple[str, str, int] | None:
+    if progress_payload is not None:
+        outputs = progress_payload.get("outputs")
+        if isinstance(outputs, dict):
+            for key, label in (("final", "final video"), ("panel", "chat panel"), ("output", "output")):
+                raw = outputs.get(key)
+                if not isinstance(raw, dict):
+                    continue
+                name = str(raw.get("name") or "").strip()
+                size_bytes = optional_int(raw.get("size_bytes"))
+                if name and size_bytes is not None:
+                    return label, name, size_bytes
+
+    current = current_isolated_render_chat_output(output_file)
+    if current is None:
+        return None
+    label, path, size_bytes = current
+    return label, path.name, size_bytes
+
+
+def optional_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def current_isolated_render_chat_output(
@@ -5069,6 +5275,25 @@ def run_render_chat_in_process_job(
             media_file,
             nvenc_device or "default",
         )
+    started_at = time.time()
+
+    def report_progress(phase: str, value: float | None) -> None:
+        now = time.time()
+        update_render_chat_job(
+            key,
+            phase=phase,
+            progress=value,
+            message=phase,
+            updated_at=now,
+            details=chat_render_job_details(
+                media_file,
+                chat_file,
+                output_file,
+                elapsed_seconds=max(0.0, now - started_at),
+                diagnostic=phase,
+            ),
+        )
+
     try:
         render_chat_video_file(
             media_file,
@@ -5080,13 +5305,7 @@ def run_render_chat_in_process_job(
             timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
-            progress_callback=lambda phase, value: update_render_chat_job(
-                key,
-                phase=phase,
-                progress=value,
-                message=phase,
-                updated_at=time.time(),
-            ),
+            progress_callback=report_progress,
         )
     except Exception as exc:  # noqa: BLE001 - web job should capture renderer failures.
         LOGGER.exception(
@@ -5102,6 +5321,13 @@ def run_render_chat_in_process_job(
             phase="Failed",
             finished_at=time.time(),
             updated_at=time.time(),
+            details=chat_render_job_details(
+                media_file,
+                chat_file,
+                output_file,
+                elapsed_seconds=max(0.0, time.time() - started_at),
+                diagnostic=message,
+            ),
         )
         record_stream_event(
             config,
@@ -5120,6 +5346,13 @@ def run_render_chat_in_process_job(
         progress=1.0,
         finished_at=time.time(),
         updated_at=time.time(),
+        details=chat_render_job_details(
+            media_file,
+            chat_file,
+            output_file,
+            elapsed_seconds=max(0.0, time.time() - started_at),
+            diagnostic="Rendered chat video",
+        ),
     )
     record_stream_event(
         config,
@@ -5163,6 +5396,7 @@ def update_render_chat_job(key: str, **changes: Any) -> None:
             phase=changes.get("phase", job.phase),
             progress=changes.get("progress", job.progress),
             updated_at=changes.get("updated_at", job.updated_at),
+            details=changes.get("details", job.details),
         )
 
 
@@ -7014,6 +7248,18 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-job-kind {{ font-weight: 650; color: var(--text); }}
     .streamer-job-phase, .streamer-job-detail {{ min-width: 0; overflow-wrap: anywhere; }}
+    .streamer-job-meta {{ display: flex; flex-wrap: wrap; gap: 4px 10px; min-width: 0; }}
+    .streamer-job-meta span {{ min-width: 0; overflow-wrap: anywhere; }}
+    .streamer-job-details {{ min-width: 0; }}
+    .streamer-job-details summary {{ cursor: pointer; width: fit-content; color: var(--muted); }}
+    .streamer-job-details-grid {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr);
+      gap: 4px 10px;
+      margin: 6px 0 0;
+    }}
+    .streamer-job-details-grid dt {{ color: var(--muted); }}
+    .streamer-job-details-grid dd {{ margin: 0; min-width: 0; overflow-wrap: anywhere; }}
     .streamer-job-row .job-progress {{ width: min(420px, 100%); min-width: 0; }}
     .stream-head {{
       display: flex;
@@ -8701,14 +8947,70 @@ def dashboard_script() -> str:
     </form>`;
   };
 
+  const jobDetailElapsed = (job) => {
+    const details = job.details || {};
+    if (details.elapsed) return String(details.elapsed);
+    if (details.elapsed_seconds !== null && details.elapsed_seconds !== undefined && !Number.isNaN(Number(details.elapsed_seconds))) {
+      return formatDuration(Number(details.elapsed_seconds));
+    }
+    if (job.started_at === null || job.started_at === undefined) return "-";
+    const end = job.finished_at === null || job.finished_at === undefined ? Date.now() / 1000 : Number(job.finished_at);
+    return formatDuration(Math.max(0, end - Number(job.started_at)));
+  };
+
+  const jobCurrentSize = (details) => {
+    details = details || {};
+    if (details.current_size) return String(details.current_size);
+    if (details.current_size_bytes !== null && details.current_size_bytes !== undefined && !Number.isNaN(Number(details.current_size_bytes))) {
+      return formatBytes(Number(details.current_size_bytes));
+    }
+    return "";
+  };
+
+  const renderJobCompactMeta = (job) => {
+    const details = job.details || {};
+    const parts = [];
+    const elapsed = jobDetailElapsed(job);
+    if (elapsed && elapsed !== "-") parts.push(`elapsed ${elapsed}`);
+    const currentSize = jobCurrentSize(details);
+    const currentLabel = String(details.current_label || "").trim();
+    if (currentSize) parts.push(`${currentLabel || "output"} ${currentSize}`);
+    const outputName = String(details.output_name || job.item || "").trim();
+    if (outputName) parts.push(`output ${outputName}`);
+    const extraDetail = String(job.detail || "").trim();
+    if (extraDetail && !new Set([outputName, job.item, job.video_id]).has(extraDetail)) parts.push(extraDetail);
+    if (!parts.length) parts.push(job.item || job.detail || job.video_id || "-");
+    return parts.map((part) => `<span>${escapeHtml(part)}</span>`).join("");
+  };
+
+  const renderJobDetailToggle = (job) => {
+    const details = job.details || {};
+    const fields = [
+      ["Media", details.media_name],
+      ["Chat", details.chat_name],
+      ["Output", details.output_name || job.item],
+      ["Current file", details.current_name],
+      ["Current size", jobCurrentSize(details)],
+      ["Elapsed", jobDetailElapsed(job)],
+      ["Updated", formatEpoch(job.updated_at)],
+      ["Message", details.diagnostic || job.message],
+    ];
+    const rows = fields
+      .filter(([_label, value]) => value !== null && value !== undefined && String(value).trim() && String(value).trim() !== "-")
+      .map(([label, value]) => `<dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd>`)
+      .join("");
+    if (!rows) return "";
+    return `<details class="streamer-job-details file-meta"><summary>Details</summary><dl class="streamer-job-details-grid">${rows}</dl></details>`;
+  };
+
   const renderStreamJobRow = (job) => {
-    const detail = job.item || job.detail || job.video_id || "-";
     return `<div class="streamer-job-row">
   <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
   <div class="streamer-job-body">
     <div class="streamer-job-heading"><span class="streamer-job-kind">${escapeHtml(job.kind || "Job")}</span><span class="streamer-job-phase muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
     <div class="streamer-job-progress">${renderJobProgress(job.progress)}</div>
-    <div class="streamer-job-detail file-meta">${escapeHtml(detail)}</div>
+    <div class="streamer-job-detail streamer-job-meta file-meta">${renderJobCompactMeta(job)}</div>
+    ${renderJobDetailToggle(job)}
   </div>
 </div>`;
   };
@@ -9052,13 +9354,13 @@ def dashboard_script() -> str:
   };
 
   const renderStreamerJobRow = (job) => {
-    const detail = job.item || job.detail || job.video_id || "-";
     return `<div class="streamer-job-row">
   <span class="badge ${escapeAttr(job.status)}">${escapeHtml(job.status || "-")}</span>
   <div class="streamer-job-body">
     <div class="streamer-job-heading"><span class="streamer-job-kind">${escapeHtml(job.kind || "Job")}</span><span class="streamer-job-phase muted">${escapeHtml(job.phase || job.message || "-")}</span></div>
     <div class="streamer-job-progress">${renderJobProgress(job.progress)}</div>
-    <div class="streamer-job-detail file-meta">${escapeHtml(detail)}</div>
+    <div class="streamer-job-detail streamer-job-meta file-meta">${renderJobCompactMeta(job)}</div>
+    ${renderJobDetailToggle(job)}
   </div>
 </div>`;
   };
@@ -9301,7 +9603,7 @@ def dashboard_script() -> str:
         `<td class="file-name">${escapeHtml(job.phase || "-")}</td>`,
         `<td class="file-name">${escapeHtml(job.video_id || "-")}</td>`,
         `<td class="file-name">${escapeHtml(job.item || "-")}</td>`,
-        `<td class="file-name">${escapeHtml(job.detail || "-")}</td>`,
+        `<td class="file-name"><div class="streamer-job-meta file-meta">${renderJobCompactMeta(job)}</div>${renderJobDetailToggle(job)}</td>`,
         `<td>${escapeHtml(started)}</td>`,
         `<td>${escapeHtml(updated)}</td>`,
         `<td>${escapeHtml(duration)}</td>`,
@@ -10127,7 +10429,6 @@ def render_streamer_jobs_summary(jobs: list[JobStatus]) -> str:
 
 
 def render_streamer_job_row(job: JobStatus) -> str:
-    detail = job.item or job.detail or job.video_id or "-"
     return (
         '<div class="streamer-job-row">'
         f'<span class="badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span>'
@@ -10137,10 +10438,86 @@ def render_streamer_job_row(job: JobStatus) -> str:
         f'<span class="streamer-job-phase muted">{escape(job.phase or job.message or "-")}</span>'
         '</div>'
         f'<div class="streamer-job-progress">{render_job_progress(job.progress)}</div>'
-        f'<div class="streamer-job-detail file-meta">{escape(detail)}</div>'
+        f'<div class="streamer-job-detail streamer-job-meta file-meta">{render_job_compact_meta(job)}</div>'
+        f'{render_job_detail_toggle(job)}'
         '</div>'
         '</div>'
     )
+
+
+def render_job_compact_meta(job: JobStatus) -> str:
+    details = job.details or {}
+    parts: list[str] = []
+    elapsed = job_detail_elapsed(job)
+    if elapsed:
+        parts.append(f"elapsed {elapsed}")
+    current_size = job_detail_current_size(details)
+    current_label = str(details.get("current_label") or "").strip()
+    if current_size:
+        parts.append(f"{current_label or 'output'} {current_size}")
+    output_name = str(details.get("output_name") or job.item or "").strip()
+    if output_name:
+        parts.append(f"output {output_name}")
+    extra_detail = str(job.detail or "").strip()
+    if extra_detail and extra_detail not in {output_name, job.item, job.video_id}:
+        parts.append(extra_detail)
+    if not parts:
+        fallback = job.item or job.detail or job.video_id or "-"
+        parts.append(fallback)
+    return '<span>' + '</span><span>'.join(escape(part) for part in parts) + '</span>'
+
+
+def render_job_detail_toggle(job: JobStatus) -> str:
+    rows = render_job_detail_rows(job)
+    if not rows:
+        return ""
+    return (
+        '<details class="streamer-job-details file-meta">'
+        '<summary>Details</summary>'
+        f'<dl class="streamer-job-details-grid">{rows}</dl>'
+        '</details>'
+    )
+
+
+def render_job_detail_rows(job: JobStatus) -> str:
+    details = job.details or {}
+    fields = [
+        ("Media", details.get("media_name")),
+        ("Chat", details.get("chat_name")),
+        ("Output", details.get("output_name") or job.item),
+        ("Current file", details.get("current_name")),
+        ("Current size", job_detail_current_size(details)),
+        ("Elapsed", job_detail_elapsed(job)),
+        ("Updated", format_optional_epoch(job.updated_at)),
+        ("Message", details.get("diagnostic") or job.message),
+    ]
+    rows: list[str] = []
+    for label, value in fields:
+        if value in (None, "", "-"):
+            continue
+        rows.append(f'<dt>{escape(label)}</dt><dd>{escape(str(value))}</dd>')
+    return "".join(rows)
+
+
+def job_detail_elapsed(job: JobStatus) -> str:
+    details = job.details or {}
+    elapsed = details.get("elapsed")
+    if elapsed:
+        return str(elapsed)
+    elapsed_seconds = optional_float(details.get("elapsed_seconds"))
+    if elapsed_seconds is not None:
+        return format_duration(max(0, int(elapsed_seconds)))
+    return format_job_duration(job)
+
+
+def job_detail_current_size(details: dict[str, Any]) -> str:
+    current_size = details.get("current_size")
+    if current_size:
+        return str(current_size)
+    size_bytes = optional_int(details.get("current_size_bytes"))
+    if size_bytes is None:
+        return ""
+    return format_bytes(size_bytes)
 
 
 def stream_platform_details(stream: StreamStatus) -> tuple[str, str, str]:
@@ -11266,7 +11643,7 @@ def render_job_row(job: JobStatus) -> str:
         f"<td class=\"file-name\">{escape(job.phase or '-')}</td>"
         f"<td class=\"file-name\">{escape(job.video_id or '-')}</td>"
         f"<td class=\"file-name\">{escape(job.item or '-')}</td>"
-        f"<td class=\"file-name\">{escape(job.detail or '-')}</td>"
+        f"<td class=\"file-name\"><div class=\"streamer-job-meta file-meta\">{render_job_compact_meta(job)}</div>{render_job_detail_toggle(job)}</td>"
         f"<td>{escape(started)}</td>"
         f"<td>{escape(updated)}</td>"
         f"<td>{escape(duration)}</td>"

@@ -117,6 +117,10 @@ def build_parser() -> argparse.ArgumentParser:
     render_chat.add_argument("--chat", required=True, help="Live chat JSON file.")
     render_chat.add_argument("--output", required=True, help="Output chat video file.")
     render_chat.add_argument(
+        "--progress-file",
+        help="Internal JSON file used by the web UI to read isolated render progress.",
+    )
+    render_chat.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace output if it already exists.",
@@ -296,14 +300,31 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     configure_logging(args.verbose, config.log_level)
     output_file = Path(args.output)
+    media_file = Path(args.media)
+    chat_file = Path(args.chat)
+    progress_file = Path(args.progress_file) if args.progress_file else None
+    started_at = time.monotonic()
     nvenc_device = choose_chat_render_nvenc_device(
         config.chat_render_nvenc_devices,
         output_file,
     )
+
+    def report_progress(phase: str, progress: float | None) -> None:
+        write_render_chat_progress_file(
+            progress_file,
+            phase,
+            progress,
+            started_at=started_at,
+            media_file=media_file,
+            chat_file=chat_file,
+            output_file=output_file,
+        )
+
+    report_progress("Starting chat render", 0.01)
     try:
         render_chat_video_file(
-            Path(args.media),
-            Path(args.chat),
+            media_file,
+            chat_file,
             ffmpeg_path=config.ffmpeg_path,
             output_file=output_file,
             overwrite=args.overwrite,
@@ -311,8 +332,10 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
             timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
+            progress_callback=report_progress,
         )
     except Exception:  # noqa: BLE001 - command should return a process failure.
+        report_progress("Failed", None)
         logging.getLogger(__name__).exception(
             "Unable to render chat video media=%s chat=%s output=%s",
             args.media,
@@ -320,7 +343,65 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
             args.output,
         )
         return 1
+    report_progress("Complete", 1.0)
     return 0
+
+
+def write_render_chat_progress_file(
+    progress_file: Path | None,
+    phase: str,
+    progress: float | None,
+    *,
+    started_at: float,
+    media_file: Path,
+    chat_file: Path,
+    output_file: Path,
+) -> None:
+    if progress_file is None:
+        return
+    now = time.time()
+    payload = {
+        "phase": phase,
+        "progress": progress,
+        "updated_at": now,
+        "elapsed_seconds": max(0.0, time.monotonic() - started_at),
+        "media_name": media_file.name,
+        "chat_name": chat_file.name,
+        "output_name": output_file.name,
+        "outputs": render_chat_progress_outputs(output_file),
+    }
+    temp_file = progress_file.with_name(
+        f".{progress_file.name}.{os.getpid()}.tmp"
+    )
+    try:
+        progress_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file.write_text(json.dumps(payload), encoding="utf-8")
+        temp_file.replace(progress_file)
+    except OSError:
+        try:
+            temp_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def render_chat_progress_outputs(output_file: Path) -> dict[str, dict[str, object]]:
+    candidates = {
+        "final": output_file.with_name(f"{output_file.stem}.rendering{output_file.suffix}"),
+        "panel": output_file.with_name(f"{output_file.stem}.panel{output_file.suffix}"),
+        "output": output_file,
+    }
+    outputs: dict[str, dict[str, object]] = {}
+    for label, path in candidates.items():
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        outputs[label] = {
+            "name": path.name,
+            "size_bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+        }
+    return outputs
 
 
 def detect_watermark_command(args: argparse.Namespace) -> int:

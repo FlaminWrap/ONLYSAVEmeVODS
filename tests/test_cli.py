@@ -23,6 +23,102 @@ class CliVersionTests(unittest.TestCase):
         self.assertIn(__version__, output.getvalue())
 
 
+class CliRenderChatTests(unittest.TestCase):
+    def test_render_chat_file_writes_progress_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+            media_file = root / "media.mp4"
+            chat_file = root / "media.live_chat.json"
+            output_file = root / "media - chat.mp4"
+            progress_file = root / "progress.json"
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+            captured: dict[str, object] = {}
+
+            def fake_render_chat_video_file(*_args: object, **kwargs: object) -> Path:
+                panel_file = output_file.with_name(f"{output_file.stem}.panel{output_file.suffix}")
+                panel_file.write_bytes(b"x" * 2048)
+                progress_callback = kwargs.get("progress_callback")
+                assert callable(progress_callback)
+                progress_callback("Rendering panel frames 2/4", 0.5)
+                captured["during"] = json.loads(progress_file.read_text(encoding="utf-8"))
+                output_file.write_text("done", encoding="utf-8")
+                return output_file
+
+            with patch("onlysavemevods.cli.render_chat_video_file", side_effect=fake_render_chat_video_file):
+                result = main(
+                    [
+                        "render-chat-file",
+                        "--config",
+                        str(config_path),
+                        "--media",
+                        str(media_file),
+                        "--chat",
+                        str(chat_file),
+                        "--output",
+                        str(output_file),
+                        "--progress-file",
+                        str(progress_file),
+                    ]
+                )
+            captured["final"] = json.loads(progress_file.read_text(encoding="utf-8"))
+
+        during = captured["during"]
+        final = captured["final"]
+        self.assertEqual(result, 0)
+        self.assertEqual(during["phase"], "Rendering panel frames 2/4")
+        self.assertEqual(during["progress"], 0.5)
+        self.assertEqual(during["media_name"], "media.mp4")
+        self.assertEqual(during["chat_name"], "media.live_chat.json")
+        self.assertEqual(during["output_name"], "media - chat.mp4")
+        self.assertEqual(during["outputs"]["panel"]["size_bytes"], 2048)
+        self.assertEqual(final["phase"], "Complete")
+        self.assertEqual(final["progress"], 1.0)
+
+    def test_render_chat_file_ignores_unwritable_progress_file(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text("", encoding="utf-8")
+            media_file = root / "media.mp4"
+            chat_file = root / "media.live_chat.json"
+            output_file = root / "media - chat.mp4"
+            blocked_parent = root / "not-a-directory"
+            blocked_parent.write_text("blocked", encoding="utf-8")
+            media_file.write_text("media", encoding="utf-8")
+            chat_file.write_text("chat", encoding="utf-8")
+
+            def fake_render_chat_video_file(*_args: object, **kwargs: object) -> Path:
+                progress_callback = kwargs.get("progress_callback")
+                assert callable(progress_callback)
+                progress_callback("Rendering panel", 0.5)
+                output_file.write_text("done", encoding="utf-8")
+                return output_file
+
+            with patch("onlysavemevods.cli.render_chat_video_file", side_effect=fake_render_chat_video_file):
+                result = main(
+                    [
+                        "render-chat-file",
+                        "--config",
+                        str(config_path),
+                        "--media",
+                        str(media_file),
+                        "--chat",
+                        str(chat_file),
+                        "--output",
+                        str(output_file),
+                        "--progress-file",
+                        str(blocked_parent / "progress.json"),
+                    ]
+                )
+            output = output_file.read_text(encoding="utf-8")
+
+        self.assertEqual(result, 0)
+        self.assertEqual(output, "done")
+
+
 class CliVoiceDetectionTests(unittest.TestCase):
     def test_voice_detection_set_fixed_updates_config(self) -> None:
         with TemporaryDirectory() as tmp:

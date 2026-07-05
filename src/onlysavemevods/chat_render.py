@@ -2290,6 +2290,7 @@ def build_render_chat_file_process_command(
     *,
     overwrite: bool = False,
     nice: bool = True,
+    progress_file: Path | None = None,
 ) -> list[str]:
     command = [
         python_executable,
@@ -2305,6 +2306,8 @@ def build_render_chat_file_process_command(
         "--output",
         str(output_file),
     ]
+    if progress_file is not None:
+        command.extend(["--progress-file", str(progress_file)])
     if overwrite:
         command.append("--overwrite")
     nice_path = shutil.which("nice") if nice else None
