@@ -75,12 +75,20 @@ from .downloader import (
     is_live_chat_file,
     is_yt_dlp_temporary_file,
     log_process_output,
+    named_segment_file_stem,
     segment_directory,
 )
-from .job_tracker import list_tracked_jobs
+from .job_tracker import (
+    finish_tracked_job,
+    list_tracked_jobs,
+    start_tracked_job,
+    update_tracked_job,
+)
 from .log_buffer import LogEntry, get_recent_log_entries
-from .sources import SourceError, resolve_source
+from .models import LiveStream
+from .sources import SourceError, live_stream_from_generic_info, resolve_source
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
+from .youtube import YtDlpError, YtDlpRunner, live_stream_from_info
 from .voice_match import (
     create_transcript_voice_sample,
     load_transcript_segments,
@@ -273,6 +281,8 @@ LIVE_CHAT_SUFFIX = ".live_chat.json"
 CHAT_RENDER_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov")
 CHAT_RENDER_OUTPUT_SUFFIX = " - chat.mp4"
 ATTENTION_STATUSES = {"checking_after_exit", "interrupted", "waiting_retry"}
+VOD_DOWNLOAD_BLOCKED_STATUSES = {"detected", "downloading", "checking_after_exit", "waiting_retry"}
+VOD_DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%")
 STATUS_LABELS = {
     "checking_after_exit": "checking after exit",
     "detected": "detected",
@@ -862,6 +872,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 if path == "/delete-stream":
                     self._delete_stream()
                     return
+                if path == "/vod-download":
+                    self._start_vod_download()
+                    return
                 if path == "/detect-events":
                     self._start_event_detection(parts.query)
                     return
@@ -1147,6 +1160,43 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             video_id = first_query_value(params, "video_id")
             confirm_delete = first_query_value(params, "confirm_delete")
             ok, message = delete_stream(config, video_id, confirm_delete)
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#streamers")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _start_vod_download(self) -> None:
+            body = self._read_request_body(16 * 1024)
+            if body is None:
+                return
+            try:
+                params = parse_qs(
+                    body.decode("utf-8", "replace"),
+                    keep_blank_values=True,
+                )
+            except UnicodeDecodeError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "Invalid form body")
+                return
+
+            action = first_query_value(params, "action") or "redownload"
+            vod_url = first_query_value(params, "vod_url")
+            if action == "manual":
+                ok, message = start_manual_vod_download_job(
+                    config,
+                    first_query_value(params, "streamer_name"),
+                    vod_url,
+                )
+            else:
+                ok, message = start_vod_redownload_job(
+                    config,
+                    first_query_value(params, "video_id"),
+                    vod_url,
+                )
             if not ok:
                 self.send_error(HTTPStatus.BAD_REQUEST, message)
                 return
@@ -3338,6 +3388,380 @@ def delete_stream(
     )
     detail = f", removed {files_removed} file(s) / {format_bytes(bytes_removed)}" if removed_directory else ""
     return True, f"Stream deleted{detail}"
+
+
+def start_vod_redownload_job(
+    config: BotConfig,
+    video_id: str,
+    vod_url: str,
+) -> tuple[bool, str]:
+    video_id = video_id.strip()
+    vod_url = vod_url.strip()
+    if not video_id:
+        return False, "Stream id is required"
+    if not vod_url:
+        return False, "VOD URL is required"
+    try:
+        resolve_source(vod_url)
+    except SourceError as exc:
+        return False, str(exc)
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+    finally:
+        state.close()
+    if record is None:
+        return False, "Stream was not found"
+    if record.status in VOD_DOWNLOAD_BLOCKED_STATUSES:
+        return False, "Cannot redownload from VOD while the stream may still be active or resume"
+
+    job_id = vod_download_job_id(record.video_id, vod_url)
+    if tracked_job_is_running(job_id):
+        return True, "VOD download is already running"
+
+    stream = stream_from_record(record, url=vod_url, is_live=False)
+    output_template = vod_output_template_for(config, stream, force_copy=True)
+    queue_vod_download_job(
+        config,
+        job_id,
+        stream,
+        vod_url,
+        output_template,
+        previous_status=record.status,
+        queued_message=f"Started VOD redownload from {vod_url}",
+        item=output_template.name.replace("%(ext)s", "media"),
+    )
+    return True, "VOD redownload queued"
+
+
+def start_manual_vod_download_job(
+    config: BotConfig,
+    streamer_name: str,
+    vod_url: str,
+) -> tuple[bool, str]:
+    streamer_name = streamer_name.strip()
+    vod_url = vod_url.strip()
+    if not streamer_name:
+        return False, "Streamer name is required"
+    if streamer_name not in config.streamers:
+        return False, "Streamer was not found"
+    if not vod_url:
+        return False, "VOD URL is required"
+
+    try:
+        stream = probe_vod_stream(config, vod_url, channel_override=streamer_name)
+    except (SourceError, YtDlpError) as exc:
+        return False, str(exc)
+
+    state = StateStore(config.db_path)
+    try:
+        existing = state.get_stream(stream.video_id)
+    finally:
+        state.close()
+    if existing is not None and existing.status in VOD_DOWNLOAD_BLOCKED_STATUSES:
+        return False, "A matching stream is still active or may resume"
+
+    job_id = vod_download_job_id(stream.video_id, vod_url)
+    if tracked_job_is_running(job_id):
+        return True, "VOD download is already running"
+
+    output_template = vod_output_template_for(config, stream, force_copy=False)
+    queue_vod_download_job(
+        config,
+        job_id,
+        stream,
+        vod_url,
+        output_template,
+        previous_status=existing.status if existing is not None else None,
+        queued_message=f"Started manual VOD download from {vod_url}",
+        item=output_template.name.replace("%(ext)s", "media"),
+    )
+    return True, "Manual VOD download queued"
+
+
+def probe_vod_stream(
+    config: BotConfig,
+    vod_url: str,
+    *,
+    channel_override: str = "",
+) -> LiveStream:
+    spec = resolve_source(vod_url)
+    info = YtDlpRunner(config.yt_dlp_path).run_json(
+        [
+            "--dump-json",
+            "--skip-download",
+            "--no-playlist",
+            "--no-warnings",
+            spec.url,
+        ]
+    )
+    if spec.platform == "youtube":
+        stream = live_stream_from_info(info, fallback_url=spec.url)
+    else:
+        stream = live_stream_from_generic_info(
+            info,
+            platform=spec.platform,
+            fallback_url=spec.url,
+            source=vod_url,
+        )
+    return LiveStream(
+        video_id=stream.video_id,
+        url=stream.url or spec.url,
+        title=stream.title,
+        channel=channel_override or stream.channel,
+        live_status=stream.live_status,
+        is_live=False,
+        platform=stream.platform,
+        source=vod_url,
+        raw=stream.raw,
+    )
+
+
+def queue_vod_download_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    vod_url: str,
+    output_template: Path,
+    *,
+    previous_status: str | None,
+    queued_message: str,
+    item: str,
+) -> None:
+    output_template.parent.mkdir(parents=True, exist_ok=True)
+    state = StateStore(config.db_path)
+    try:
+        state.mark_vod_downloading(stream, message=queued_message)
+    finally:
+        state.close()
+
+    start_tracked_job(
+        job_id,
+        kind="VOD download",
+        video_id=stream.video_id,
+        item=item,
+        detail=vod_url,
+        phase="Queued",
+        message="Queued VOD download",
+        progress=0.0,
+    )
+    thread = Thread(
+        target=run_vod_download_job,
+        args=(config, job_id, stream, vod_url, output_template, previous_status),
+        name=f"onlysavemevods-vod-download-{stream.video_id}",
+        daemon=True,
+    )
+    thread.start()
+    LOGGER.info(
+        "Queued VOD download video_id=%s url=%s output=%s",
+        stream.video_id,
+        vod_url,
+        output_template,
+    )
+
+
+def run_vod_download_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    vod_url: str,
+    output_template: Path,
+    previous_status: str | None = None,
+) -> None:
+    command = build_vod_download_command(config, vod_url, output_template)
+    update_tracked_job(
+        job_id,
+        phase="Starting yt-dlp",
+        message="Starting VOD download",
+        progress=0.02,
+    )
+    LOGGER.debug("yt-dlp VOD command for %s: %s", stream.video_id, command_for_log(command))
+    last_output = ""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError as exc:
+        message = f"yt-dlp binary not found: {config.yt_dlp_path}"
+        finish_failed_vod_download(config, job_id, stream.video_id, message, previous_status)
+        LOGGER.exception("Unable to start yt-dlp for VOD download")
+        return
+    except OSError as exc:
+        message = str(exc) or exc.__class__.__name__
+        finish_failed_vod_download(config, job_id, stream.video_id, message, previous_status)
+        LOGGER.exception("Unable to start VOD download for %s", stream.video_id)
+        return
+
+    if process.stdout is not None:
+        for line in process.stdout:
+            stripped = line.strip()
+            if stripped:
+                last_output = stripped
+            progress = vod_download_progress_from_line(stripped)
+            if progress is not None:
+                update_tracked_job(
+                    job_id,
+                    phase=f"Downloading {progress * 100:.1f}%",
+                    message=stripped,
+                    progress=min(0.98, max(0.02, progress)),
+                )
+            elif stripped:
+                update_tracked_job(job_id, message=stripped)
+    return_code = process.wait()
+    if return_code != 0:
+        message = last_output or f"yt-dlp exited with code {return_code}"
+        finish_failed_vod_download(
+            config,
+            job_id,
+            stream.video_id,
+            message,
+            previous_status,
+            exit_code=return_code,
+        )
+        LOGGER.warning(
+            "VOD download failed video_id=%s code=%s output=%s",
+            stream.video_id,
+            return_code,
+            message,
+        )
+        return
+
+    finish_tracked_job(
+        job_id,
+        status="done",
+        phase="Complete",
+        message="VOD download completed",
+        progress=1.0,
+    )
+    state = StateStore(config.db_path)
+    try:
+        state.mark_vod_download_finished(
+            stream.video_id,
+            message=f"VOD download completed from {vod_url}",
+        )
+    finally:
+        state.close()
+    with FILE_SCAN_CACHE_LOCK:
+        FILE_SCAN_CACHE.pop(str(output_template.parent), None)
+    LOGGER.info("VOD download completed video_id=%s output=%s", stream.video_id, output_template)
+
+
+def finish_failed_vod_download(
+    config: BotConfig,
+    job_id: str,
+    video_id: str,
+    message: str,
+    previous_status: str | None,
+    *,
+    exit_code: int | None = None,
+) -> None:
+    finish_tracked_job(
+        job_id,
+        status="failed",
+        phase="Failed",
+        message=message,
+        progress=None,
+    )
+    restore_status = previous_status if previous_status in {"ended", "interrupted"} else None
+    state = StateStore(config.db_path)
+    try:
+        state.mark_vod_download_failed(
+            video_id,
+            f"VOD download failed: {message}",
+            restore_status=restore_status,
+            exit_code=exit_code,
+        )
+    finally:
+        state.close()
+
+
+def build_vod_download_command(
+    config: BotConfig,
+    vod_url: str,
+    output_template: Path,
+) -> list[str]:
+    return [
+        config.yt_dlp_path,
+        *config.extra_yt_dlp_args,
+        "--continue",
+        "--part",
+        "--progress",
+        "--newline",
+        "--progress-delta",
+        "5",
+        "--no-playlist",
+        "-o",
+        str(output_template),
+        vod_url,
+    ]
+
+
+def vod_download_progress_from_line(line: str) -> float | None:
+    match = VOD_DOWNLOAD_PROGRESS_RE.search(line)
+    if not match:
+        return None
+    try:
+        return float(match.group("percent")) / 100.0
+    except ValueError:
+        return None
+
+
+def vod_output_template_for(
+    config: BotConfig,
+    stream: LiveStream,
+    *,
+    force_copy: bool = False,
+) -> Path:
+    directory = segment_directory(config, stream.video_id, stream.channel)
+    stem = named_segment_file_stem(stream.title or stream.video_id, stream.video_id, 1)
+    if force_copy or output_stem_exists(directory, stem):
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        stem = f"{stem} - vod-{stamp}"
+    return directory / f"{stem}.%(ext)s"
+
+
+def output_stem_exists(directory: Path, stem: str) -> bool:
+    if not directory.is_dir():
+        return False
+    try:
+        return any(path.is_file() and path.stem == stem for path in directory.iterdir())
+    except OSError:
+        return False
+
+
+def vod_download_job_id(video_id: str, vod_url: str) -> str:
+    digest = hashlib.sha1(vod_url.encode("utf-8", "replace")).hexdigest()[:16]
+    return f"vod-download:{video_id}:{digest}"
+
+
+def tracked_job_is_running(job_id: str) -> bool:
+    return any(
+        job.job_id == job_id and job.status in {"queued", "running"}
+        for job in list_tracked_jobs(limit=1000)
+    )
+
+
+def stream_from_record(
+    record: StreamRecord,
+    *,
+    url: str | None = None,
+    is_live: bool = False,
+) -> LiveStream:
+    return LiveStream(
+        video_id=record.video_id,
+        url=url or record.url,
+        title=record.title,
+        channel=record.channel,
+        live_status="",
+        is_live=is_live,
+        platform=record.platform,
+        source=record.source,
+    )
 
 
 def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path:
@@ -6493,6 +6917,27 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-form .wide, .streamer-form .settings-actions {{ grid-column: 1 / -1; }}
     .streamer-meta {{ color: var(--muted); align-self: end; }}
+    .manual-vod-panel, .vod-download-box {{
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 10px;
+      background: var(--panel);
+    }}
+    .manual-vod-panel h4 {{ margin: 0 0 8px; font-size: 13px; }}
+    .vod-download-box summary {{ cursor: pointer; width: fit-content; }}
+    .vod-download-form {{
+      display: grid;
+      grid-template-columns: minmax(220px, 1fr) max-content;
+      gap: 8px;
+      align-items: end;
+      margin-top: 8px;
+    }}
+    .vod-download-form .wide {{ grid-column: auto; }}
+    @media (max-width: 760px) {{
+      .vod-download-form {{ grid-template-columns: 1fr; }}
+      .vod-download-form .wide {{ grid-column: 1 / -1; }}
+    }}
     .streamer-wizard {{
       width: min(760px, calc(100vw - 32px));
       max-height: min(760px, calc(100vh - 32px));
@@ -7825,6 +8270,25 @@ def dashboard_script() -> str:
     return `${prefix}${channel} - <a href="${url}">${videoId}</a>`;
   };
 
+  const renderStreamVodRedownloadForm = (stream) => {
+    const videoId = String((stream && stream.video_id) || "");
+    const blockedStatuses = new Set(["detected", "downloading", "checking_after_exit", "waiting_retry"]);
+    if (!videoId || blockedStatuses.has(String((stream && stream.status) || ""))) return "";
+    const rawUrl = String((stream && stream.url) || "");
+    const defaultUrl = rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : "";
+    return `<details class="vod-download-box">
+  <summary class="download action-button">Redownload from VOD</summary>
+  <form class="vod-download-form" method="post" action="/vod-download">
+    <input type="hidden" name="action" value="redownload">
+    <input type="hidden" name="video_id" value="${escapeAttr(videoId)}">
+    <label class="settings-field wide">VOD URL
+      <input name="vod_url" value="${escapeAttr(defaultUrl)}" placeholder="Paste the VOD URL" required>
+    </label>
+    <button class="download action-button" type="submit">Download VOD Copy</button>
+  </form>
+</details>`;
+  };
+
   const renderStreamCard = (stream, streamer) => {
     const title = stream.title || stream.video_id;
     const platform = streamPlatform(stream);
@@ -7844,6 +8308,7 @@ def dashboard_script() -> str:
     const logTabId = `stream-tab-${videoId}-log`;
     const jobsTabId = `stream-tab-${videoId}-jobs`;
     const tabName = `stream-tabs-${videoId}`;
+    const vodRedownload = renderStreamVodRedownloadForm(stream);
     return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}">
   <div class="stream-head">
     <div class="stream-title-block">
@@ -7880,6 +8345,7 @@ def dashboard_script() -> str:
       <div class="wide">Kinds: ${escapeHtml(formatKindCounts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: ${escapeHtml(stream.directory)}</div>
     </div>
+    ${vodRedownload}
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(filesTabId)}" data-stream-tab="files" data-video-id="${escapeAttr(videoId)}" checked>
       <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(eventsTabId)}" data-stream-tab="events" data-video-id="${escapeAttr(videoId)}">
@@ -7923,6 +8389,22 @@ def dashboard_script() -> str:
       const initial = sourcePlatformInitials[platform] || sourcePlatformInitials.unknown;
       return `<span class="source-chip">${renderPlatformIcon(platform, label, initial)}<span>${escapeHtml(source)}</span></span>`;
     }).join("")}</div>`;
+  };
+
+  const renderManualVodForm = (streamer) => {
+    const name = String((streamer && streamer.name) || "");
+    if (!name || !(streamer && streamer.configured)) return "";
+    return `<section class="manual-vod-panel">
+  <h4>Add VOD</h4>
+  <form class="vod-download-form" method="post" action="/vod-download">
+    <input type="hidden" name="action" value="manual">
+    <input type="hidden" name="streamer_name" value="${escapeAttr(name)}">
+    <label class="settings-field wide">VOD URL
+      <input name="vod_url" placeholder="Paste a YouTube, Twitch, Kick, or Rumble VOD URL" required>
+    </label>
+    <button class="download action-button" type="submit">Add VOD</button>
+  </form>
+</section>`;
   };
 
   const renderStreamerForm = (streamer) => {
@@ -8080,7 +8562,7 @@ def dashboard_script() -> str:
       <label class="streamer-settings-events-label" for="${escapeAttr(eventsTabId)}">Content Events</label>
     </div>
     <div class="streamer-settings-panels">
-      <section class="streamer-settings-panel streamer-settings-main">${renderStreamerForm(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-main">${renderStreamerForm(streamer)}${renderManualVodForm(streamer)}</section>
       <section class="streamer-settings-panel streamer-settings-voices">${renderStreamerVoiceSettings(streamer, snapshot)}</section>
       <section class="streamer-settings-panel streamer-settings-events">${renderStreamerEventSettings(streamer)}</section>
     </div>
@@ -9116,7 +9598,7 @@ def render_streamer_settings_area(
       <label class="streamer-settings-events-label" for="{escape(events_tab_id, quote=True)}">Content Events</label>
     </div>
     <div class="streamer-settings-panels">
-      <section class="streamer-settings-panel streamer-settings-main">{render_streamer_group_form(streamer)}</section>
+      <section class="streamer-settings-panel streamer-settings-main">{render_streamer_group_form(streamer)}{render_manual_vod_form(streamer)}</section>
       <section class="streamer-settings-panel streamer-settings-voices">{render_streamer_voice_settings(streamer, snapshot)}</section>
       <section class="streamer-settings-panel streamer-settings-events">{render_streamer_event_settings_form(streamer)}</section>
     </div>
@@ -9204,6 +9686,20 @@ def render_streamer_streams(streamer: StreamerStatStatus) -> str:
 def snapshot_config_path(snapshot: StatusSnapshot) -> str:
     return str(snapshot.configuration.get("Paths", {}).get("config_path", "-"))
 
+
+
+def render_manual_vod_form(streamer: StreamerStatStatus) -> str:
+    return f"""<section class="manual-vod-panel">
+  <h4>Add VOD</h4>
+  <form class="vod-download-form" method="post" action="/vod-download">
+    <input type="hidden" name="action" value="manual">
+    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    <label class="settings-field wide">VOD URL
+      <input name="vod_url" placeholder="Paste a YouTube, Twitch, Kick, or Rumble VOD URL" required>
+    </label>
+    <button class="download action-button" type="submit">Add VOD</button>
+  </form>
+</section>"""
 
 
 def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | None) -> str:
@@ -9919,6 +10415,23 @@ def render_delete_stream_action(stream: StreamStatus) -> str:
     )
 
 
+def render_stream_vod_redownload_form(stream: StreamStatus) -> str:
+    if stream.status in VOD_DOWNLOAD_BLOCKED_STATUSES:
+        return ""
+    default_url = stream.url if stream.url.startswith(("http://", "https://")) else ""
+    return f"""<details class="vod-download-box">
+  <summary class="download action-button">Redownload from VOD</summary>
+  <form class="vod-download-form" method="post" action="/vod-download">
+    <input type="hidden" name="action" value="redownload">
+    <input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">
+    <label class="settings-field wide">VOD URL
+      <input name="vod_url" value="{escape(default_url, quote=True)}" placeholder="Paste the VOD URL" required>
+    </label>
+    <button class="download action-button" type="submit">Download VOD Copy</button>
+  </form>
+</details>"""
+
+
 def render_stream_speakers_panel(
     streamer: StreamerStatStatus | None,
     stream: StreamStatus,
@@ -9956,6 +10469,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     content_events = render_content_events(stream.content_events)
     speakers = render_stream_speakers_panel(streamer, stream)
     jobs = render_stream_jobs(stream.jobs)
+    vod_redownload = render_stream_vod_redownload_form(stream)
     tab_key = escape(stream.video_id, quote=True)
     files_tab_id = f"stream-tab-{tab_key}-files"
     content_events_tab_id = f"stream-tab-{tab_key}-events"
@@ -10000,6 +10514,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
       <div class="wide">Kinds: {escape(format_kind_counts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: {escape(stream.directory)}</div>
     </div>
+    {vod_redownload}
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="{tab_name}" id="{files_tab_id}" data-stream-tab="files" data-video-id="{tab_key}" checked>
       <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="{tab_name}" id="{content_events_tab_id}" data-stream-tab="events" data-video-id="{tab_key}">

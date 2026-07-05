@@ -9,7 +9,7 @@ import unittest
 from onlysavemevods import __version__
 from onlysavemevods.config import BotConfig, ConfigError, StreamerConfig, VoiceDetectionConfig, VoiceProfileConfig, load_config
 from onlysavemevods.chat_refresh import ChatRefreshResult
-from onlysavemevods.job_tracker import clear_tracked_jobs, start_tracked_job
+from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs, start_tracked_job
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
@@ -17,6 +17,7 @@ from onlysavemevods.web import (
     build_config_summary,
     build_status_snapshot,
     build_lite_status_payload,
+    build_vod_download_command,
     build_streamer_voice_details_payload,
     build_stream_voice_speakers_payload,
     dashboard_script,
@@ -43,6 +44,9 @@ from onlysavemevods.web import (
     cleanup_stream_fragments,
     delete_stream,
     resolve_watermark_download_file,
+    start_vod_redownload_job,
+    vod_download_progress_from_line,
+    vod_output_template_for,
     resolve_watermark_source_file,
     delete_watermark_copy,
     resolve_transcription_source_file,
@@ -150,6 +154,113 @@ class WebStatusTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         clear_tracked_jobs()
+
+    def test_vod_download_helpers_build_command_template_and_progress(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                yt_dlp_path="yt-dlp",
+                extra_yt_dlp_args=["--cookies", "cookies.txt"],
+            )
+            stream = LiveStream(
+                video_id="kick:Hungover 2026-07-05 06:18",
+                url="https://kick.com/oumb/videos/123",
+                title="Hungover 2026-07-05 06:18",
+                channel="OUMB3rd",
+                platform="kick",
+                source="kick:oumb",
+                is_live=False,
+            )
+
+            template = vod_output_template_for(config, stream, force_copy=False)
+            command = build_vod_download_command(
+                config,
+                "https://kick.com/oumb/videos/123",
+                template,
+            )
+
+        self.assertEqual(
+            template,
+            Path(tmp)
+            / "downloads"
+            / "OUMB3rd"
+            / "kick_Hungover 2026-07-05 06_18"
+            / "Hungover 2026-07-05 06_18 [kick].%(ext)s",
+        )
+        self.assertIn("--no-playlist", command)
+        self.assertIn("--cookies", command)
+        self.assertIn("cookies.txt", command)
+        self.assertEqual(command[-1], "https://kick.com/oumb/videos/123")
+        self.assertEqual(vod_download_progress_from_line("[download]  42.5% of 1.00GiB"), 0.425)
+        self.assertIsNone(vod_download_progress_from_line("[download] Destination: file.mp4"))
+
+    def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            with patch("onlysavemevods.web.Thread") as thread_cls:
+                ok, message = start_vod_redownload_job(
+                    config,
+                    stream.video_id,
+                    video_url("LIVEVIDEO01"),
+                )
+
+            state = StateStore(config.db_path)
+            record = state.get_stream(stream.video_id)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            state.close()
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "VOD redownload queued")
+        thread_cls.return_value.start.assert_called_once()
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "downloading")
+        self.assertEqual(record.url, video_url("LIVEVIDEO01"))
+        self.assertTrue(any(job.kind == "VOD download" for job in list_tracked_jobs()))
+        self.assertIn(
+            "Started VOD redownload",
+            "\n".join(event.message for event in events[stream.video_id]),
+        )
+
+    def test_streamer_ui_shows_manual_and_redownload_vod_controls(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                streamers={"OUMB3rd": StreamerConfig(sources=["@OUMB3rd"])},
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            html = render_status_html(build_status_snapshot(config, include_speaker_scan=False))
+
+        self.assertIn("Add VOD", html)
+        self.assertIn("Redownload from VOD", html)
+        self.assertIn('/vod-download', html)
+        self.assertIn("Download VOD Copy", html)
 
     def test_status_snapshot_reads_state_and_download_files(self) -> None:
         with TemporaryDirectory() as tmp:

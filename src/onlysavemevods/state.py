@@ -291,6 +291,147 @@ class StateStore:
         )
         self.conn.commit()
 
+    def upsert_vod_stream(
+        self,
+        stream: LiveStream,
+        *,
+        status: str = "ended",
+        event_message: str = "Added VOD stream",
+    ) -> StreamRecord:
+        now = utc_now()
+        existing = self.get_stream(stream.video_id)
+        if existing is None:
+            self.conn.execute(
+                """
+                INSERT INTO streams (
+                    video_id, title, channel, url, platform, source, status, segment_index,
+                    first_seen_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    stream.video_id,
+                    stream.title,
+                    stream.channel,
+                    stream.url,
+                    stream.platform,
+                    stream.source,
+                    status,
+                    now,
+                    now,
+                ),
+            )
+        else:
+            self.conn.execute(
+                """
+                UPDATE streams
+                SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
+                    status = ?, updated_at = ?
+                WHERE video_id = ?
+                """,
+                (
+                    stream.title,
+                    stream.channel,
+                    stream.url,
+                    stream.platform,
+                    stream.source,
+                    status,
+                    now,
+                    stream.video_id,
+                ),
+            )
+        self._insert_stream_event(
+            stream.video_id,
+            event_message,
+            segment_index=1,
+            created_at=now,
+        )
+        self.conn.commit()
+        record = self.get_stream(stream.video_id)
+        assert record is not None
+        return record
+
+    def mark_vod_downloading(self, stream: LiveStream, *, message: str = "Started VOD download") -> None:
+        now = utc_now()
+        existing = self.get_stream(stream.video_id)
+        if existing is None:
+            self.upsert_vod_stream(
+                stream,
+                status="downloading",
+                event_message=message,
+            )
+            return
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
+                status = 'downloading', segment_index = 1, last_started_at = ?,
+                updated_at = ?, exit_code = NULL
+            WHERE video_id = ?
+            """,
+            (
+                stream.title,
+                stream.channel,
+                stream.url,
+                stream.platform,
+                stream.source,
+                now,
+                now,
+                stream.video_id,
+            ),
+        )
+        self._insert_stream_event(
+            stream.video_id,
+            message,
+            segment_index=1,
+            created_at=now,
+        )
+        self.conn.commit()
+
+    def mark_vod_download_finished(self, video_id: str, *, message: str = "VOD download completed") -> None:
+        now = utc_now()
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET status = 'ended', last_exit_at = ?, updated_at = ?, exit_code = 0
+            WHERE video_id = ?
+            """,
+            (now, now, video_id),
+        )
+        self._insert_stream_event(
+            video_id,
+            message,
+            segment_index=1,
+            created_at=now,
+        )
+        self.conn.commit()
+
+    def mark_vod_download_failed(
+        self,
+        video_id: str,
+        message: str,
+        *,
+        restore_status: str | None = None,
+        exit_code: int | None = None,
+    ) -> None:
+        now = utc_now()
+        status = restore_status or "interrupted"
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET status = ?, last_exit_at = ?, updated_at = ?, exit_code = ?
+            WHERE video_id = ?
+            """,
+            (status, now, now, exit_code, video_id),
+        )
+        self._insert_stream_event(
+            video_id,
+            message,
+            level="error",
+            segment_index=1,
+            created_at=now,
+        )
+        self.conn.commit()
+
     def mark_waiting_retry(self, video_id: str, exit_code: int | None = None) -> None:
         now = utc_now()
         self.conn.execute(

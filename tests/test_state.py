@@ -77,6 +77,37 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertTrue(deleted)
         self.assertIsNone(after_delete)
 
+    def test_vod_stream_lifecycle_records_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            stream = LiveStream(
+                video_id="youtube:VODVIDEO001",
+                url="https://www.youtube.com/watch?v=VODVIDEO001",
+                title="VOD Stream",
+                channel="Example Streamer",
+                platform="youtube",
+                source="https://www.youtube.com/watch?v=VODVIDEO001",
+                is_live=False,
+            )
+
+            state.upsert_vod_stream(stream, event_message="Added manual VOD")
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.mark_vod_download_finished(stream.video_id)
+            record = state.get_stream(stream.video_id)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=10)
+            state.close()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "ended")
+        self.assertEqual(record.channel, "Example Streamer")
+        self.assertEqual(record.platform, "youtube")
+        self.assertEqual(record.source, "https://www.youtube.com/watch?v=VODVIDEO001")
+        self.assertEqual(record.exit_code, 0)
+        self.assertIn("Added manual VOD", [event.message for event in events[stream.video_id]])
+        self.assertIn("Started VOD download", [event.message for event in events[stream.video_id]])
+        self.assertIn("VOD download completed", [event.message for event in events[stream.video_id]])
+
     def test_delete_stream_removes_record_events_and_watermark_copies(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")
