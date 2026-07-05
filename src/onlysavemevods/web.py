@@ -87,6 +87,12 @@ from .job_tracker import (
 from .kick_chat import download_kick_vod_chat_replay
 from .log_buffer import LogEntry, get_recent_log_entries
 from .models import LiveStream
+from .powerchat import (
+    POWERCHAT_EVENT_SUFFIX,
+    is_powerchat_event_file,
+    load_powerchat_sidecar,
+    powerchat_totals,
+)
 from .sources import SourceError, live_stream_from_generic_info, resolve_source
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
 from .youtube import YtDlpError, YtDlpRunner, live_stream_from_info
@@ -512,6 +518,21 @@ class ContentEventStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class PowerchatEventStatus:
+    source: str
+    received_at: str
+    offset_seconds: float | None
+    kind: str
+    donor: str
+    platform: str
+    message: str
+    money_amount: float | None
+    money_currency: str
+    unit_amount: float | None
+    unit: str
+
+
+@dataclass(frozen=True, slots=True)
 class StreamStatus:
     video_id: str
     title: str
@@ -542,6 +563,10 @@ class StreamStatus:
     events: list[StreamEventStatus]
     content_event_count: int
     content_events: list[ContentEventStatus]
+    powerchat_event_count: int
+    powerchat_money_totals: list[dict[str, Any]]
+    powerchat_unit_totals: list[dict[str, Any]]
+    powerchat_events: list[PowerchatEventStatus]
     jobs: list[JobStatus]
     files: list[FileStatus]
 
@@ -590,6 +615,8 @@ class StreamerStatus:
     name: str
     sources: list[str]
     download_dir_name: str
+    powerchat_enabled: bool
+    powerchat_username: str
     voice_detection: str
     speaker_label_count: int
     voices: list[VoiceProfileStatus]
@@ -602,6 +629,8 @@ class StreamerStatStatus:
     name: str
     sources: list[str]
     download_dir_name: str
+    powerchat_enabled: bool
+    powerchat_username: str
     configured: bool
     needs_grouping: bool
     voice_detection: str
@@ -2095,6 +2124,8 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
             name=name,
             sources=list(streamer.sources),
             download_dir_name=streamer.download_dir_name,
+            powerchat_enabled=streamer.powerchat_enabled,
+            powerchat_username=streamer.powerchat_username,
             voice_detection=(
                 voice_detection_config_summary(streamer.voice_detection)
                 if streamer.voice_detection is not None
@@ -2147,6 +2178,8 @@ def build_streamer_stats(
                 configured=True,
                 needs_grouping=False,
                 download_dir_name=streamer.download_dir_name or name,
+                powerchat_enabled=streamer.powerchat_enabled,
+                powerchat_username=streamer.powerchat_username,
                 voice_detection=voice_detection,
                 speaker_label_count=len(streamer.speaker_labels),
                 voices=voice_profile_statuses(streamer.voices),
@@ -2183,6 +2216,8 @@ def build_streamer_stats(
                 configured=False,
                 needs_grouping=True,
                 download_dir_name=name,
+                powerchat_enabled=False,
+                powerchat_username="",
                 voice_detection=voice_detection_summary_for_source_group(config, name, sources),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
                 voices=[],
@@ -2204,6 +2239,8 @@ def build_streamer_stats(
                 configured=False,
                 needs_grouping=True,
                 download_dir_name=name,
+                powerchat_enabled=False,
+                powerchat_username="",
                 voice_detection=voice_detection_summary_for_source_group(config, name, []),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, []),
                 voices=[],
@@ -2223,6 +2260,8 @@ def streamer_stat_from_channel_status(
     configured: bool,
     needs_grouping: bool,
     download_dir_name: str,
+    powerchat_enabled: bool,
+    powerchat_username: str,
     voice_detection: str,
     speaker_label_count: int,
     voices: list[VoiceProfileStatus],
@@ -2241,6 +2280,8 @@ def streamer_stat_from_channel_status(
         name=status.name,
         sources=list(status.configured_sources),
         download_dir_name=download_dir_name,
+        powerchat_enabled=powerchat_enabled,
+        powerchat_username=powerchat_username,
         configured=configured,
         needs_grouping=needs_grouping,
         voice_detection=voice_detection,
@@ -2562,6 +2603,7 @@ def transcript_json_files(directory: Path) -> list[Path]:
         if path.is_file()
         and not path.name.endswith(".voice-attribution.json")
         and not path.name.endswith(".stream-events.json")
+        and not is_powerchat_event_file(path.name)
         and not is_live_chat_file(path.name)
         and not is_chat_timing_file(path.name)
     )
@@ -2612,6 +2654,70 @@ def content_event_status(media_name: str, event: dict[str, Any]) -> ContentEvent
     )
 
 
+def powerchat_status_for_directory(
+    directory: Path,
+) -> tuple[list[PowerchatEventStatus], list[dict[str, Any]], list[dict[str, Any]]]:
+    if not directory.is_dir():
+        return [], [], []
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for sidecar in sorted(directory.glob(f"*{POWERCHAT_EVENT_SUFFIX}")):
+        payload = load_powerchat_sidecar(sidecar)
+        for event in payload.get("events", []):
+            if not isinstance(event, dict):
+                continue
+            key = str(event.get("dedupe_key") or event.get("id") or "").strip()
+            if not key:
+                key = hashlib.sha1(
+                    json.dumps(event, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(event)
+    rows.sort(
+        key=lambda event: (
+            event.get("offset_seconds") is None,
+            float(event.get("offset_seconds") or 0.0),
+            str(event.get("received_at") or ""),
+        )
+    )
+    totals = powerchat_totals(rows)
+    return (
+        [powerchat_event_status(event) for event in rows],
+        totals.get("money", []),
+        totals.get("units", []),
+    )
+
+
+def powerchat_event_status(event: dict[str, Any]) -> PowerchatEventStatus:
+    return PowerchatEventStatus(
+        source=str(event.get("source") or ""),
+        received_at=str(event.get("received_at") or ""),
+        offset_seconds=(
+            float(event["offset_seconds"])
+            if event.get("offset_seconds") is not None
+            else None
+        ),
+        kind=str(event.get("kind") or "unknown"),
+        donor=str(event.get("donor") or ""),
+        platform=str(event.get("platform") or ""),
+        message=str(event.get("message") or ""),
+        money_amount=(
+            float(event["money_amount"])
+            if event.get("money_amount") is not None
+            else None
+        ),
+        money_currency=str(event.get("money_currency") or ""),
+        unit_amount=(
+            float(event["unit_amount"])
+            if event.get("unit_amount") is not None
+            else None
+        ),
+        unit=str(event.get("unit") or ""),
+    )
+
+
 def stream_status_from_record(
     config: BotConfig,
     record: StreamRecord,
@@ -2650,6 +2756,12 @@ def stream_status_from_record(
     perf_step(steps, "content_events", step_started_at)
 
     step_started_at = time.perf_counter()
+    powerchat_events, powerchat_money_totals, powerchat_unit_totals = (
+        powerchat_status_for_directory(directory)
+    )
+    perf_step(steps, "powerchat", step_started_at)
+
+    step_started_at = time.perf_counter()
     segment_name = f"segment-{record.segment_index:03d}"
     has_part_files = segment_name in file_summary.part_segments
     has_mixed_formats = has_part_files and segment_name in file_summary.final_format_segments
@@ -2685,6 +2797,10 @@ def stream_status_from_record(
         events=[stream_event_status(event) for event in event_records or []],
         content_event_count=len(content_events),
         content_events=content_events,
+        powerchat_event_count=len(powerchat_events),
+        powerchat_money_totals=powerchat_money_totals,
+        powerchat_unit_totals=powerchat_unit_totals,
+        powerchat_events=powerchat_events,
         jobs=list(job_records or []),
         files=file_summary.files,
     )
@@ -5622,11 +5738,15 @@ def update_streamer_from_form(
         "sources",
     )
     download_dir_name = first_query_value(params, "download_dir_name").strip()
+    powerchat_enabled = query_flag(params, "powerchat_enabled")
+    powerchat_username = first_query_value(params, "powerchat_username").strip()
     update_streamer_config(
         config.config_path,
         streamer_name,
         sources,
         download_dir_name,
+        powerchat_enabled,
+        powerchat_username,
     )
     reload_running_config(config)
 
@@ -6844,6 +6964,7 @@ def file_kind(name: str) -> str:
         is_chat_timing_file(name)
         or name.endswith(".voice-attribution.json")
         or name.endswith(".stream-events.json")
+        or is_powerchat_event_file(name)
     ):
         return "state"
     if is_live_chat_file(name):
@@ -7313,6 +7434,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     .stream-tab-panel {{ display: none; }}
     .stream-tab-files-toggle:checked ~ .stream-tab-labels .stream-tab-files-label,
     .stream-tab-events-toggle:checked ~ .stream-tab-labels .stream-tab-events-label,
+    .stream-tab-powerchat-toggle:checked ~ .stream-tab-labels .stream-tab-powerchat-label,
     .stream-tab-speakers-toggle:checked ~ .stream-tab-labels .stream-tab-speakers-label,
     .stream-tab-log-toggle:checked ~ .stream-tab-labels .stream-tab-log-label,
     .stream-tab-jobs-toggle:checked ~ .stream-tab-labels .stream-tab-jobs-label {{
@@ -7322,10 +7444,25 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .stream-tab-files-toggle:checked ~ .stream-tab-panels .stream-tab-files,
     .stream-tab-events-toggle:checked ~ .stream-tab-panels .stream-tab-events,
+    .stream-tab-powerchat-toggle:checked ~ .stream-tab-panels .stream-tab-powerchat,
     .stream-tab-speakers-toggle:checked ~ .stream-tab-panels .stream-tab-speakers,
     .stream-tab-log-toggle:checked ~ .stream-tab-panels .stream-tab-log,
     .stream-tab-jobs-toggle:checked ~ .stream-tab-panels .stream-tab-jobs {{ display: block; }}
     .content-events {{ display: grid; gap: 8px; }}
+    .powerchat-events {{ display: grid; gap: 8px; }}
+    .powerchat-event {{
+      display: grid;
+      grid-template-columns: max-content minmax(0, 1fr) minmax(160px, 0.35fr);
+      gap: 12px;
+      align-items: start;
+      border: 1px solid var(--line);
+      border-left: 4px solid var(--active);
+      border-radius: 6px;
+      padding: 10px;
+      background: var(--panel);
+    }}
+    .powerchat-event.unknown {{ border-left-color: var(--muted); }}
+    .powerchat-event-amount {{ font-weight: 700; }}
     .content-event {{
       display: grid;
       grid-template-columns: max-content minmax(0, 1fr) minmax(180px, 0.4fr);
@@ -7610,6 +7747,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel);
       font: inherit;
     }}
+    .settings-field.checkbox-field span {{ display: flex; align-items: center; gap: 8px; min-height: 34px; color: var(--text); }}
+    .settings-field.checkbox-field input {{ width: auto; padding: 0; }}
     .settings-field textarea {{
       min-height: 72px;
       resize: vertical;
@@ -8810,6 +8949,61 @@ def dashboard_script() -> str:
     return `<div class="content-events">${rows}</div>`;
   };
 
+  const formatPowerchatNumber = (value, decimals = 0) => {
+    value = Number(value || 0);
+    if (!decimals && Number.isInteger(value)) return String(value);
+    return decimals ? value.toFixed(decimals) : String(value);
+  };
+
+  const formatPowerchatSummary = (moneyTotals, unitTotals) => {
+    const parts = [];
+    (moneyTotals || []).forEach((total) => {
+      const currency = String(total.currency || "").toUpperCase();
+      if (currency && total.amount !== undefined && total.amount !== null) {
+        parts.push(`${currency} ${formatPowerchatNumber(total.amount, 2)}`);
+      }
+    });
+    (unitTotals || []).forEach((total) => {
+      const platform = String(total.platform || "").trim();
+      const unit = String(total.unit || "").trim();
+      if (unit && total.amount !== undefined && total.amount !== null) {
+        const formatted = `${formatPowerchatNumber(total.amount)} ${unit}`;
+        parts.push(platform ? `${platform}: ${formatted}` : formatted);
+      }
+    });
+    return parts.join(", ");
+  };
+
+  const powerchatEventAmountText = (event) => {
+    if (event.kind === "money" && event.money_amount !== null && event.money_amount !== undefined && event.money_currency) {
+      return `${String(event.money_currency).toUpperCase()} ${formatPowerchatNumber(event.money_amount, 2)}`;
+    }
+    if (event.kind === "unit" && event.unit_amount !== null && event.unit_amount !== undefined && event.unit) {
+      const formatted = `${formatPowerchatNumber(event.unit_amount)} ${event.unit}`;
+      return event.platform ? `${event.platform}: ${formatted}` : formatted;
+    }
+    return "";
+  };
+
+  const renderPowerchatEvents = (stream) => {
+    const events = (stream && stream.powerchat_events) || [];
+    if (!events.length) return '<div class="file-meta">No Powerchat support events captured yet.</div>';
+    const summary = formatPowerchatSummary(stream.powerchat_money_totals || [], stream.powerchat_unit_totals || []);
+    const rows = events.slice(0, 100).map((event) => {
+      const kind = ["money", "unit", "unknown"].includes(String(event.kind || "")) ? String(event.kind || "unknown") : "unknown";
+      const timestamp = event.offset_seconds === null || event.offset_seconds === undefined ? formatIso(event.received_at) : formatEventOffset(event.offset_seconds);
+      const donor = event.donor || "Unknown donor";
+      const platform = event.platform || "Powerchat";
+      const meta = [event.source, platform, event.kind].filter(Boolean).join(" / ");
+      return `<div class="powerchat-event ${escapeAttr(kind)}">
+        <div class="content-event-time"><span>${escapeHtml(timestamp)}</span></div>
+        <div class="content-event-main"><strong>${escapeHtml(donor)}</strong><div>${escapeHtml(event.message || "-")}</div><span class="file-meta">${escapeHtml(meta)}</span></div>
+        <div class="powerchat-event-amount">${escapeHtml(powerchatEventAmountText(event) || "-")}</div>
+      </div>`;
+    }).join("");
+    return `<div class="file-meta">Totals: ${escapeHtml(summary || "-")}</div><div class="powerchat-events">${rows}</div>`;
+  };
+
   const renderFileAction = (file) => {
     const actions = [];
     if (file.download_url) {
@@ -9082,11 +9276,13 @@ def dashboard_script() -> str:
       || '<tr><td colspan="7" class="file-meta">No files found</td></tr>';
     const filesTabId = `stream-tab-${videoId}-files`;
     const eventsTabId = `stream-tab-${videoId}-events`;
+    const powerchatTabId = `stream-tab-${videoId}-powerchat`;
     const speakersTabId = `stream-tab-${videoId}-speakers`;
     const logTabId = `stream-tab-${videoId}-log`;
     const jobsTabId = `stream-tab-${videoId}-jobs`;
     const tabName = `stream-tabs-${videoId}`;
     const vodRedownload = renderStreamVodRedownloadForm(stream);
+    const powerchatSummary = formatPowerchatSummary(stream.powerchat_money_totals || [], stream.powerchat_unit_totals || []);
     return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}">
   <div class="stream-head">
     <div class="stream-title-block">
@@ -9114,6 +9310,7 @@ def dashboard_script() -> str:
       <div>Chat size: ${escapeHtml(formatBytes(stream.chat_bytes))}</div>
       <div>Fragment size: ${escapeHtml(formatBytes(stream.fragment_bytes))}</div>
       <div>Content events: ${escapeHtml(stream.content_event_count || 0)}</div>
+      <div>Powerchat: ${escapeHtml(stream.powerchat_event_count || 0)} <span class="muted">${escapeHtml(powerchatSummary)}</span></div>
       <div>Mixed formats: ${mixed}</div>
       <div>Exit code: ${escapeHtml(formatOptionalInt(stream.exit_code))}</div>
       <div>Started: ${escapeHtml(formatIso(stream.last_started_at))}</div>
@@ -9127,12 +9324,14 @@ def dashboard_script() -> str:
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(filesTabId)}" data-stream-tab="files" data-video-id="${escapeAttr(videoId)}" checked>
       <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(eventsTabId)}" data-stream-tab="events" data-video-id="${escapeAttr(videoId)}">
+      <input class="stream-tab-radio stream-tab-powerchat-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(powerchatTabId)}" data-stream-tab="powerchat" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-speakers-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(speakersTabId)}" data-stream-tab="speakers" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(jobsTabId)}" data-stream-tab="jobs" data-video-id="${escapeAttr(videoId)}">
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="${escapeAttr(tabName)}" id="${escapeAttr(logTabId)}" data-stream-tab="log" data-video-id="${escapeAttr(videoId)}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="${escapeAttr(filesTabId)}">Files</label>
         <label class="stream-tab-events-label" for="${escapeAttr(eventsTabId)}">Content Events</label>
+        <label class="stream-tab-powerchat-label" for="${escapeAttr(powerchatTabId)}">Powerchat</label>
         <label class="stream-tab-speakers-label" for="${escapeAttr(speakersTabId)}">Detected Speakers</label>
         <label class="stream-tab-jobs-label" for="${escapeAttr(jobsTabId)}">Jobs</label>
         <label class="stream-tab-log-label" for="${escapeAttr(logTabId)}">Stream Log</label>
@@ -9147,6 +9346,7 @@ def dashboard_script() -> str:
           </div>
         </section>
         <section class="stream-tab-panel stream-tab-events">${renderContentEvents(stream.content_events || [])}</section>
+        <section class="stream-tab-panel stream-tab-powerchat">${renderPowerchatEvents(stream)}</section>
         <section class="stream-tab-panel stream-tab-speakers">${renderStreamSpeakersPanel(streamer, stream)}</section>
         <section class="stream-tab-panel stream-tab-jobs">${renderStreamJobs(stream.jobs || [])}</section>
         <section class="stream-tab-panel stream-tab-log">${renderStreamEvents(stream.events || [])}</section>
@@ -9190,6 +9390,8 @@ def dashboard_script() -> str:
     const name = isExisting ? String(streamer.name || "") : "";
     const sources = isExisting ? (streamer.sources || []) : [];
     const downloadDirName = isExisting ? String(streamer.download_dir_name || "") : "";
+    const powerchatEnabled = Boolean(streamer && streamer.powerchat_enabled);
+    const powerchatUsername = isExisting ? String(streamer.powerchat_username || "") : "";
     const readonly = isExisting ? " readonly" : "";
     const deleteButton = isExisting
       ? '<button class="download action-button" name="action" value="delete" type="submit">Delete</button>'
@@ -9204,6 +9406,12 @@ def dashboard_script() -> str:
   </label>
   <label class="settings-field">Download Dir Name
     <input name="download_dir_name" value="${escapeAttr(downloadDirName)}">
+  </label>
+  <label class="settings-field checkbox-field">Powerchat
+    <span><input name="powerchat_enabled" type="checkbox" value="true"${powerchatEnabled ? " checked" : ""}> Listen for live support events</span>
+  </label>
+  <label class="settings-field">Powerchat Username
+    <input name="powerchat_username" value="${escapeAttr(powerchatUsername)}" placeholder="Powerchat username">
   </label>
   ${meta}
   <div class="settings-field wide"><span>Sources</span>${renderSourceBuilder(sources)}</div>
@@ -9964,6 +10172,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <div><strong>{escape(streamer.voice_detection)}</strong><br><span class="muted">Voice</span></div>
       <div><strong>{streamer.speaker_label_count}</strong><br><span class="muted">Speaker labels</span></div>
       <div><strong>{len(streamer.voices)}</strong><br><span class="muted">Known voices</span></div>
+      <div><strong>{escape(streamer.powerchat_username or '-')}</strong><br><span class="muted">Powerchat {'on' if streamer.powerchat_enabled else 'off'}</span></div>
     </div>
     <div class="streamer-settings-panel" data-streamer-settings-panel hidden>
       {settings}
@@ -10566,6 +10775,8 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
     name = streamer.name if streamer is not None else ""
     sources = "\n".join(streamer.sources) if streamer is not None else ""
     download_dir_name = streamer.download_dir_name if streamer is not None else ""
+    powerchat_enabled = streamer.powerchat_enabled if streamer is not None else False
+    powerchat_username = streamer.powerchat_username if streamer is not None else ""
     voice_detection = streamer.voice_detection if streamer is not None else "default"
     speaker_label_count = streamer.speaker_label_count if streamer is not None else 0
     readonly = " readonly" if is_existing else ""
@@ -10587,6 +10798,12 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
   </label>
   <label class="settings-field">Download Dir Name
     <input name="download_dir_name" value="{escape(download_dir_name, quote=True)}">
+  </label>
+  <label class="settings-field checkbox-field">Powerchat
+    <span><input name="powerchat_enabled" type="checkbox" value="true"{' checked' if powerchat_enabled else ''}> Listen for live support events</span>
+  </label>
+  <label class="settings-field">Powerchat Username
+    <input name="powerchat_username" value="{escape(powerchat_username, quote=True)}" placeholder="Powerchat username">
   </label>
   {meta}
   <div class="settings-field wide"><span>Sources</span>{render_source_editor(streamer.sources if streamer is not None else [])}</div>
@@ -11244,6 +11461,80 @@ def render_content_event(event: ContentEventStatus) -> str:
     )
 
 
+def render_powerchat_events(stream: StreamStatus) -> str:
+    if not stream.powerchat_events:
+        return '<div class="file-meta">No Powerchat support events captured yet.</div>'
+    summary = format_powerchat_summary(
+        stream.powerchat_money_totals,
+        stream.powerchat_unit_totals,
+    )
+    rows = "".join(render_powerchat_event(event) for event in stream.powerchat_events[:100])
+    return (
+        f'<div class="file-meta">Totals: {escape(summary or "-")}</div>'
+        f'<div class="powerchat-events">{rows}</div>'
+    )
+
+
+def render_powerchat_event(event: PowerchatEventStatus) -> str:
+    amount = powerchat_event_amount_text(event)
+    timestamp = (
+        format_event_offset(event.offset_seconds)
+        if event.offset_seconds is not None
+        else format_optional_iso(event.received_at)
+    )
+    kind = event.kind if event.kind in {"money", "unit", "unknown"} else "unknown"
+    platform = event.platform or "Powerchat"
+    donor = event.donor or "Unknown donor"
+    message = event.message or "-"
+    meta = " / ".join(part for part in [event.source, platform, event.kind] if part)
+    return (
+        f'<div class="powerchat-event {escape(kind, quote=True)}">'
+        f'<div class="content-event-time"><span>{escape(timestamp)}</span></div>'
+        '<div class="content-event-main">'
+        f'<strong>{escape(donor)}</strong>'
+        f'<div>{escape(message)}</div>'
+        f'<span class="file-meta">{escape(meta)}</span>'
+        '</div>'
+        f'<div class="powerchat-event-amount">{escape(amount or "-")}</div>'
+        '</div>'
+    )
+
+
+def powerchat_event_amount_text(event: PowerchatEventStatus) -> str:
+    if event.kind == "money" and event.money_amount is not None and event.money_currency:
+        return f"{event.money_currency} {format_powerchat_number(event.money_amount, decimals=2)}"
+    if event.kind == "unit" and event.unit_amount is not None and event.unit:
+        amount = f"{format_powerchat_number(event.unit_amount)} {event.unit}"
+        return f"{event.platform}: {amount}" if event.platform else amount
+    return ""
+
+
+def format_powerchat_summary(
+    money_totals: list[dict[str, Any]],
+    unit_totals: list[dict[str, Any]],
+) -> str:
+    parts: list[str] = []
+    for total in money_totals:
+        currency = str(total.get("currency") or "").upper()
+        amount = total.get("amount")
+        if currency and amount is not None:
+            parts.append(f"{currency} {format_powerchat_number(float(amount), decimals=2)}")
+    for total in unit_totals:
+        platform = str(total.get("platform") or "").strip()
+        unit = str(total.get("unit") or "").strip()
+        amount = total.get("amount")
+        if unit and amount is not None:
+            formatted = f"{format_powerchat_number(float(amount))} {unit}"
+            parts.append(f"{platform}: {formatted}" if platform else formatted)
+    return ", ".join(parts)
+
+
+def format_powerchat_number(value: float, *, decimals: int = 0) -> str:
+    if decimals <= 0 and float(value).is_integer():
+        return str(int(value))
+    return f"{value:.{decimals}f}" if decimals > 0 else f"{value:g}"
+
+
 def render_cleanup_fragments_action(stream: StreamStatus) -> str:
     count = stream.file_kind_counts.get("fragment", 0)
     if count <= 0 or stream.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
@@ -11326,12 +11617,18 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
         files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
     events = render_stream_event_timeline(stream.events)
     content_events = render_content_events(stream.content_events)
+    powerchat = render_powerchat_events(stream)
+    powerchat_summary = format_powerchat_summary(
+        stream.powerchat_money_totals,
+        stream.powerchat_unit_totals,
+    )
     speakers = render_stream_speakers_panel(streamer, stream)
     jobs = render_stream_jobs(stream.jobs)
     vod_redownload = render_stream_vod_redownload_form(stream)
     tab_key = escape(stream.video_id, quote=True)
     files_tab_id = f"stream-tab-{tab_key}-files"
     content_events_tab_id = f"stream-tab-{tab_key}-events"
+    powerchat_tab_id = f"stream-tab-{tab_key}-powerchat"
     speakers_tab_id = f"stream-tab-{tab_key}-speakers"
     log_tab_id = f"stream-tab-{tab_key}-log"
     jobs_tab_id = f"stream-tab-{tab_key}-jobs"
@@ -11364,6 +11661,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
       <div>Chat size: {escape(format_bytes(stream.chat_bytes))}</div>
       <div>Fragment size: {escape(format_bytes(stream.fragment_bytes))}</div>
       <div>Content events: {stream.content_event_count}</div>
+      <div>Powerchat: {stream.powerchat_event_count} <span class="muted">{escape(powerchat_summary)}</span></div>
       <div>Mixed formats: {mixed}</div>
       <div>Exit code: {escape(format_optional_int(stream.exit_code))}</div>
       <div>Started: {escape(format_optional_iso(stream.last_started_at))}</div>
@@ -11377,12 +11675,14 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     <div class="stream-detail-tabs">
       <input class="stream-tab-radio stream-tab-files-toggle" type="radio" name="{tab_name}" id="{files_tab_id}" data-stream-tab="files" data-video-id="{tab_key}" checked>
       <input class="stream-tab-radio stream-tab-events-toggle" type="radio" name="{tab_name}" id="{content_events_tab_id}" data-stream-tab="events" data-video-id="{tab_key}">
+      <input class="stream-tab-radio stream-tab-powerchat-toggle" type="radio" name="{tab_name}" id="{powerchat_tab_id}" data-stream-tab="powerchat" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-speakers-toggle" type="radio" name="{tab_name}" id="{speakers_tab_id}" data-stream-tab="speakers" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-jobs-toggle" type="radio" name="{tab_name}" id="{jobs_tab_id}" data-stream-tab="jobs" data-video-id="{tab_key}">
       <input class="stream-tab-radio stream-tab-log-toggle" type="radio" name="{tab_name}" id="{log_tab_id}" data-stream-tab="log" data-video-id="{tab_key}">
       <div class="stream-tab-labels">
         <label class="stream-tab-files-label" for="{files_tab_id}">Files</label>
         <label class="stream-tab-events-label" for="{content_events_tab_id}">Content Events</label>
+        <label class="stream-tab-powerchat-label" for="{powerchat_tab_id}">Powerchat</label>
         <label class="stream-tab-speakers-label" for="{speakers_tab_id}">Detected Speakers</label>
         <label class="stream-tab-jobs-label" for="{jobs_tab_id}">Jobs</label>
         <label class="stream-tab-log-label" for="{log_tab_id}">Stream Log</label>
@@ -11397,6 +11697,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
           </div>
         </section>
         <section class="stream-tab-panel stream-tab-events">{content_events}</section>
+        <section class="stream-tab-panel stream-tab-powerchat">{powerchat}</section>
         <section class="stream-tab-panel stream-tab-speakers">{speakers}</section>
         <section class="stream-tab-panel stream-tab-jobs">{jobs}</section>
         <section class="stream-tab-panel stream-tab-log">{events}</section>

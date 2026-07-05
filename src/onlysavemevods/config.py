@@ -119,6 +119,8 @@ class StreamEventDetectionConfig:
 class StreamerConfig:
     sources: list[str] = field(default_factory=list)
     download_dir_name: str = ""
+    powerchat_enabled: bool = False
+    powerchat_username: str = ""
     voice_detection: VoiceDetectionConfig | None = None
     speaker_labels: dict[str, str] = field(default_factory=dict)
     voices: dict[str, VoiceProfileConfig] = field(default_factory=dict)
@@ -740,6 +742,8 @@ def update_streamer_config(
     streamer_name: str,
     sources: list[str],
     download_dir_name: str = "",
+    powerchat_enabled: bool = False,
+    powerchat_username: str = "",
 ) -> bool:
     target = Path(config_path).expanduser()
     try:
@@ -762,6 +766,14 @@ def update_streamer_config(
         download_dir_name,
         f"streamers.{streamer_name}.download_dir_name",
     )
+    normalized_powerchat_enabled = _as_bool(
+        powerchat_enabled,
+        f"streamers.{streamer_name}.powerchat_enabled",
+    )
+    normalized_powerchat_username = _as_optional_str(
+        powerchat_username,
+        f"streamers.{streamer_name}.powerchat_username",
+    )
 
     table_name = f"streamers.{_toml_key(streamer_name)}"
     pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
@@ -769,6 +781,8 @@ def update_streamer_config(
         streamer_name,
         normalized_sources,
         normalized_download_dir_name,
+        normalized_powerchat_enabled,
+        normalized_powerchat_username,
     )
     if pattern.search(current_text):
         updated_text = pattern.sub(block + "\n", current_text, count=1)
@@ -1204,12 +1218,20 @@ def _streamer_block(
     streamer_name: str,
     sources: list[str],
     download_dir_name: str,
+    powerchat_enabled: bool = False,
+    powerchat_username: str = "",
 ) -> str:
     lines = [f"[streamers.{_toml_key(streamer_name)}]"]
     lines.append(f"sources = {_toml_value(sources, 'sources')}")
     if download_dir_name:
         lines.append(
             f"download_dir_name = {_toml_value(download_dir_name, 'download_dir_name')}"
+        )
+    if powerchat_enabled:
+        lines.append("powerchat_enabled = true")
+    if powerchat_username:
+        lines.append(
+            f"powerchat_username = {_toml_value(powerchat_username, 'powerchat_username')}"
         )
     return "\n".join(lines)
 
@@ -1498,6 +1520,14 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             download_dir_name=_as_optional_str(
                 raw_config.get("download_dir_name", ""),
                 f"{name}.{streamer_name}.download_dir_name",
+            ),
+            powerchat_enabled=_as_bool(
+                raw_config.get("powerchat_enabled", False),
+                f"{name}.{streamer_name}.powerchat_enabled",
+            ),
+            powerchat_username=_as_optional_str(
+                raw_config.get("powerchat_username", ""),
+                f"{name}.{streamer_name}.powerchat_username",
             ),
             voice_detection=voice_detection,
             speaker_labels=speaker_labels,

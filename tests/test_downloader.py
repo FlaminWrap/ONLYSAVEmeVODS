@@ -5,7 +5,7 @@ import asyncio
 import json
 import unittest
 
-from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
+from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS, StreamerConfig
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.chat_timing import read_chat_timing
@@ -29,6 +29,11 @@ from onlysavemevods.downloader import (
     segment_directory,
 )
 from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.powerchat import (
+    load_powerchat_sidecar,
+    normalize_powerchat_payload,
+    write_powerchat_sidecar,
+)
 from onlysavemevods.state import StateStore
 from onlysavemevods.twitch_ad_repair import TwitchAdRepairResult
 
@@ -997,6 +1002,69 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1], chat_file)
         self.assertIsNotNone(calls[0][2])
         self.assertEqual(calls[0][3], timing_file)
+
+    async def test_finish_ended_stream_moves_powerchat_sidecar_to_named_media(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                streamers={
+                    "OUMB3rd": StreamerConfig(
+                        sources=["kick:oumb"],
+                        powerchat_enabled=True,
+                        powerchat_username="oumb",
+                    )
+                },
+            )
+            stream = LiveStream(
+                video_id="kick:oumb",
+                url="https://kick.com/oumb",
+                title="Kick Stream",
+                channel="oumb",
+                platform="kick",
+                source="kick:oumb",
+            )
+            segment_dir = segment_directory(config, stream.video_id, stream.channel)
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
+            event = normalize_powerchat_payload(
+                "KDrizzy69 just gifted 50 Kicks on Kick",
+                source="tts",
+                received_at="2026-07-05T10:00:30+00:00",
+            )
+            assert event is not None
+            write_powerchat_sidecar(
+                segment_dir / "segment-001.powerchat-events.json",
+                events=[event],
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            try:
+                await manager.finish_ended_stream(stream, 1)
+                events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
+                    stream.video_id
+                ]
+            finally:
+                state.close()
+
+            target = segment_dir / "Kick Stream [kick_oumb].powerchat-events.json"
+            payload = load_powerchat_sidecar(target)
+            target_exists = target.exists()
+            source_exists = (segment_dir / "segment-001.powerchat-events.json").exists()
+
+        self.assertTrue(target_exists)
+        self.assertFalse(source_exists)
+        self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(payload["totals"]["units"][0]["amount"], 50.0)
+        self.assertTrue(
+            any("Powerchat events saved" in event.message for event in events)
+        )
 
     async def test_finish_ended_twitch_stream_runs_ad_repair_job(self) -> None:
         with TemporaryDirectory() as tmp:

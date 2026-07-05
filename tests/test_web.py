@@ -13,6 +13,7 @@ from onlysavemevods.kick_chat import KickChatReplayResult
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs, start_tracked_job
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.powerchat import normalize_powerchat_payload, write_powerchat_sidecar
 from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     build_config_summary,
@@ -720,6 +721,65 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(unused_channel.configured_sources, ["@Unused"])
         self.assertEqual(unused_channel.stream_count, 0)
+
+    def test_status_snapshot_and_html_include_powerchat_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["kick:oumb"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="kick:oumb",
+                url="https://kick.com/oumb",
+                title="Kick Stream",
+                channel="oumb",
+                platform="kick",
+                source="kick:oumb",
+            )
+            state = StateStore(config.db_path)
+            state.mark_ended(stream.video_id)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+
+            segment_dir = config.download_dir / "oumb" / "kick_oumb"
+            segment_dir.mkdir(parents=True)
+            media = segment_dir / "Kick Stream [kick_oumb].mp4"
+            media.write_text("media", encoding="utf-8")
+            event = normalize_powerchat_payload(
+                "KDrizzy69 just gifted 50 Kicks on Kick",
+                source="tts",
+                received_at="2026-07-05T10:00:30+00:00",
+                stream_started_at="2026-07-05T10:00:00+00:00",
+            )
+            assert event is not None
+            write_powerchat_sidecar(
+                segment_dir / "Kick Stream [kick_oumb].powerchat-events.json",
+                events=[event],
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+                stream_started_at="2026-07-05T10:00:00+00:00",
+            )
+
+            snapshot = build_status_snapshot(config)
+            html = render_status_html(snapshot)
+            payload = snapshot_to_dict(snapshot)
+
+        stream_status = snapshot.streams[0]
+        self.assertEqual(stream_status.powerchat_event_count, 1)
+        self.assertEqual(stream_status.powerchat_unit_totals, [
+            {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
+        ])
+        self.assertEqual(stream_status.powerchat_events[0].donor, "KDrizzy69")
+        self.assertEqual(file_kind("Kick Stream [kick_oumb].powerchat-events.json"), "state")
+        self.assertIn("Powerchat", html)
+        self.assertIn("KDrizzy69", html)
+        self.assertIn("Kick: 50 Kicks", html)
+        self.assertEqual(payload["streams"][0]["powerchat_event_count"], 1)
+        self.assertEqual(payload["streams"][0]["powerchat_events"][0]["platform"], "Kick")
 
     def test_status_snapshot_groups_streamer_sources(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -23,6 +23,8 @@ channels = []
 #   "https://rumble.com/user/SomeStreamer",
 # ]
 # download_dir_name = "Some Streamer"
+# powerchat_enabled = true
+# powerchat_username = "SomeStreamer"
 #
 # [streamers."Some Streamer".voice_detection]
 # mode = "fixed"

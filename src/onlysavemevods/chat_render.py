@@ -35,6 +35,7 @@ CHAT_FINAL_EVENT_PADDING_SECONDS = 7 * 24 * 60 * 60
 CHAT_WRAP_WIDTH = 34
 CHAT_MAX_MESSAGE_LENGTH = 280
 CHAT_MESSAGE_MAX_LINES = 6
+CHAT_PANEL_EMOJI_SIZE = 30
 CHAT_PANEL_FPS = 60
 CHAT_ANIMATION_FRAME_SECONDS = 1 / CHAT_PANEL_FPS
 EMOJI_ANIMATION_DEFAULT_DURATION_MS = 100
@@ -1796,7 +1797,7 @@ def panel_emoji_y(y: int, layout: ChatLayout, fonts: ChatPanelFonts) -> int:
 
 
 def panel_emoji_size(layout: ChatLayout) -> int:
-    return max(layout.font_size, round(layout.font_size * 1.1))
+    return CHAT_PANEL_EMOJI_SIZE
 
 
 def panel_inline_gap(layout: ChatLayout) -> int:

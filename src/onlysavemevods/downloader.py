@@ -39,7 +39,7 @@ from .chat_timing import (
     update_chat_timing,
     utc_now_iso,
 )
-from .config import BotConfig, download_group_name_for_channel
+from .config import BotConfig, download_group_name_for_channel, streamer_for_channel
 from .content_events import (
     ContentEventDetectorUnavailable,
     detect_content_events_for_media,
@@ -47,6 +47,12 @@ from .content_events import (
 )
 from .job_tracker import finish_tracked_job, start_tracked_job, update_tracked_job
 from .models import LiveStream
+from .powerchat import (
+    PowerchatRecorder,
+    copy_powerchat_segment_sidecar,
+    is_powerchat_event_file,
+    run_powerchat_listener,
+)
 from .state import StateStore
 from .transcription import transcribe_media_file, transcription_config_for_channel
 from .twitch_ad_repair import repair_twitch_ads_for_media
@@ -88,6 +94,30 @@ def post_exit_probe_target(stream: LiveStream) -> str:
     return stream.url
 
 
+def powerchat_settings_for_stream(
+    config: BotConfig,
+    stream: LiveStream,
+) -> tuple[str, str] | None:
+    for target in (stream.source, stream.channel):
+        match = streamer_for_channel(config, target)
+        if match is None:
+            continue
+        streamer_name, streamer = match
+        username = streamer.powerchat_username.strip()
+        if streamer.powerchat_enabled and username:
+            return streamer_name, username
+    return None
+
+
+def powerchat_segment_sidecar_file(
+    config: BotConfig,
+    stream: LiveStream,
+    segment_index: int,
+) -> Path:
+    directory = segment_directory(config, stream.video_id, stream.channel)
+    return directory / f"segment-{segment_index:03d}.powerchat-events.json"
+
+
 SleepFunc = Callable[[float], Awaitable[None]]
 ProbeVideoFunc = Callable[[str], Awaitable[LiveStream]]
 
@@ -110,6 +140,8 @@ class ActiveDownload:
     chat_process: asyncio.subprocess.Process | None = None
     chat_task: asyncio.Task[None] | None = None
     chat_output_task: asyncio.Task[None] | None = None
+    powerchat_task: asyncio.Task[None] | None = None
+    powerchat_recorder: PowerchatRecorder | None = None
 
 
 @dataclass(slots=True)
@@ -314,6 +346,13 @@ class DownloadManager:
             mixed_segment_task=mixed_segment_task,
         )
         self.active[stream.video_id] = active
+        powerchat_recorder, powerchat_task = self._start_powerchat_listener(
+            stream,
+            segment_index,
+            media_started_at=stream_start_iso(stream.raw) or media_started_at,
+        )
+        active.powerchat_recorder = powerchat_recorder
+        active.powerchat_task = powerchat_task
         if record_chat:
             chat_process, chat_task, chat_output_task = await self._start_chat_recorder(
                 stream,
@@ -394,6 +433,55 @@ class DownloadManager:
             )
             output_task.add_done_callback(discard_task_exception)
         return process, task, output_task
+
+    def _start_powerchat_listener(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        media_started_at: str,
+    ) -> tuple[PowerchatRecorder | None, asyncio.Task[None] | None]:
+        settings = powerchat_settings_for_stream(self.config, stream)
+        if settings is None:
+            return None, None
+        streamer_name, username = settings
+        sidecar_path = powerchat_segment_sidecar_file(
+            self.config,
+            stream,
+            segment_index,
+        )
+        recorder = PowerchatRecorder(
+            sidecar_path=sidecar_path,
+            streamer_name=streamer_name,
+            username=username,
+            video_id=stream.video_id,
+            segment_index=segment_index,
+            stream_started_at=media_started_at,
+        )
+
+        def status_callback(message: str, level: str) -> None:
+            self.state.add_stream_event(
+                stream.video_id,
+                message,
+                level=level,
+                segment_index=segment_index,
+            )
+
+        task = asyncio.create_task(
+            run_powerchat_listener(
+                username,
+                recorder,
+                logger=self.logger,
+                status_callback=status_callback,
+            )
+        )
+        task.add_done_callback(discard_task_exception)
+        self.state.add_stream_event(
+            stream.video_id,
+            f"Powerchat listener starting username={username}",
+            segment_index=segment_index,
+        )
+        return recorder, task
 
     async def _planned_reconnect_timer(
         self,
@@ -600,6 +688,7 @@ class DownloadManager:
                 active.mixed_segment_task.cancel()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
+            await self._stop_powerchat_listener(active)
             await self._stop_chat_recorder(active)
 
         if self._stopping:
@@ -678,6 +767,32 @@ class DownloadManager:
                 raise
             except Exception as exc:
                 self.logger.debug("live chat watcher exited with error: %s", exc)
+
+    async def _stop_powerchat_listener(self, active: ActiveDownload) -> None:
+        task = active.powerchat_task
+        recorder = active.powerchat_recorder
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except asyncio.TimeoutError:
+                self.logger.debug(
+                    "Powerchat listener did not stop promptly for %s",
+                    active.stream.video_id,
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                self.logger.debug("Powerchat listener exited with error: %s", exc)
+        if recorder is not None:
+            try:
+                recorder.write()
+            except OSError as exc:
+                self.logger.warning(
+                    "Unable to flush Powerchat sidecar for %s: %s",
+                    active.stream.video_id,
+                    exc,
+                )
 
     async def handle_planned_reconnect(
         self,
@@ -900,6 +1015,7 @@ class DownloadManager:
             stream.channel,
         )
         finalized_files = self.rename_finalized_segments(stream, segment_index)
+        self.finalize_powerchat_sidecars(stream, finalized_files)
         if should_record_chat_for_stream(self.config, stream):
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
@@ -947,6 +1063,39 @@ class DownloadManager:
                 )
             )
         return finalized_files
+
+    def finalize_powerchat_sidecars(
+        self,
+        stream: LiveStream,
+        finalized_files: list[FinalizedSegmentFiles],
+    ) -> None:
+        settings = powerchat_settings_for_stream(self.config, stream)
+        streamer_name = settings[0] if settings else ""
+        username = settings[1] if settings else ""
+        for files in finalized_files:
+            if files.media_file is None:
+                continue
+            source = powerchat_segment_sidecar_file(
+                self.config,
+                stream,
+                files.segment_index,
+            )
+            target = copy_powerchat_segment_sidecar(
+                source,
+                files.media_file,
+                streamer_name=streamer_name,
+                username=username,
+                video_id=stream.video_id,
+                segment_index=files.segment_index,
+                logger=self.logger,
+            )
+            if target is None:
+                continue
+            self.state.add_stream_event(
+                stream.video_id,
+                f"Powerchat events saved for {files.media_file.name}",
+                segment_index=files.segment_index,
+            )
 
     async def render_finalized_chat_videos(
         self,
@@ -2003,6 +2152,7 @@ class DownloadManager:
                 await active.process.wait()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
+            await self._stop_powerchat_listener(active)
             await self._stop_chat_recorder(active)
 
         for task in list(self._post_exit_tasks):
@@ -2313,6 +2463,7 @@ def segment_final_format_files(
         and not is_yt_dlp_temporary_file(path.name)
         and not is_live_chat_file(path.name)
         and not is_chat_timing_file(path.name)
+        and not is_powerchat_event_file(path.name)
         and path.stem != segment_name
     )
 
@@ -2528,6 +2679,7 @@ def finalized_segment_file(
         for path in directory.glob(f"{stem}.*")
         if path.is_file()
         and not is_yt_dlp_temporary_file(path.name)
+        and not is_powerchat_event_file(path.name)
         and path.stem == stem
     )
     return next(iter(matches), None)

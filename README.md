@@ -34,6 +34,8 @@ sources = [
   "https://rumble.com/user/OUMB3rd",
 ]
 download_dir_name = "OUMB3rd"
+powerchat_enabled = true
+powerchat_username = "OUMB3rd"
 
 [streamers."OUMB3rd".voice_detection]
 mode = "fixed"
@@ -264,6 +266,14 @@ scripts/uninstall-systemd.sh
   a `.twitch-ad-repair.json` sidecar. Originals are left untouched. Set
   `twitch_ad_repair_scan_seconds = 0` to scan the whole file, or set
   `twitch_ad_repair_enabled = false` to disable the automatic job.
+- Powerchat support-event listening is a streamer setting. Enable
+  `powerchat_enabled = true` and set `powerchat_username` on the streamer card
+  or in `[streamers."Name"]` to listen to both Powerchat websocket feeds while
+  that streamer is being recorded. Captured rows are written beside the media as
+  `<media>.powerchat-events.json`, shown on the stream Powerchat tab, and tallied
+  as separate money totals and platform-unit totals such as Kick gifts. This is a
+  best-effort unofficial integration, so unknown payloads are preserved in the
+  sidecar for later parser fixes but are not counted.
 - Set `render_live_chat_video = true` to also create a separate
   `Title [VIDEOID] - chat.mp4` after the stream ends. The original finalized
   media file is left untouched; the chat version is re-encoded with the video on

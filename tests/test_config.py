@@ -573,6 +573,37 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config_after_remove.streamers, {})
         self.assertNotIn("OUMB3rd", text_after_remove)
 
+    def test_streamer_config_reads_and_writes_powerchat_settings(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["kick:oumb"]\n'
+                "powerchat_enabled = true\n"
+                'powerchat_username = "oumb"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            updated = update_streamer_config(
+                config_path,
+                "OUMB3rd",
+                ["kick:oumb", "@OUMB3rd"],
+                "OUMB3rd Shared",
+                powerchat_enabled=False,
+                powerchat_username="",
+            )
+            updated_config = load_config(config_path)
+            updated_text = config_path.read_text(encoding="utf-8")
+
+        self.assertTrue(config.streamers["OUMB3rd"].powerchat_enabled)
+        self.assertEqual(config.streamers["OUMB3rd"].powerchat_username, "oumb")
+        self.assertTrue(updated)
+        self.assertFalse(updated_config.streamers["OUMB3rd"].powerchat_enabled)
+        self.assertEqual(updated_config.streamers["OUMB3rd"].powerchat_username, "")
+        self.assertNotIn("powerchat_enabled", updated_text)
+        self.assertNotIn("powerchat_username", updated_text)
+
     def test_streamer_shared_settings_update_writes_and_removes_tables(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
