@@ -6774,6 +6774,24 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       margin-top: 14px;
     }}
     .panel {{ padding: 14px; }}
+    .about-heading {{
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 14px;
+    }}
+    .about-icon {{
+      width: clamp(72px, 12vw, 128px);
+      height: clamp(72px, 12vw, 128px);
+      object-fit: contain;
+      flex: 0 0 auto;
+    }}
+    .about-title {{ min-width: 0; }}
+    .about-title h2 {{ margin: 0 0 4px; }}
+    @media (max-width: 520px) {{
+      .about-heading {{ align-items: flex-start; }}
+      .about-icon {{ width: 72px; height: 72px; }}
+    }}
     dl {{
       display: grid;
       grid-template-columns: minmax(110px, max-content) minmax(0, 1fr);
@@ -9429,7 +9447,13 @@ def render_about_panel(snapshot: StatusSnapshot) -> str:
         time.localtime(snapshot.generated_at),
     )
     return f"""<section class="panel">
-  <h2>About</h2>
+  <div class="about-heading">
+    <img class="about-icon" src="/Favicon.png?v={escape(APP_VERSION, quote=True)}" alt="" loading="lazy">
+    <div class="about-title">
+      <h2>About</h2>
+      <div class="file-meta">ONLYSAVEmeVODS dashboard</div>
+    </div>
+  </div>
   <dl>
     <dt>Application</dt><dd id="about-app-name">{escape(snapshot.app.name)}</dd>
     <dt>Version</dt><dd id="about-app-version">{escape(snapshot.app.version)}</dd>

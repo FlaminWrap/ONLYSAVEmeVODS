@@ -1483,6 +1483,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('href="/favicon-16x16.png?v=', html)
         self.assertIn('href="/apple-touch-icon.png?v=', html)
         self.assertIn('href="/android-chrome-192x192.png?v=', html)
+        self.assertIn('class="about-icon" src="/Favicon.png?v=', html)
         for path in FAVICON_ROUTES.values():
             self.assertTrue(Path(path).is_file(), path)
             self.assertIn("assets/favicons", Path(path).as_posix())
