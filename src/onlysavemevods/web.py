@@ -3631,24 +3631,114 @@ def run_vod_download_job(
         )
         return
 
+    job_message = "VOD download completed"
+    stream_message = f"VOD download completed from {vod_url}"
+    if stream.platform == "youtube":
+        chat_ok, chat_message = run_youtube_vod_chat_download_job(
+            config,
+            job_id,
+            stream,
+            vod_url,
+            output_template,
+        )
+        if chat_ok:
+            job_message = "VOD download completed with live chat replay"
+            stream_message = f"VOD download completed with live chat replay from {vod_url}"
+        else:
+            reason = chat_message or "live chat replay was not available"
+            job_message = "VOD download completed; live chat replay unavailable"
+            stream_message = f"VOD download completed from {vod_url}; live chat replay unavailable"
+            record_stream_event(
+                config,
+                stream.video_id,
+                f"YouTube VOD live chat replay unavailable: {reason}",
+                level="warning",
+                segment_index=1,
+            )
+
     finish_tracked_job(
         job_id,
         status="done",
         phase="Complete",
-        message="VOD download completed",
+        message=job_message,
         progress=1.0,
     )
     state = StateStore(config.db_path)
     try:
         state.mark_vod_download_finished(
             stream.video_id,
-            message=f"VOD download completed from {vod_url}",
+            message=stream_message,
         )
     finally:
         state.close()
     with FILE_SCAN_CACHE_LOCK:
         FILE_SCAN_CACHE.pop(str(output_template.parent), None)
     LOGGER.info("VOD download completed video_id=%s output=%s", stream.video_id, output_template)
+
+
+def run_youtube_vod_chat_download_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    vod_url: str,
+    output_template: Path,
+) -> tuple[bool, str]:
+    update_tracked_job(
+        job_id,
+        phase="Downloading live chat replay",
+        message="Trying YouTube live chat replay",
+        progress=0.99,
+    )
+    command = build_vod_chat_download_command(config, vod_url, output_template)
+    LOGGER.debug(
+        "yt-dlp YouTube VOD chat command for %s: %s",
+        stream.video_id,
+        command_for_log(command),
+    )
+    last_output = ""
+    try:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+    except FileNotFoundError:
+        message = f"yt-dlp binary not found: {config.yt_dlp_path}"
+        LOGGER.warning("Unable to start yt-dlp for YouTube VOD chat: %s", message)
+        return False, message
+    except OSError as exc:
+        message = str(exc) or exc.__class__.__name__
+        LOGGER.warning("Unable to start YouTube VOD chat download for %s: %s", stream.video_id, message)
+        return False, message
+
+    if process.stdout is not None:
+        for line in process.stdout:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            last_output = stripped
+            update_tracked_job(
+                job_id,
+                phase="Downloading live chat replay",
+                message=stripped,
+                progress=0.99,
+            )
+    return_code = process.wait()
+    if return_code != 0:
+        return False, last_output or f"yt-dlp exited with code {return_code}"
+
+    chat_file = vod_chat_sidecar_for_output_template(output_template)
+    if not chat_file.is_file():
+        return False, last_output or "yt-dlp did not create a live chat replay sidecar"
+    record_stream_event(
+        config,
+        stream.video_id,
+        f"YouTube VOD live chat replay downloaded: {chat_file.name}",
+        segment_index=1,
+    )
+    return True, f"Live chat replay downloaded: {chat_file.name}"
 
 
 def finish_failed_vod_download(
@@ -3699,6 +3789,38 @@ def build_vod_download_command(
         str(output_template),
         vod_url,
     ]
+
+
+def build_vod_chat_download_command(
+    config: BotConfig,
+    vod_url: str,
+    output_template: Path,
+) -> list[str]:
+    return [
+        config.yt_dlp_path,
+        *config.extra_yt_dlp_args,
+        "--skip-download",
+        "--write-subs",
+        "--sub-langs",
+        "live_chat",
+        "--continue",
+        "--part",
+        "--progress",
+        "--newline",
+        "--progress-delta",
+        "5",
+        "--no-playlist",
+        "-o",
+        str(output_template),
+        vod_url,
+    ]
+
+
+def vod_chat_sidecar_for_output_template(output_template: Path) -> Path:
+    template = str(output_template)
+    if "%(ext)s" in template:
+        return Path(template.replace("%(ext)s", "live_chat.json"))
+    return output_template.with_suffix(".live_chat.json")
 
 
 def vod_download_progress_from_line(line: str) -> float | None:

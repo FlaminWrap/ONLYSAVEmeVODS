@@ -17,6 +17,7 @@ from onlysavemevods.web import (
     build_config_summary,
     build_status_snapshot,
     build_lite_status_payload,
+    build_vod_chat_download_command,
     build_vod_download_command,
     build_streamer_voice_details_payload,
     build_stream_voice_speakers_payload,
@@ -56,6 +57,7 @@ from onlysavemevods.web import (
     run_render_chat_in_process_job,
     update_render_chat_job,
     run_render_chat_process_job,
+    run_vod_download_job,
     run_transcription_job,
     event_detection_job_key,
     run_event_detection_job,
@@ -179,6 +181,11 @@ class WebStatusTests(unittest.TestCase):
                 "https://kick.com/oumb/videos/123",
                 template,
             )
+            chat_command = build_vod_chat_download_command(
+                config,
+                "https://www.youtube.com/watch?v=LIVEVIDEO01",
+                template,
+            )
 
         self.assertEqual(
             template,
@@ -192,8 +199,94 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("--cookies", command)
         self.assertIn("cookies.txt", command)
         self.assertEqual(command[-1], "https://kick.com/oumb/videos/123")
+        self.assertIn("--skip-download", chat_command)
+        self.assertIn("--write-subs", chat_command)
+        self.assertIn("live_chat", chat_command)
+        self.assertNotIn("--live-from-start", chat_command)
+        self.assertEqual(chat_command[chat_command.index("-o") + 1], str(template))
+        self.assertEqual(chat_command[-1], "https://www.youtube.com/watch?v=LIVEVIDEO01")
         self.assertEqual(vod_download_progress_from_line("[download]  42.5% of 1.00GiB"), 0.425)
         self.assertIsNone(vod_download_progress_from_line("[download] Destination: file.mp4"))
+
+    def test_youtube_vod_download_warns_when_chat_replay_is_unavailable(self) -> None:
+        class FakeProcess:
+            def __init__(self, lines: list[str], return_code: int) -> None:
+                self.stdout = iter(lines)
+                self.return_code = return_code
+
+            def wait(self) -> int:
+                return self.return_code
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                yt_dlp_path="yt-dlp",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+                platform="youtube",
+                source="@Example",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.close()
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            job_id = "vod-download:LIVEVIDEO01:test"
+            start_tracked_job(
+                job_id,
+                kind="VOD download",
+                video_id=stream.video_id,
+                item="Live Status.media",
+                detail=stream.url,
+                phase="Queued",
+                message="Queued VOD download",
+                progress=0.0,
+            )
+
+            with patch(
+                "onlysavemevods.web.subprocess.Popen",
+                side_effect=[
+                    FakeProcess(["[download] 100.0% of 1.00GiB"], 0),
+                    FakeProcess(["ERROR: no live chat replay available"], 1),
+                ],
+            ) as popen:
+                run_vod_download_job(
+                    config,
+                    job_id,
+                    stream,
+                    stream.url,
+                    output_template,
+                    previous_status="ended",
+                )
+
+            state = StateStore(config.db_path)
+            record = state.get_stream(stream.video_id)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            state.close()
+            jobs = list_tracked_jobs()
+
+        self.assertEqual(popen.call_count, 2)
+        chat_command = popen.call_args_list[1].args[0]
+        self.assertIn("--write-subs", chat_command)
+        self.assertIn("live_chat", chat_command)
+        self.assertNotIn("--live-from-start", chat_command)
+        self.assertEqual(chat_command[chat_command.index("-o") + 1], str(output_template))
+        self.assertEqual(chat_command[-1], stream.url)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "ended")
+        self.assertEqual(record.exit_code, 0)
+        event_text = "\n".join(event.message for event in events[stream.video_id])
+        self.assertIn("YouTube VOD live chat replay unavailable", event_text)
+        self.assertIn("VOD download completed from", event_text)
+        self.assertTrue(any(job.job_id == job_id and job.status == "done" for job in jobs))
+        self.assertTrue(any("live chat replay unavailable" in job.message for job in jobs))
 
     def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
         with TemporaryDirectory() as tmp:
