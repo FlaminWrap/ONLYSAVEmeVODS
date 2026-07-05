@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from urllib.parse import parse_qs, unquote, urlsplit
 import json
 import unittest
 
@@ -101,6 +102,61 @@ class KickChatReplayTests(unittest.TestCase):
         self.assertEqual([message["id"] for message in messages], ["m1", "m2"])
         self.assertEqual(messages[0]["offset_ms"], 2000)
         self.assertEqual(messages[1]["offset_ms"], 8000)
+
+    def test_history_continues_after_long_quiet_gap(self) -> None:
+        metadata = kick_vod_chat_metadata(
+            LiveStream(
+                video_id="kick:vod",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Kick VOD",
+                platform="kick",
+                raw={
+                    "id": "voduuid",
+                    "channel_id": "channel-1",
+                    "timestamp": "2026-07-05T02:18:22Z",
+                    "duration": 80,
+                },
+            )
+        )
+
+        def requester(url: str) -> dict[str, object]:
+            start_time = unquote(parse_qs(urlsplit(url).query)["start_time"][0])
+            if start_time == "2026-07-05T02:18:22Z":
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "id": "m1",
+                                "created_at": "2026-07-05T02:18:24Z",
+                                "content": "first",
+                                "sender": {"username": "Alice"},
+                            }
+                        ]
+                    }
+                }
+            if start_time == "2026-07-05T02:19:32Z":
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "id": "m2",
+                                "created_at": "2026-07-05T02:19:35Z",
+                                "content": "after quiet gap",
+                                "sender": {"username": "Bob"},
+                            }
+                        ]
+                    }
+                }
+            return {"data": {"messages": []}}
+
+        messages = fetch_kick_chat_history(
+            metadata,
+            requester=requester,
+            sleep_seconds=0,
+        )
+
+        self.assertEqual([message["id"] for message in messages], ["m1", "m2"])
+        self.assertEqual(messages[1]["offset_ms"], 73_000)
 
     def test_download_writes_normalized_sidecar(self) -> None:
         with TemporaryDirectory() as tmp:

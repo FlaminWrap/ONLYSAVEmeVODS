@@ -218,7 +218,7 @@ def fetch_kick_chat_history_for_id(
     messages: list[dict[str, Any]] = []
     seen: set[str] = set()
     total_steps = max(1, int(metadata.duration_seconds // KICK_CHAT_HISTORY_STEP_SECONDS) + 1)
-    empty_pages = 0
+    consecutive_errors = 0
     last_error = ""
 
     for step in range(total_steps):
@@ -235,17 +235,13 @@ def fetch_kick_chat_history_for_id(
             last_error = str(exc)
             if step == 0:
                 raise
-            empty_pages += 1
-            if empty_pages >= 12:
+            consecutive_errors += 1
+            if consecutive_errors >= 12:
                 break
             continue
+        consecutive_errors = 0
 
         page_messages = kick_history_messages(payload)
-        if page_messages:
-            empty_pages = 0
-        else:
-            empty_pages += 1
-
         for raw_message in page_messages:
             normalized = normalize_kick_chat_message(raw_message, metadata.stream_start)
             if normalized is None:

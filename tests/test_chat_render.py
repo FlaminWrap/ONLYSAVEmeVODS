@@ -15,6 +15,7 @@ from onlysavemevods.chat_render import (
     ChatEntry,
     ChatToken,
     CHAT_AUTHOR_COLORS,
+    CHAT_PANEL_FPS,
     choose_chat_render_nvenc_device,
     detect_nvidia_devices,
     EmojiImageCache,
@@ -591,6 +592,35 @@ class ChatRenderTests(unittest.TestCase):
         self.assertEqual(len(image_segments), 4)
         self.assertEqual(image_segments[0][0], 0.0)
         self.assertEqual(image_segments[-1][1], 1.0)
+
+    def test_chat_panel_animation_segments_use_actual_animated_images_only(self) -> None:
+        image_entry = ChatEntry(
+            offset_seconds=0.0,
+            author="Bob",
+            message="wave",
+            tokens=(
+                ChatToken(
+                    " wave ",
+                    image_url="https://example.test/wave.gif",
+                    image_key="wave",
+                    is_emoji=True,
+                ),
+            ),
+        )
+
+        static_segments = split_chat_panel_segments_for_animations(
+            [(0.0, 1.0, [(image_entry, 120)])],
+            animation_steps={},
+        )
+        animated_segments = split_chat_panel_segments_for_animations(
+            [(0.0, 0.2, [(image_entry, 120)])],
+            animation_steps={("https://example.test/wave.gif", "wave"): 1 / CHAT_PANEL_FPS},
+        )
+
+        self.assertEqual(static_segments, [(0.0, 1.0, [(image_entry, 120)])])
+        self.assertEqual(len(animated_segments), 12)
+        self.assertEqual(animated_segments[0][0], 0.0)
+        self.assertAlmostEqual(animated_segments[-1][1], 0.2)
 
     def test_render_chat_panel_video_parallel_frames_keep_concat_order(self) -> None:
         class InlineProcessPoolExecutor:

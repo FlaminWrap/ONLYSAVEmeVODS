@@ -35,9 +35,10 @@ CHAT_FINAL_EVENT_PADDING_SECONDS = 7 * 24 * 60 * 60
 CHAT_WRAP_WIDTH = 34
 CHAT_MAX_MESSAGE_LENGTH = 280
 CHAT_MESSAGE_MAX_LINES = 6
-CHAT_ANIMATION_FRAME_SECONDS = 0.25
+CHAT_PANEL_FPS = 60
+CHAT_ANIMATION_FRAME_SECONDS = 1 / CHAT_PANEL_FPS
 EMOJI_ANIMATION_DEFAULT_DURATION_MS = 100
-EMOJI_ANIMATION_MIN_DURATION_MS = 20
+EMOJI_ANIMATION_MIN_DURATION_MS = 17
 EMOJI_ANIMATION_MAX_FRAMES = 96
 KICK_EMOTE_RE = re.compile(r"\[emote:(?P<id>\d+):(?P<name>[^\]\r\n]+)\]")
 KICK_EMOTE_URL_TEMPLATE = "https://files.kick.com/emotes/{emote_id}/fullsize"
@@ -167,7 +168,6 @@ CHAT_AUTHOR_COLORS = (
     (255, 153, 153),
     (255, 128, 128),
 )
-CHAT_PANEL_FPS = 30
 DEFAULT_CHAT_RENDER_TIMEOUT_SECONDS = 60 * 60
 FFMPEG_OUTPUT_PROGRESS_POLL_SECONDS = 2.0
 KIRKLAND_TIME_ZONE = "America/Los_Angeles"
@@ -272,6 +272,19 @@ class CachedEmojiImage:
     frames: tuple[Any, ...]
     durations_ms: tuple[int, ...]
     total_duration_ms: int
+
+    @property
+    def animated(self) -> bool:
+        return len(self.frames) > 1 and self.total_duration_ms > 0
+
+    @property
+    def frame_step_seconds(self) -> float:
+        if not self.animated:
+            return 0.0
+        duration_ms = min((duration for duration in self.durations_ms if duration > 0), default=0)
+        if duration_ms <= 0:
+            duration_ms = EMOJI_ANIMATION_DEFAULT_DURATION_MS
+        return max(1 / CHAT_PANEL_FPS, duration_ms / 1000.0)
 
     def frame_at(self, at_seconds: float) -> Any | None:
         if not self.frames:
@@ -960,7 +973,8 @@ def render_chat_panel_video(
                 segments,
                 clock_origin_us,
             )
-        segments = split_chat_panel_segments_for_animations(segments)
+        animation_steps = chat_animation_steps_for_entries(entries, cache)
+        segments = split_chat_panel_segments_for_animations(segments, animation_steps=animation_steps)
         if not segments:
             segments = [(0.0, duration_seconds, [])]
         LOGGER.info(
@@ -1277,6 +1291,26 @@ def prewarm_emoji_cache(entries: list[ChatEntry], cache: "EmojiImageCache") -> i
     return len(seen)
 
 
+def chat_animation_steps_for_entries(
+    entries: list[ChatEntry],
+    cache: "EmojiImageCache",
+) -> dict[tuple[str, str], float]:
+    steps: dict[tuple[str, str], float] = {}
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        for token in entry.tokens:
+            if not token.image_url:
+                continue
+            key = (token.image_url, token.image_key)
+            if key in seen:
+                continue
+            seen.add(key)
+            step_seconds = cache.frame_step_seconds(token.image_url, token.image_key)
+            if step_seconds > 0:
+                steps[key] = step_seconds
+    return steps
+
+
 def chat_panel_segments(
     entries: list[ChatEntry],
     duration_seconds: float,
@@ -1351,22 +1385,49 @@ def split_chat_panel_segments_by_clock_minutes(
 def split_chat_panel_segments_for_animations(
     segments: list[tuple[float, float, list[tuple[ChatEntry, int]]]],
     frame_seconds: float = CHAT_ANIMATION_FRAME_SECONDS,
+    animation_steps: dict[tuple[str, str], float] | None = None,
 ) -> list[tuple[float, float, list[tuple[ChatEntry, int]]]]:
     if frame_seconds <= 0:
         return segments
 
     split_segments: list[tuple[float, float, list[tuple[ChatEntry, int]]]] = []
     for start, end, stack in segments:
-        if end <= start or not chat_stack_has_image_tokens(stack):
+        stack_frame_seconds = chat_stack_animation_frame_seconds(
+            stack,
+            animation_steps,
+            frame_seconds,
+        )
+        if end <= start or stack_frame_seconds <= 0:
             split_segments.append((start, end, stack))
             continue
 
         current = start
         while current + 0.0005 < end:
-            next_end = min(end, current + frame_seconds)
+            next_end = min(end, current + stack_frame_seconds)
             split_segments.append((current, next_end, stack))
             current = next_end
     return split_segments
+
+
+def chat_stack_animation_frame_seconds(
+    stack: list[tuple[ChatEntry, int]],
+    animation_steps: dict[tuple[str, str], float] | None,
+    fallback_frame_seconds: float,
+) -> float:
+    if animation_steps is None:
+        return fallback_frame_seconds if chat_stack_has_image_tokens(stack) else 0.0
+
+    steps: list[float] = []
+    for entry, _y in stack:
+        for token in entry.tokens:
+            if not token.image_url:
+                continue
+            step = animation_steps.get((token.image_url, token.image_key), 0.0)
+            if step > 0:
+                steps.append(step)
+    if not steps:
+        return 0.0
+    return min(steps)
 
 
 def chat_stack_has_image_tokens(stack: list[tuple[ChatEntry, int]]) -> bool:
@@ -1810,6 +1871,19 @@ class EmojiImageCache:
         if cached is None:
             return None
         return cached.frame_at(at_seconds)
+
+    def frame_step_seconds(self, url: str, key: str = "") -> float:
+        if not url:
+            return 0.0
+        cache_key = key or url
+        cached = self.memory.get(cache_key)
+        if cached is None:
+            cached = self._load(url, cache_key)
+            if cached is not None:
+                self.memory[cache_key] = cached
+        if cached is None:
+            return 0.0
+        return cached.frame_step_seconds
 
     def _load(self, url: str, cache_key: str) -> CachedEmojiImage | None:
         from PIL import Image
