@@ -281,6 +281,8 @@ STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
 STREAMER_JOB_PAGE_SIZE = 5
+STREAMER_STREAM_PAGE_SIZE = 5
+STREAMER_STREAM_PAGE_SIZE_OPTIONS = (5, 10, 25, 50)
 CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
@@ -7324,6 +7326,50 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .streamer-streams {{ display: grid; gap: 8px; }}
     .streamer-streams .stream {{ margin-top: 0; }}
+    .stream-browser {{ display: grid; gap: 8px; }}
+    .stream-browser-controls {{
+      display: grid;
+      grid-template-columns: minmax(135px, 0.7fr) minmax(220px, 1.4fr) repeat(2, minmax(140px, 0.7fr)) minmax(120px, 0.55fr);
+      gap: 8px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }}
+    .stream-browser-controls label {{
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      min-width: 0;
+    }}
+    .stream-browser-controls input,
+    .stream-browser-controls select {{
+      width: 100%;
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 6px 8px;
+      color: var(--text);
+      background: var(--panel);
+      font: inherit;
+    }}
+    .stream-browser-footer {{
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }}
+    .stream-browser-pager {{ display: flex; align-items: center; gap: 6px; }}
+    .stream-browser-list {{ display: grid; gap: 8px; }}
+    @media (max-width: 980px) {{
+      .stream-browser-controls {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    }}
+    @media (max-width: 640px) {{
+      .stream-browser-controls {{ grid-template-columns: 1fr; }}
+    }}
     .streamer-jobs {{
       display: grid;
       gap: 8px;
@@ -8252,6 +8298,9 @@ def dashboard_script() -> str:
   const expandedStreamerKey = "onlysavemevods.expandedStreamers";
   const openStreamerSettingsKey = "onlysavemevods.openStreamerSettings";
   const streamTabKey = "onlysavemevods.streamTabs";
+  const streamerStreamFilterKey = "onlysavemevods.streamerStreamFilters";
+  const streamerStreamPageSizeDefault = 5;
+  const streamerStreamPageSizeOptions = [5, 10, 25, 50];
   const tabs = ["tab-streamers", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
@@ -8498,12 +8547,21 @@ def dashboard_script() -> str:
       return {};
     }
   };
+  const readStreamerStreamFilters = () => {
+    try {
+      const parsed = JSON.parse(readLocalStorageValue(streamerStreamFilterKey) || "{}");
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  };
   const collapsedStreams = readStreamSet(collapsedKey);
   const expandedStreams = readStreamSet(expandedKey);
   const collapsedStreamers = readStreamSet(collapsedStreamerKey);
   const expandedStreamers = readStreamSet(expandedStreamerKey);
   const openStreamerSettings = readStreamSet(openStreamerSettingsKey);
   const selectedStreamTabs = readStreamTabState();
+  const streamerStreamFilters = readStreamerStreamFilters();
   const writeCollapsedStreams = () => {
     try { localStorage.setItem(collapsedKey, JSON.stringify([...collapsedStreams])); } catch (_) {}
   };
@@ -8521,6 +8579,9 @@ def dashboard_script() -> str:
   };
   const writeSelectedStreamTabs = () => {
     try { localStorage.setItem(streamTabKey, JSON.stringify(selectedStreamTabs)); } catch (_) {}
+  };
+  const writeStreamerStreamFilters = () => {
+    try { localStorage.setItem(streamerStreamFilterKey, JSON.stringify(streamerStreamFilters)); } catch (_) {}
   };
   const streamIsCollapsed = (videoId, status) => (
     collapsedStreams.has(videoId) || (status === "ended" && !expandedStreams.has(videoId))
@@ -8542,6 +8603,114 @@ def dashboard_script() -> str:
   const streamerIsCollapsed = (key, expandsDefault) => (
     collapsedStreamers.has(key) || (!expandsDefault && !expandedStreamers.has(key))
   );
+
+  const defaultStreamerStreamFilter = () => ({ platform: "all", search: "", from: "", to: "", page: 1, page_size: streamerStreamPageSizeDefault });
+  const normalizeStreamerStreamFilter = (value) => {
+    const defaults = defaultStreamerStreamFilter();
+    const state = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    const pageSize = Number(state.page_size || defaults.page_size);
+    return {
+      platform: String(state.platform || defaults.platform).toLowerCase() || "all",
+      search: String(state.search || ""),
+      from: String(state.from || ""),
+      to: String(state.to || ""),
+      page: Math.max(1, Math.trunc(Number(state.page || defaults.page)) || 1),
+      page_size: streamerStreamPageSizeOptions.includes(pageSize) ? pageSize : defaults.page_size,
+    };
+  };
+  const streamerStreamFilterFor = (key) => {
+    key = String(key || "");
+    const normalized = normalizeStreamerStreamFilter(streamerStreamFilters[key]);
+    streamerStreamFilters[key] = normalized;
+    return normalized;
+  };
+  const streamDateValue = (stream) => {
+    const iso = String((stream && (stream.last_started_at || stream.updated_at)) || "");
+    if (iso.length >= 10) return iso.slice(0, 10);
+    const epoch = Number(stream && stream.latest_file_modified_at);
+    if (epoch > 0) return new Date(epoch * 1000).toISOString().slice(0, 10);
+    return "";
+  };
+  const streamCardMatchesFilter = (card, state) => {
+    const platform = String(card.getAttribute("data-stream-platform") || "unknown").toLowerCase();
+    if (state.platform !== "all" && platform !== state.platform) return false;
+    const query = state.search.trim().toLowerCase();
+    if (query) {
+      const haystack = [
+        card.getAttribute("data-stream-title") || "",
+        card.getAttribute("data-video-id") || "",
+      ].join(" ").toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    const date = String(card.getAttribute("data-stream-date") || "");
+    if (state.from && (!date || date < state.from)) return false;
+    if (state.to && (!date || date > state.to)) return false;
+    return true;
+  };
+  const setStreamerBrowserControls = (browser, state) => {
+    const platform = browser.querySelector("[data-stream-filter-platform]");
+    const search = browser.querySelector("[data-stream-filter-search]");
+    const from = browser.querySelector("[data-stream-filter-from]");
+    const to = browser.querySelector("[data-stream-filter-to]");
+    const pageSize = browser.querySelector("[data-stream-page-size]");
+    if (platform) platform.value = state.platform;
+    if (search) search.value = state.search;
+    if (from) from.value = state.from;
+    if (to) to.value = state.to;
+    if (pageSize) pageSize.value = String(state.page_size);
+  };
+  const readStreamerBrowserControls = (browser, state) => {
+    const platform = browser.querySelector("[data-stream-filter-platform]");
+    const search = browser.querySelector("[data-stream-filter-search]");
+    const from = browser.querySelector("[data-stream-filter-from]");
+    const to = browser.querySelector("[data-stream-filter-to]");
+    const pageSize = browser.querySelector("[data-stream-page-size]");
+    const size = Number(pageSize ? pageSize.value : state.page_size);
+    state.platform = String(platform ? platform.value : state.platform || "all").toLowerCase() || "all";
+    state.search = String(search ? search.value : state.search || "");
+    state.from = String(from ? from.value : state.from || "");
+    state.to = String(to ? to.value : state.to || "");
+    state.page_size = streamerStreamPageSizeOptions.includes(size) ? size : streamerStreamPageSizeDefault;
+    state.page = Math.max(1, Math.trunc(Number(state.page || 1)) || 1);
+    return state;
+  };
+  const applyStreamerStreamBrowser = (browser) => {
+    const key = browser.getAttribute("data-streamer-key") || "";
+    const state = streamerStreamFilterFor(key);
+    if (browser.getAttribute("data-stream-browser-ready") !== "true") {
+      setStreamerBrowserControls(browser, state);
+      browser.setAttribute("data-stream-browser-ready", "true");
+    } else {
+      readStreamerBrowserControls(browser, state);
+    }
+    const cards = Array.from(browser.querySelectorAll(".stream[data-video-id]"));
+    const matches = cards.filter((card) => streamCardMatchesFilter(card, state));
+    const pageCount = Math.max(1, Math.ceil(matches.length / state.page_size));
+    state.page = Math.min(Math.max(1, state.page), pageCount);
+    const start = (state.page - 1) * state.page_size;
+    const visible = new Set(matches.slice(start, start + state.page_size));
+    cards.forEach((card) => { card.hidden = !visible.has(card); });
+    const stateText = browser.querySelector("[data-stream-browser-state]");
+    if (stateText) {
+      if (!matches.length) {
+        stateText.textContent = `No streams match ${cards.length} total stream${cards.length === 1 ? "" : "s"}.`;
+      } else {
+        const first = start + 1;
+        const last = Math.min(start + state.page_size, matches.length);
+        stateText.textContent = `Showing ${first}-${last} of ${matches.length} stream${matches.length === 1 ? "" : "s"} · page ${state.page} of ${pageCount}`;
+      }
+    }
+    const prev = browser.querySelector("[data-stream-page-prev]");
+    const next = browser.querySelector("[data-stream-page-next]");
+    if (prev) prev.disabled = state.page <= 1;
+    if (next) next.disabled = state.page >= pageCount;
+    writeStreamerStreamFilters();
+  };
+  const applyStreamerStreamBrowsers = (root) => {
+    for (const browser of root.querySelectorAll("[data-stream-browser]")) {
+      applyStreamerStreamBrowser(browser);
+    }
+  };
 
   const normalizeTabId = (id) => ({
     "tab-streams": "tab-streamers",
@@ -8628,6 +8797,19 @@ def dashboard_script() -> str:
 
   document.addEventListener("input", (event) => {
     const target = event.target;
+    const streamFilter = target && target.closest ? target.closest("[data-stream-filter-control]") : null;
+    if (streamFilter) {
+      const browser = streamFilter.closest("[data-stream-browser]");
+      if (browser) {
+        const key = browser.getAttribute("data-streamer-key") || "";
+        const state = streamerStreamFilterFor(key);
+        state.page = 1;
+        browser.setAttribute("data-stream-browser-ready", "true");
+        readStreamerBrowserControls(browser, state);
+        applyStreamerStreamBrowser(browser);
+      }
+      return;
+    }
     if (target && target.closest && target.closest("form.streamer-form")) {
       markStreamerFormDirty(target);
     }
@@ -8635,6 +8817,19 @@ def dashboard_script() -> str:
 
   document.addEventListener("change", (event) => {
     const target = event.target;
+    const streamFilter = target && target.closest ? target.closest("[data-stream-filter-control]") : null;
+    if (streamFilter) {
+      const browser = streamFilter.closest("[data-stream-browser]");
+      if (browser) {
+        const key = browser.getAttribute("data-streamer-key") || "";
+        const state = streamerStreamFilterFor(key);
+        state.page = 1;
+        browser.setAttribute("data-stream-browser-ready", "true");
+        readStreamerBrowserControls(browser, state);
+        applyStreamerStreamBrowser(browser);
+      }
+      return;
+    }
     if (target && target.closest && target.closest("form.streamer-form")) {
       markStreamerFormDirty(target);
     }
@@ -8669,7 +8864,7 @@ def dashboard_script() -> str:
     for (const card of root.querySelectorAll(".stream[data-video-id]")) {
       const videoId = card.getAttribute("data-video-id") || "";
       const selected = selectedStreamTabs[videoId];
-      if (!["files", "events", "speakers", "log", "jobs"].includes(selected)) continue;
+      if (!["files", "events", "powerchat", "speakers", "log", "jobs"].includes(selected)) continue;
       const input = card.querySelector(`[data-stream-tab="${selected}"]`);
       if (input) input.checked = true;
     }
@@ -8689,6 +8884,7 @@ def dashboard_script() -> str:
       button.textContent = collapsed ? "Expand" : "Collapse";
       button.setAttribute("aria-expanded", collapsed ? "false" : "true");
     }
+    applyStreamerStreamBrowsers(root);
   };
 
   document.addEventListener("change", (event) => {
@@ -8710,6 +8906,20 @@ def dashboard_script() -> str:
     if (voiceDetailsButton) {
       event.preventDefault();
       loadVoiceDetails(voiceDetailsButton);
+      return;
+    }
+
+    const streamPageButton = event.target.closest("[data-stream-page-prev], [data-stream-page-next]");
+    if (streamPageButton) {
+      event.preventDefault();
+      const browser = streamPageButton.closest("[data-stream-browser]");
+      if (!browser) return;
+      const key = browser.getAttribute("data-streamer-key") || "";
+      const state = streamerStreamFilterFor(key);
+      browser.setAttribute("data-stream-browser-ready", "true");
+      readStreamerBrowserControls(browser, state);
+      state.page += streamPageButton.hasAttribute("data-stream-page-next") ? 1 : -1;
+      applyStreamerStreamBrowser(browser);
       return;
     }
 
@@ -9283,7 +9493,8 @@ def dashboard_script() -> str:
     const tabName = `stream-tabs-${videoId}`;
     const vodRedownload = renderStreamVodRedownloadForm(stream);
     const powerchatSummary = formatPowerchatSummary(stream.powerchat_money_totals || [], stream.powerchat_unit_totals || []);
-    return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}">
+    const dateValue = streamDateValue(stream);
+    return `<section class="stream${collapsedClass}" data-video-id="${escapeAttr(videoId)}" data-stream-status="${escapeAttr(stream.status)}" data-stream-platform="${escapeAttr(platform)}" data-stream-title="${escapeAttr(title)}" data-stream-date="${escapeAttr(dateValue)}">
   <div class="stream-head">
     <div class="stream-title-block">
       ${renderPlatformIcon(platform, platformLabel, platformInitial)}
@@ -9592,10 +9803,44 @@ def dashboard_script() -> str:
 </div>`;
   };
 
+  const renderStreamerStreamPlatformOptions = (streams, selected) => {
+    const platforms = new Set((streams || []).map(streamPlatform).filter(Boolean));
+    if (selected && selected !== "all") platforms.add(selected);
+    const ordered = ["youtube", "twitch", "kick", "rumble", "unknown"].filter((platform) => platforms.has(platform));
+    return [`<option value="all"${selected === "all" ? " selected" : ""}>All platforms</option>`]
+      .concat(ordered.map((platform) => `<option value="${escapeAttr(platform)}"${selected === platform ? " selected" : ""}>${escapeHtml(sourcePlatformLabels[platform] || platform)}</option>`))
+      .join("");
+  };
+
+  const renderStreamerStreamPageSizeOptions = (selected) => streamerStreamPageSizeOptions
+    .map((size) => `<option value="${size}"${Number(selected) === size ? " selected" : ""}>${size}</option>`)
+    .join("");
+
+  const renderStreamerStreamBrowser = (streamer, streams) => {
+    const key = String((streamer && streamer.name) || "");
+    const state = streamerStreamFilterFor(key);
+    const controls = `<div class="stream-browser-controls">
+      <label>Platform <select data-stream-filter-control data-stream-filter-platform>${renderStreamerStreamPlatformOptions(streams, state.platform)}</select></label>
+      <label>Search title <input data-stream-filter-control data-stream-filter-search value="${escapeAttr(state.search)}" placeholder="Search title or stream id"></label>
+      <label>From <input data-stream-filter-control data-stream-filter-from type="date" value="${escapeAttr(state.from)}"></label>
+      <label>To <input data-stream-filter-control data-stream-filter-to type="date" value="${escapeAttr(state.to)}"></label>
+      <label>Per page <select data-stream-filter-control data-stream-page-size>${renderStreamerStreamPageSizeOptions(state.page_size)}</select></label>
+    </div>`;
+    const cards = streams.map((stream) => renderStreamCard(stream, streamer)).join("");
+    return `<div class="stream-browser" data-stream-browser data-streamer-key="${escapeAttr(key)}">
+      ${controls}
+      <div class="stream-browser-footer">
+        <span class="file-meta" data-stream-browser-state>Showing streams...</span>
+        <div class="stream-browser-pager"><button class="download action-button" type="button" data-stream-page-prev>Previous</button><button class="download action-button" type="button" data-stream-page-next>Next</button></div>
+      </div>
+      <div class="stream-browser-list" data-stream-list>${cards}</div>
+    </div>`;
+  };
+
   const renderStreamerStreams = (streamer) => {
     const streams = (streamer && streamer.streams) || [];
     if (!streams.length) return '<section class="empty">No streams have been seen for this streamer.</section>';
-    return streams.map((stream) => renderStreamCard(stream, streamer)).join("");
+    return renderStreamerStreamBrowser(streamer, streams);
   };
 
   const renderStreamerGroupingAction = (streamer, snapshot) => {
@@ -10737,6 +10982,15 @@ def stream_platform_details(stream: StreamStatus) -> tuple[str, str, str]:
     return platform, SOURCE_PLATFORM_LABELS[platform], SOURCE_PLATFORM_INITIALS[platform]
 
 
+def stream_filter_date_value(stream: StreamStatus) -> str:
+    for value in (stream.last_started_at, stream.updated_at):
+        if value and len(value) >= 10:
+            return value[:10]
+    if stream.latest_file_modified_at is not None:
+        return time.strftime("%Y-%m-%d", time.localtime(stream.latest_file_modified_at))
+    return ""
+
+
 def render_stream_source_meta(stream: StreamStatus) -> str:
     prefix = f"{escape(stream.source)} - " if stream.source else ""
     return (
@@ -10748,7 +11002,59 @@ def render_stream_source_meta(stream: StreamStatus) -> str:
 def render_streamer_streams(streamer: StreamerStatStatus) -> str:
     if not streamer.streams:
         return '<section class="empty">No streams have been seen for this streamer.</section>'
-    return "\n".join(render_stream_card(stream, streamer) for stream in streamer.streams)
+    return render_streamer_stream_browser(streamer, streamer.streams)
+
+
+def render_streamer_stream_browser(
+    streamer: StreamerStatStatus,
+    streams: list[StreamStatus],
+) -> str:
+    controls = render_streamer_stream_controls(streams)
+    cards = "\n".join(render_stream_card(stream, streamer) for stream in streams)
+    return f"""<div class="stream-browser" data-stream-browser data-streamer-key="{escape(streamer.name, quote=True)}">
+      {controls}
+      <div class="stream-browser-footer">
+        <span class="file-meta" data-stream-browser-state>Showing streams...</span>
+        <div class="stream-browser-pager">
+          <button class="download action-button" type="button" data-stream-page-prev>Previous</button>
+          <button class="download action-button" type="button" data-stream-page-next>Next</button>
+        </div>
+      </div>
+      <div class="stream-browser-list" data-stream-list>{cards}</div>
+    </div>"""
+
+
+def render_streamer_stream_controls(streams: list[StreamStatus]) -> str:
+    platform_options = render_streamer_stream_platform_options(streams)
+    page_size_options = "".join(
+        f'<option value="{size}"{" selected" if size == STREAMER_STREAM_PAGE_SIZE else ""}>{size}</option>'
+        for size in STREAMER_STREAM_PAGE_SIZE_OPTIONS
+    )
+    return f"""<div class="stream-browser-controls">
+      <label>Platform <select data-stream-filter-control data-stream-filter-platform>{platform_options}</select></label>
+      <label>Search title <input data-stream-filter-control data-stream-filter-search placeholder="Search title or stream id"></label>
+      <label>From <input data-stream-filter-control data-stream-filter-from type="date"></label>
+      <label>To <input data-stream-filter-control data-stream-filter-to type="date"></label>
+      <label>Per page <select data-stream-filter-control data-stream-page-size>{page_size_options}</select></label>
+    </div>"""
+
+
+def render_streamer_stream_platform_options(streams: list[StreamStatus]) -> str:
+    platforms = {
+        stream_platform_details(stream)[0]
+        for stream in streams
+    }
+    ordered = [
+        platform
+        for platform in ("youtube", "twitch", "kick", "rumble", "unknown")
+        if platform in platforms
+    ]
+    options = ['<option value="all" selected>All platforms</option>']
+    options.extend(
+        f'<option value="{escape(platform, quote=True)}">{escape(SOURCE_PLATFORM_LABELS.get(platform, platform))}</option>'
+        for platform in ordered
+    )
+    return "".join(options)
 
 
 def snapshot_config_path(snapshot: StatusSnapshot) -> str:
@@ -11622,6 +11928,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
         stream.powerchat_money_totals,
         stream.powerchat_unit_totals,
     )
+    date_value = stream_filter_date_value(stream)
     speakers = render_stream_speakers_panel(streamer, stream)
     jobs = render_stream_jobs(stream.jobs)
     vod_redownload = render_stream_vod_redownload_form(stream)
@@ -11634,7 +11941,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     jobs_tab_id = f"stream-tab-{tab_key}-jobs"
     tab_name = f"stream-tabs-{tab_key}"
 
-    return f"""<section class="stream{collapsed_class}" data-video-id="{escape(stream.video_id, quote=True)}" data-stream-status="{escape(stream.status, quote=True)}">
+    return f"""<section class="stream{collapsed_class}" data-video-id="{escape(stream.video_id, quote=True)}" data-stream-status="{escape(stream.status, quote=True)}" data-stream-platform="{escape(platform, quote=True)}" data-stream-title="{escape(title, quote=True)}" data-stream-date="{escape(date_value, quote=True)}">
   <div class="stream-head">
     <div class="stream-title-block">
       {render_platform_icon(platform, platform_label, platform_initial)}

@@ -995,9 +995,16 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("onlysavemevods.expandedStreamers", html)
         self.assertIn("onlysavemevods.openStreamerSettings", html)
         self.assertIn("onlysavemevods.streamTabs", html)
+        self.assertIn("onlysavemevods.streamerStreamFilters", html)
         self.assertIn("data-streamer-toggle", html)
         self.assertIn("data-streamer-settings-toggle", html)
         self.assertIn("data-streamer-settings-panel", html)
+        self.assertIn("data-stream-browser", html)
+        self.assertIn("data-stream-filter-platform", html)
+        self.assertIn("data-stream-filter-search", html)
+        self.assertIn("data-stream-filter-from", html)
+        self.assertIn("data-stream-filter-to", html)
+        self.assertIn("data-stream-page-size", html)
         self.assertIn("streamer-details", html)
         self.assertIn(".streamer-settings-tabs .streamer-settings-panel", html)
         self.assertNotIn("\n    .streamer-settings-panel { display: none", html)
@@ -1781,6 +1788,13 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("data-load-stream-speakers", script)
         self.assertIn("data-streamer-job-page-button", script)
         self.assertIn("data-streamer-job-page-state", script)
+        self.assertIn("onlysavemevods.streamerStreamFilters", script)
+        self.assertIn("applyStreamerStreamBrowser", script)
+        self.assertIn("data-stream-filter-platform", script)
+        self.assertIn("data-stream-filter-search", script)
+        self.assertIn("data-stream-filter-from", script)
+        self.assertIn("data-stream-filter-to", script)
+        self.assertIn("data-stream-page-next", script)
         self.assertNotIn("data-open-voice-manager", script)
         self.assertNotIn('join("' + "\n" + '")', script)
 
@@ -1922,6 +1936,73 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-streamer-job-page-state>Page 1 of 2', html)
         self.assertIn('part-1.live_chat.json', html)
         self.assertIn('part-6.live_chat.json', html)
+
+    def test_streamer_streams_have_filter_controls_and_metadata(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                streamers={
+                    "OUMB3rd": StreamerConfig(
+                        sources=["@OUMB3rd", "twitch:OUMB3rd", "kick:oumb", "rumble:user/OUMB3rd"],
+                    )
+                },
+            )
+            state = StateStore(config.db_path)
+            streams = [
+                LiveStream(
+                    video_id="youtube:YOUTUBE01",
+                    url="https://www.youtube.com/watch?v=YOUTUBE01",
+                    title="YouTube Stream",
+                    channel="OUMB3rd",
+                    platform="youtube",
+                    source="@OUMB3rd",
+                ),
+                LiveStream(
+                    video_id="twitch:OUMB3rd",
+                    url="https://www.twitch.tv/OUMB3rd",
+                    title="Twitch Stream",
+                    channel="OUMB3rd",
+                    platform="twitch",
+                    source="twitch:OUMB3rd",
+                ),
+                LiveStream(
+                    video_id="kick:oumb",
+                    url="https://kick.com/oumb",
+                    title="Kick Stream",
+                    channel="oumb",
+                    platform="kick",
+                    source="kick:oumb",
+                ),
+                LiveStream(
+                    video_id="rumble:OUMB3rd",
+                    url="https://rumble.com/user/OUMB3rd",
+                    title="Rumble Stream",
+                    channel="OUMB3rd",
+                    platform="rumble",
+                    source="rumble:user/OUMB3rd",
+                ),
+            ]
+            for stream in streams:
+                state.mark_downloading(stream, 1)
+                state.mark_ended(stream.video_id)
+            state.close()
+
+            html = render_status_html(build_status_snapshot(config))
+
+        self.assertIn('data-stream-browser data-streamer-key="OUMB3rd"', html)
+        self.assertIn('data-stream-filter-platform', html)
+        self.assertIn('data-stream-filter-search', html)
+        self.assertIn('data-stream-filter-from', html)
+        self.assertIn('data-stream-filter-to', html)
+        self.assertIn('data-stream-page-size', html)
+        self.assertIn('data-stream-page-prev', html)
+        self.assertIn('data-stream-page-next', html)
+        self.assertIn('<option value="twitch">Twitch</option>', html)
+        self.assertIn('<option value="kick">Kick</option>', html)
+        self.assertIn('<option value="rumble">Rumble</option>', html)
+        self.assertIn('data-stream-platform="kick"', html)
+        self.assertIn('data-stream-title="Kick Stream"', html)
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:
