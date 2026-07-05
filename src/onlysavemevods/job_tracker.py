@@ -107,7 +107,7 @@ def list_tracked_jobs(limit: int = MAX_TRACKED_JOBS) -> list[TrackedJob]:
     with _TRACKED_JOBS_LOCK:
         jobs = sorted(
             _TRACKED_JOBS.values(),
-            key=lambda job: job.updated_at or job.started_at,
+            key=lambda job: (job.started_at or job.updated_at or 0.0, job.job_id),
             reverse=True,
         )
     return jobs[:limit]

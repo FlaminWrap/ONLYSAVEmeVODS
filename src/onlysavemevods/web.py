@@ -1927,11 +1927,11 @@ def build_job_statuses(
             )
         )
 
-    return sorted(
-        jobs,
-        key=lambda job: job.updated_at or job.started_at or 0.0,
-        reverse=True,
-    )[:JOB_LIMIT]
+    return sorted(jobs, key=job_started_sort_key, reverse=True)[:JOB_LIMIT]
+
+
+def job_started_sort_key(job: JobStatus) -> tuple[float, str]:
+    return (job.started_at or job.updated_at or 0.0, job.job_id)
 
 
 def render_chat_status_details(job: RenderChatJob) -> dict[str, Any]:

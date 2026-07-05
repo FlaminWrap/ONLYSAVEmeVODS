@@ -23,6 +23,7 @@ from onlysavemevods.web import (
     build_vod_download_command,
     build_streamer_voice_details_payload,
     build_stream_voice_speakers_payload,
+    build_job_statuses,
     dashboard_script,
     chat_media_file_for_chat_file,
     file_kind,
@@ -1852,6 +1853,47 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(any(job["progress"] == 0.42 for job in payload["jobs"]))
         self.assertTrue(any(job["status"] == "queued" for job in payload["jobs"]))
         self.assertEqual(payload["job_limit"], 200)
+
+    def test_dashboard_jobs_order_by_start_time_not_update_time(self) -> None:
+        chat_key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
+        transcription_key = "LIVEVIDEO02\0Other.mp4"
+        with (
+            CHAT_RENDER_JOBS_LOCK,
+            TRANSCRIPTION_JOBS_LOCK,
+        ):
+            CHAT_RENDER_JOBS[chat_key] = RenderChatJob(
+                video_id="LIVEVIDEO01",
+                chat_name="Live Status [LIVEVIDEO01].live_chat.json",
+                media_name="Live Status [LIVEVIDEO01].mp4",
+                output_name="Live Status [LIVEVIDEO01] - chat.mp4",
+                status="running",
+                message="Rendering chat video",
+                started_at=100.0,
+                phase="Rendering",
+                progress=0.8,
+                updated_at=300.0,
+            )
+            TRANSCRIPTION_JOBS[transcription_key] = TranscriptionJob(
+                video_id="LIVEVIDEO02",
+                media_name="Other.mp4",
+                status="running",
+                message="Transcribing",
+                started_at=200.0,
+                phase="Running WhisperX",
+                progress=0.1,
+                updated_at=210.0,
+            )
+
+        try:
+            jobs = build_job_statuses([])
+        finally:
+            with CHAT_RENDER_JOBS_LOCK:
+                CHAT_RENDER_JOBS.pop(chat_key, None)
+            with TRANSCRIPTION_JOBS_LOCK:
+                TRANSCRIPTION_JOBS.pop(transcription_key, None)
+
+        self.assertEqual([job.kind for job in jobs[:2]], ["Transcription", "Chat render"])
+        self.assertEqual(jobs[1].updated_at, 300.0)
 
     def test_streamer_stats_include_matching_jobs(self) -> None:
         with TemporaryDirectory() as tmp:
