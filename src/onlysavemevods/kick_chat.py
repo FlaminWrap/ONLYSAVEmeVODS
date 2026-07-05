@@ -18,6 +18,8 @@ from .models import LiveStream
 
 LOGGER = logging.getLogger(__name__)
 KICK_CHAT_HISTORY_STEP_SECONDS = 5
+KICK_CHAT_HISTORY_DEFAULT_SLEEP_SECONDS = 0.1
+KICK_CHAT_HISTORY_PAGE_RETRIES = 2
 KICK_CHAT_HISTORY_ENDPOINT_HOSTS = ("https://web.kick.com", "https://kick.com")
 KICK_EMOTE_RE = re.compile(r"\[emote:(?P<id>\d+):(?P<name>[^\]\r\n]+)\]")
 KICK_CHAT_USER_AGENT = (
@@ -27,7 +29,16 @@ KICK_CHAT_USER_AGENT = (
 
 
 class KickChatReplayError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,7 +70,7 @@ def download_kick_vod_chat_replay(
     *,
     requester: JsonRequester | None = None,
     progress: ProgressCallback | None = None,
-    sleep_seconds: float = 0.05,
+    sleep_seconds: float = KICK_CHAT_HISTORY_DEFAULT_SLEEP_SECONDS,
 ) -> KickChatReplayResult:
     if stream.platform != "kick":
         return KickChatReplayResult(False, "stream is not a Kick VOD")
@@ -174,7 +185,7 @@ def fetch_kick_chat_history(
     *,
     requester: JsonRequester | None = None,
     progress: ProgressCallback | None = None,
-    sleep_seconds: float = 0.05,
+    sleep_seconds: float = KICK_CHAT_HISTORY_DEFAULT_SLEEP_SECONDS,
 ) -> list[dict[str, Any]]:
     requester = requester or request_kick_json
     candidates = [
@@ -230,14 +241,22 @@ def fetch_kick_chat_history_for_id(
             f"?start_time={quote(start_iso, safe='')}"
         )
         try:
-            payload = requester(url)
+            payload = request_kick_history_page(
+                url,
+                requester=requester,
+                sleep_seconds=sleep_seconds,
+            )
         except KickChatReplayError as exc:
             last_error = str(exc)
             if step == 0:
                 raise
             consecutive_errors += 1
-            if consecutive_errors >= 12:
-                break
+            LOGGER.debug(
+                "Skipping Kick chat replay page after error offset=%ss history_id=%s error=%s",
+                offset_seconds,
+                history_id,
+                exc,
+            )
             continue
         consecutive_errors = 0
 
@@ -265,6 +284,43 @@ def fetch_kick_chat_history_for_id(
     if messages:
         return messages
     raise KickChatReplayError(last_error or "Kick chat replay returned no messages")
+
+
+def request_kick_history_page(
+    url: str,
+    *,
+    requester: JsonRequester,
+    sleep_seconds: float,
+) -> dict[str, Any]:
+    last_error: KickChatReplayError | None = None
+    for attempt in range(KICK_CHAT_HISTORY_PAGE_RETRIES + 1):
+        try:
+            return requester(url)
+        except KickChatReplayError as exc:
+            last_error = exc
+            if attempt >= KICK_CHAT_HISTORY_PAGE_RETRIES or not kick_chat_error_is_retryable(exc):
+                raise
+            delay = kick_chat_retry_delay(exc, sleep_seconds, attempt)
+            if delay > 0:
+                time.sleep(delay)
+    assert last_error is not None
+    raise last_error
+
+
+def kick_chat_error_is_retryable(exc: KickChatReplayError) -> bool:
+    if exc.status_code is None:
+        return True
+    return exc.status_code in {408, 425, 429} or 500 <= exc.status_code < 600
+
+
+def kick_chat_retry_delay(
+    exc: KickChatReplayError,
+    sleep_seconds: float,
+    attempt: int,
+) -> float:
+    if exc.retry_after_seconds is not None:
+        return max(0.0, exc.retry_after_seconds)
+    return max(0.0, sleep_seconds) * (attempt + 1) * 4
 
 
 def kick_history_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -401,7 +457,11 @@ def request_kick_json(url: str) -> dict[str, Any]:
         with urlopen(request, timeout=30) as response:
             body = response.read()
     except HTTPError as exc:
-        raise KickChatReplayError(f"Kick returned HTTP {exc.code}") from exc
+        raise KickChatReplayError(
+            f"Kick returned HTTP {exc.code}",
+            status_code=exc.code,
+            retry_after_seconds=parse_retry_after_seconds(exc.headers.get("Retry-After")),
+        ) from exc
     except URLError as exc:
         raise KickChatReplayError(str(exc.reason) or exc.__class__.__name__) from exc
     except OSError as exc:
@@ -416,6 +476,18 @@ def request_kick_json(url: str) -> dict[str, Any]:
     if "message" in parsed and not parsed.get("data") and not parsed.get("messages"):
         message = str(parsed.get("message") or "Kick chat replay was not available").strip()
         raise KickChatReplayError(message or "Kick chat replay was not available")
+    return parsed
+
+
+def parse_retry_after_seconds(value: str | None) -> float | None:
+    if value is None:
+        return None
+    try:
+        parsed = float(value.strip())
+    except ValueError:
+        return None
+    if parsed < 0:
+        return None
     return parsed
 
 

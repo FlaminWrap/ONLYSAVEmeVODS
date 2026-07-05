@@ -158,6 +158,66 @@ class KickChatReplayTests(unittest.TestCase):
         self.assertEqual([message["id"] for message in messages], ["m1", "m2"])
         self.assertEqual(messages[1]["offset_ms"], 73_000)
 
+    def test_history_continues_after_transient_error_run(self) -> None:
+        metadata = kick_vod_chat_metadata(
+            LiveStream(
+                video_id="kick:vod",
+                url="https://kick.com/oumb/videos/voduuid",
+                title="Kick VOD",
+                platform="kick",
+                raw={
+                    "id": "voduuid",
+                    "channel_id": "channel-1",
+                    "timestamp": "2026-07-05T02:18:22Z",
+                    "duration": 90,
+                },
+            )
+        )
+        stream_start = datetime.fromisoformat("2026-07-05T02:18:22+00:00")
+
+        def requester(url: str) -> dict[str, object]:
+            start_time = unquote(parse_qs(urlsplit(url).query)["start_time"][0])
+            requested = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            offset_seconds = int((requested - stream_start).total_seconds())
+            if offset_seconds == 0:
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "id": "m1",
+                                "created_at": "2026-07-05T02:18:24Z",
+                                "content": "first",
+                                "sender": {"username": "Alice"},
+                            }
+                        ]
+                    }
+                }
+            if 5 <= offset_seconds <= 65:
+                raise KickChatReplayError("temporary Kick history error")
+            if offset_seconds == 70:
+                return {
+                    "data": {
+                        "messages": [
+                            {
+                                "id": "m2",
+                                "created_at": "2026-07-05T02:19:34Z",
+                                "content": "after errors",
+                                "sender": {"username": "Bob"},
+                            }
+                        ]
+                    }
+                }
+            return {"data": {"messages": []}}
+
+        messages = fetch_kick_chat_history(
+            metadata,
+            requester=requester,
+            sleep_seconds=0,
+        )
+
+        self.assertEqual([message["id"] for message in messages], ["m1", "m2"])
+        self.assertEqual(messages[1]["offset_ms"], 72_000)
+
     def test_download_writes_normalized_sidecar(self) -> None:
         with TemporaryDirectory() as tmp:
             output_template = Path(tmp) / "Hungover [kick].%(ext)s"
