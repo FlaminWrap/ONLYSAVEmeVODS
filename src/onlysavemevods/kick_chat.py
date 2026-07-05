@@ -9,6 +9,7 @@ from urllib.parse import quote, urlsplit
 from urllib.request import Request, urlopen
 import json
 import logging
+import re
 import tempfile
 import time
 
@@ -18,6 +19,7 @@ from .models import LiveStream
 LOGGER = logging.getLogger(__name__)
 KICK_CHAT_HISTORY_STEP_SECONDS = 5
 KICK_CHAT_HISTORY_ENDPOINT_HOSTS = ("https://web.kick.com", "https://kick.com")
+KICK_EMOTE_RE = re.compile(r"\[emote:(?P<id>\d+):(?P<name>[^\]\r\n]+)\]")
 KICK_CHAT_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -311,9 +313,49 @@ def normalize_kick_chat_message(
         "author": author,
         "message": content,
         "badges": list(raw_message.get("badges") or sender_dict.get("badges") or []),
-        "emotes": list(raw_message.get("emotes") or []),
+        "emotes": normalized_kick_emotes(raw_message.get("emotes"), content),
         "raw": raw_message,
     }
+
+
+def normalized_kick_emotes(raw_emotes: Any, content: str) -> list[dict[str, Any]]:
+    emotes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if isinstance(raw_emotes, list):
+        for raw in raw_emotes:
+            if not isinstance(raw, dict):
+                continue
+            emote_id = first_text(raw.get("id"), raw.get("emote_id"), raw.get("emoteId"))
+            name = first_text(raw.get("name"), raw.get("text"), raw.get("code"))
+            if not emote_id or emote_id in seen:
+                continue
+            seen.add(emote_id)
+            emotes.append(
+                {
+                    "id": emote_id,
+                    "name": name,
+                    "image_url": kick_emote_image_url(emote_id),
+                    "raw": raw,
+                }
+            )
+
+    for match in KICK_EMOTE_RE.finditer(content):
+        emote_id = match.group("id")
+        if emote_id in seen:
+            continue
+        seen.add(emote_id)
+        emotes.append(
+            {
+                "id": emote_id,
+                "name": match.group("name").strip(),
+                "image_url": kick_emote_image_url(emote_id),
+            }
+        )
+    return emotes
+
+
+def kick_emote_image_url(emote_id: str) -> str:
+    return f"https://files.kick.com/emotes/{emote_id}/fullsize"
 
 
 def write_kick_chat_sidecar(

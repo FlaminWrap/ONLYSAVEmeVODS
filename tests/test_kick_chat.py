@@ -126,7 +126,7 @@ class KickChatReplayTests(unittest.TestCase):
                             {
                                 "id": "m1",
                                 "created_at": "2026-07-05T02:18:23Z",
-                                "content": "replay chat",
+                                "content": "replay [emote:4148074:HYPERCLAP] chat",
                                 "sender": {"username": "Alice"},
                             }
                         ]
@@ -147,8 +147,18 @@ class KickChatReplayTests(unittest.TestCase):
         self.assertEqual(result.messages, 1)
         self.assertEqual(payload["platform"], "kick")
         self.assertEqual(payload["source"], "kick:oumb")
-        self.assertEqual(payload["messages"][0]["message"], "replay chat")
+        self.assertEqual(payload["messages"][0]["message"], "replay [emote:4148074:HYPERCLAP] chat")
         self.assertEqual(payload["messages"][0]["offset_ms"], 1000)
+        self.assertEqual(
+            payload["messages"][0]["emotes"],
+            [
+                {
+                    "id": "4148074",
+                    "name": "HYPERCLAP",
+                    "image_url": "https://files.kick.com/emotes/4148074/fullsize",
+                }
+            ],
+        )
 
     def test_missing_history_reports_unavailable(self) -> None:
         metadata = kick_vod_chat_metadata(

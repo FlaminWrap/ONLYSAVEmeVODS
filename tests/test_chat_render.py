@@ -41,6 +41,7 @@ from onlysavemevods.chat_render import (
     render_chat_ass,
     render_chat_video_file,
     resolve_chat_render_panel_workers,
+    split_chat_panel_segments_for_animations,
     visible_chat_stack,
     wrap_panel_message_lines,
 )
@@ -173,6 +174,51 @@ class ChatRenderTests(unittest.TestCase):
         self.assertEqual(entries[0].author, "Alice")
         self.assertEqual(entries[0].message, "hello Kick")
         self.assertEqual(entries[0].tokens[0].text, "hello Kick")
+
+    def test_parse_normalized_kick_live_chat_converts_emote_placeholders_to_images(self) -> None:
+        with TemporaryDirectory() as tmp:
+            chat_file = Path(tmp) / "Kick [kick].live_chat.json"
+            chat_file.write_text(
+                json.dumps(
+                    {
+                        "platform": "kick",
+                        "source": "kick:oumb",
+                        "video_id": "kick:vod",
+                        "messages": [
+                            {
+                                "id": "m1",
+                                "created_at": "2026-07-05T02:18:24Z",
+                                "offset_ms": 2000,
+                                "author": "Alice",
+                                "message": "hello [emote:4148074:HYPERCLAP] chat",
+                                "badges": [],
+                                "emotes": [
+                                    {
+                                        "id": "4148074",
+                                        "name": "HYPERCLAP",
+                                        "image_url": "https://files.kick.com/emotes/4148074/fullsize",
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            entries = parse_live_chat_file(chat_file)
+
+        self.assertEqual(entries[0].message, "hello HYPERCLAP chat")
+        self.assertEqual(len(entries[0].tokens), 3)
+        self.assertEqual(entries[0].tokens[0].text, "hello ")
+        self.assertTrue(entries[0].tokens[1].is_emoji)
+        self.assertEqual(entries[0].tokens[1].text, " HYPERCLAP ")
+        self.assertEqual(
+            entries[0].tokens[1].image_url,
+            "https://files.kick.com/emotes/4148074/fullsize",
+        )
+        self.assertEqual(entries[0].tokens[1].image_key, "kick-emote:4148074")
+        self.assertEqual(entries[0].tokens[2].text, " chat")
 
     def test_parse_live_chat_resolves_youtube_emoji_shortcodes(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -420,6 +466,131 @@ class ChatRenderTests(unittest.TestCase):
             if pixels[x, y][0] > 200 and pixels[x, y][1] < 60 and pixels[x, y][2] < 60
         )
         self.assertGreater(red_pixels, 20)
+
+    def test_emoji_cache_animates_gif_frames(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from PIL import Image
+
+            gif_path = Path(tmp) / "animated.gif"
+            first = Image.new("RGBA", (12, 12), (255, 0, 0, 255))
+            second = Image.new("RGBA", (12, 12), (0, 0, 255, 255))
+            first.save(
+                gif_path,
+                save_all=True,
+                append_images=[second],
+                duration=80,
+                loop=0,
+            )
+
+            cache = EmojiImageCache(Path(tmp) / "cache")
+            image = cache.get(gif_path.as_uri(), "animated")
+            second_image = cache.get_frame(gif_path.as_uri(), "animated", at_seconds=0.09)
+
+        self.assertIsNotNone(image)
+        assert image is not None
+        pixel = image.getpixel((3, 3))
+        self.assertGreater(pixel[0], 200)
+        self.assertLess(pixel[2], 80)
+        self.assertIsNotNone(second_image)
+        assert second_image is not None
+        second_pixel = second_image.getpixel((3, 3))
+        self.assertLess(second_pixel[0], 80)
+        self.assertGreater(second_pixel[2], 200)
+
+    def test_render_chat_panel_frame_uses_animation_time_for_emoji_images(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from PIL import Image
+
+            gif_path = Path(tmp) / "animated.gif"
+            first = Image.new("RGBA", (24, 24), (255, 0, 0, 255))
+            second = Image.new("RGBA", (24, 24), (0, 0, 255, 255))
+            first.save(
+                gif_path,
+                save_all=True,
+                append_images=[second],
+                duration=80,
+                loop=0,
+            )
+            layout = chat_layout_for_video(1280, 720)
+            entry = ChatEntry(
+                offset_seconds=1.25,
+                author="Alice",
+                message="hello fire",
+                tokens=(
+                    ChatToken("hello "),
+                    ChatToken(
+                        " fire ",
+                        image_url=gif_path.as_uri(),
+                        image_key="animated-fire",
+                        is_emoji=True,
+                    ),
+                ),
+            )
+            cache = EmojiImageCache(Path(tmp) / "cache")
+
+            first_frame = render_chat_panel_frame(
+                [(entry, 120)],
+                layout,
+                cache=cache,
+                animation_time=0.0,
+            )
+            second_frame = render_chat_panel_frame(
+                [(entry, 120)],
+                layout,
+                cache=cache,
+                animation_time=0.09,
+            )
+
+        first_pixels = first_frame.load()
+        second_pixels = second_frame.load()
+        first_red_pixels = sum(
+            1
+            for y in range(first_frame.height)
+            for x in range(first_frame.width)
+            if first_pixels[x, y][0] > 200
+            and first_pixels[x, y][1] < 60
+            and first_pixels[x, y][2] < 60
+        )
+        second_blue_pixels = sum(
+            1
+            for y in range(second_frame.height)
+            for x in range(second_frame.width)
+            if second_pixels[x, y][0] < 60
+            and second_pixels[x, y][1] < 60
+            and second_pixels[x, y][2] > 200
+        )
+        self.assertGreater(first_red_pixels, 20)
+        self.assertGreater(second_blue_pixels, 20)
+
+    def test_chat_panel_animation_segments_split_only_when_images_are_visible(self) -> None:
+        text_entry = ChatEntry(offset_seconds=0.0, author="Alice", message="hello")
+        image_entry = ChatEntry(
+            offset_seconds=0.0,
+            author="Bob",
+            message="wave",
+            tokens=(
+                ChatToken(
+                    " wave ",
+                    image_url="https://example.test/wave.gif",
+                    image_key="wave",
+                    is_emoji=True,
+                ),
+            ),
+        )
+
+        text_segments = split_chat_panel_segments_for_animations(
+            [(0.0, 1.0, [(text_entry, 120)])],
+            frame_seconds=0.25,
+        )
+        image_segments = split_chat_panel_segments_for_animations(
+            [(0.0, 1.0, [(image_entry, 120)])],
+            frame_seconds=0.25,
+        )
+
+        self.assertEqual(text_segments, [(0.0, 1.0, [(text_entry, 120)])])
+        self.assertEqual(len(image_segments), 4)
+        self.assertEqual(image_segments[0][0], 0.0)
+        self.assertEqual(image_segments[-1][1], 1.0)
 
     def test_render_chat_panel_video_parallel_frames_keep_concat_order(self) -> None:
         class InlineProcessPoolExecutor:

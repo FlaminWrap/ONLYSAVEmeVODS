@@ -35,6 +35,12 @@ CHAT_FINAL_EVENT_PADDING_SECONDS = 7 * 24 * 60 * 60
 CHAT_WRAP_WIDTH = 34
 CHAT_MAX_MESSAGE_LENGTH = 280
 CHAT_MESSAGE_MAX_LINES = 6
+CHAT_ANIMATION_FRAME_SECONDS = 0.25
+EMOJI_ANIMATION_DEFAULT_DURATION_MS = 100
+EMOJI_ANIMATION_MIN_DURATION_MS = 20
+EMOJI_ANIMATION_MAX_FRAMES = 96
+KICK_EMOTE_RE = re.compile(r"\[emote:(?P<id>\d+):(?P<name>[^\]\r\n]+)\]")
+KICK_EMOTE_URL_TEMPLATE = "https://files.kick.com/emotes/{emote_id}/fullsize"
 
 CHAT_RENDERER_KEYS = {
     "liveChatMembershipItemRenderer",
@@ -261,6 +267,27 @@ class ChatPanelFrameJob:
     duration: float
 
 
+@dataclass(frozen=True, slots=True)
+class CachedEmojiImage:
+    frames: tuple[Any, ...]
+    durations_ms: tuple[int, ...]
+    total_duration_ms: int
+
+    def frame_at(self, at_seconds: float) -> Any | None:
+        if not self.frames:
+            return None
+        if len(self.frames) == 1 or self.total_duration_ms <= 0:
+            return self.frames[0]
+
+        at_ms = int(max(0.0, at_seconds) * 1000) % self.total_duration_ms
+        elapsed = 0
+        for frame, duration_ms in zip(self.frames, self.durations_ms):
+            elapsed += duration_ms
+            if at_ms < elapsed:
+                return frame
+        return self.frames[-1]
+
+
 _CHAT_PANEL_WORKER_LAYOUT: ChatLayout | None = None
 _CHAT_PANEL_WORKER_FONTS: ChatPanelFonts | None = None
 _CHAT_PANEL_WORKER_CACHE: "EmojiImageCache | None" = None
@@ -478,9 +505,12 @@ def parse_normalized_live_chat_file(path: Path) -> list[ChatEntry] | None:
         offset_ms = coerce_int(message.get("offset_ms"), None)
         created_at = parse_chat_iso_timestamp_us(message.get("created_at"))
         author = clean_chat_text(str(message.get("author") or "Unknown")) or "Unknown"
-        text = clean_chat_text(str(message.get("message") or ""))
+        raw_text = str(message.get("message") or "")
+        tokens = tuple(kick_chat_tokens(raw_text))
+        text = clean_chat_text("".join(token.text for token in tokens))
         if not text:
             continue
+        tokens = clean_chat_tokens(tokens, text)
         offset_seconds = max(0.0, (offset_ms or 0) / 1000)
         key = (round(offset_seconds * 100), author, text)
         if key in seen:
@@ -491,11 +521,37 @@ def parse_normalized_live_chat_file(path: Path) -> list[ChatEntry] | None:
                 offset_seconds=offset_seconds,
                 author=author,
                 message=text,
-                tokens=(ChatToken(text),),
+                tokens=tokens,
                 timestamp_us=created_at,
             )
         )
     return sorted(entries, key=lambda entry: entry.offset_seconds)
+
+
+def kick_chat_tokens(message: str) -> list[ChatToken]:
+    tokens: list[ChatToken] = []
+    cursor = 0
+    for match in KICK_EMOTE_RE.finditer(message):
+        if match.start() > cursor:
+            tokens.append(ChatToken(message[cursor : match.start()]))
+        emote_id = match.group("id")
+        emote_name = match.group("name").strip() or "emote"
+        tokens.append(
+            ChatToken(
+                f" {emote_name} ",
+                image_url=kick_emote_image_url(emote_id),
+                image_key=f"kick-emote:{emote_id}",
+                is_emoji=True,
+            )
+        )
+        cursor = match.end()
+    if cursor < len(message):
+        tokens.append(ChatToken(message[cursor:]))
+    return tokens or [ChatToken(message)]
+
+
+def kick_emote_image_url(emote_id: str) -> str:
+    return KICK_EMOTE_URL_TEMPLATE.format(emote_id=emote_id)
 
 
 def parse_chat_iso_timestamp_us(value: Any) -> int | None:
@@ -904,6 +960,7 @@ def render_chat_panel_video(
                 segments,
                 clock_origin_us,
             )
+        segments = split_chat_panel_segments_for_animations(segments)
         if not segments:
             segments = [(0.0, duration_seconds, [])]
         LOGGER.info(
@@ -1163,6 +1220,7 @@ def render_chat_panel_frame_job(
         fonts,
         cache,
         job.header_time_text,
+        animation_time=job.start,
     )
     image.save(job.path)
 
@@ -1290,6 +1348,35 @@ def split_chat_panel_segments_by_clock_minutes(
     return split_segments
 
 
+def split_chat_panel_segments_for_animations(
+    segments: list[tuple[float, float, list[tuple[ChatEntry, int]]]],
+    frame_seconds: float = CHAT_ANIMATION_FRAME_SECONDS,
+) -> list[tuple[float, float, list[tuple[ChatEntry, int]]]]:
+    if frame_seconds <= 0:
+        return segments
+
+    split_segments: list[tuple[float, float, list[tuple[ChatEntry, int]]]] = []
+    for start, end, stack in segments:
+        if end <= start or not chat_stack_has_image_tokens(stack):
+            split_segments.append((start, end, stack))
+            continue
+
+        current = start
+        while current + 0.0005 < end:
+            next_end = min(end, current + frame_seconds)
+            split_segments.append((current, next_end, stack))
+            current = next_end
+    return split_segments
+
+
+def chat_stack_has_image_tokens(stack: list[tuple[ChatEntry, int]]) -> bool:
+    for entry, _y in stack:
+        for token in entry.tokens:
+            if token.image_url:
+                return True
+    return False
+
+
 def next_clock_minute_offset_seconds(clock_origin_us: int, offset_seconds: float) -> float:
     timestamp_us = clock_origin_us + round(offset_seconds * 1_000_000)
     next_minute_us = ((timestamp_us // 60_000_000) + 1) * 60_000_000
@@ -1329,6 +1416,7 @@ def render_chat_panel_frame(
     fonts: ChatPanelFonts | None = None,
     cache: "EmojiImageCache | None" = None,
     header_time_text: str = "",
+    animation_time: float = 0.0,
 ) -> Any:
     from PIL import Image, ImageDraw
 
@@ -1341,7 +1429,7 @@ def render_chat_panel_frame(
     )
     draw = ImageDraw.Draw(image)
 
-    draw_chat_messages(draw, image, stack, layout, fonts, cache)
+    draw_chat_messages(draw, image, stack, layout, fonts, cache, animation_time)
     draw_chat_header(draw, layout, fonts, header_time_text)
     return image
 
@@ -1415,9 +1503,20 @@ def draw_chat_messages(
     layout: ChatLayout,
     fonts: ChatPanelFonts,
     cache: "EmojiImageCache",
+    animation_time: float = 0.0,
 ) -> None:
     for entry, y in stack:
-        draw_chat_entry(draw, image, entry, layout.panel_padding_x, y, layout, fonts, cache)
+        draw_chat_entry(
+            draw,
+            image,
+            entry,
+            layout.panel_padding_x,
+            y,
+            layout,
+            fonts,
+            cache,
+            animation_time,
+        )
 
 
 def draw_chat_entry(
@@ -1429,6 +1528,7 @@ def draw_chat_entry(
     layout: ChatLayout,
     fonts: ChatPanelFonts,
     cache: "EmojiImageCache",
+    animation_time: float = 0.0,
 ) -> None:
     line_height = panel_line_height(layout)
     draw.text(
@@ -1441,7 +1541,17 @@ def draw_chat_entry(
     )
     current_y = y + line_height
     for line in wrap_panel_message_lines(entry, layout, fonts):
-        draw_panel_line(draw, image, line, x, current_y, layout, fonts, cache)
+        draw_panel_line(
+            draw,
+            image,
+            line,
+            x,
+            current_y,
+            layout,
+            fonts,
+            cache,
+            animation_time,
+        )
         current_y += line_height
 
 
@@ -1454,12 +1564,13 @@ def draw_panel_line(
     layout: ChatLayout,
     fonts: ChatPanelFonts,
     cache: "EmojiImageCache",
+    animation_time: float = 0.0,
 ) -> None:
     current_x = x
     emoji_size = panel_emoji_size(layout)
     for item in line:
         if item.is_image and item.image_url:
-            emoji = cache.get(item.image_url, item.image_key)
+            emoji = cache.get_frame(item.image_url, item.image_key, animation_time)
             if emoji is not None:
                 resized = emoji.resize((emoji_size, emoji_size))
                 image.paste(
@@ -1680,31 +1791,60 @@ def find_font_file(pattern: str) -> str:
 class EmojiImageCache:
     def __init__(self, cache_dir: Path | None) -> None:
         self.cache_dir = cache_dir
-        self.memory: dict[str, Any] = {}
+        self.memory: dict[str, CachedEmojiImage] = {}
         if self.cache_dir is not None:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def get(self, url: str, key: str = "") -> Any | None:
+        return self.get_frame(url, key, 0.0)
+
+    def get_frame(self, url: str, key: str = "", at_seconds: float = 0.0) -> Any | None:
         if not url:
             return None
         cache_key = key or url
-        if cache_key in self.memory:
-            return self.memory[cache_key]
+        cached = self.memory.get(cache_key)
+        if cached is None:
+            cached = self._load(url, cache_key)
+            if cached is not None:
+                self.memory[cache_key] = cached
+        if cached is None:
+            return None
+        return cached.frame_at(at_seconds)
 
-        image = self._load(url, cache_key)
-        if image is not None:
-            self.memory[cache_key] = image
-        return image
-
-    def _load(self, url: str, cache_key: str) -> Any | None:
+    def _load(self, url: str, cache_key: str) -> CachedEmojiImage | None:
         from PIL import Image
 
-        path = self._cache_path(cache_key)
-        if path is not None and path.exists():
+        data = self._read_image_bytes(url, cache_key)
+        if data is not None:
             try:
-                return Image.open(path).convert("RGBA")
+                cached = self._decode_image(data)
             except OSError:
-                path.unlink(missing_ok=True)
+                cached = None
+            if cached is not None:
+                self._save_static_fallback(cache_key, cached.frames[0])
+                return cached
+
+        path = self._cache_path(cache_key)
+        if path is None or not path.exists():
+            return None
+        try:
+            image = Image.open(path).convert("RGBA")
+        except OSError:
+            path.unlink(missing_ok=True)
+            return None
+        return CachedEmojiImage(
+            frames=(image,),
+            durations_ms=(EMOJI_ANIMATION_DEFAULT_DURATION_MS,),
+            total_duration_ms=EMOJI_ANIMATION_DEFAULT_DURATION_MS,
+        )
+
+    def _read_image_bytes(self, url: str, cache_key: str) -> bytes | None:
+        blob_path = self._blob_cache_path(cache_key)
+        if blob_path is not None and blob_path.exists():
+            try:
+                return blob_path.read_bytes()
+            except OSError:
+                blob_path.unlink(missing_ok=True)
 
         try:
             with urlopen(url, timeout=10) as response:
@@ -1712,23 +1852,62 @@ class EmojiImageCache:
         except (OSError, URLError):
             return None
 
+        if blob_path is not None:
+            try:
+                blob_path.write_bytes(data)
+            except OSError:
+                pass
+        return data
+
+    def _decode_image(self, data: bytes) -> CachedEmojiImage | None:
+        from PIL import Image, ImageSequence
+
         try:
-            image = Image.open(BytesIO(data)).convert("RGBA")
+            image = Image.open(BytesIO(data))
         except OSError:
             return None
 
-        if path is not None:
-            try:
-                image.save(path)
-            except OSError:
-                pass
-        return image
+        frames: list[Any] = []
+        durations_ms: list[int] = []
+        for frame in ImageSequence.Iterator(image):
+            frames.append(frame.convert("RGBA").copy())
+            duration_ms = coerce_int(
+                frame.info.get("duration"),
+                EMOJI_ANIMATION_DEFAULT_DURATION_MS,
+            )
+            durations_ms.append(max(EMOJI_ANIMATION_MIN_DURATION_MS, duration_ms or 0))
+            if len(frames) >= EMOJI_ANIMATION_MAX_FRAMES:
+                break
+
+        if not frames:
+            return None
+        total_duration_ms = sum(durations_ms) or EMOJI_ANIMATION_DEFAULT_DURATION_MS
+        return CachedEmojiImage(
+            frames=tuple(frames),
+            durations_ms=tuple(durations_ms),
+            total_duration_ms=total_duration_ms,
+        )
+
+    def _save_static_fallback(self, cache_key: str, image: Any) -> None:
+        path = self._cache_path(cache_key)
+        if path is None:
+            return
+        try:
+            image.save(path)
+        except OSError:
+            pass
 
     def _cache_path(self, cache_key: str) -> Path | None:
         if self.cache_dir is None:
             return None
         digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.png"
+
+    def _blob_cache_path(self, cache_key: str) -> Path | None:
+        if self.cache_dir is None:
+            return None
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+        return self.cache_dir / f"{digest}.image"
 
 
 def escape_concat_path(path: Path) -> str:
