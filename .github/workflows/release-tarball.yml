@@ -1,0 +1,191 @@
+name: Release tarball
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Existing release tag to attach the tarball to"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release-tarball:
+    name: Build install bundle
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag_name }}
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag_name }}
+
+      - name: Build install bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${RELEASE_TAG}" ]]; then
+            echo "::error::Release tag is empty"
+            exit 1
+          fi
+          if [[ "${RELEASE_TAG}" == */* ]]; then
+            echo "::error::Release tag contains '/', which cannot be used in the bundle filename: ${RELEASE_TAG}"
+            exit 1
+          fi
+
+          package_version="${RELEASE_TAG#[vV]}"
+          if [[ ! "${package_version}" =~ ^[0-9]+([.][0-9]+)*([a-zA-Z]+[0-9]+)?([.](post|dev)[0-9]+)?([+][A-Za-z0-9]+([._-][A-Za-z0-9]+)*)?$ ]]; then
+            echo "::error::Release tag must be a PEP 440-ish Python package version, optionally prefixed with v: ${RELEASE_TAG}"
+            exit 1
+          fi
+          echo "PACKAGE_VERSION=${package_version}" >> "${GITHUB_ENV}"
+
+          bundle="ONLYSAVEmeVODS-${RELEASE_TAG}"
+          staging="dist/${bundle}"
+
+          rm -rf dist
+          mkdir -p "${staging}"
+
+          required_paths=(
+            pyproject.toml
+            README.md
+            config.example.toml
+            src
+            scripts
+            tests
+          )
+
+          for path in "${required_paths[@]}"; do
+            if [[ ! -e "${path}" ]]; then
+              echo "::error::Required bundle path is missing: ${path}"
+              exit 1
+            fi
+            cp -a "${path}" "${staging}/"
+          done
+
+          if [[ -d docs ]]; then
+            cp -a docs "${staging}/"
+          fi
+
+          python - "${staging}" "${package_version}" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          root = Path(sys.argv[1])
+          package_version = sys.argv[2]
+
+          pyproject = root / "pyproject.toml"
+          pyproject_text = pyproject.read_text(encoding="utf-8")
+          pyproject_text, pyproject_count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{package_version}"',
+              pyproject_text,
+              count=1,
+          )
+          if pyproject_count != 1:
+              raise SystemExit("Unable to update pyproject.toml project version")
+          pyproject.write_text(pyproject_text, encoding="utf-8")
+
+          init_file = root / "src" / "onlysavemevods" / "__init__.py"
+          init_text = init_file.read_text(encoding="utf-8")
+          if re.search(r'(?m)^_FALLBACK_VERSION = "[^"]+"$', init_text):
+              init_text, init_count = re.subn(
+                  r'(?m)^_FALLBACK_VERSION = "[^"]+"$',
+                  f'_FALLBACK_VERSION = "{package_version}"',
+                  init_text,
+                  count=1,
+              )
+          else:
+              init_text, init_count = re.subn(
+                  r'(?m)^__version__ = "[^"]+"$',
+                  f'__version__ = "{package_version}"',
+                  init_text,
+                  count=1,
+              )
+          if init_count != 1:
+              raise SystemExit("Unable to update onlysavemevods fallback version")
+          init_file.write_text(init_text, encoding="utf-8")
+          PY
+
+          find "${staging}" -type d -name __pycache__ -prune -exec rm -rf {} +
+          find "${staging}" -type f \( -name "*.pyc" -o -name "*.pyo" -o -name "*.log" \) -delete
+          find "${staging}" -type d \( -name ".pytest_cache" -o -name ".mypy_cache" -o -name ".ruff_cache" -o -name "*.egg-info" \) -prune -exec rm -rf {} +
+
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          (cd dist && sha256sum "${bundle}.tar.gz" > "${bundle}.tar.gz.sha256")
+
+      - name: Smoke test bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          bundle="ONLYSAVEmeVODS-${RELEASE_TAG}"
+          archive="dist/${bundle}.tar.gz"
+          contents="dist/${bundle}.contents.txt"
+
+          tar -tzf "${archive}" | sort | tee "${contents}"
+
+          required_paths=(
+            "${bundle}/pyproject.toml"
+            "${bundle}/README.md"
+            "${bundle}/config.example.toml"
+            "${bundle}/src/"
+            "${bundle}/scripts/"
+            "${bundle}/tests/"
+            "${bundle}/src/onlysavemevods/__init__.py"
+            "${bundle}/scripts/install-almalinux.sh"
+            "${bundle}/scripts/install-debian.sh"
+            "${bundle}/scripts/install-ubuntu.sh"
+          )
+
+          for path in "${required_paths[@]}"; do
+            if ! grep -Fxq "${path}" "${contents}"; then
+              echo "::error::Bundle is missing expected path: ${path}"
+              exit 1
+            fi
+          done
+
+          forbidden_paths=(
+            "${bundle}/.git"
+            "${bundle}/.github"
+            "${bundle}/.venv"
+            "${bundle}/downloads"
+            "${bundle}/state"
+            "${bundle}/config.toml"
+            "${bundle}/secrets.env"
+            "${bundle}/build"
+            "${bundle}/dist"
+          )
+
+          for path in "${forbidden_paths[@]}"; do
+            if grep -Fq "${path}/" "${contents}" || grep -Fxq "${path}" "${contents}"; then
+              echo "::error::Bundle contains forbidden path: ${path}"
+              exit 1
+            fi
+          done
+
+          if grep -Eq '(^|/)(__pycache__|\.pytest_cache|\.mypy_cache|\.ruff_cache)(/|$)|\.py[co]$|\.log$|\.egg-info(/|$)' "${contents}"; then
+            echo "::error::Bundle contains cache, log, or build artifact paths"
+            exit 1
+          fi
+
+          (cd dist && sha256sum -c "${bundle}.tar.gz.sha256")
+          tar -xOf "${archive}" "${bundle}/pyproject.toml" | grep -Fxq "version = \"${PACKAGE_VERSION}\""
+          tar -xOf "${archive}" "${bundle}/src/onlysavemevods/__init__.py" | grep -Fxq "_FALLBACK_VERSION = \"${PACKAGE_VERSION}\""
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            dist/ONLYSAVEmeVODS-${{ env.RELEASE_TAG }}.tar.gz
+            dist/ONLYSAVEmeVODS-${{ env.RELEASE_TAG }}.tar.gz.sha256
