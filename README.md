@@ -65,8 +65,11 @@ for shared source settings, voice detection, known voice samples, and speaker
 attribution review. The About tab shows the app version and runtime details, and
 the Config tab can save app settings back to `config.toml` while keeping
 sensitive yt-dlp arguments redacted. Bind address and port changes are saved for
-the next restart. Finalized media files and sidecars such as live chat and
-subtitles can be downloaded from the dashboard:
+the next restart. The Powerchat tab summarizes captured support events by
+streamer, stream, donor, and stream-relative hour, and each stream card has a
+matching Powerchat tab for that stream only. Finalized media files and sidecars
+such as live chat, subtitles, and Powerchat events can be downloaded from the
+dashboard:
 
 ```text
 http://127.0.0.1:8080/
@@ -78,6 +81,248 @@ To run only the status page against an existing state database:
 ```bash
 .venv/bin/onlysavemevods web --config config.toml
 ```
+
+## Using the Web Dashboard
+
+Open the dashboard in a browser. On the machine running the service, the default
+URL is:
+
+```text
+http://127.0.0.1:8080/
+```
+
+From another machine on the same network, use the server's IP address and the
+configured `web_port`, for example:
+
+```text
+http://192.168.10.220:8080/
+```
+
+The dashboard is currently a trusted local admin interface. Do not expose it to
+the public internet without putting authentication or a private network/VPN in
+front of it.
+
+### Streamers Tab
+
+![Streamers dashboard](docs/screenshots/dashboard-streamers.png)
+
+The Streamers tab is the main working view. A streamer is the shared identity
+for one person or group, and it can contain several platform sources such as a
+YouTube handle, a Twitch channel, a Kick channel, and a Rumble user page.
+
+Use it for day-to-day operations:
+
+1. Click **Add Streamer** to open the setup wizard.
+2. Enter the streamer name. This is also the default folder name used under
+   `download_dir` unless you set a custom download directory name.
+3. Add one or more sources. You can paste a full URL such as
+   `https://kick.com/oumb`, `https://www.twitch.tv/name`, or
+   `https://rumble.com/user/name`, and the UI will normalize it to the matching
+   source shorthand where possible.
+4. Optionally set voice detection and speaker names in the wizard.
+5. Save the streamer. The running service reloads the saved config where it can.
+
+Configured source examples:
+
+```text
+@SomeYouTubeHandle
+https://www.youtube.com/@SomeYouTubeVODs
+twitch:somechannel
+kick:somechannel
+rumble:user/someuser
+```
+
+If old top-level `channels = [...]` entries exist, the dashboard shows them as
+**Needs Grouping**. They are still monitored, but you should create a streamer
+for them so settings, voices, Powerchat, and source lists are managed in one
+place.
+
+Each streamer card can be expanded or collapsed. Use the card buttons for:
+
+- **Settings**: edit streamer name, download directory name, sources, shared
+  transcription/voice settings, content event rules, and Powerchat settings.
+- **Voices**: manage known voice profiles, upload voice samples, create samples
+  from diarized transcript speakers, and review match suggestions.
+- **Streams**: browse recorded and active streams for that streamer. Use the
+  platform, title search, date range, and pagination controls when a streamer has
+  many streams.
+
+Each stream has its own tabs:
+
+- **Files** lists finalized media and sidecars, with actions such as Download,
+  Transcribe/Retranscribe, Render chat, Refresh chat, Watermark, and Delete copy
+  where available.
+- **Content Events** shows detected stream moments from configured audio/keyword
+  rules.
+- **Powerchat** shows donations/gifts for that stream only, including donations
+  per hour, top donors, an event ledger, and JSON/CSV downloads.
+- **Detected Speakers** loads diarized transcript speakers for that stream so
+  they can be used as voice samples.
+- **Jobs** shows active/recent processing jobs for the stream.
+- **Stream Log** shows newest-first operational events for that stream.
+
+### Config Tab
+
+![Config dashboard](docs/screenshots/dashboard-config.png)
+
+The Config tab edits app-wide settings in `config.toml`. Click **Save App
+Settings** after changing fields. Most runtime settings are reloaded by the
+daemon, but web bind address and port changes require a service restart.
+
+Useful settings to start with:
+
+- `channels`: legacy/simple source list. Prefer Streamers for new setups.
+- `download_dir` and `state_dir`: where media and app state are stored.
+- `poll_interval_seconds`: how often sources are checked.
+- `max_concurrent_downloads`: live downloads allowed at once.
+- `record_live_chat`: records YouTube live chat sidecars.
+- `render_live_chat_video`: creates separate `- chat.mp4` videos after capture.
+- `transcribe_subtitles`: runs WhisperX after finalized media.
+- `voice_match_enabled`: enables sample-backed voice attribution.
+- `stream_event_detection_enabled`: enables content-event detection after
+  finalize/transcription.
+- `watermark_enabled`: enables per-recipient watermark copy creation.
+- `log_level`: set to `DEBUG` when diagnosing discovery, downloads, or web
+  slowness.
+
+The Config tab also includes sections for speaker labels and content event
+rules. Speaker labels are manual mappings such as `SPEAKER_00 = "Host"`; they
+override automatic voice matches. Content event rules define what moments should
+be flagged using a mix of audio labels, transcript keywords, loudness, duration,
+severity, and optional voice matching.
+
+### Powerchat Tab
+
+![Powerchat dashboard](docs/screenshots/dashboard-powerchat.png)
+
+The top-level Powerchat tab aggregates every captured Powerchat event across all
+streams. Enable Powerchat per streamer first by setting `powerchat_enabled =
+true` and `powerchat_username = "name"` in the streamer Settings panel or in
+`config.toml`.
+
+The dashboard shows:
+
+- total money by currency, kept separate from unit gifts such as Kick gifts;
+- normalized donation rate, for example `USD 322.00 over 1.8h = USD 183.62/hr`;
+- per-streamer cards with stream totals, donations per hour, and top donors;
+- an optional **Overall Breakdown** for all streamers combined;
+- a searchable/filterable event ledger.
+
+Use the filters for streamer, platform/payment source, event kind, date range,
+and donor/message/title search. The **Download JSON** and **Download CSV** links
+respect the current filters. Streamer cards and individual stream Powerchat tabs
+also provide scoped JSON/CSV downloads.
+
+Direct export URLs are also available:
+
+```text
+/powerchat-events?format=json
+/powerchat-events?format=csv
+/powerchat-events?format=csv&streamer=OUMB3rd
+/powerchat-events?format=csv&video_id=kick:oumb
+```
+
+Captured raw sidecars are written beside finalized media as
+`<media>.powerchat-events.json`. These raw sidecars are downloadable from the
+stream Files tab.
+
+### Jobs And Logs
+
+The global Jobs tab shows active/recent work across the whole app. Streamer
+cards and stream cards also show jobs scoped to that streamer or stream. Jobs
+are ordered by start time so running items do not jump around. Chat render jobs
+show structured progress when the isolated renderer reports it, including phase,
+elapsed time, target output, and current temporary output size.
+
+Use stream logs when you need to understand what happened to a specific stream:
+segment switches, yt-dlp exits, post-exit checks, finalization, retries, chat
+refresh, and Powerchat listener messages are recorded there. Use systemd logs
+for service-wide diagnostics:
+
+```bash
+journalctl -u onlysavemevods.service -f
+```
+
+For web performance issues, set `log_level = "DEBUG"`, restart the service, and
+look for `Slow web ...` warnings in the journal. Large stream folders with many
+fragments can slow dashboard scans; use **Clean fragments** on ended streams
+when the fragments are no longer needed for resume/debugging.
+
+### Common Tasks
+
+Add a new streamer:
+
+1. Open **Streamers**.
+2. Click **Add Streamer**.
+3. Enter a streamer name and sources.
+4. Optionally configure voice detection and speaker names.
+5. Save the wizard.
+
+Add or remove a source for an existing streamer:
+
+1. Open the streamer card.
+2. Click **Settings**.
+3. Use **Add Source** to paste a URL or choose a supported platform.
+4. Save the source. Source URL inputs are normalized to shorthand values when
+   possible, such as `kick:oumb`.
+
+Manually add or redownload a VOD:
+
+1. Use the streamer card VOD form to add a new VOD URL, or open a stream and use
+   **Redownload from VOD**.
+2. YouTube VOD downloads try to fetch live chat replay when available.
+3. Kick VOD downloads try to fetch chat replay best-effort.
+4. Post-processing jobs that are enabled for live downloads, such as
+   transcription, content events, chat render, and voice matching, are queued for
+   VOD downloads too.
+
+Create a chat video:
+
+1. Enable `record_live_chat = true` for YouTube live chat capture.
+2. Enable `render_live_chat_video = true` for automatic post-stream chat videos,
+   or click **Render chat** / **Regenerate chat video** from the Files tab.
+3. Watch the Jobs tab for render progress. The output is a separate
+   `Title [VIDEOID] - chat.mp4`; the original media is not modified.
+
+Transcribe and attribute speakers:
+
+1. Enable `transcribe_subtitles = true` or click **Transcribe** on a finalized
+   media file.
+2. Use **Detected Speakers** on a stream to inspect diarized labels.
+3. Use the streamer **Voices** button to add known voice profiles and upload or
+   create samples.
+4. Manual speaker labels in the Config tab or streamer Settings win over
+   automatic voice matches.
+
+Configure content events:
+
+1. Enable `stream_event_detection_enabled = true`.
+2. Install the optional dependency with `.[stream-events]` if the installer has
+   not already done it.
+3. Add content event rules in the Config tab or streamer Settings.
+4. Use labels, keywords, loudness, duration bounds, severity, and optional voice
+   criteria to define what should be detected.
+5. Events appear on each stream's **Content Events** tab and can be regenerated
+   from the Files tab.
+
+Create and manage watermarked copies:
+
+1. Enable `watermark_enabled = true` and make sure the watermark secret
+   environment variable is configured.
+2. On a finalized media or chat video file, enter a recipient label and click
+   **Watermark**.
+3. Watermarked copies are separate files under `.watermarks/` and can be
+   downloaded or deleted from the Files tab.
+4. Use the Watermark Detection panel to upload a suspect clip and identify the
+   matching recipient/copy.
+
+Delete or clean up a stream:
+
+1. Use **Clean fragments** on ended streams to remove saved `.part-Frag` files.
+2. Use **Delete stream** to remove the stream record and downloaded stream
+   folder. The UI asks for confirmation because this cannot be undone.
+3. Active/downloading streams cannot be deleted or cleaned up until they are no
+   longer in a resume-sensitive state.
 
 ## Systemd
 
@@ -273,7 +518,15 @@ scripts/uninstall-systemd.sh
   `<media>.powerchat-events.json`, shown on the stream Powerchat tab, and tallied
   as separate money totals and platform-unit totals such as Kick gifts. This is a
   best-effort unofficial integration, so unknown payloads are preserved in the
-  sidecar for later parser fixes but are not counted.
+  sidecar for later parser fixes but are not counted. The top-level Powerchat
+  dashboard has per-streamer cards, an overall breakdown, donations per hour,
+  top donors, a searchable ledger, and filtered JSON/CSV export links. Streamer
+  cards and individual stream Powerchat tabs also provide scoped JSON/CSV
+  downloads. Raw `.powerchat-events.json` sidecars are downloadable from the
+  stream file list, and the export endpoint is available directly as
+  `/powerchat-events?format=json` or `/powerchat-events?format=csv` with optional
+  filters such as `streamer=`, `video_id=`, `platform=`, `kind=`, `from=`, `to=`,
+  and `search=`.
 - Set `render_live_chat_video = true` to also create a separate
   `Title [VIDEOID] - chat.mp4` after the stream ends. The original finalized
   media file is left untouched; the chat version is re-encoded with the video on
