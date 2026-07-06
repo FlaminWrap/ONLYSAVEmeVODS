@@ -17,6 +17,7 @@ from onlysavemevods.powerchat import normalize_powerchat_payload, write_powercha
 from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     build_config_summary,
+    build_powerchat_stats,
     build_status_snapshot,
     build_lite_status_payload,
     build_vod_chat_download_command,
@@ -75,6 +76,7 @@ from onlysavemevods.web import (
     CHAT_RENDER_JOBS_LOCK,
     FAVICON_ROUTES,
     JobStatus,
+    PowerchatEventStatus,
     PLATFORM_ICON_ROUTES,
     snapshot_to_dict,
     transcription_job_key,
@@ -85,7 +87,9 @@ from onlysavemevods.web import (
     EVENT_DETECTION_JOBS,
     EVENT_DETECTION_JOBS_LOCK,
     StatusWebServer,
+    StreamStatus,
     StreamEventStatus,
+    StreamerStatStatus,
     render_stream_event_timeline,
     render_streamer_jobs_summary,
     STREAM_DELETE_CONFIRM_VALUE,
@@ -781,6 +785,140 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Kick: 50 Kicks", html)
         self.assertEqual(payload["streams"][0]["powerchat_event_count"], 1)
         self.assertEqual(payload["streams"][0]["powerchat_events"][0]["platform"], "Kick")
+        self.assertEqual(payload["powerchat_stats"]["event_count"], 1)
+        self.assertEqual(payload["powerchat_stats"]["unit_totals"], [
+            {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
+        ])
+        self.assertEqual(payload["powerchat_stats"]["hourly_totals"][0]["hour_label"], "0:00-0:59")
+        self.assertEqual(payload["powerchat_stats"]["events"][0]["streamer"], "oumb")
+
+    def test_powerchat_stats_include_hourly_buckets_and_rates(self) -> None:
+        stream = StreamStatus(
+            video_id="kick:oumb",
+            title="Donation Stream",
+            channel="OUMB3rd",
+            url="https://kick.com/oumb",
+            platform="kick",
+            source="kick:oumb",
+            status="ended",
+            segment_index=1,
+            first_seen_at="2026-07-05T10:00:00+00:00",
+            updated_at="2026-07-05T12:00:00+00:00",
+            last_started_at="2026-07-05T10:00:00+00:00",
+            last_exit_at="2026-07-05T12:00:00+00:00",
+            exit_code=0,
+            directory="/tmp/downloads/OUMB3rd/kick_oumb",
+            file_count=0,
+            total_bytes=0,
+            part_bytes=0,
+            final_bytes=0,
+            chat_bytes=0,
+            fragment_bytes=0,
+            state_bytes=0,
+            temporary_bytes=0,
+            file_kind_counts={},
+            latest_file_modified_at=None,
+            has_part_files=False,
+            has_mixed_formats=False,
+            events=[],
+            content_event_count=0,
+            content_events=[],
+            powerchat_event_count=3,
+            powerchat_money_totals=[{"currency": "USD", "amount": 120.0}],
+            powerchat_unit_totals=[],
+            powerchat_events=[
+                PowerchatEventStatus(
+                    source="feed",
+                    received_at="2026-07-05T10:00:30+00:00",
+                    offset_seconds=30.0,
+                    kind="money",
+                    donor="Alice",
+                    platform="Square",
+                    message="first hour",
+                    money_amount=60.0,
+                    money_currency="USD",
+                    unit_amount=None,
+                    unit="",
+                ),
+                PowerchatEventStatus(
+                    source="feed",
+                    received_at="2026-07-05T11:01:10+00:00",
+                    offset_seconds=3670.0,
+                    kind="money",
+                    donor="Bob",
+                    platform="PayPal",
+                    message="second hour",
+                    money_amount=40.0,
+                    money_currency="USD",
+                    unit_amount=None,
+                    unit="",
+                ),
+                PowerchatEventStatus(
+                    source="feed",
+                    received_at="2026-07-05T11:30:00+00:00",
+                    offset_seconds=None,
+                    kind="money",
+                    donor="Alice",
+                    platform="Square",
+                    message="missing offset",
+                    money_amount=20.0,
+                    money_currency="USD",
+                    unit_amount=None,
+                    unit="",
+                ),
+            ],
+            jobs=[],
+            files=[],
+        )
+        streamer = StreamerStatStatus(
+            name="OUMB3rd",
+            sources=["kick:oumb"],
+            download_dir_name="OUMB3rd",
+            powerchat_enabled=True,
+            powerchat_username="oumb",
+            configured=True,
+            needs_grouping=False,
+            voice_detection="default",
+            speaker_label_count=0,
+            voices=[],
+            stream_event_detection={},
+            stream_event_rules=[],
+            stream_count=1,
+            active_count=0,
+            checking_count=0,
+            ended_count=1,
+            attention_count=0,
+            file_count=0,
+            downloadable_count=0,
+            total_bytes=0,
+            part_bytes=0,
+            final_bytes=0,
+            chat_bytes=0,
+            fragment_bytes=0,
+            latest_updated_at="2026-07-05T12:00:00+00:00",
+            latest_file_modified_at=None,
+            latest_activity_at=None,
+            jobs=[],
+            streams=[stream],
+        )
+
+        stats = build_powerchat_stats([streamer])
+
+        self.assertEqual(stats["event_count"], 3)
+        self.assertEqual(stats["money_totals"], [{"currency": "USD", "amount": 120.0}])
+        self.assertEqual(stats["events_without_offset"], 1)
+        self.assertEqual(stats["money_rates"], [
+            {"currency": "USD", "amount": 120.0, "duration_hours": 2.0, "amount_per_hour": 60.0}
+        ])
+        self.assertEqual(
+            [(row["hour_label"], row["money_totals"]) for row in stats["hourly_totals"]],
+            [
+                ("0:00-0:59", [{"currency": "USD", "amount": 60.0}]),
+                ("1:00-1:59", [{"currency": "USD", "amount": 40.0}]),
+            ],
+        )
+        self.assertEqual(stats["stream_totals"][0]["money_rates"][0]["amount_per_hour"], 60.0)
+        self.assertEqual(stats["top_donors"][0]["donor"], "Alice")
 
     def test_status_snapshot_groups_streamer_sources(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -959,6 +1097,10 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("Streamers", html)
         self.assertIn('id="tab-streamers"', html)
         self.assertIn('for="tab-streamers"', html)
+        self.assertIn('id="tab-powerchat"', html)
+        self.assertIn('for="tab-powerchat"', html)
+        self.assertIn("powerchat-dashboard", html)
+        self.assertIn("Donations Per Hour", html)
         self.assertIn('id="streamer-list"', html)
         self.assertIn("Needs Grouping", html)
         self.assertIn("renderStreamerList", html)
@@ -1006,6 +1148,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("data-stream-filter-from", html)
         self.assertIn("data-stream-filter-to", html)
         self.assertIn("data-stream-page-size", html)
+        self.assertIn("data-powerchat-filter-streamer", html)
+        self.assertIn("data-powerchat-filter-platform", html)
+        self.assertIn("data-powerchat-filter-search", html)
         self.assertIn("streamer-details", html)
         self.assertIn(".streamer-settings-tabs .streamer-settings-panel", html)
         self.assertNotIn("\n    .streamer-settings-panel { display: none", html)

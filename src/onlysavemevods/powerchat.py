@@ -127,12 +127,13 @@ def normalize_powerchat_payload(
     else:
         return None
 
-    received = received_at or utc_now_iso()
+    received = received_at or first_string(raw, "createdAt", "created_at", "timestamp") or utc_now_iso()
     message = first_string(raw, "message", "text", "body", "subMessage")
     donor = first_string(raw, "donator", "donor", "displayName", "name")
     platform = first_string(raw, "paymentPlatform", "platform")
     explicit_id = first_string(raw, *EXPLICIT_ID_FIELDS)
     currency = first_string(raw, "currency", "fiat_currency", "fiatCurrency").upper()
+    gift_match = POWERCHAT_GIFT_RE.match(message) if message else None
 
     money_amount: float | None = None
     money_currency = currency
@@ -147,14 +148,14 @@ def normalize_powerchat_payload(
         money_amount = fiat
         money_currency = money_currency or "USD"
         kind = "money"
-    elif currency:
+    elif not gift_match:
         amount = parse_number(raw.get("amount"))
-        if amount is not None:
+        if amount is not None and (currency or platform):
             money_amount = amount
+            money_currency = money_currency or "USD"
             kind = "money"
 
     if money_amount is None and message:
-        gift_match = POWERCHAT_GIFT_RE.match(message)
         if gift_match:
             donor = donor or gift_match.group("donor").strip()
             unit_amount = parse_number(gift_match.group("amount"))
@@ -269,7 +270,76 @@ def load_powerchat_sidecar(path: Path) -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    return repair_powerchat_sidecar_payload(payload)
+
+
+def repair_powerchat_sidecar_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_events = payload.get("events")
+    if not isinstance(raw_events, list):
+        return payload
+
+    stream_started_at = str(payload.get("stream_start") or "")
+    events = [
+        repair_powerchat_event(event, stream_started_at=stream_started_at)
+        for event in raw_events
+        if isinstance(event, dict)
+    ]
+    repaired = dict(payload)
+    repaired["events"] = events
+    repaired["event_count"] = len(events)
+    repaired["totals"] = powerchat_totals(events)
+    return repaired
+
+
+def repair_powerchat_event(
+    event: dict[str, Any],
+    *,
+    stream_started_at: str = "",
+) -> dict[str, Any]:
+    raw = event.get("raw")
+    if not isinstance(raw, dict):
+        return dict(event)
+
+    source = str(event.get("source") or "feed")
+    raw_timestamp = first_string(raw, "createdAt", "created_at", "timestamp")
+    fallback_received_at = str(event.get("received_at") or "") or None
+    repaired = normalize_powerchat_payload(
+        raw,
+        source=source,
+        received_at=None if raw_timestamp else fallback_received_at,
+        stream_started_at=stream_started_at,
+    )
+    if repaired is None or repaired.get("kind") == "unknown":
+        return dict(event)
+
+    if event.get("kind") not in {None, "", "unknown"}:
+        return dict(event)
+
+    merged = dict(event)
+    for key in (
+        "id",
+        "dedupe_key",
+        "source",
+        "received_at",
+        "kind",
+        "donor",
+        "platform",
+        "message",
+        "money_amount",
+        "money_currency",
+        "unit_amount",
+        "unit",
+        "raw",
+    ):
+        merged[key] = repaired.get(key)
+    merged["offset_seconds"] = (
+        repaired.get("offset_seconds")
+        if repaired.get("offset_seconds") is not None
+        else event.get("offset_seconds")
+    )
+    return merged
 
 
 def powerchat_totals(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
@@ -524,6 +594,7 @@ def normalize_platform_label(value: str) -> str:
         "twitch": "Twitch",
         "rumble": "Rumble",
         "powerchat": "Powerchat",
+        "paypal": "PayPal",
     }
     return known.get(text.casefold(), text[:1].upper() + text[1:])
 

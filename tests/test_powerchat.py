@@ -66,6 +66,108 @@ class PowerchatTests(unittest.TestCase):
             "units": [],
         })
 
+    def test_powerchat_paypal_payload_without_currency_defaults_to_usd(self) -> None:
+        event = normalize_powerchat_payload(
+            {
+                "donator": "Anonymous",
+                "message": "Can I get a Buffalo ayooo",
+                "amount": 3,
+                "paymentPlatform": "paypal",
+                "id": 1499195,
+                "createdAt": "2026-07-06T04:26:34.417Z",
+                "username": "onlyusemeblade",
+                "shouldPlayTTS": True,
+            },
+            source="feed",
+            stream_started_at="2026-07-06T04:26:00Z",
+        )
+
+        assert event is not None
+        self.assertEqual(event["kind"], "money")
+        self.assertEqual(event["dedupe_key"], "id:1499195")
+        self.assertEqual(event["donor"], "Anonymous")
+        self.assertEqual(event["platform"], "PayPal")
+        self.assertEqual(event["money_amount"], 3.0)
+        self.assertEqual(event["money_currency"], "USD")
+        self.assertEqual(event["offset_seconds"], 34.417)
+        self.assertEqual(powerchat_totals([event]), {
+            "money": [{"currency": "USD", "amount": 3.0}],
+            "units": [],
+        })
+
+    def test_load_sidecar_repairs_legacy_unknown_structured_money_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "stream.powerchat-events.json"
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "event_count": 2,
+                        "totals": {"money": [], "units": []},
+                        "events": [
+                            {
+                                "id": "1498949",
+                                "dedupe_key": "id:1498949",
+                                "kind": "unknown",
+                                "source": "feed",
+                                "received_at": "2026-07-06T03:05:43+00:00",
+                                "offset_seconds": 113.0,
+                                "donor": "Anonymous",
+                                "platform": "Square",
+                                "message": "Great firework show last night",
+                                "money_amount": None,
+                                "money_currency": "",
+                                "unit_amount": None,
+                                "unit": "",
+                                "raw": {
+                                    "id": 1498949,
+                                    "donator": "Anonymous",
+                                    "message": "Great firework show last night",
+                                    "amount": 3,
+                                    "paymentPlatform": "square",
+                                    "createdAt": "2026-07-06T03:05:43.902Z",
+                                },
+                            },
+                            {
+                                "id": "1498981",
+                                "dedupe_key": "id:1498981",
+                                "kind": "unknown",
+                                "source": "feed",
+                                "received_at": "2026-07-06T03:14:30+00:00",
+                                "offset_seconds": 640.0,
+                                "donor": "Anonymous",
+                                "platform": "Paypal",
+                                "message": "",
+                                "money_amount": None,
+                                "money_currency": "",
+                                "unit_amount": None,
+                                "unit": "",
+                                "raw": {
+                                    "id": 1498981,
+                                    "donator": "Anonymous",
+                                    "message": "",
+                                    "amount": 21,
+                                    "paymentPlatform": "paypal",
+                                    "createdAt": "2026-07-06T03:14:30.000Z",
+                                },
+                            },
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = load_powerchat_sidecar(sidecar)
+
+        self.assertEqual(payload["event_count"], 2)
+        self.assertEqual(payload["totals"], {
+            "money": [{"currency": "USD", "amount": 24.0}],
+            "units": [],
+        })
+        self.assertEqual([event["kind"] for event in payload["events"]], ["money", "money"])
+        self.assertEqual(payload["events"][0]["platform"], "Square")
+        self.assertEqual(payload["events"][1]["platform"], "PayPal")
+        self.assertEqual(payload["events"][0]["offset_seconds"], 113.0)
+
     def test_recorder_dedupes_feed_and_tts_duplicates(self) -> None:
         with TemporaryDirectory() as tmp:
             sidecar = Path(tmp) / "segment-001.powerchat-events.json"

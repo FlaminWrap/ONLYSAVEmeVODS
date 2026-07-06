@@ -697,6 +697,7 @@ class StatusSnapshot:
     stream_limit: int
     configured_channels: list[str]
     streamer_stats: list[StreamerStatStatus]
+    powerchat_stats: dict[str, Any]
     streamer_groups: list[StreamerStatus]
     configuration: dict[str, dict[str, Any]]
     channel_stats: list[ChannelStatus]
@@ -1664,6 +1665,7 @@ def build_status_snapshot(
 
     channel_stats = build_channel_stats(streams, config)
     streamer_stats = build_streamer_stats(config, streams, jobs)
+    powerchat_stats = build_powerchat_stats(streamer_stats)
     perf_step(steps, "aggregate", step_started_at)
 
     step_started_at = time.perf_counter()
@@ -1694,6 +1696,7 @@ def build_status_snapshot(
         stream_limit=STREAM_LIMIT,
         configured_channels=list(config.channels),
         streamer_stats=streamer_stats,
+        powerchat_stats=powerchat_stats,
         streamer_groups=build_streamer_statuses(config),
         configuration=build_config_summary(config),
         channel_stats=channel_stats,
@@ -2351,6 +2354,331 @@ def streamer_stat_sort_key(status: StreamerStatStatus) -> tuple[bool, bool, bool
         status.attention_count == 0,
         -(status.latest_activity_at or 0.0),
         status.name.lower(),
+    )
+
+
+def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str, Any]:
+    totals = new_powerchat_accumulator()
+    donors: dict[str, dict[str, Any]] = {}
+    streamers: dict[str, dict[str, Any]] = {}
+    hours: dict[int, dict[str, Any]] = {}
+    stream_rows: list[dict[str, Any]] = []
+    event_rows: list[dict[str, Any]] = []
+    streams_with_powerchat = 0
+    duration_seconds = 0.0
+    events_without_offset = 0
+    seen_streams: set[str] = set()
+
+    for streamer in streamer_stats:
+        streamer_acc = streamers.setdefault(
+            streamer.name,
+            {
+                "streamer": streamer.name,
+                "event_count": 0,
+                "stream_count": 0,
+                "duration_seconds": 0.0,
+                "accumulator": new_powerchat_accumulator(),
+            },
+        )
+        for stream in streamer.streams:
+            if stream.video_id in seen_streams:
+                continue
+            seen_streams.add(stream.video_id)
+            events = list(stream.powerchat_events)
+            if not events:
+                continue
+
+            streams_with_powerchat += 1
+            stream_duration = powerchat_stream_duration_seconds(stream, events)
+            duration_seconds += stream_duration
+            streamer_acc["stream_count"] += 1
+            streamer_acc["duration_seconds"] += stream_duration
+
+            stream_acc = new_powerchat_accumulator()
+            for event in events:
+                row = powerchat_dashboard_event_row(streamer.name, stream, event)
+                event_rows.append(row)
+                add_powerchat_event_to_accumulator(totals, event)
+                add_powerchat_event_to_accumulator(streamer_acc["accumulator"], event)
+                add_powerchat_event_to_accumulator(stream_acc, event)
+
+                donor_name = event.donor or "Unknown donor"
+                donor_acc = donors.setdefault(
+                    donor_name,
+                    {
+                        "donor": donor_name,
+                        "event_count": 0,
+                        "accumulator": new_powerchat_accumulator(),
+                        "latest_received_at": "",
+                    },
+                )
+                donor_acc["event_count"] += 1
+                if event.received_at and event.received_at > donor_acc["latest_received_at"]:
+                    donor_acc["latest_received_at"] = event.received_at
+                add_powerchat_event_to_accumulator(donor_acc["accumulator"], event)
+
+                if row["hour_index"] is None:
+                    events_without_offset += 1
+                    continue
+                hour = hours.setdefault(
+                    row["hour_index"],
+                    {
+                        "hour_index": row["hour_index"],
+                        "hour_label": row["hour_label"],
+                        "event_count": 0,
+                        "accumulator": new_powerchat_accumulator(),
+                    },
+                )
+                hour["event_count"] += 1
+                add_powerchat_event_to_accumulator(hour["accumulator"], event)
+
+            streamer_acc["event_count"] += len(events)
+            stream_rows.append(
+                finalize_powerchat_stream_row(
+                    streamer.name,
+                    stream,
+                    stream_acc,
+                    len(events),
+                    stream_duration,
+                )
+            )
+
+    donor_rows = [finalize_powerchat_donor_row(item) for item in donors.values()]
+    streamer_rows = [finalize_powerchat_streamer_row(item) for item in streamers.values() if item["event_count"]]
+    hour_rows = [finalize_powerchat_hour_row(item) for item in hours.values()]
+    event_rows.sort(key=powerchat_event_row_sort_key, reverse=True)
+
+    return {
+        "event_count": totals["event_count"],
+        "streams_with_powerchat": streams_with_powerchat,
+        "duration_seconds": round(duration_seconds, 3),
+        "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
+        "events_without_offset": events_without_offset,
+        "money_totals": powerchat_accumulator_money_totals(totals),
+        "unit_totals": powerchat_accumulator_unit_totals(totals),
+        "money_rates": powerchat_money_rates(totals, duration_seconds),
+        "top_donors": sorted(donor_rows, key=powerchat_summary_sort_key, reverse=True)[:25],
+        "streamer_totals": sorted(streamer_rows, key=powerchat_summary_sort_key, reverse=True),
+        "stream_totals": sorted(stream_rows, key=powerchat_summary_sort_key, reverse=True),
+        "hourly_totals": sorted(hour_rows, key=lambda row: int(row.get("hour_index") or 0)),
+        "events": event_rows,
+    }
+
+
+def new_powerchat_accumulator() -> dict[str, Any]:
+    return {
+        "event_count": 0,
+        "money": {},
+        "money_event_counts": {},
+        "units": {},
+    }
+
+
+def add_powerchat_event_to_accumulator(
+    accumulator: dict[str, Any],
+    event: PowerchatEventStatus,
+) -> None:
+    accumulator["event_count"] = int(accumulator.get("event_count") or 0) + 1
+    if event.kind == "money" and event.money_amount is not None and event.money_currency:
+        currency = event.money_currency.upper()
+        money = accumulator.setdefault("money", {})
+        money[currency] = float(money.get(currency, 0.0)) + float(event.money_amount)
+        counts = accumulator.setdefault("money_event_counts", {})
+        counts[currency] = int(counts.get(currency, 0)) + 1
+    elif event.kind == "unit" and event.unit_amount is not None and event.unit:
+        platform = event.platform or ""
+        key = f"{platform}\0{event.unit}"
+        units = accumulator.setdefault("units", {})
+        units[key] = float(units.get(key, 0.0)) + float(event.unit_amount)
+
+
+def powerchat_accumulator_money_totals(accumulator: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"currency": currency, "amount": round(float(amount), 2)}
+        for currency, amount in sorted((accumulator.get("money") or {}).items())
+    ]
+
+
+def powerchat_accumulator_unit_totals(accumulator: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for key, amount in sorted((accumulator.get("units") or {}).items()):
+        platform, _separator, unit = str(key).partition("\0")
+        rows.append({"platform": platform, "unit": unit, "amount": round(float(amount), 2)})
+    return rows
+
+
+def powerchat_money_averages(accumulator: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    counts = accumulator.get("money_event_counts") or {}
+    for currency, amount in sorted((accumulator.get("money") or {}).items()):
+        count = int(counts.get(currency) or 0)
+        if count > 0:
+            rows.append({"currency": currency, "amount": round(float(amount) / count, 2)})
+    return rows
+
+
+def powerchat_money_rates(
+    accumulator: dict[str, Any],
+    duration_seconds: float,
+) -> list[dict[str, Any]]:
+    if duration_seconds <= 0:
+        return []
+    duration_hours = duration_seconds / 3600
+    return [
+        {
+            "currency": row["currency"],
+            "amount": row["amount"],
+            "duration_hours": round(duration_hours, 3),
+            "amount_per_hour": round(float(row["amount"]) / duration_hours, 2),
+        }
+        for row in powerchat_accumulator_money_totals(accumulator)
+    ]
+
+
+def powerchat_stream_duration_seconds(
+    stream: StreamStatus,
+    events: list[PowerchatEventStatus],
+) -> float:
+    started_at = iso_to_epoch(stream.last_started_at) or iso_to_epoch(stream.first_seen_at)
+    ended_at = iso_to_epoch(stream.last_exit_at)
+    if started_at is not None and ended_at is not None and ended_at > started_at:
+        return max(0.0, ended_at - started_at)
+    if started_at is not None and stream.status in {"detected", "downloading", "checking_after_exit", "waiting_retry"}:
+        updated_at = iso_to_epoch(stream.updated_at) or time.time()
+        if updated_at > started_at:
+            return max(0.0, updated_at - started_at)
+    offsets = [event.offset_seconds for event in events if event.offset_seconds is not None]
+    if len(offsets) >= 2:
+        return max(0.0, max(offsets) - min(offsets))
+    if len(offsets) == 1:
+        return max(0.0, offsets[0] or 0.0)
+    return 0.0
+
+
+def powerchat_dashboard_event_row(
+    streamer_name: str,
+    stream: StreamStatus,
+    event: PowerchatEventStatus,
+) -> dict[str, Any]:
+    hour_index = powerchat_event_hour_index(event)
+    return {
+        "streamer": streamer_name,
+        "video_id": stream.video_id,
+        "stream_title": stream.title,
+        "stream_url": stream.url,
+        "stream_platform": stream.platform,
+        "stream_source": stream.source,
+        "source": event.source,
+        "received_at": event.received_at,
+        "offset_seconds": event.offset_seconds,
+        "hour_index": hour_index,
+        "hour_label": powerchat_hour_label(hour_index) if hour_index is not None else "No stream offset",
+        "kind": event.kind,
+        "donor": event.donor,
+        "platform": event.platform,
+        "message": event.message,
+        "money_amount": event.money_amount,
+        "money_currency": event.money_currency,
+        "unit_amount": event.unit_amount,
+        "unit": event.unit,
+    }
+
+
+def powerchat_event_hour_index(event: PowerchatEventStatus) -> int | None:
+    if event.offset_seconds is None:
+        return None
+    return max(0, int(event.offset_seconds // 3600))
+
+
+def powerchat_hour_label(hour_index: int | None) -> str:
+    if hour_index is None:
+        return "No stream offset"
+    return f"{hour_index}:00-{hour_index}:59"
+
+
+def finalize_powerchat_stream_row(
+    streamer_name: str,
+    stream: StreamStatus,
+    accumulator: dict[str, Any],
+    event_count: int,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    return {
+        "streamer": streamer_name,
+        "video_id": stream.video_id,
+        "title": stream.title,
+        "platform": stream.platform,
+        "source": stream.source,
+        "url": stream.url,
+        "status": stream.status,
+        "event_count": event_count,
+        "duration_seconds": round(duration_seconds, 3),
+        "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
+        "money_totals": powerchat_accumulator_money_totals(accumulator),
+        "unit_totals": powerchat_accumulator_unit_totals(accumulator),
+        "money_rates": powerchat_money_rates(accumulator, duration_seconds),
+        "sort_amount": powerchat_sort_amount(accumulator),
+    }
+
+
+def finalize_powerchat_streamer_row(item: dict[str, Any]) -> dict[str, Any]:
+    accumulator = item["accumulator"]
+    duration_seconds = float(item.get("duration_seconds") or 0.0)
+    return {
+        "streamer": item["streamer"],
+        "event_count": item["event_count"],
+        "stream_count": item["stream_count"],
+        "duration_seconds": round(duration_seconds, 3),
+        "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
+        "money_totals": powerchat_accumulator_money_totals(accumulator),
+        "unit_totals": powerchat_accumulator_unit_totals(accumulator),
+        "money_rates": powerchat_money_rates(accumulator, duration_seconds),
+        "sort_amount": powerchat_sort_amount(accumulator),
+    }
+
+
+def finalize_powerchat_donor_row(item: dict[str, Any]) -> dict[str, Any]:
+    accumulator = item["accumulator"]
+    return {
+        "donor": item["donor"],
+        "event_count": item["event_count"],
+        "latest_received_at": item["latest_received_at"],
+        "money_totals": powerchat_accumulator_money_totals(accumulator),
+        "unit_totals": powerchat_accumulator_unit_totals(accumulator),
+        "sort_amount": powerchat_sort_amount(accumulator),
+    }
+
+
+def finalize_powerchat_hour_row(item: dict[str, Any]) -> dict[str, Any]:
+    accumulator = item["accumulator"]
+    return {
+        "hour_index": item["hour_index"],
+        "hour_label": item["hour_label"],
+        "event_count": item["event_count"],
+        "money_totals": powerchat_accumulator_money_totals(accumulator),
+        "unit_totals": powerchat_accumulator_unit_totals(accumulator),
+        "average_money": powerchat_money_averages(accumulator),
+        "sort_amount": powerchat_sort_amount(accumulator),
+    }
+
+
+def powerchat_sort_amount(accumulator: dict[str, Any]) -> float:
+    return round(sum(float(amount) for amount in (accumulator.get("money") or {}).values()), 2)
+
+
+def powerchat_summary_sort_key(row: dict[str, Any]) -> tuple[float, int, str]:
+    return (
+        float(row.get("sort_amount") or 0.0),
+        int(row.get("event_count") or 0),
+        str(row.get("streamer") or row.get("donor") or row.get("title") or "").lower(),
+    )
+
+
+def powerchat_event_row_sort_key(row: dict[str, Any]) -> tuple[str, float, str]:
+    return (
+        str(row.get("received_at") or ""),
+        float(row.get("offset_seconds") or 0.0),
+        str(row.get("video_id") or ""),
     )
 
 
@@ -6982,6 +7310,15 @@ def snapshot_to_dict(snapshot: StatusSnapshot) -> dict[str, Any]:
     return payload
 
 
+def json_script_payload(value: Any) -> str:
+    return (
+        json.dumps(value, sort_keys=True)
+        .replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
 def render_status_html(snapshot: StatusSnapshot) -> str:
     started_at = time.perf_counter()
     generated = time.strftime(
@@ -7009,6 +7346,8 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     log_rows = render_log_rows(snapshot.recent_logs)
     watermark_detection = render_watermark_detection_panel(snapshot.configuration)
     about_panel = render_about_panel(snapshot)
+    powerchat_dashboard = render_powerchat_dashboard(snapshot.powerchat_stats)
+    powerchat_stats_json = json_script_payload(snapshot.powerchat_stats)
     script = dashboard_script()
 
     body = f"""<!doctype html>
@@ -7105,6 +7444,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .tab-panel {{ display: none; }}
     #tab-streamers:checked ~ .tabs label[for="tab-streamers"],
+    #tab-powerchat:checked ~ .tabs label[for="tab-powerchat"],
     #tab-jobs:checked ~ .tabs label[for="tab-jobs"],
     #tab-logs:checked ~ .tabs label[for="tab-logs"],
     #tab-about:checked ~ .tabs label[for="tab-about"],
@@ -7114,6 +7454,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       font-weight: 650;
     }}
     #tab-streamers:checked ~ .streamers-panel,
+    #tab-powerchat:checked ~ .powerchat-panel,
     #tab-jobs:checked ~ .jobs-panel,
     #tab-logs:checked ~ .logs-panel,
     #tab-about:checked ~ .about-panel,
@@ -7509,6 +7850,16 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .powerchat-event.unknown {{ border-left-color: var(--muted); }}
     .powerchat-event-amount {{ font-weight: 700; }}
+    .powerchat-dashboard {{ display: grid; gap: 12px; }}
+    .powerchat-summary-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; }}
+    .powerchat-summary-card {{ border: 1px solid var(--line); border-radius: 6px; padding: 10px; background: #fff; }}
+    .powerchat-summary-card strong {{ display: block; font-size: 18px; }}
+    .powerchat-dashboard-controls {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 8px; align-items: end; }}
+    .powerchat-dashboard-controls label {{ display: grid; gap: 4px; color: var(--muted); font-size: 12px; }}
+    .powerchat-dashboard-controls input,
+    .powerchat-dashboard-controls select {{ width: 100%; }}
+    .powerchat-dashboard-section {{ display: grid; gap: 8px; }}
+    .powerchat-ledger-footer {{ display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; }}
     .content-event {{
       display: grid;
       grid-template-columns: max-content minmax(0, 1fr) minmax(180px, 0.4fr);
@@ -8195,12 +8546,14 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
   </header>
   <main>
     <input class="tab-radio" type="radio" id="tab-streamers" name="dashboard-tab" checked>
+    <input class="tab-radio" type="radio" id="tab-powerchat" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-jobs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-logs" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-about" name="dashboard-tab">
     <input class="tab-radio" type="radio" id="tab-config" name="dashboard-tab">
     <div class="tabs">
       <label for="tab-streamers">Streamers</label>
+      <label for="tab-powerchat">Powerchat</label>
       <label for="tab-jobs">Jobs</label>
       <label for="tab-logs">Logs</label>
       <label for="tab-about">About</label>
@@ -8233,6 +8586,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       {streamer_toolbar}
       {streamer_wizard}
       <div class="streamer-list" id="streamer-list">{streamer_cards}</div>
+    </section>
+    <section class="tab-panel powerchat-panel">
+      {powerchat_dashboard}
     </section>
     <section class="tab-panel jobs-panel">
       <section class="panel">
@@ -8273,6 +8629,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       </div>
     </section>
   </main>
+  <script type="application/json" id="powerchat-stats-json">{powerchat_stats_json}</script>
   {script}
 </body>
 </html>
@@ -8301,7 +8658,11 @@ def dashboard_script() -> str:
   const streamerStreamFilterKey = "onlysavemevods.streamerStreamFilters";
   const streamerStreamPageSizeDefault = 5;
   const streamerStreamPageSizeOptions = [5, 10, 25, 50];
-  const tabs = ["tab-streamers", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
+  const powerchatPageSizeDefault = 50;
+  const powerchatPageSizeOptions = [25, 50, 100];
+  let powerchatPage = 1;
+  let latestPowerchatStats = null;
+  const tabs = ["tab-streamers", "tab-powerchat", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
     detected: "detected",
@@ -8316,6 +8677,11 @@ def dashboard_script() -> str:
   const setText = (id, value) => {
     const element = byId(id);
     if (element) element.textContent = value;
+  };
+  const readInitialPowerchatStats = () => {
+    const element = byId("powerchat-stats-json");
+    if (!element) return null;
+    try { return JSON.parse(element.textContent || "{}"); } catch (_) { return null; }
   };
   const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -8797,6 +9163,12 @@ def dashboard_script() -> str:
 
   document.addEventListener("input", (event) => {
     const target = event.target;
+    const powerchatFilter = target && target.closest ? target.closest("[data-powerchat-filter-control]") : null;
+    if (powerchatFilter) {
+      powerchatPage = 1;
+      renderPowerchatDashboard(latestPowerchatStats || readInitialPowerchatStats() || {});
+      return;
+    }
     const streamFilter = target && target.closest ? target.closest("[data-stream-filter-control]") : null;
     if (streamFilter) {
       const browser = streamFilter.closest("[data-stream-browser]");
@@ -8817,6 +9189,12 @@ def dashboard_script() -> str:
 
   document.addEventListener("change", (event) => {
     const target = event.target;
+    const powerchatFilter = target && target.closest ? target.closest("[data-powerchat-filter-control]") : null;
+    if (powerchatFilter) {
+      powerchatPage = 1;
+      renderPowerchatDashboard(latestPowerchatStats || readInitialPowerchatStats() || {});
+      return;
+    }
     const streamFilter = target && target.closest ? target.closest("[data-stream-filter-control]") : null;
     if (streamFilter) {
       const browser = streamFilter.closest("[data-stream-browser]");
@@ -8920,6 +9298,14 @@ def dashboard_script() -> str:
       readStreamerBrowserControls(browser, state);
       state.page += streamPageButton.hasAttribute("data-stream-page-next") ? 1 : -1;
       applyStreamerStreamBrowser(browser);
+      return;
+    }
+
+    const powerchatPageButton = event.target.closest("[data-powerchat-page-prev], [data-powerchat-page-next]");
+    if (powerchatPageButton) {
+      event.preventDefault();
+      powerchatPage += powerchatPageButton.hasAttribute("data-powerchat-page-next") ? 1 : -1;
+      renderPowerchatDashboard(latestPowerchatStats || readInitialPowerchatStats() || {});
       return;
     }
 
@@ -9212,6 +9598,191 @@ def dashboard_script() -> str:
       </div>`;
     }).join("");
     return `<div class="file-meta">Totals: ${escapeHtml(summary || "-")}</div><div class="powerchat-events">${rows}</div>`;
+  };
+
+  const formatPowerchatRates = (rates) => (rates || []).map((rate) => {
+    const currency = String(rate.currency || "").toUpperCase();
+    if (!currency || rate.amount_per_hour === undefined || rate.amount_per_hour === null) return "";
+    return `${currency} ${formatPowerchatNumber(rate.amount_per_hour, 2)}/hr`;
+  }).filter(Boolean).join(", ");
+
+  const newPowerchatAccumulator = () => ({ event_count: 0, money: {}, money_event_counts: {}, units: {} });
+  const addPowerchatEventToAccumulator = (accumulator, event) => {
+    accumulator.event_count += 1;
+    if (event.kind === "money" && event.money_amount !== null && event.money_amount !== undefined && event.money_currency) {
+      const currency = String(event.money_currency || "").toUpperCase();
+      accumulator.money[currency] = Number(accumulator.money[currency] || 0) + Number(event.money_amount || 0);
+      accumulator.money_event_counts[currency] = Number(accumulator.money_event_counts[currency] || 0) + 1;
+    } else if (event.kind === "unit" && event.unit_amount !== null && event.unit_amount !== undefined && event.unit) {
+      const key = `${event.platform || ""}\u0000${event.unit || ""}`;
+      accumulator.units[key] = Number(accumulator.units[key] || 0) + Number(event.unit_amount || 0);
+    }
+  };
+  const powerchatMoneyTotalsFromAccumulator = (accumulator) => Object.entries(accumulator.money || {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([currency, amount]) => ({ currency, amount: Math.round(Number(amount || 0) * 100) / 100 }));
+  const powerchatUnitTotalsFromAccumulator = (accumulator) => Object.entries(accumulator.units || {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, amount]) => {
+      const [platform, unit] = String(key).split("\u0000");
+      return { platform: platform || "", unit: unit || "", amount: Math.round(Number(amount || 0) * 100) / 100 };
+    });
+  const powerchatAveragesFromAccumulator = (accumulator) => Object.entries(accumulator.money || {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([currency, amount]) => {
+      const count = Number((accumulator.money_event_counts || {})[currency] || 0);
+      return count > 0 ? { currency, amount: Math.round((Number(amount || 0) / count) * 100) / 100 } : null;
+    }).filter(Boolean);
+  const powerchatRatesFromAccumulator = (accumulator, durationSeconds) => {
+    durationSeconds = Number(durationSeconds || 0);
+    if (durationSeconds <= 0) return [];
+    const durationHours = durationSeconds / 3600;
+    return powerchatMoneyTotalsFromAccumulator(accumulator).map((row) => ({
+      currency: row.currency,
+      amount: row.amount,
+      duration_hours: Math.round(durationHours * 1000) / 1000,
+      amount_per_hour: Math.round((Number(row.amount || 0) / durationHours) * 100) / 100,
+    }));
+  };
+  const powerchatSortAmount = (accumulator) => Object.values(accumulator.money || {}).reduce((total, amount) => total + Number(amount || 0), 0);
+  const powerchatHourLabel = (hourIndex) => hourIndex === null || hourIndex === undefined ? "No stream offset" : `${hourIndex}:00-${hourIndex}:59`;
+  const powerchatEventTime = (event) => event.offset_seconds === null || event.offset_seconds === undefined ? formatIso(event.received_at) : formatEventOffset(event.offset_seconds);
+  const powerchatEventDate = (event) => String(event.received_at || "").slice(0, 10);
+  const powerchatDashboardEventMatches = (event, filters) => {
+    if (filters.streamer !== "all" && event.streamer !== filters.streamer) return false;
+    if (filters.platform !== "all" && event.platform !== filters.platform) return false;
+    if (filters.kind !== "all" && event.kind !== filters.kind) return false;
+    const date = powerchatEventDate(event);
+    if (filters.from && date && date < filters.from) return false;
+    if (filters.to && date && date > filters.to) return false;
+    const query = filters.search.trim().toLowerCase();
+    if (query) {
+      const haystack = [event.donor, event.message, event.stream_title, event.streamer, event.video_id, event.platform].join(" ").toLowerCase();
+      if (!haystack.includes(query)) return false;
+    }
+    return true;
+  };
+  const powerchatControlValue = (selector, fallback = "") => {
+    const element = document.querySelector(selector);
+    return element ? String(element.value || fallback) : fallback;
+  };
+  const readPowerchatFilters = () => ({
+    streamer: powerchatControlValue("[data-powerchat-filter-streamer]", "all"),
+    platform: powerchatControlValue("[data-powerchat-filter-platform]", "all"),
+    kind: powerchatControlValue("[data-powerchat-filter-kind]", "all"),
+    from: powerchatControlValue("[data-powerchat-filter-from]", ""),
+    to: powerchatControlValue("[data-powerchat-filter-to]", ""),
+    search: powerchatControlValue("[data-powerchat-filter-search]", ""),
+    page_size: powerchatPageSizeOptions.includes(Number(powerchatControlValue("[data-powerchat-page-size]", powerchatPageSizeDefault))) ? Number(powerchatControlValue("[data-powerchat-page-size]", powerchatPageSizeDefault)) : powerchatPageSizeDefault,
+  });
+  const setPowerchatSelectOptions = (selector, values, allLabel) => {
+    const select = document.querySelector(selector);
+    if (!select) return;
+    const current = select.value || "all";
+    const options = [`<option value="all">${escapeHtml(allLabel)}</option>`]
+      .concat([...values].sort((a, b) => String(a).localeCompare(String(b))).map((value) => `<option value="${escapeAttr(value)}">${escapeHtml(value)}</option>`));
+    select.innerHTML = options.join("");
+    select.value = values.has(current) ? current : "all";
+  };
+  const updatePowerchatFilterOptions = (events) => {
+    setPowerchatSelectOptions("[data-powerchat-filter-streamer]", new Set(events.map((event) => event.streamer).filter(Boolean)), "All streamers");
+    setPowerchatSelectOptions("[data-powerchat-filter-platform]", new Set(events.map((event) => event.platform).filter(Boolean)), "All platforms");
+    setPowerchatSelectOptions("[data-powerchat-filter-kind]", new Set(events.map((event) => event.kind).filter(Boolean)), "All kinds");
+  };
+  const aggregatePowerchatEvents = (events, stats) => {
+    const totals = newPowerchatAccumulator();
+    const donors = new Map();
+    const streams = new Map();
+    const hours = new Map();
+    const streamDurations = new Map((stats.stream_totals || []).map((stream) => [stream.video_id, Number(stream.duration_seconds || 0)]));
+    let eventsWithoutOffset = 0;
+    events.forEach((event) => {
+      addPowerchatEventToAccumulator(totals, event);
+      const donorName = event.donor || "Unknown donor";
+      if (!donors.has(donorName)) donors.set(donorName, { donor: donorName, event_count: 0, latest_received_at: "", accumulator: newPowerchatAccumulator() });
+      const donor = donors.get(donorName);
+      donor.event_count += 1;
+      if (event.received_at && event.received_at > donor.latest_received_at) donor.latest_received_at = event.received_at;
+      addPowerchatEventToAccumulator(donor.accumulator, event);
+      const streamKey = event.video_id || event.stream_title || "unknown";
+      if (!streams.has(streamKey)) streams.set(streamKey, { video_id: event.video_id || "", streamer: event.streamer || "", title: event.stream_title || "-", event_count: 0, duration_seconds: streamDurations.get(event.video_id) || 0, accumulator: newPowerchatAccumulator() });
+      const stream = streams.get(streamKey);
+      stream.event_count += 1;
+      addPowerchatEventToAccumulator(stream.accumulator, event);
+      if (event.hour_index === null || event.hour_index === undefined) {
+        eventsWithoutOffset += 1;
+      } else {
+        const hourIndex = Number(event.hour_index || 0);
+        if (!hours.has(hourIndex)) hours.set(hourIndex, { hour_index: hourIndex, hour_label: powerchatHourLabel(hourIndex), event_count: 0, accumulator: newPowerchatAccumulator() });
+        const hour = hours.get(hourIndex);
+        hour.event_count += 1;
+        addPowerchatEventToAccumulator(hour.accumulator, event);
+      }
+    });
+    const durationSeconds = [...streams.values()].reduce((total, stream) => total + Number(stream.duration_seconds || 0), 0);
+    return {
+      event_count: events.length,
+      streams_with_powerchat: streams.size,
+      events_without_offset: eventsWithoutOffset,
+      money_totals: powerchatMoneyTotalsFromAccumulator(totals),
+      unit_totals: powerchatUnitTotalsFromAccumulator(totals),
+      money_rates: powerchatRatesFromAccumulator(totals, durationSeconds),
+      top_donors: [...donors.values()].map((donor) => ({ donor: donor.donor, event_count: donor.event_count, latest_received_at: donor.latest_received_at, money_totals: powerchatMoneyTotalsFromAccumulator(donor.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(donor.accumulator), sort_amount: powerchatSortAmount(donor.accumulator) })).sort((a, b) => (b.sort_amount - a.sort_amount) || (b.event_count - a.event_count)).slice(0, 25),
+      stream_totals: [...streams.values()].map((stream) => ({ streamer: stream.streamer, video_id: stream.video_id, title: stream.title, event_count: stream.event_count, duration_seconds: stream.duration_seconds, money_totals: powerchatMoneyTotalsFromAccumulator(stream.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(stream.accumulator), money_rates: powerchatRatesFromAccumulator(stream.accumulator, stream.duration_seconds), sort_amount: powerchatSortAmount(stream.accumulator) })).sort((a, b) => (b.sort_amount - a.sort_amount) || (b.event_count - a.event_count)),
+      hourly_totals: [...hours.values()].map((hour) => ({ hour_index: hour.hour_index, hour_label: hour.hour_label, event_count: hour.event_count, money_totals: powerchatMoneyTotalsFromAccumulator(hour.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(hour.accumulator), average_money: powerchatAveragesFromAccumulator(hour.accumulator) })).sort((a, b) => a.hour_index - b.hour_index),
+    };
+  };
+  const renderPowerchatSummaryCards = (stats) => {
+    const topDonor = (stats.top_donors || [])[0];
+    const cards = [
+      ["Total", formatPowerchatSummary(stats.money_totals || [], stats.unit_totals || []) || "-"],
+      ["Per hour", formatPowerchatRates(stats.money_rates || []) || "-"],
+      ["Events", String(stats.event_count || 0)],
+      ["Top donor", topDonor ? topDonor.donor : "-"],
+      ["Streams", String(stats.streams_with_powerchat || 0)],
+      ["No offset", String(stats.events_without_offset || 0)],
+    ];
+    return cards.map(([label, value]) => `<div class="powerchat-summary-card"><strong>${escapeHtml(value)}</strong><span class="muted">${escapeHtml(label)}</span></div>`).join("");
+  };
+  const renderPowerchatHourlyRows = (rows) => {
+    if (!rows || !rows.length) return '<tr><td colspan="4" class="file-meta">No hourly Powerchat events captured yet</td></tr>';
+    return rows.map((row) => `<tr><td>${escapeHtml(row.hour_label || "-")}</td><td>${escapeHtml(row.event_count || 0)}</td><td>${escapeHtml(formatPowerchatSummary(row.money_totals || [], row.unit_totals || []) || "-")}</td><td>${escapeHtml(formatPowerchatSummary(row.average_money || [], []) || "-")}</td></tr>`).join("");
+  };
+  const renderPowerchatDashboardStreamRows = (rows) => {
+    if (!rows || !rows.length) return '<tr><td colspan="6" class="file-meta">No streams with Powerchat events yet</td></tr>';
+    return rows.slice(0, 50).map((row) => `<tr><td>${escapeHtml(row.streamer || "-")}</td><td class="file-name">${escapeHtml(row.title || row.video_id || "-")}</td><td>${escapeHtml(row.event_count || 0)}</td><td>${escapeHtml(formatPowerchatSummary(row.money_totals || [], row.unit_totals || []) || "-")}</td><td>${escapeHtml(formatDuration(row.duration_seconds || 0))}</td><td>${escapeHtml(formatPowerchatRates(row.money_rates || []) || "-")}</td></tr>`).join("");
+  };
+  const renderPowerchatDonorRows = (rows) => {
+    if (!rows || !rows.length) return '<tr><td colspan="4" class="file-meta">No Powerchat donors yet</td></tr>';
+    return rows.slice(0, 25).map((row) => `<tr><td>${escapeHtml(row.donor || "Unknown donor")}</td><td>${escapeHtml(row.event_count || 0)}</td><td>${escapeHtml(formatPowerchatSummary(row.money_totals || [], row.unit_totals || []) || "-")}</td><td>${escapeHtml(formatIso(row.latest_received_at || ""))}</td></tr>`).join("");
+  };
+  const renderPowerchatLedgerRows = (events) => {
+    if (!events || !events.length) return '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>';
+    return events.map((event) => `<tr><td>${escapeHtml(powerchatEventTime(event))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatEventAmountText(event) || "-")}</td><td>${escapeHtml(event.platform || "Powerchat")}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("");
+  };
+  const renderPowerchatDashboard = (stats) => {
+    stats = stats || { events: [] };
+    const allEvents = stats.events || [];
+    updatePowerchatFilterOptions(allEvents);
+    const filters = readPowerchatFilters();
+    const filteredEvents = allEvents.filter((event) => powerchatDashboardEventMatches(event, filters));
+    const filteredStats = aggregatePowerchatEvents(filteredEvents, stats);
+    const maxPage = Math.max(1, Math.ceil(filteredEvents.length / filters.page_size));
+    powerchatPage = Math.max(1, Math.min(powerchatPage, maxPage));
+    const start = (powerchatPage - 1) * filters.page_size;
+    const pageEvents = filteredEvents.slice(start, start + filters.page_size);
+    const cards = byId("powerchat-summary-cards");
+    if (cards) cards.innerHTML = renderPowerchatSummaryCards(filteredStats);
+    const hourly = byId("powerchat-hourly-rows");
+    if (hourly) hourly.innerHTML = renderPowerchatHourlyRows(filteredStats.hourly_totals || []);
+    const streams = byId("powerchat-stream-rows");
+    if (streams) streams.innerHTML = renderPowerchatDashboardStreamRows(filteredStats.stream_totals || []);
+    const donors = byId("powerchat-donor-rows");
+    if (donors) donors.innerHTML = renderPowerchatDonorRows(filteredStats.top_donors || []);
+    const ledger = byId("powerchat-ledger-rows");
+    if (ledger) ledger.innerHTML = renderPowerchatLedgerRows(pageEvents);
+    const state = byId("powerchat-ledger-state");
+    if (state) state.textContent = filteredEvents.length ? `Showing ${start + 1}-${Math.min(start + pageEvents.length, filteredEvents.length)} of ${filteredEvents.length} events` : "Showing 0 events";
   };
 
   const renderFileAction = (file) => {
@@ -10151,6 +10722,8 @@ def dashboard_script() -> str:
       }
       const configSections = byId("config-sections");
       if (configSections) configSections.innerHTML = renderConfigSections(snapshot.configuration || {});
+      latestPowerchatStats = snapshot.powerchat_stats || { events: [] };
+      renderPowerchatDashboard(latestPowerchatStats);
     }
 
     if (isLite) {
@@ -10191,6 +10764,8 @@ def dashboard_script() -> str:
     }
   };
 
+  latestPowerchatStats = readInitialPowerchatStats() || { events: [] };
+  renderPowerchatDashboard(latestPowerchatStats);
   window.setInterval(refreshStatus, 15000);
 })();
 </script>"""
@@ -11765,6 +12340,164 @@ def render_content_event(event: ContentEventStatus) -> str:
         f'<span><b>Voice</b> {escape(voice)}</span><span><b>Labels</b> {escape(labels)}</span><span><b>Keywords</b> {escape(keywords)}</span>'
         '</div></div>'
     )
+
+
+def render_powerchat_dashboard(stats: dict[str, Any]) -> str:
+    return f"""<section class="panel powerchat-dashboard" id="powerchat-dashboard">
+  <h2>Powerchat</h2>
+  <div class="powerchat-summary-grid" id="powerchat-summary-cards">{render_powerchat_summary_cards(stats)}</div>
+  <div class="powerchat-dashboard-controls">
+    <label>Streamer <select data-powerchat-filter-control data-powerchat-filter-streamer>{render_powerchat_filter_options(powerchat_filter_values(stats, "streamer"), "All streamers")}</select></label>
+    <label>Platform <select data-powerchat-filter-control data-powerchat-filter-platform>{render_powerchat_filter_options(powerchat_filter_values(stats, "platform"), "All platforms")}</select></label>
+    <label>Kind <select data-powerchat-filter-control data-powerchat-filter-kind>{render_powerchat_filter_options(powerchat_filter_values(stats, "kind"), "All kinds")}</select></label>
+    <label>From <input data-powerchat-filter-control data-powerchat-filter-from type="date"></label>
+    <label>To <input data-powerchat-filter-control data-powerchat-filter-to type="date"></label>
+    <label>Search <input data-powerchat-filter-control data-powerchat-filter-search placeholder="Donor, message, title"></label>
+    <label>Per page <select data-powerchat-filter-control data-powerchat-page-size><option>25</option><option selected>50</option><option>100</option></select></label>
+  </div>
+  <div class="powerchat-dashboard-section">
+    <h3>Donations Per Hour</h3>
+    <div class="table-wrap"><table><thead><tr><th>Stream Hour</th><th>Events</th><th>Total</th><th>Average</th></tr></thead><tbody id="powerchat-hourly-rows">{render_powerchat_hourly_rows(stats.get("hourly_totals", []))}</tbody></table></div>
+  </div>
+  <div class="powerchat-dashboard-section">
+    <h3>Streams</h3>
+    <div class="table-wrap"><table><thead><tr><th>Streamer</th><th>Stream</th><th>Events</th><th>Total</th><th>Duration</th><th>Per hour</th></tr></thead><tbody id="powerchat-stream-rows">{render_powerchat_dashboard_stream_rows(stats.get("stream_totals", []))}</tbody></table></div>
+  </div>
+  <div class="powerchat-dashboard-section">
+    <h3>Top Donors</h3>
+    <div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead><tbody id="powerchat-donor-rows">{render_powerchat_donor_rows(stats.get("top_donors", []))}</tbody></table></div>
+  </div>
+  <div class="powerchat-dashboard-section">
+    <h3>Ledger</h3>
+    <div class="table-wrap"><table><thead><tr><th>Time</th><th>Streamer</th><th>Stream</th><th>Donor</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead><tbody id="powerchat-ledger-rows">{render_powerchat_ledger_rows(stats.get("events", [])[:50])}</tbody></table></div>
+    <div class="powerchat-ledger-footer"><span class="file-meta" id="powerchat-ledger-state">Showing {min(len(stats.get("events", [])), 50)} of {len(stats.get("events", []))} events</span><div class="stream-browser-pager"><button class="download action-button" type="button" data-powerchat-page-prev>Previous</button><button class="download action-button" type="button" data-powerchat-page-next>Next</button></div></div>
+  </div>
+</section>"""
+
+
+def render_powerchat_summary_cards(stats: dict[str, Any]) -> str:
+    top_donors = stats.get("top_donors") or []
+    top_donor = top_donors[0].get("donor") if top_donors else "-"
+    cards = [
+        ("Total", format_powerchat_summary(stats.get("money_totals", []), stats.get("unit_totals", [])) or "-"),
+        ("Per hour", format_powerchat_rates(stats.get("money_rates", [])) or "-"),
+        ("Events", str(stats.get("event_count") or 0)),
+        ("Top donor", str(top_donor or "-")),
+        ("Streams", str(stats.get("streams_with_powerchat") or 0)),
+        ("No offset", str(stats.get("events_without_offset") or 0)),
+    ]
+    return "".join(
+        f'<div class="powerchat-summary-card"><strong>{escape(value)}</strong><span class="muted">{escape(label)}</span></div>'
+        for label, value in cards
+    )
+
+
+def powerchat_filter_values(stats: dict[str, Any], key: str) -> list[str]:
+    return sorted(
+        {
+            str(event.get(key) or "").strip()
+            for event in stats.get("events", [])
+            if str(event.get(key) or "").strip()
+        },
+        key=str.casefold,
+    )
+
+
+def render_powerchat_filter_options(values: list[str], all_label: str) -> str:
+    options = [f'<option value="all" selected>{escape(all_label)}</option>']
+    options.extend(
+        f'<option value="{escape(value, quote=True)}">{escape(value)}</option>'
+        for value in values
+    )
+    return "".join(options)
+
+
+def render_powerchat_hourly_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="4" class="file-meta">No hourly Powerchat events captured yet</td></tr>'
+    return "".join(
+        "<tr>"
+        f'<td>{escape(str(row.get("hour_label") or "-"))}</td>'
+        f'<td>{escape(str(row.get("event_count") or 0))}</td>'
+        f'<td>{escape(format_powerchat_summary(row.get("money_totals", []), row.get("unit_totals", [])) or "-")}</td>'
+        f'<td>{escape(format_powerchat_summary(row.get("average_money", []), []) or "-")}</td>'
+        "</tr>"
+        for row in rows
+    )
+
+
+def render_powerchat_dashboard_stream_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="6" class="file-meta">No streams with Powerchat events yet</td></tr>'
+    return "".join(
+        "<tr>"
+        f'<td>{escape(str(row.get("streamer") or "-"))}</td>'
+        f'<td class="file-name">{escape(str(row.get("title") or row.get("video_id") or "-"))}</td>'
+        f'<td>{escape(str(row.get("event_count") or 0))}</td>'
+        f'<td>{escape(format_powerchat_summary(row.get("money_totals", []), row.get("unit_totals", [])) or "-")}</td>'
+        f'<td>{escape(format_duration(int(float(row.get("duration_seconds") or 0))))}</td>'
+        f'<td>{escape(format_powerchat_rates(row.get("money_rates", [])) or "-")}</td>'
+        "</tr>"
+        for row in rows[:50]
+    )
+
+
+def render_powerchat_donor_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="4" class="file-meta">No Powerchat donors yet</td></tr>'
+    return "".join(
+        "<tr>"
+        f'<td>{escape(str(row.get("donor") or "Unknown donor"))}</td>'
+        f'<td>{escape(str(row.get("event_count") or 0))}</td>'
+        f'<td>{escape(format_powerchat_summary(row.get("money_totals", []), row.get("unit_totals", [])) or "-")}</td>'
+        f'<td>{escape(format_optional_iso(str(row.get("latest_received_at") or "")))}</td>'
+        "</tr>"
+        for row in rows[:25]
+    )
+
+
+def render_powerchat_ledger_rows(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>'
+    return "".join(
+        "<tr>"
+        f'<td>{escape(powerchat_dashboard_event_time(row))}</td>'
+        f'<td>{escape(str(row.get("streamer") or "-"))}</td>'
+        f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
+        f'<td>{escape(str(row.get("donor") or "Unknown donor"))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_amount_text(row) or "-")}</td>'
+        f'<td>{escape(str(row.get("platform") or "Powerchat"))}</td>'
+        f'<td class="log-message">{escape(str(row.get("message") or "-"))}</td>'
+        "</tr>"
+        for row in rows
+    )
+
+
+def powerchat_dashboard_event_time(row: dict[str, Any]) -> str:
+    if row.get("offset_seconds") is not None:
+        return format_event_offset(float(row.get("offset_seconds") or 0.0))
+    return format_optional_iso(str(row.get("received_at") or ""))
+
+
+def powerchat_dashboard_event_amount_text(row: dict[str, Any]) -> str:
+    kind = str(row.get("kind") or "")
+    if kind == "money" and row.get("money_amount") is not None and row.get("money_currency"):
+        return f'{str(row.get("money_currency") or "").upper()} {format_powerchat_number(float(row.get("money_amount") or 0.0), decimals=2)}'
+    if kind == "unit" and row.get("unit_amount") is not None and row.get("unit"):
+        amount = f'{format_powerchat_number(float(row.get("unit_amount") or 0.0))} {row.get("unit")}'
+        platform = str(row.get("platform") or "")
+        return f"{platform}: {amount}" if platform else amount
+    return ""
+
+
+def format_powerchat_rates(rates: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for rate in rates:
+        currency = str(rate.get("currency") or "").upper()
+        amount = rate.get("amount_per_hour")
+        if currency and amount is not None:
+            parts.append(f"{currency} {format_powerchat_number(float(amount), decimals=2)}/hr")
+    return ", ".join(parts)
 
 
 def render_powerchat_events(stream: StreamStatus) -> str:
