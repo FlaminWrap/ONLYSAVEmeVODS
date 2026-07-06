@@ -84,6 +84,7 @@ class AppUpdateReleaseTests(unittest.TestCase):
     def test_release_version_is_newer_than_dev_checkout(self) -> None:
         self.assertTrue(is_newer_version("v0.1.0", "0.1.0.dev0"))
         self.assertFalse(is_newer_version("v0.1.0", "0.1.0"))
+        self.assertFalse(is_newer_version("v0.1.0", "0.1.1.dev0"))
 
 
 class AppUpdateModeTests(unittest.TestCase):

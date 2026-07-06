@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onlysavemevods"
-version = "0.1.0.dev0"
+version = "0.1.1.dev0"
 description = "Watch streamer sources and automatically record live streams with yt-dlp."
 readme = "README.md"
 license = { file = "LICENSE" }
