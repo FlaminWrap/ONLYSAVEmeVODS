@@ -7847,9 +7847,56 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     }}
     .about-title {{ min-width: 0; }}
     .about-title h2 {{ margin: 0 0 4px; }}
+    .about-update-panel {{
+      display: grid;
+      gap: 12px;
+      margin-top: 18px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-strong);
+    }}
+    .about-update-header {{
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }}
+    .about-update-title {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }}
+    .about-update-title h3 {{ margin: 0; }}
+    .about-update-status {{ display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; }}
+    .about-update-summary {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+      gap: 10px;
+    }}
+    .about-update-summary .metric {{ background: var(--panel); }}
+    .about-update-summary .metric strong {{ font-size: 15px; overflow-wrap: anywhere; }}
+    .about-update-message {{
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }}
+    .about-update-message.error {{
+      color: var(--bad);
+      border-color: color-mix(in srgb, var(--bad), transparent 55%);
+      background: color-mix(in srgb, var(--bad), transparent 94%);
+    }}
+    .about-update-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
+    .about-update-footer {{ display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); }}
     @media (max-width: 520px) {{
       .about-heading {{ align-items: flex-start; }}
       .about-icon {{ width: 72px; height: 72px; }}
+      .about-update-header {{ display: grid; }}
+      .about-update-status {{ justify-content: flex-start; }}
     }}
     dl {{
       display: grid;
@@ -11488,9 +11535,14 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     if pending and update.get("pending_tag"):
         pending_label = f"{update.get('pending_tag')} ({update.get('pending_source') or 'manual'})"
     error = str(update.get("last_error") or "")
-    error_row = ""
-    if error:
-        error_row = f"<dt>Last error</dt><dd>{escape(error)}</dd>"
+    repo = str(update.get("repository") or "-")
+    checked_at = str(update.get("checked_at") or "-")
+    installed = str(update.get("last_installed_tag") or update.get("last_installed_version") or "-")
+    status_class = app_update_status_badge_class(status)
+    status_label = app_update_status_label(status)
+    mode_label = app_update_mode_label(mode)
+    message_text = error or message or app_update_mode_message(mode)
+    message_class = " error" if error or status == "failed" else ""
     install_form = ""
     if mode in {"manual", "auto_install"}:
         install_form = f"""
@@ -11499,25 +11551,67 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
       <button class="download action-button" type="submit"{install_disabled}{install_title}>Install update</button>
     </form>"""
     return f"""<section class="about-update-panel">
-  <h3>App Updates</h3>
-  <dl>
-    <dt>Mode</dt><dd>{escape(mode)}</dd>
-    <dt>Status</dt><dd>{escape(status)}</dd>
-    <dt>Repository</dt><dd>{escape(str(update.get('repository') or '-'))}</dd>
-    <dt>Latest release</dt><dd>{latest_html}</dd>
-    <dt>Pending install</dt><dd>{escape(pending_label)}</dd>
-    <dt>Checked</dt><dd>{escape(str(update.get('checked_at') or '-'))}</dd>
-    <dt>Last installed</dt><dd>{escape(str(update.get('last_installed_tag') or update.get('last_installed_version') or '-'))}</dd>
-    {error_row}
-  </dl>
-  <div class="file-meta">{escape(message or app_update_mode_message(mode))}</div>
-  <div class="settings-actions">
+  <div class="about-update-header">
+    <div class="about-update-title">
+      <h3>App Updates</h3>
+    </div>
+    <div class="about-update-status">
+      <span class="badge {status_class}">{escape(status_label)}</span>
+      <span class="badge">{escape(mode_label)}</span>
+    </div>
+  </div>
+  <div class="about-update-summary">
+    <div class="metric"><span>Repository</span><strong>{escape(repo)}</strong></div>
+    <div class="metric"><span>Latest release</span><strong>{latest_html}</strong></div>
+    <div class="metric"><span>Pending install</span><strong>{escape(pending_label)}</strong></div>
+    <div class="metric"><span>Last checked</span><strong>{escape(checked_at)}</strong></div>
+  </div>
+  <div class="about-update-message{message_class}">{escape(message_text)}</div>
+  <div class="about-update-actions">
     <form class="inline-form" method="post" action="/app-update/check">
       <button class="download action-button" type="submit"{check_disabled}>Check for updates</button>
     </form>
     {install_form}
   </div>
+  <div class="about-update-footer">
+    <span>Current version: {escape(str(update.get('current_version') or APP_VERSION))}</span>
+    <span>Last installed: {escape(installed)}</span>
+  </div>
 </section>"""
+
+
+def app_update_status_label(status: str) -> str:
+    labels = {
+        "disabled": "Disabled",
+        "failed": "Check failed",
+        "installed": "Installed",
+        "installing": "Installing",
+        "requested": "Install pending",
+        "update_available": "Update available",
+        "up_to_date": "Up to date",
+        "unknown": "Not checked",
+    }
+    return labels.get(status, status.replace("_", " ").title())
+
+
+def app_update_mode_label(mode: str) -> str:
+    labels = {
+        "disabled": "Disabled mode",
+        "manual": "Manual mode",
+        "check_only": "Check-only mode",
+        "auto_install": "Auto-install mode",
+    }
+    return labels.get(mode, mode.replace("_", " ").title())
+
+
+def app_update_status_badge_class(status: str) -> str:
+    if status in {"failed"}:
+        return "failed"
+    if status in {"update_available", "requested", "installing"}:
+        return "queued"
+    if status in {"up_to_date", "installed"}:
+        return "done"
+    return "ended"
 
 
 def app_update_mode_message(mode: str) -> str:
