@@ -685,3 +685,8 @@ scripts/uninstall-systemd.sh
 - The systemd installer only removes/replaces the root-owned app copy during
   updates; uninstalling the service leaves config, downloads, state, venv, Deno,
   and the `onlysavemevods` user in place.
+
+## License
+
+ONLYSAVEmeVODS is licensed under the GNU Affero General Public License v3.0.
+See [LICENSE](LICENSE) for the full license text.

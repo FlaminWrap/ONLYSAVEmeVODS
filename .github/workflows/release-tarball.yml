@@ -57,6 +57,7 @@ jobs:
           required_paths=(
             pyproject.toml
             README.md
+            LICENSE
             config.example.toml
             src
             scripts
@@ -137,6 +138,7 @@ jobs:
           required_paths=(
             "${bundle}/pyproject.toml"
             "${bundle}/README.md"
+            "${bundle}/LICENSE"
             "${bundle}/config.example.toml"
             "${bundle}/src/"
             "${bundle}/scripts/"
