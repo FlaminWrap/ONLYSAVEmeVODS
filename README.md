@@ -406,6 +406,10 @@ The installer also enables a GitHub Release app updater. It checks
 and applies updates only when the service is idle. Configure behavior in
 `config.toml` with `app_update_mode`:
 
+Source checkouts identify themselves as development builds, such as
+`0.1.0.dev0`. Release tarballs rewrite the package and About-page version to
+the published tag, such as `0.1.0`, during the GitHub release workflow.
+
 - `disabled`: no checks or install controls.
 - `manual`: the About tab checks and installs only when you click the buttons.
 - `check_only`: scheduled/manual checks report newer releases but never install.

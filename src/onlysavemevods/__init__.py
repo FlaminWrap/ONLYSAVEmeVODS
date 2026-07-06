@@ -2,7 +2,9 @@
 
 from importlib.metadata import PackageNotFoundError, version
 
-_FALLBACK_VERSION = "0.1.0"
+# Source checkouts are development builds. Release tarballs rewrite this and
+# pyproject.toml to the published tag version.
+_FALLBACK_VERSION = "0.1.0.dev0"
 
 try:
     __version__ = version("onlysavemevods")
