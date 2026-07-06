@@ -30,6 +30,11 @@ import tempfile
 import time
 
 from . import __version__ as APP_VERSION
+from .app_update import (
+    check_for_updates,
+    request_update,
+    update_status as app_update_status,
+)
 from .chat_render import (
     build_render_chat_file_process_command,
     chat_video_output_file,
@@ -687,6 +692,7 @@ class StatusSnapshot:
     stream_revision: str
     job_revision: str
     app: AppInfo
+    app_update: dict[str, Any]
     download_dir: str
     state_db: str
     counts: dict[str, int]
@@ -761,6 +767,15 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("web_enabled", "Web", "bool"),
     ConfigFormField("web_host", "Web", "text"),
     ConfigFormField("web_port", "Web", "int", minimum=1),
+    ConfigFormField(
+        "app_update_mode",
+        "App Updates",
+        "choice",
+        options=("disabled", "manual", "check_only", "auto_install"),
+    ),
+    ConfigFormField("app_update_repository", "App Updates", "text"),
+    ConfigFormField("app_update_include_prereleases", "App Updates", "bool"),
+    ConfigFormField("app_update_github_token_env", "App Updates", "text"),
     ConfigFormField("log_level", "Tools", "choice", options=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")),
     ConfigFormField("yt_dlp_path", "Tools", "text"),
     ConfigFormField("ffmpeg_path", "Tools", "text"),
@@ -946,6 +961,12 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/config":
                     self._update_config()
+                    return
+                if path == "/app-update/check":
+                    self._check_app_update()
+                    return
+                if path == "/app-update/request":
+                    self._request_app_update()
                     return
                 if path == "/watermark":
                     self._start_watermark()
@@ -1489,6 +1510,38 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
+        def _check_app_update(self) -> None:
+            self._discard_request_body()
+            try:
+                check_for_updates(config, current_version=APP_VERSION)
+            except Exception as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#about")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _request_app_update(self) -> None:
+            body = self._read_request_body(4096)
+            if body is None:
+                return
+            try:
+                params = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+                tag = first_query_value(params, "tag").strip() or None
+                request_update(config, tag=tag, source="manual", current_version=APP_VERSION)
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", "/#about")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
         def _update_streamers(self) -> None:
             body = self._read_request_body(64 * 1024)
             if body is None:
@@ -1717,6 +1770,7 @@ def build_status_snapshot(
         stream_revision=stream_revision_for_records(records),
         job_revision=job_revision_for_jobs(jobs),
         app=build_app_info(),
+        app_update=app_update_status(config, current_version=APP_VERSION),
         download_dir=str(config.download_dir),
         state_db=str(config.db_path),
         counts=counts,
@@ -1830,6 +1884,7 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
         "jobs": [asdict(job) for job in jobs],
         "job_limit": JOB_LIMIT,
         "app": asdict(build_app_info()),
+        "app_update": app_update_status(config, current_version=APP_VERSION),
     }
     log_perf(
         "status-lite",
@@ -2104,6 +2159,16 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "web_enabled": config.web_enabled,
             "web_host": config.web_host,
             "web_port": config.web_port,
+        },
+        "App Updates": {
+            "app_update_mode": config.app_update_mode,
+            "app_update_repository": config.app_update_repository,
+            "app_update_include_prereleases": config.app_update_include_prereleases,
+            "app_update_github_token_env": config.app_update_github_token_env,
+            "app_update_github_token_configured": bool(
+                config.app_update_github_token_env
+                and os_environ_has(config.app_update_github_token_env)
+            ),
         },
         "Tools": {
             "log_level": config.log_level,
@@ -11387,7 +11452,82 @@ def render_about_panel(snapshot: StatusSnapshot) -> str:
     <dt>Executable</dt><dd id="about-executable">{escape(snapshot.app.executable)}</dd>
     <dt>Status generated</dt><dd>{escape(generated)}</dd>
   </dl>
+  {render_app_update_panel(snapshot.app_update)}
 </section>"""
+
+
+def render_app_update_panel(update: dict[str, Any]) -> str:
+    mode = str(update.get("mode") or "manual")
+    status = str(update.get("status") or "unknown")
+    message = str(update.get("message") or "")
+    latest_tag = str(update.get("latest_tag") or "")
+    latest_version = str(update.get("latest_version") or "")
+    release_url = str(update.get("release_url") or update.get("latest_url") or "")
+    pending = bool(update.get("pending"))
+    available = bool(update.get("available"))
+    disabled = mode == "disabled"
+    check_disabled = " disabled" if disabled else ""
+    install_allowed = mode in {"manual", "auto_install"} and available and not pending
+    install_disabled = "" if install_allowed else " disabled"
+    install_title = ""
+    if mode == "check_only":
+        install_title = ' title="Updater is in check-only mode"'
+    elif pending:
+        install_title = ' title="Update is already requested"'
+    elif not available:
+        install_title = ' title="No checked update is available"'
+    latest_label = "-"
+    if latest_tag:
+        latest_label = latest_tag
+        if latest_version and latest_version != latest_tag:
+            latest_label = f"{latest_tag} ({latest_version})"
+    latest_html = escape(latest_label)
+    if release_url:
+        latest_html = f'<a href="{escape(release_url, quote=True)}">{latest_html}</a>'
+    pending_label = "yes" if pending else "no"
+    if pending and update.get("pending_tag"):
+        pending_label = f"{update.get('pending_tag')} ({update.get('pending_source') or 'manual'})"
+    error = str(update.get("last_error") or "")
+    error_row = ""
+    if error:
+        error_row = f"<dt>Last error</dt><dd>{escape(error)}</dd>"
+    install_form = ""
+    if mode in {"manual", "auto_install"}:
+        install_form = f"""
+    <form class="inline-form" method="post" action="/app-update/request">
+      <input type="hidden" name="tag" value="{escape(latest_tag, quote=True)}">
+      <button class="download action-button" type="submit"{install_disabled}{install_title}>Install update</button>
+    </form>"""
+    return f"""<section class="about-update-panel">
+  <h3>App Updates</h3>
+  <dl>
+    <dt>Mode</dt><dd>{escape(mode)}</dd>
+    <dt>Status</dt><dd>{escape(status)}</dd>
+    <dt>Repository</dt><dd>{escape(str(update.get('repository') or '-'))}</dd>
+    <dt>Latest release</dt><dd>{latest_html}</dd>
+    <dt>Pending install</dt><dd>{escape(pending_label)}</dd>
+    <dt>Checked</dt><dd>{escape(str(update.get('checked_at') or '-'))}</dd>
+    <dt>Last installed</dt><dd>{escape(str(update.get('last_installed_tag') or update.get('last_installed_version') or '-'))}</dd>
+    {error_row}
+  </dl>
+  <div class="file-meta">{escape(message or app_update_mode_message(mode))}</div>
+  <div class="settings-actions">
+    <form class="inline-form" method="post" action="/app-update/check">
+      <button class="download action-button" type="submit"{check_disabled}>Check for updates</button>
+    </form>
+    {install_form}
+  </div>
+</section>"""
+
+
+def app_update_mode_message(mode: str) -> str:
+    if mode == "disabled":
+        return "App updater is disabled."
+    if mode == "check_only":
+        return "Checks can report updates, but installs are disabled."
+    if mode == "auto_install":
+        return "Scheduled checks will request newer releases and install them when idle."
+    return "Updates are checked and installed only when requested."
 
 
 def voice_detection_overrides_for_summary(config: BotConfig) -> dict[str, str]:

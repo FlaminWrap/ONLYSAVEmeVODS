@@ -61,6 +61,9 @@ DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS = 300
 DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS = 2
 DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS = 180
 DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT = 5
+APP_UPDATE_MODES = {"disabled", "manual", "check_only", "auto_install"}
+DEFAULT_APP_UPDATE_REPOSITORY = "FlaminWrap/ONLYSAVEmeVODS"
+DEFAULT_APP_UPDATE_GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
 CONFIG_UPDATE_COMMENT = (
     "# Added by ONLYSAVEmeVODS config update. "
     "Existing settings above were left unchanged."
@@ -190,6 +193,10 @@ class BotConfig:
     web_enabled: bool = True
     web_host: str = "127.0.0.1"
     web_port: int = 8080
+    app_update_mode: str = "manual"
+    app_update_repository: str = DEFAULT_APP_UPDATE_REPOSITORY
+    app_update_include_prereleases: bool = False
+    app_update_github_token_env: str = DEFAULT_APP_UPDATE_GITHUB_TOKEN_ENV
     log_level: str = "INFO"
     yt_dlp_path: str = "yt-dlp"
     ffmpeg_path: str = "ffmpeg"
@@ -439,6 +446,25 @@ def load_config(path: str | Path) -> BotConfig:
         web_enabled=_as_bool(raw.get("web_enabled", True), "web_enabled"),
         web_host=_as_str(raw.get("web_host", "127.0.0.1"), "web_host"),
         web_port=_as_port(raw.get("web_port", 8080), "web_port"),
+        app_update_mode=_as_app_update_mode(
+            raw.get("app_update_mode", "manual"),
+            "app_update_mode",
+        ),
+        app_update_repository=_as_github_repository(
+            raw.get("app_update_repository", DEFAULT_APP_UPDATE_REPOSITORY),
+            "app_update_repository",
+        ),
+        app_update_include_prereleases=_as_bool(
+            raw.get("app_update_include_prereleases", False),
+            "app_update_include_prereleases",
+        ),
+        app_update_github_token_env=_as_env_var_name(
+            raw.get(
+                "app_update_github_token_env",
+                DEFAULT_APP_UPDATE_GITHUB_TOKEN_ENV,
+            ),
+            "app_update_github_token_env",
+        ),
         log_level=_as_log_level(raw.get("log_level", "INFO"), "log_level"),
         yt_dlp_path=_as_str(raw.get("yt_dlp_path", "yt-dlp"), "yt_dlp_path"),
         ffmpeg_path=_as_str(raw.get("ffmpeg_path", "ffmpeg"), "ffmpeg_path"),
@@ -1811,6 +1837,29 @@ def _as_voice_detection_mode(value: Any, name: str) -> str:
         allowed = ", ".join(sorted(VOICE_DETECTION_MODES))
         raise ConfigError(f"{name} must be one of: {allowed}")
     return mode
+
+
+def _as_app_update_mode(value: Any, name: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"{name} must be a string")
+    mode = value.strip().lower()
+    if mode not in APP_UPDATE_MODES:
+        allowed = ", ".join(sorted(APP_UPDATE_MODES))
+        raise ConfigError(f"{name} must be one of: {allowed}")
+    return mode
+
+
+def _as_github_repository(value: Any, name: str) -> str:
+    repository = _as_str(value, name).strip().strip("/")
+    if repository.endswith(".git"):
+        repository = repository[:-4]
+    parts = repository.split("/")
+    if len(parts) != 2 or not all(parts):
+        raise ConfigError(f"{name} must use owner/repository format")
+    for part in parts:
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", part):
+            raise ConfigError(f"{name} contains invalid GitHub repository characters")
+    return repository
 
 
 def _as_str(value: Any, name: str) -> str:

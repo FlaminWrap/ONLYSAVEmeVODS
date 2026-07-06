@@ -401,6 +401,29 @@ ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR='*-*-* 03:30:00' scripts/install-systemd.s
 ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY=20m scripts/install-systemd.sh
 ```
 
+The installer also enables a GitHub Release app updater. It checks
+`FlaminWrap/ONLYSAVEmeVODS` release tarballs, verifies the `.sha256` checksum,
+and applies updates only when the service is idle. Configure behavior in
+`config.toml` with `app_update_mode`:
+
+- `disabled`: no checks or install controls.
+- `manual`: the About tab checks and installs only when you click the buttons.
+- `check_only`: scheduled/manual checks report newer releases but never install.
+- `auto_install`: scheduled checks request newer releases and install them when
+  idle.
+
+Manual install requests are written under `state/app-update-request.json`; the
+web process does not replace root-owned app files itself. The systemd app
+updater applies the request, backs up the current app directory, restores it if
+the update fails, and preserves config, secrets, downloads, state, venv, Deno,
+and cache directories. Its default timer runs at `05:15` with up to `45m`
+randomized delay. Reschedule it at install time with:
+
+```bash
+ONLYSAVEMEVODS_APP_UPDATE_CALENDAR='*-*-* 05:30:00' scripts/install-systemd.sh
+ONLYSAVEMEVODS_APP_UPDATE_RANDOM_DELAY=20m scripts/install-systemd.sh
+```
+
 To install somewhere other than `/opt/onlysavemevods`:
 
 ```bash
@@ -450,8 +473,10 @@ Inspect it:
 ```bash
 sudo systemctl status onlysavemevods.service
 systemctl list-timers onlysavemevods-python-update.timer
+systemctl list-timers onlysavemevods-app-update.timer
 journalctl -u onlysavemevods.service -f
 journalctl -u onlysavemevods-python-update.service
+journalctl -u onlysavemevods-app-update.service
 ```
 
 Set `log_level = "DEBUG"` in `config.toml` and restart the service when you need

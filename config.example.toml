@@ -175,6 +175,16 @@ web_enabled = true
 web_host = "127.0.0.1"
 web_port = 8080
 
+# GitHub Release updater. Modes:
+# disabled: no checks or install controls.
+# manual: check/install only when requested from the About tab.
+# check_only: scheduled/manual checks show available updates but never install.
+# auto_install: scheduled checks request newer release installs when idle.
+app_update_mode = "manual"
+app_update_repository = "FlaminWrap/ONLYSAVEmeVODS"
+app_update_include_prereleases = false
+app_update_github_token_env = "GITHUB_TOKEN"
+
 # Keep downloaded media fragments while a segment is active. This costs extra
 # disk space, but it lets the bot turn an accidentally finalized audio/video
 # format back into a resumable .part file without dropping fragments.

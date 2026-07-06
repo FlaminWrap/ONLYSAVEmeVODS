@@ -95,6 +95,7 @@ from onlysavemevods.web import (
     StreamEventStatus,
     StreamerStatStatus,
     render_stream_event_timeline,
+    render_app_update_panel,
     render_streamer_jobs_summary,
     STREAM_DELETE_CONFIRM_VALUE,
 )
@@ -151,6 +152,10 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "web_enabled": "true",
         "web_host": "127.0.0.1",
         "web_port": "8080",
+        "app_update_mode": "manual",
+        "app_update_repository": "FlaminWrap/ONLYSAVEmeVODS",
+        "app_update_include_prereleases": "false",
+        "app_update_github_token_env": "GITHUB_TOKEN",
         "log_level": "INFO",
         "yt_dlp_path": "yt-dlp",
         "ffmpeg_path": "ffmpeg",
@@ -169,6 +174,27 @@ class WebStatusTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         clear_tracked_jobs()
+
+    def test_app_update_panel_controls_match_mode(self) -> None:
+        base = {
+            "repository": "FlaminWrap/ONLYSAVEmeVODS",
+            "status": "update_available",
+            "available": True,
+            "latest_tag": "v2.0.0",
+            "latest_version": "2.0.0",
+        }
+
+        manual = render_app_update_panel({**base, "mode": "manual"})
+        check_only = render_app_update_panel({**base, "mode": "check_only"})
+        disabled = render_app_update_panel({**base, "mode": "disabled"})
+
+        self.assertIn("/app-update/check", manual)
+        self.assertIn("/app-update/request", manual)
+        self.assertIn("Install update", manual)
+        self.assertIn("/app-update/check", check_only)
+        self.assertNotIn("/app-update/request", check_only)
+        self.assertIn("Check for updates", disabled)
+        self.assertIn("disabled", disabled)
 
     def test_vod_download_helpers_build_command_template_and_progress(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1171,6 +1197,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("About", html)
         self.assertIn("Version", html)
         self.assertIn(__version__, html)
+        self.assertIn("App Updates", html)
+        self.assertIn("/app-update/check", html)
+        self.assertIn("/app-update/request", html)
         self.assertIn("Current Configuration", html)
         self.assertIn("Content Event Rules", html)
         self.assertIn('action="/stream-event-rules"', html)
@@ -1277,9 +1306,13 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(payload["app"]["name"], "ONLYSAVEmeVODS")
         self.assertEqual(payload["app"]["version"], __version__)
         self.assertIn("python_version", payload["app"])
+        self.assertIn("app_update", payload)
+        self.assertEqual(payload["app_update"]["mode"], "manual")
+        self.assertEqual(payload["app_update"]["repository"], "FlaminWrap/ONLYSAVEmeVODS")
         self.assertIn("configuration", payload)
         self.assertTrue(payload["configuration"]["Live Chat"]["record_live_chat"])
         self.assertTrue(payload["configuration"]["Live Chat"]["render_live_chat_video"])
+        self.assertEqual(payload["configuration"]["App Updates"]["app_update_mode"], "manual")
         self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_panel_workers"], 0)
         self.assertEqual(payload["configuration"]["Live Chat"]["chat_render_timeout_seconds"], 3600)
         self.assertFalse(payload["configuration"]["Live Chat"]["chat_render_use_nvenc"])

@@ -91,6 +91,42 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(added, [])
         self.assertEqual(text, original)
 
+    def test_app_update_settings_parse_and_validate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                'app_update_mode = "auto_install"\n'
+                'app_update_repository = "Example/Repo.git"\n'
+                'app_update_include_prereleases = true\n'
+                'app_update_github_token_env = "ONLYSAVE_GITHUB_TOKEN"\n',
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.app_update_mode, "auto_install")
+        self.assertEqual(config.app_update_repository, "Example/Repo")
+        self.assertTrue(config.app_update_include_prereleases)
+        self.assertEqual(config.app_update_github_token_env, "ONLYSAVE_GITHUB_TOKEN")
+
+    def test_app_update_rejects_invalid_mode_and_repository(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.toml"
+            config_path.write_text('app_update_mode = "sometimes"\n', encoding="utf-8")
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
+            config_path.write_text(
+                'app_update_repository = "https://github.com/Example/Repo"\n',
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
     def test_append_missing_config_values_inserts_root_values_before_tables(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

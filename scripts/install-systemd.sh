@@ -21,6 +21,12 @@ PYTHON_UPDATE_SERVICE_NAME="onlysavemevods-python-update.service"
 PYTHON_UPDATE_TIMER_NAME="onlysavemevods-python-update.timer"
 PYTHON_UPDATE_SERVICE_UNIT="/etc/systemd/system/${PYTHON_UPDATE_SERVICE_NAME}"
 PYTHON_UPDATE_TIMER_UNIT="/etc/systemd/system/${PYTHON_UPDATE_TIMER_NAME}"
+APP_UPDATE_SERVICE_NAME="onlysavemevods-app-update.service"
+APP_UPDATE_PATH_NAME="onlysavemevods-app-update.path"
+APP_UPDATE_TIMER_NAME="onlysavemevods-app-update.timer"
+APP_UPDATE_SERVICE_UNIT="/etc/systemd/system/${APP_UPDATE_SERVICE_NAME}"
+APP_UPDATE_PATH_UNIT="/etc/systemd/system/${APP_UPDATE_PATH_NAME}"
+APP_UPDATE_TIMER_UNIT="/etc/systemd/system/${APP_UPDATE_TIMER_NAME}"
 SERVICE_USER="${ONLYSAVEMEVODS_USER:-onlysavemevods}"
 PYTHON_BIN="${PYTHON:-}"
 SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-0}"
@@ -32,6 +38,8 @@ INSTALL_STREAM_EVENTS="${ONLYSAVEMEVODS_INSTALL_STREAM_EVENTS:-auto}"
 ENABLE_PYTHON_UPDATER="${ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER:-1}"
 PYTHON_UPDATE_CALENDAR="${ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR:-*-*-* 04:15:00}"
 PYTHON_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY:-45m}"
+APP_UPDATE_CALENDAR="${ONLYSAVEMEVODS_APP_UPDATE_CALENDAR:-*-*-* 05:15:00}"
+APP_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_APP_UPDATE_RANDOM_DELAY:-45m}"
 APT_UPDATED=0
 
 die() {
@@ -186,6 +194,9 @@ install_application_files() {
   sudo chmod -R go-w "${APP_DIR}"
   if [[ -f "${APP_DIR}/scripts/update-python-deps.sh" ]]; then
     sudo chmod 0755 "${APP_DIR}/scripts/update-python-deps.sh"
+  fi
+  if [[ -f "${APP_DIR}/scripts/app-update.sh" ]]; then
+    sudo chmod 0755 "${APP_DIR}/scripts/app-update.sh"
   fi
 }
 
@@ -831,6 +842,60 @@ install_or_disable_python_update_units() {
   sudo chmod 0644 "${PYTHON_UPDATE_SERVICE_UNIT}" "${PYTHON_UPDATE_TIMER_UNIT}"
 }
 
+install_app_update_units() {
+  echo "Installing GitHub Release app updater..."
+  sudo tee "${APP_UPDATE_SERVICE_UNIT}" >/dev/null <<EOF
+[Unit]
+Description=ONLYSAVEmeVODS GitHub Release app updater
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=${VENV_DIR}/bin/python
+ConditionPathExists=${APP_DIR}/scripts/app-update.sh
+
+[Service]
+Type=oneshot
+Environment="ONLYSAVEMEVODS_INSTALL_DIR=${INSTALL_DIR}"
+Environment="ONLYSAVEMEVODS_APP_DIR=${APP_DIR}"
+Environment="ONLYSAVEMEVODS_VENV_DIR=${VENV_DIR}"
+Environment="ONLYSAVEMEVODS_CONFIG_FILE=${CONFIG_FILE}"
+Environment="ONLYSAVEMEVODS_SERVICE_NAME=${SERVICE_NAME}"
+EnvironmentFile=${SECRETS_FILE}
+ExecStart=${APP_DIR}/scripts/app-update.sh
+
+EOF
+
+  sudo tee "${APP_UPDATE_PATH_UNIT}" >/dev/null <<EOF
+[Unit]
+Description=Watch for ONLYSAVEmeVODS app update requests
+
+[Path]
+PathExists=${STATE_DIR}/app-update-request.json
+Unit=${APP_UPDATE_SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+
+EOF
+
+  sudo tee "${APP_UPDATE_TIMER_UNIT}" >/dev/null <<EOF
+[Unit]
+Description=Scheduled ONLYSAVEmeVODS GitHub Release update check
+
+[Timer]
+OnCalendar=${APP_UPDATE_CALENDAR}
+RandomizedDelaySec=${APP_UPDATE_RANDOM_DELAY}
+Persistent=true
+Unit=${APP_UPDATE_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+
+EOF
+
+  sudo chown root:root "${APP_UPDATE_SERVICE_UNIT}" "${APP_UPDATE_PATH_UNIT}" "${APP_UPDATE_TIMER_UNIT}"
+  sudo chmod 0644 "${APP_UPDATE_SERVICE_UNIT}" "${APP_UPDATE_PATH_UNIT}" "${APP_UPDATE_TIMER_UNIT}"
+}
+
 stage_source_if_inside_install_tree
 install_os_dependencies
 
@@ -917,12 +982,15 @@ WantedBy=multi-user.target
 EOF
 
 install_or_disable_python_update_units
+install_app_update_units
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}" --now
 sudo systemctl restart "${SERVICE_NAME}"
 if python_updater_enabled; then
   sudo systemctl enable "${PYTHON_UPDATE_TIMER_NAME}" --now
 fi
+sudo systemctl enable "${APP_UPDATE_PATH_NAME}" --now
+sudo systemctl enable "${APP_UPDATE_TIMER_NAME}" --now
 
 echo "Installed and restarted ${SERVICE_NAME}"
 echo "Install dir: ${INSTALL_DIR}"
@@ -932,5 +1000,6 @@ if python_updater_enabled; then
 else
   echo "Python updater: disabled"
 fi
+echo "App updater: ${APP_UPDATE_TIMER_NAME} (${APP_UPDATE_CALENDAR}, randomized delay ${APP_UPDATE_RANDOM_DELAY})"
 echo "Status: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:   journalctl -u ${SERVICE_NAME} -f"
