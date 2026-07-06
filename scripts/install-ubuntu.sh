@@ -10,4 +10,4 @@ if [[ -r /etc/os-release ]]; then
   fi
 fi
 
-exec "${SCRIPT_DIR}/install-almalinux.sh" "$@"
+exec "${SCRIPT_DIR}/install-systemd.sh" "$@"

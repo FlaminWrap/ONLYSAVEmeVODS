@@ -329,12 +329,14 @@ Delete or clean up a stream:
 Install and enable the system service:
 
 ```bash
-scripts/install-almalinux.sh
+scripts/install-systemd.sh
 ```
 
-On Debian or Ubuntu, you can use the distro-named entrypoints instead:
+The distro-named entrypoints have the same functionality and delegate to the
+same shared systemd installer:
 
 ```bash
+scripts/install-almalinux.sh
 scripts/install-debian.sh
 scripts/install-ubuntu.sh
 ```
@@ -394,47 +396,47 @@ local status endpoint cannot be read, the updater skips that run rather than
 guessing. Disable or reschedule it at install time with:
 
 ```bash
-ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER=0 scripts/install-almalinux.sh
-ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR='*-*-* 03:30:00' scripts/install-almalinux.sh
-ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY=20m scripts/install-almalinux.sh
+ONLYSAVEMEVODS_ENABLE_PYTHON_UPDATER=0 scripts/install-systemd.sh
+ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR='*-*-* 03:30:00' scripts/install-systemd.sh
+ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY=20m scripts/install-systemd.sh
 ```
 
 To install somewhere other than `/opt/onlysavemevods`:
 
 ```bash
-ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods scripts/install-almalinux.sh
+ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods scripts/install-systemd.sh
 ```
 
 To skip OS package installation and only use what is already present:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_OS_DEPS=1 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_SKIP_OS_DEPS=1 scripts/install-systemd.sh
 ```
 
 To install OS packages but skip NVIDIA driver/NVENC package installation:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_SKIP_NVIDIA_DEPS=1 scripts/install-systemd.sh
 ```
 
 To skip Deno installation because you already provide a supported runtime on
 `PATH`:
 
 ```bash
-ONLYSAVEMEVODS_SKIP_DENO=1 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_SKIP_DENO=1 scripts/install-systemd.sh
 ```
 
 To install WhisperX even before transcription is enabled in `config.toml`:
 
 ```bash
-ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_INSTALL_WHISPERX=1 scripts/install-systemd.sh
 ```
 
 To install voice matching even before `voice_match_enabled = true` is present in
 `config.toml`:
 
 ```bash
-ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1 scripts/install-almalinux.sh
+ONLYSAVEMEVODS_INSTALL_VOICE_MATCH=1 scripts/install-systemd.sh
 ```
 
 To update a config file manually without changing existing values:

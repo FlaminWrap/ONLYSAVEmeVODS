@@ -142,6 +142,7 @@ jobs:
             "${bundle}/scripts/"
             "${bundle}/tests/"
             "${bundle}/src/onlysavemevods/__init__.py"
+            "${bundle}/scripts/install-systemd.sh"
             "${bundle}/scripts/install-almalinux.sh"
             "${bundle}/scripts/install-debian.sh"
             "${bundle}/scripts/install-ubuntu.sh"

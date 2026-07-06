@@ -2,7 +2,8 @@ from pathlib import Path
 import unittest
 
 
-INSTALL_SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "install-almalinux.sh"
+SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
+INSTALL_SCRIPT = SCRIPTS_DIR / "install-systemd.sh"
 
 
 class SystemdInstallerTests(unittest.TestCase):
@@ -13,6 +14,14 @@ class SystemdInstallerTests(unittest.TestCase):
         self.assertIn("sudo chmod 0664 \"${CONFIG_FILE}\"", script)
         self.assertIn("sudo chown root:\"${service_group}\" \"${CONFIG_FILE}\"", script)
         self.assertIn("ReadWritePaths=${CACHE_DIR} ${DOWNLOAD_DIR} ${STATE_DIR} ${CONFIG_FILE}", script)
+
+    def test_distro_installers_delegate_to_shared_systemd_installer(self) -> None:
+        for name in ("install-almalinux.sh", "install-debian.sh", "install-ubuntu.sh"):
+            with self.subTest(name=name):
+                script = (SCRIPTS_DIR / name).read_text(encoding="utf-8")
+
+                self.assertIn('exec "${SCRIPT_DIR}/install-systemd.sh" "$@"', script)
+                self.assertNotIn('exec "${SCRIPT_DIR}/install-almalinux.sh" "$@"', script)
 
 
 if __name__ == "__main__":

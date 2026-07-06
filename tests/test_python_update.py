@@ -120,7 +120,7 @@ class PythonUpdateScriptTests(unittest.TestCase):
         self.assertTrue(any(item.startswith("torchcodec>=0.6.0,<0.8.0") for item in extra))
 
     def test_installer_can_install_voice_match_extra(self) -> None:
-        script = Path("scripts/install-almalinux.sh").read_text(encoding="utf-8")
+        script = Path("scripts/install-systemd.sh").read_text(encoding="utf-8")
 
         self.assertIn("ONLYSAVEMEVODS_INSTALL_VOICE_MATCH", script)
         self.assertIn("from onlysavemevods.config import ConfigError, load_config", script)
