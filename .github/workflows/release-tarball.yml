@@ -183,8 +183,13 @@ jobs:
           fi
 
           (cd dist && sha256sum -c "${bundle}.tar.gz.sha256")
-          tar -xOf "${archive}" "${bundle}/pyproject.toml" | grep -Fxq "version = \"${PACKAGE_VERSION}\""
-          tar -xOf "${archive}" "${bundle}/src/onlysavemevods/__init__.py" | grep -Fxq "_FALLBACK_VERSION = \"${PACKAGE_VERSION}\""
+          tmp_pyproject="$(mktemp)"
+          tmp_init="$(mktemp)"
+          trap 'rm -f "${tmp_pyproject}" "${tmp_init}"' EXIT
+          tar -xOf "${archive}" "${bundle}/pyproject.toml" > "${tmp_pyproject}"
+          tar -xOf "${archive}" "${bundle}/src/onlysavemevods/__init__.py" > "${tmp_init}"
+          grep -Fxq "version = \"${PACKAGE_VERSION}\"" "${tmp_pyproject}"
+          grep -Fxq "_FALLBACK_VERSION = \"${PACKAGE_VERSION}\"" "${tmp_init}"
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2
