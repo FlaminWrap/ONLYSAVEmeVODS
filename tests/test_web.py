@@ -17,7 +17,9 @@ from onlysavemevods.powerchat import normalize_powerchat_payload, write_powercha
 from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     build_config_summary,
+    build_powerchat_export_payload,
     build_powerchat_stats,
+    build_stream_powerchat_stats,
     build_status_snapshot,
     build_lite_status_payload,
     build_vod_chat_download_command,
@@ -77,6 +79,8 @@ from onlysavemevods.web import (
     FAVICON_ROUTES,
     JobStatus,
     PowerchatEventStatus,
+    powerchat_export_csv,
+    powerchat_export_url,
     PLATFORM_ICON_ROUTES,
     snapshot_to_dict,
     transcription_job_key,
@@ -772,6 +776,11 @@ class WebStatusTests(unittest.TestCase):
             snapshot = build_status_snapshot(config)
             html = render_status_html(snapshot)
             payload = snapshot_to_dict(snapshot)
+            export_payload = build_powerchat_export_payload(
+                config,
+                {"streamer": ["oumb"], "format": ["json"]},
+            )
+            export_csv = powerchat_export_csv(export_payload["events"])
 
         stream_status = snapshot.streams[0]
         self.assertEqual(stream_status.powerchat_event_count, 1)
@@ -781,8 +790,14 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(stream_status.powerchat_events[0].donor, "KDrizzy69")
         self.assertEqual(file_kind("Kick Stream [kick_oumb].powerchat-events.json"), "state")
         self.assertIn("Powerchat", html)
+        self.assertIn("stream-powerchat-dashboard", html)
         self.assertIn("KDrizzy69", html)
         self.assertIn("Kick: 50 Kicks", html)
+        self.assertIn("Overall Breakdown", html)
+        self.assertIn("Event Ledger", html)
+        self.assertIn("/powerchat-events?format=json", html)
+        self.assertIn("/powerchat-events?format=csv", html)
+        self.assertIn("data-powerchat-export=\"json\"", html)
         self.assertEqual(payload["streams"][0]["powerchat_event_count"], 1)
         self.assertEqual(payload["streams"][0]["powerchat_events"][0]["platform"], "Kick")
         self.assertEqual(payload["powerchat_stats"]["event_count"], 1)
@@ -791,6 +806,15 @@ class WebStatusTests(unittest.TestCase):
         ])
         self.assertEqual(payload["powerchat_stats"]["hourly_totals"][0]["hour_label"], "0:00-0:59")
         self.assertEqual(payload["powerchat_stats"]["events"][0]["streamer"], "oumb")
+        self.assertEqual(payload["powerchat_stats"]["streamer_dashboards"][0]["streamer"], "oumb")
+        self.assertEqual(payload["powerchat_stats"]["streamer_dashboards"][0]["hourly_totals"][0]["hour_label"], "0:00-0:59")
+        self.assertIn("powerchat-streamer-card", html)
+        self.assertEqual(export_payload["event_count"], 1)
+        self.assertEqual(export_payload["unit_totals"], [
+            {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
+        ])
+        self.assertIn("received_at,offset_seconds,hour_label,streamer", export_csv)
+        self.assertIn("KDrizzy69", export_csv)
 
     def test_powerchat_stats_include_hourly_buckets_and_rates(self) -> None:
         stream = StreamStatus(
@@ -903,6 +927,7 @@ class WebStatusTests(unittest.TestCase):
         )
 
         stats = build_powerchat_stats([streamer])
+        stream_stats = build_stream_powerchat_stats(stream, "OUMB3rd")
 
         self.assertEqual(stats["event_count"], 3)
         self.assertEqual(stats["money_totals"], [{"currency": "USD", "amount": 120.0}])
@@ -919,6 +944,31 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(stats["stream_totals"][0]["money_rates"][0]["amount_per_hour"], 60.0)
         self.assertEqual(stats["top_donors"][0]["donor"], "Alice")
+        streamer_dashboard = stats["streamer_dashboards"][0]
+        self.assertEqual(streamer_dashboard["streamer"], "OUMB3rd")
+        self.assertEqual(streamer_dashboard["event_count"], 3)
+        self.assertEqual(streamer_dashboard["events_without_offset"], 1)
+        self.assertEqual(streamer_dashboard["money_rates"][0]["amount_per_hour"], 60.0)
+        self.assertEqual(
+            [(row["hour_label"], row["money_totals"]) for row in streamer_dashboard["hourly_totals"]],
+            [
+                ("0:00-0:59", [{"currency": "USD", "amount": 60.0}]),
+                ("1:00-1:59", [{"currency": "USD", "amount": 40.0}]),
+            ],
+        )
+        self.assertEqual(stream_stats["event_count"], 3)
+        self.assertEqual(stream_stats["events_without_offset"], 1)
+        self.assertEqual(stream_stats["money_rates"], [
+            {"currency": "USD", "amount": 120.0, "duration_hours": 2.0, "amount_per_hour": 60.0}
+        ])
+        self.assertEqual(
+            [(row["hour_label"], row["money_totals"]) for row in stream_stats["hourly_totals"]],
+            [
+                ("0:00-0:59", [{"currency": "USD", "amount": 60.0}]),
+                ("1:00-1:59", [{"currency": "USD", "amount": 40.0}]),
+            ],
+        )
+        self.assertEqual(stream_stats["top_donors"][0]["donor"], "Alice")
 
     def test_status_snapshot_groups_streamer_sources(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1101,6 +1151,10 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('for="tab-powerchat"', html)
         self.assertIn("powerchat-dashboard", html)
         self.assertIn("Donations Per Hour", html)
+        self.assertIn("By Streamer", html)
+        self.assertIn('id="powerchat-streamer-rows"', html)
+        self.assertIn("Overall Breakdown", html)
+        self.assertIn("Event Ledger", html)
         self.assertIn('id="streamer-list"', html)
         self.assertIn("Needs Grouping", html)
         self.assertIn("renderStreamerList", html)
@@ -2213,10 +2267,12 @@ class WebStatusTests(unittest.TestCase):
             format_file = segment_dir / "segment-001.f137.mp4"
             part_file = segment_dir / "segment-001.f140.mp4.part"
             chat_file = segment_dir / "Live Status [LIVEVIDEO01].live_chat.json"
+            powerchat_file = segment_dir / "Live Status [LIVEVIDEO01].powerchat-events.json"
             final_file.write_text("final", encoding="utf-8")
             format_file.write_text("video only", encoding="utf-8")
             part_file.write_text("part", encoding="utf-8")
             chat_file.write_text("chat", encoding="utf-8")
+            powerchat_file.write_text('{"events": []}', encoding="utf-8")
 
             resolved = resolve_download_file(
                 config,
@@ -2232,6 +2288,11 @@ class WebStatusTests(unittest.TestCase):
                 config,
                 "LIVEVIDEO01",
                 chat_file.name,
+            )
+            resolved_powerchat = resolve_download_file(
+                config,
+                "LIVEVIDEO01",
+                powerchat_file.name,
             )
             rejected_format = resolve_download_file(
                 config,
@@ -2251,6 +2312,11 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertEqual(resolved, final_file.resolve())
         self.assertEqual(resolved_chat, chat_file.resolve())
+        self.assertEqual(resolved_powerchat, powerchat_file.resolve())
+        self.assertEqual(
+            powerchat_export_url("csv", streamer="OUMB3rd"),
+            "/powerchat-events?format=csv&streamer=OUMB3rd",
+        )
         self.assertIsNone(rejected_part)
         self.assertIsNone(rejected_format)
         self.assertIsNone(rejected_unknown)
