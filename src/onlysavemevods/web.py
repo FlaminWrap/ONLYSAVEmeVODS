@@ -9901,19 +9901,7 @@ def dashboard_script() -> str:
     if (!events.length) return '<div class="file-meta">No Powerchat support events captured yet.</div>';
     const stats = buildStreamPowerchatStats(stream);
     const videoId = String((stream && stream.video_id) || "");
-    const rows = events.slice(0, 100).map((event) => {
-      const kind = ["money", "unit", "unknown"].includes(String(event.kind || "")) ? String(event.kind || "unknown") : "unknown";
-      const timestamp = event.offset_seconds === null || event.offset_seconds === undefined ? formatIso(event.received_at) : formatEventOffset(event.offset_seconds);
-      const donor = event.donor || "Unknown donor";
-      const platform = event.platform || "Powerchat";
-      const meta = [event.source, platform, event.kind].filter(Boolean).join(" / ");
-      return `<div class="powerchat-event ${escapeAttr(kind)}">
-        <div class="content-event-time"><span>${escapeHtml(timestamp)}</span></div>
-        <div class="content-event-main"><strong>${escapeHtml(donor)}</strong><div>${escapeHtml(event.message || "-")}</div><span class="file-meta">${escapeHtml(meta)}</span></div>
-        <div class="powerchat-event-amount">${escapeHtml(powerchatEventAmountText(event) || "-")}</div>
-      </div>`;
-    }).join("");
-    return `<div class="stream-powerchat-dashboard">
+    return `<div class="powerchat-dashboard stream-powerchat-dashboard">
       <div class="powerchat-export-actions">
         <a class="download action-button" href="${escapeAttr(powerchatExportUrl("json", { video_id: videoId }))}">Download JSON</a>
         <a class="download action-button" href="${escapeAttr(powerchatExportUrl("csv", { video_id: videoId }))}">Download CSV</a>
@@ -9924,8 +9912,12 @@ def dashboard_script() -> str:
         <div class="table-wrap"><table><thead><tr><th>Stream Hour</th><th>Events</th><th>Total</th><th>Average</th></tr></thead><tbody>${renderPowerchatHourlyRows(stats.hourly_totals || [])}</tbody></table></div>
       </div>
       <div class="powerchat-dashboard-section">
-        <h4>Events</h4>
-        <div class="powerchat-events">${rows}</div>
+        <h4>Top Donors</h4>
+        <div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead><tbody>${renderPowerchatDonorRows(stats.top_donors || [])}</tbody></table></div>
+      </div>
+      <div class="powerchat-dashboard-section">
+        <h4>Event Ledger</h4>
+        <div class="table-wrap"><table><thead><tr><th>Time</th><th>Streamer</th><th>Stream</th><th>Donor</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead><tbody>${renderPowerchatLedgerRows((stats.events || []).slice(0, 100))}</tbody></table></div>
       </div>
     </div>`;
   };
@@ -10024,8 +10016,31 @@ def dashboard_script() -> str:
     const totals = newPowerchatAccumulator();
     const donors = new Map();
     const hours = new Map();
+    const eventRows = [];
     let eventsWithoutOffset = 0;
     events.forEach((event) => {
+      const hourIndex = event.offset_seconds === null || event.offset_seconds === undefined ? null : Math.max(0, Math.floor(Number(event.offset_seconds || 0) / 3600));
+      eventRows.push({
+        streamer: (stream && stream.channel) || "",
+        video_id: (stream && stream.video_id) || "",
+        stream_title: (stream && stream.title) || "",
+        stream_url: (stream && stream.url) || "",
+        stream_platform: (stream && stream.platform) || "",
+        stream_source: (stream && stream.source) || "",
+        source: event.source || "",
+        received_at: event.received_at || "",
+        offset_seconds: event.offset_seconds,
+        hour_index: hourIndex,
+        hour_label: powerchatHourLabel(hourIndex),
+        kind: event.kind || "",
+        donor: event.donor || "",
+        platform: event.platform || "",
+        message: event.message || "",
+        money_amount: event.money_amount,
+        money_currency: event.money_currency || "",
+        unit_amount: event.unit_amount,
+        unit: event.unit || "",
+      });
       addPowerchatEventToAccumulator(totals, event);
       const donorName = event.donor || "Unknown donor";
       if (!donors.has(donorName)) donors.set(donorName, { donor: donorName, event_count: 0, latest_received_at: "", accumulator: newPowerchatAccumulator() });
@@ -10037,7 +10052,6 @@ def dashboard_script() -> str:
         eventsWithoutOffset += 1;
         return;
       }
-      const hourIndex = Math.max(0, Math.floor(Number(event.offset_seconds || 0) / 3600));
       if (!hours.has(hourIndex)) hours.set(hourIndex, { hour_index: hourIndex, hour_label: powerchatHourLabel(hourIndex), event_count: 0, accumulator: newPowerchatAccumulator() });
       const hour = hours.get(hourIndex);
       hour.event_count += 1;
@@ -10071,6 +10085,7 @@ def dashboard_script() -> str:
       money_rates: powerchatRatesFromAccumulator(totals, durationSeconds),
       top_donors: donorRows.slice(0, 10),
       hourly_totals: hourlyRows,
+      events: eventRows.sort((a, b) => String(b.received_at || "").localeCompare(String(a.received_at || ""))),
     };
   };
   const powerchatEventDate = (event) => String(event.received_at || "").slice(0, 10);
@@ -13173,9 +13188,8 @@ def render_powerchat_events(stream: StreamStatus) -> str:
     if not stream.powerchat_events:
         return '<div class="file-meta">No Powerchat support events captured yet.</div>'
     stats = build_stream_powerchat_stats(stream)
-    rows = "".join(render_powerchat_event(event) for event in stream.powerchat_events[:100])
     return (
-        '<div class="stream-powerchat-dashboard">'
+        '<div class="powerchat-dashboard stream-powerchat-dashboard">'
         '<div class="powerchat-export-actions">'
         f'<a class="download action-button" href="{escape(powerchat_export_url("json", video_id=stream.video_id), quote=True)}">Download JSON</a>'
         f'<a class="download action-button" href="{escape(powerchat_export_url("csv", video_id=stream.video_id), quote=True)}">Download CSV</a>'
@@ -13187,8 +13201,14 @@ def render_powerchat_events(stream: StreamStatus) -> str:
         f'<tbody>{render_powerchat_hourly_rows(stats.get("hourly_totals", []))}</tbody></table></div>'
         '</div>'
         '<div class="powerchat-dashboard-section">'
-        '<h4>Events</h4>'
-        f'<div class="powerchat-events">{rows}</div>'
+        '<h4>Top Donors</h4>'
+        '<div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead>'
+        f'<tbody>{render_powerchat_donor_rows(stats.get("top_donors", []))}</tbody></table></div>'
+        '</div>'
+        '<div class="powerchat-dashboard-section">'
+        '<h4>Event Ledger</h4>'
+        '<div class="table-wrap"><table><thead><tr><th>Time</th><th>Streamer</th><th>Stream</th><th>Donor</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead>'
+        f'<tbody>{render_powerchat_ledger_rows(stats.get("events", [])[:100])}</tbody></table></div>'
         '</div>'
         '</div>'
     )

@@ -791,6 +791,8 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(file_kind("Kick Stream [kick_oumb].powerchat-events.json"), "state")
         self.assertIn("Powerchat", html)
         self.assertIn("stream-powerchat-dashboard", html)
+        self.assertIn('class="powerchat-dashboard stream-powerchat-dashboard"', html)
+        self.assertIn("<h4>Event Ledger</h4>", html)
         self.assertIn("KDrizzy69", html)
         self.assertIn("Kick: 50 Kicks", html)
         self.assertIn("Overall Breakdown", html)
@@ -969,6 +971,8 @@ class WebStatusTests(unittest.TestCase):
             ],
         )
         self.assertEqual(stream_stats["top_donors"][0]["donor"], "Alice")
+        self.assertEqual(stream_stats["events"][0]["stream_title"], "Donation Stream")
+        self.assertEqual(stream_stats["events"][0]["video_id"], "kick:oumb")
 
     def test_status_snapshot_groups_streamer_sources(self) -> None:
         with TemporaryDirectory() as tmp:
