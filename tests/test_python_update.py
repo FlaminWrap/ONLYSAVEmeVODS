@@ -101,7 +101,7 @@ class PythonUpdateUnitTests(unittest.TestCase):
         )
 
         self.assertIn('Environment="ONLYSAVEMEVODS_INSTALL_DIR=/srv/onlysavemevods"', service)
-        self.assertIn("ExecStart=/srv/onlysavemevods/app/scripts/update-python-deps.sh", service)
+        self.assertIn("ExecStart=/usr/bin/env bash /srv/onlysavemevods/app/scripts/update-python-deps.sh", service)
         self.assertIn("OnCalendar=*-*-* 04:15:00", timer)
         self.assertIn("RandomizedDelaySec=45m", timer)
         self.assertIn("Persistent=true", timer)

@@ -33,6 +33,15 @@ APP_UPDATE_BACKUP_DIRNAME = "app-update-backups"
 GITHUB_API_ROOT = "https://api.github.com"
 UPDATE_USER_AGENT = "ONLYSAVEmeVODS updater"
 CHECK_STATUSES = {"checked", "update_available", "up_to_date", "failed", "disabled"}
+EXECUTABLE_SCRIPT_NAMES = (
+    "app-update.sh",
+    "install-almalinux.sh",
+    "install-debian.sh",
+    "install-systemd.sh",
+    "install-ubuntu.sh",
+    "uninstall-systemd.sh",
+    "update-python-deps.sh",
+)
 
 
 class AppUpdateError(RuntimeError):
@@ -494,6 +503,7 @@ def replace_app_dir(bundle_root: Path, app_dir: Path) -> None:
         else:
             shutil.copy2(item, target)
     chmod_tree_readable(app_dir)
+    chmod_packaged_scripts_executable(app_dir)
 
 
 def restore_app_dir(backup_dir: Path, app_dir: Path) -> None:
@@ -501,6 +511,7 @@ def restore_app_dir(backup_dir: Path, app_dir: Path) -> None:
         shutil.rmtree(app_dir)
     shutil.copytree(backup_dir, app_dir, symlinks=True)
     chmod_tree_readable(app_dir)
+    chmod_packaged_scripts_executable(app_dir)
 
 
 def repair_install(config: BotConfig, *, app_dir: Path, venv_dir: Path) -> None:
@@ -543,6 +554,17 @@ def chmod_tree_readable(root: Path) -> None:
                 path.chmod((mode | 0o755) & ~0o022)
             else:
                 path.chmod((mode | 0o644) & ~0o022)
+        except OSError:
+            pass
+
+
+def chmod_packaged_scripts_executable(app_dir: Path) -> None:
+    scripts_dir = app_dir / "scripts"
+    for name in EXECUTABLE_SCRIPT_NAMES:
+        path = scripts_dir / name
+        try:
+            if path.is_file():
+                path.chmod((path.stat().st_mode | 0o755) & ~0o022)
         except OSError:
             pass
 

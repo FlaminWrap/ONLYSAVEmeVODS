@@ -860,7 +860,7 @@ Environment="ONLYSAVEMEVODS_VENV_DIR=${VENV_DIR}"
 Environment="ONLYSAVEMEVODS_CONFIG_FILE=${CONFIG_FILE}"
 Environment="ONLYSAVEMEVODS_SERVICE_NAME=${SERVICE_NAME}"
 EnvironmentFile=${SECRETS_FILE}
-ExecStart=${APP_DIR}/scripts/app-update.sh
+ExecStart=/usr/bin/env bash ${APP_DIR}/scripts/app-update.sh
 
 EOF
 

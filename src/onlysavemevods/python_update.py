@@ -177,7 +177,7 @@ def render_python_update_service_unit(
             systemd_environment_line("ONLYSAVEMEVODS_VENV_DIR", venv_dir),
             systemd_environment_line("ONLYSAVEMEVODS_CONFIG_FILE", config_file),
             systemd_environment_line("ONLYSAVEMEVODS_SERVICE_NAME", main_service_name),
-            f"ExecStart={script}",
+            f"ExecStart=/usr/bin/env bash {script}",
             "",
         ]
     )

@@ -163,6 +163,8 @@ class AppUpdateApplyTests(unittest.TestCase):
 
             self.assertFalse((app_dir / "old.txt").exists())
             self.assertTrue((app_dir / "src" / "onlysavemevods").is_dir())
+            self.assertExecutable(app_dir / "scripts" / "app-update.sh")
+            self.assertExecutable(app_dir / "scripts" / "update-python-deps.sh")
             self.assertFalse(request_path(config).exists())
             self.assertEqual(status["status"], "installed")
             repair.assert_called_once()
@@ -197,6 +199,10 @@ class AppUpdateApplyTests(unittest.TestCase):
             self.assertEqual(status["status"], "failed")
             self.assertIn("pip failed", status["last_error"])
 
+    def assertExecutable(self, path: Path) -> None:
+        self.assertTrue(path.is_file())
+        self.assertTrue(path.stat().st_mode & 0o111, f"{path} is not executable")
+
 
 def create_release_bundle(root: Path, tag: str) -> tuple[Path, Path]:
     bundle = root / f"ONLYSAVEmeVODS-{tag}"
@@ -208,6 +214,8 @@ def create_release_bundle(root: Path, tag: str) -> tuple[Path, Path]:
     (bundle / "config.example.toml").write_text("channels = []\n", encoding="utf-8")
     (bundle / "src" / "onlysavemevods" / "__init__.py").write_text("", encoding="utf-8")
     (bundle / "scripts" / "install-systemd.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (bundle / "scripts" / "app-update.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (bundle / "scripts" / "update-python-deps.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     archive = root / f"ONLYSAVEmeVODS-{tag}.tar.gz"
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(bundle, arcname=bundle.name)
