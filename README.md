@@ -233,6 +233,8 @@ cards and stream cards also show jobs scoped to that streamer or stream. Jobs
 are ordered by start time so running items do not jump around. Chat render jobs
 show structured progress when the isolated renderer reports it, including phase,
 elapsed time, target output, and current temporary output size.
+Successfully completed automatic jobs remain visible for five minutes; failed or
+interrupted jobs remain available for diagnosis.
 
 Use stream logs when you need to understand what happened to a specific stream:
 segment switches, yt-dlp exits, post-exit checks, finalization, retries, chat
