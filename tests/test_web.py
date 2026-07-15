@@ -20,6 +20,7 @@ from onlysavemevods.web import (
     build_powerchat_export_payload,
     build_powerchat_stats,
     build_stream_powerchat_stats,
+    build_streamer_stream_page_payload,
     build_status_snapshot,
     build_lite_status_payload,
     build_vod_chat_download_command,
@@ -2090,6 +2091,54 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(any(job["status"] == "queued" for job in payload["jobs"]))
         self.assertEqual(payload["job_limit"], 200)
 
+    def test_completed_watermark_jobs_expire_but_copies_remain(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            state = StateStore(config.db_path)
+            state.create_watermark_copy(
+                copy_id="wm-copy001",
+                video_id="LIVEVIDEO01",
+                source_name="Live Status [LIVEVIDEO01].mp4",
+                output_name=".watermarks/Live Status [LIVEVIDEO01] - wm-copy001.mp4",
+                recipient_label="Recipient A",
+            )
+            state.update_watermark_copy(
+                "wm-copy001",
+                status="done",
+                message="Watermark complete",
+                progress=1.0,
+                finished=True,
+            )
+            state.conn.execute(
+                "UPDATE watermark_copies SET updated_at = ?, finished_at = ? WHERE copy_id = ?",
+                (
+                    "1970-01-01T00:01:40+00:00",
+                    "1970-01-01T00:01:40+00:00",
+                    "wm-copy001",
+                ),
+            )
+            state.conn.commit()
+            records = state.list_watermark_copies()
+            state.close()
+
+            with patch("onlysavemevods.web.time.time", return_value=399.0):
+                visible_jobs = build_job_statuses(records)
+            with patch("onlysavemevods.web.time.time", return_value=400.0):
+                expired_jobs = build_job_statuses(records)
+
+            state = StateStore(config.db_path)
+            saved_copy = state.get_watermark_copy("wm-copy001")
+            state.close()
+
+        self.assertTrue(any(job.job_id == "watermark:wm-copy001" for job in visible_jobs))
+        self.assertFalse(any(job.job_id == "watermark:wm-copy001" for job in expired_jobs))
+        self.assertIsNotNone(saved_copy)
+        assert saved_copy is not None
+        self.assertEqual(saved_copy.status, "done")
+
     def test_dashboard_jobs_order_by_start_time_not_update_time(self) -> None:
         chat_key = "LIVEVIDEO01\0Live Status [LIVEVIDEO01].live_chat.json"
         transcription_key = "LIVEVIDEO02\0Other.mp4"
@@ -2281,6 +2330,63 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('<option value="rumble">Rumble</option>', html)
         self.assertIn('data-stream-platform="kick"', html)
         self.assertIn('data-stream-title="Kick Stream"', html)
+        self.assertIn('data-streamer-configured="true"', html)
+        self.assertIn('/streamer-streams.json?', html)
+
+    def test_streamer_stream_pages_reach_records_beyond_fifty(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                streamers={
+                    "OUMB3rd": StreamerConfig(sources=["kick:oumb"]),
+                },
+            )
+            state = StateStore(config.db_path)
+            for index in range(61):
+                stream = LiveStream(
+                    video_id=f"kick:oumb:{index:03d}",
+                    url=f"https://kick.com/oumb?stream={index}",
+                    title=f"Kick Stream {index:03d}",
+                    channel="oumb",
+                    platform="kick",
+                    source="kick:oumb",
+                )
+                state.upsert_vod_stream(stream)
+                state.conn.execute(
+                    "UPDATE streams SET updated_at = ? WHERE video_id = ?",
+                    (f"2026-07-15T00:00:00.{index:06d}+00:00", stream.video_id),
+                )
+            state.conn.commit()
+            state.close()
+
+            first_page = build_streamer_stream_page_payload(
+                config,
+                {
+                    "streamer": ["OUMB3rd"],
+                    "page": ["1"],
+                    "page_size": ["50"],
+                },
+            )
+            second_page = build_streamer_stream_page_payload(
+                config,
+                {
+                    "streamer": ["OUMB3rd"],
+                    "page": ["2"],
+                    "page_size": ["50"],
+                },
+            )
+
+        first_ids = {stream["video_id"] for stream in first_page["streams"]}
+        second_ids = {stream["video_id"] for stream in second_page["streams"]}
+        self.assertEqual(first_page["total"], 61)
+        self.assertEqual(first_page["streamer_total"], 61)
+        self.assertEqual(first_page["page_count"], 2)
+        self.assertEqual(first_page["available_platforms"], ["kick"])
+        self.assertEqual(len(first_ids), 50)
+        self.assertEqual(len(second_ids), 11)
+        self.assertFalse(first_ids & second_ids)
+        self.assertEqual(len(first_ids | second_ids), 61)
 
     def test_download_resolver_serves_only_final_files_for_known_stream(self) -> None:
         with TemporaryDirectory() as tmp:

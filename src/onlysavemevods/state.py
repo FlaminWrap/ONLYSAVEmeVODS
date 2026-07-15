@@ -643,18 +643,19 @@ class StateStore:
             return None
         return _record_from_row(row)
 
-    def list_streams(self, limit: int = 100) -> list[StreamRecord]:
-        rows = self.conn.execute(
-            """
+    def list_streams(self, limit: int | None = 100) -> list[StreamRecord]:
+        query = """
             SELECT video_id, title, channel, url, status, segment_index,
                    platform, source,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             ORDER BY updated_at DESC, first_seen_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+        """
+        values: tuple[int, ...] = ()
+        if limit is not None:
+            query += " LIMIT ?"
+            values = (limit,)
+        rows = self.conn.execute(query, values).fetchall()
         return [_record_from_row(row) for row in rows]
 
     def list_streams_by_status(
