@@ -2541,6 +2541,43 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(directory_exists)
         self.assertIsNotNone(record)
 
+    def test_delete_stream_allows_detected_record(self) -> None:
+        clear_tracked_jobs()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="kick:92722911-black-ops-ports-hotel-internet",
+                url="https://kick.com/oumb",
+                title="Black ops ports hotel internet",
+                channel="oumb",
+                platform="kick",
+                source="kick:oumb",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.close()
+
+            html = render_status_html(build_status_snapshot(config))
+            rendered_body = html.split("<script>", 1)[0]
+            ok, message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
+            state = StateStore(config.db_path)
+            try:
+                record = state.get_stream(stream.video_id)
+            finally:
+                state.close()
+
+        self.assertIn('/delete-stream', rendered_body)
+        self.assertIn("If the source is still live, it may be detected again.", rendered_body)
+        self.assertTrue(ok, message)
+        self.assertIsNone(record)
+
     def test_delete_stream_rejects_active_download(self) -> None:
         clear_tracked_jobs()
         with TemporaryDirectory() as tmp:

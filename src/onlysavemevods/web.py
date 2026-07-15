@@ -4083,7 +4083,6 @@ FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
 }
 STREAM_DELETE_BLOCKED_STATUSES = {
     "checking_after_exit",
-    "detected",
     "downloading",
     "waiting_retry",
 }
@@ -13527,9 +13526,14 @@ def render_cleanup_fragments_action(stream: StreamStatus) -> str:
 def render_delete_stream_action(stream: StreamStatus) -> str:
     if stream.status in STREAM_DELETE_BLOCKED_STATUSES:
         return ""
+    confirmation = (
+        "Delete this detected stream record? If the source is still live, it may be detected again."
+        if stream.status == "detected"
+        else "Delete this stream and all downloaded files? This cannot be undone."
+    )
     return (
         '<form class="inline-form stream-delete-form" method="post" action="/delete-stream" '
-        'onsubmit="return confirm(\'Delete this stream and all downloaded files? This cannot be undone.\');">'
+        f'onsubmit="return confirm(\'{escape(confirmation, quote=True)}\');">'
         f'<input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">'
         f'<input type="hidden" name="confirm_delete" value="{STREAM_DELETE_CONFIRM_VALUE}">'
         '<button class="download action-button danger-action" type="submit" '
