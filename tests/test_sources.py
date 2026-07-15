@@ -106,22 +106,18 @@ class SourceMonitorTests(unittest.TestCase):
 
         self.assertEqual(monitor.discover_live_streams("kick:OUMB3rd"), [])
 
-    def test_kick_live_source_uses_title_and_start_time_stream_id(self) -> None:
+    def test_kick_live_source_uses_stable_livestream_id(self) -> None:
         start_timestamp = datetime(2026, 7, 5, 5, 18, tzinfo=timezone.utc).timestamp()
-        expected_start = (
-            datetime.fromtimestamp(start_timestamp, tz=timezone.utc)
-            .astimezone()
-            .strftime("%Y-%m-%d %H:%M")
-        )
         runner = FakeRunner(
             {
                 "https://kick.com/OUMB3rd": {
-                    "id": "OUMB3rd",
-                    "title": "Hungover 4th of July $3 tts no toxicity",
+                    "id": "92722911-hungover-4th-of-july",
+                    "title": "Hungover 4th of July $3 tts no toxicity 2026-07-05 06:18",
                     "uploader": "OUMB3rd",
                     "webpage_url": "https://kick.com/OUMB3rd",
                     "live_status": "is_live",
                     "timestamp": start_timestamp,
+                    "release_timestamp": start_timestamp - 60,
                 }
             }
         )
@@ -132,9 +128,74 @@ class SourceMonitorTests(unittest.TestCase):
         self.assertEqual(len(streams), 1)
         self.assertEqual(streams[0].platform, "kick")
         self.assertEqual(streams[0].source, "kick:OUMB3rd")
+        self.assertEqual(streams[0].video_id, "kick:92722911-hungover-4th-of-july")
+        self.assertEqual(streams[0].title, "Hungover 4th of July $3 tts no toxicity")
+
+    def test_kick_repeated_live_probes_keep_the_same_stream_id(self) -> None:
+        start_timestamp = datetime(2026, 7, 15, 1, 42, tzinfo=timezone.utc).timestamp()
+        base_info = {
+            "id": "92722911-black-ops-ports-hotel-internet",
+            "uploader": "oumb",
+            "webpage_url": "https://kick.com/oumb",
+            "live_status": "is_live",
+            "release_timestamp": start_timestamp,
+        }
+        runner = FakeRunner(
+            {
+                "https://kick.com/oumb": [
+                    {
+                        **base_info,
+                        "title": "Black ops ports hotel internet 2026-07-15 02:42",
+                        "timestamp": start_timestamp + 60,
+                    },
+                    {
+                        **base_info,
+                        "title": "Black ops ports hotel internet 2026-07-15 02:43",
+                        "timestamp": start_timestamp + 120,
+                    },
+                ]
+            }
+        )
+        monitor = SourceMonitor(runner)
+
+        first = monitor.discover_live_streams("kick:oumb")
+        second = monitor.discover_live_streams("kick:oumb")
+
+        self.assertEqual(first[0].video_id, second[0].video_id)
+        self.assertEqual(
+            first[0].video_id,
+            "kick:92722911-black-ops-ports-hotel-internet",
+        )
+        self.assertEqual(first[0].title, "Black ops ports hotel internet")
+        self.assertEqual(second[0].title, "Black ops ports hotel internet")
+
+    def test_kick_channel_id_fallback_uses_release_time(self) -> None:
+        release_timestamp = datetime(2026, 7, 15, 1, 42, tzinfo=timezone.utc).timestamp()
+        expected_start = (
+            datetime.fromtimestamp(release_timestamp, tz=timezone.utc)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M")
+        )
+        runner = FakeRunner(
+            {
+                "https://kick.com/oumb": {
+                    "id": "oumb",
+                    "title": "Black ops ports hotel internet 2026-07-15 02:43",
+                    "uploader": "oumb",
+                    "webpage_url": "https://kick.com/oumb",
+                    "live_status": "is_live",
+                    "timestamp": release_timestamp + 60,
+                    "release_timestamp": release_timestamp,
+                }
+            }
+        )
+        monitor = SourceMonitor(runner)
+
+        streams = monitor.discover_live_streams("kick:oumb")
+
         self.assertEqual(
             streams[0].video_id,
-            f"kick:Hungover 4th of July $3 tts no toxicity {expected_start}",
+            f"kick:Black ops ports hotel internet {expected_start}",
         )
 
     def test_rumble_live_url_produces_platform_stream(self) -> None:

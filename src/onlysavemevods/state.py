@@ -3,10 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import re
 import sqlite3
 from datetime import datetime, timezone
 
 from .models import LiveStream
+
+
+LEGACY_KICK_STREAM_ID_RE = re.compile(
+    r"^kick:.+\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +96,7 @@ class StateStore:
             """
         )
         self._ensure_stream_source_columns()
+        self._mark_legacy_kick_detections_ended()
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS stream_events (
@@ -150,6 +157,34 @@ class StateStore:
                 "ALTER TABLE streams "
                 "ADD COLUMN source TEXT NOT NULL DEFAULT ''"
             )
+
+    def _mark_legacy_kick_detections_ended(self) -> None:
+        rows = self.conn.execute(
+            """
+            SELECT video_id, title
+            FROM streams
+            WHERE platform = 'kick' AND status = 'detected'
+            """
+        ).fetchall()
+        legacy_video_ids = [
+            str(row["video_id"])
+            for row in rows
+            if (
+                LEGACY_KICK_STREAM_ID_RE.fullmatch(str(row["video_id"]))
+                and str(row["video_id"]) == f"kick:{str(row['title']).strip()}"
+            )
+        ]
+        if not legacy_video_ids:
+            return
+        now = utc_now()
+        self.conn.executemany(
+            """
+            UPDATE streams
+            SET status = 'ended', updated_at = ?
+            WHERE video_id = ? AND status = 'detected'
+            """,
+            [(now, video_id) for video_id in legacy_video_ids],
+        )
 
     def _ensure_watermark_progress_columns(self) -> None:
         rows = self.conn.execute("PRAGMA table_info(watermark_copies)").fetchall()

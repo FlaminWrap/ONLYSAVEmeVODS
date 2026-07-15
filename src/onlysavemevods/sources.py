@@ -15,6 +15,9 @@ LOGGER = logging.getLogger(__name__)
 SUPPORTED_PLATFORMS = {"youtube", "twitch", "kick", "rumble"}
 PREFIX_RE = re.compile(r"^(?P<platform>[A-Za-z][A-Za-z0-9_-]*):(?P<value>.+)$")
 SESSION_TITLE_DATE_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+YT_DLP_LIVE_TITLE_SUFFIX_RE = re.compile(
+    r"^(?P<title>.*\S)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}$"
+)
 
 
 class SourceError(ValueError):
@@ -290,7 +293,7 @@ def session_stream_raw_id(
     source: str,
     fallback_url: str,
 ) -> str:
-    title = str(info.get("title") or "").strip()
+    title = normalized_stream_title(info)
     start_time = format_stream_start_time(info)
     if title:
         if start_time and not SESSION_TITLE_DATE_RE.search(title):
@@ -313,6 +316,42 @@ def session_stream_raw_id(
     return ""
 
 
+def kick_stream_raw_id(
+    info: dict[str, Any],
+    *,
+    source: str,
+    fallback_url: str,
+) -> str:
+    extracted_id = str(info.get("id") or info.get("display_id") or "").strip()
+    channel_identifiers = {
+        str(value or "").strip().casefold()
+        for value in (
+            info.get("channel"),
+            info.get("uploader"),
+            info.get("uploader_id"),
+            info.get("channel_id"),
+            source_display_name(source or fallback_url),
+        )
+        if str(value or "").strip()
+    }
+    if extracted_id and extracted_id.casefold() not in channel_identifiers:
+        return extracted_id
+    return session_stream_raw_id(
+        info,
+        source=source,
+        fallback_url=fallback_url,
+    )
+
+
+def normalized_stream_title(info: dict[str, Any]) -> str:
+    title = str(info.get("title") or "").strip()
+    live_status = str(info.get("live_status") or "")
+    if not title or not (bool(info.get("is_live")) or live_status == "is_live"):
+        return title
+    match = YT_DLP_LIVE_TITLE_SUFFIX_RE.fullmatch(title)
+    return match.group("title") if match else title
+
+
 def format_stream_start_time(info: dict[str, Any]) -> str:
     timestamp = stream_start_timestamp(info)
     if timestamp is None:
@@ -329,8 +368,8 @@ def stream_start_timestamp(info: dict[str, Any]) -> float | None:
         "actual_start_timestamp",
         "start_timestamp",
         "live_start_timestamp",
-        "timestamp",
         "release_timestamp",
+        "timestamp",
     ):
         timestamp = parse_timestamp_value(info.get(key))
         if timestamp is not None:
@@ -369,7 +408,13 @@ def live_stream_from_generic_info(
     fallback_url: str,
     source: str = "",
 ) -> LiveStream:
-    if platform in {"kick", "twitch", "rumble"}:
+    if platform == "kick":
+        raw_id = kick_stream_raw_id(
+            info,
+            source=source,
+            fallback_url=fallback_url,
+        )
+    elif platform in {"twitch", "rumble"}:
         raw_id = session_stream_raw_id(info, source=source, fallback_url=fallback_url)
     else:
         raw_id = str(
@@ -385,7 +430,7 @@ def live_stream_from_generic_info(
     return LiveStream(
         video_id=qualified_stream_id(platform, raw_id),
         url=str(info.get("webpage_url") or fallback_url),
-        title=str(info.get("title") or ""),
+        title=normalized_stream_title(info),
         channel=str(
             info.get("channel")
             or info.get("uploader")

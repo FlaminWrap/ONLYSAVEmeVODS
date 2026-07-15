@@ -28,6 +28,61 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertEqual(record.platform, "twitch")
         self.assertEqual(record.source, "twitch:OUMB3rd")
 
+    def test_legacy_kick_detected_duplicates_become_deletable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite3"
+            state = StateStore(db_path)
+            legacy_id = "kick:Black ops ports hotel internet 2026-07-15 02:43"
+            stable_id = "kick:92722911-black-ops-ports-hotel-internet"
+            fallback_id = "kick:Black ops ports hotel internet 2026-07-15 01:42"
+            state.upsert_detected(
+                LiveStream(
+                    video_id=legacy_id,
+                    url="https://kick.com/oumb",
+                    title="Black ops ports hotel internet 2026-07-15 02:43",
+                    channel="oumb",
+                    platform="kick",
+                    source="kick:oumb",
+                )
+            )
+            state.upsert_detected(
+                LiveStream(
+                    video_id=stable_id,
+                    url="https://kick.com/oumb",
+                    title="Black ops ports hotel internet",
+                    channel="oumb",
+                    platform="kick",
+                    source="kick:oumb",
+                )
+            )
+            state.upsert_detected(
+                LiveStream(
+                    video_id=fallback_id,
+                    url="https://kick.com/oumb",
+                    title="Black ops ports hotel internet",
+                    channel="oumb",
+                    platform="kick",
+                    source="kick:oumb",
+                )
+            )
+            state.close()
+
+            reopened = StateStore(db_path)
+            legacy = reopened.get_stream(legacy_id)
+            stable = reopened.get_stream(stable_id)
+            fallback = reopened.get_stream(fallback_id)
+            reopened.close()
+
+        self.assertIsNotNone(legacy)
+        self.assertIsNotNone(stable)
+        self.assertIsNotNone(fallback)
+        assert legacy is not None
+        assert stable is not None
+        assert fallback is not None
+        self.assertEqual(legacy.status, "ended")
+        self.assertEqual(stable.status, "detected")
+        self.assertEqual(fallback.status, "detected")
+
     def test_watermark_copy_lifecycle(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")
