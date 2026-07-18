@@ -5,6 +5,7 @@ import unittest
 from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     ConfigError,
+    PostStreamConfig,
     StreamEventDetectionConfig,
     StreamEventRuleConfig,
     VoiceDetectionConfig,
@@ -14,6 +15,7 @@ from onlysavemevods.config import (
     load_config,
     load_config_text,
     monitored_sources,
+    post_stream_config_for_channel,
     streamer_display_name_for_channel,
     update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
@@ -21,6 +23,7 @@ from onlysavemevods.config import (
     update_global_stream_event_rules_config,
     update_config_values,
     update_streamer_config,
+    update_streamer_post_stream_config,
     update_streamer_speaker_labels_config,
     update_streamer_stream_event_config,
     update_streamer_voice_detection_config,
@@ -651,6 +654,59 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(updated_config.streamers["OUMB3rd"].powerchat_username, "")
         self.assertNotIn("powerchat_enabled", updated_text)
         self.assertNotIn("powerchat_username", updated_text)
+
+    def test_streamer_post_stream_overrides_inherit_write_and_remove(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "transcribe_subtitles = false\n"
+                "render_live_chat_video = true\n"
+                '[streamers."OUMB3rd"]\n'
+                'sources = ["kick:oumb"]\n'
+                '[streamers."OUMB3rd".post_stream]\n'
+                "transcribe_subtitles = true\n"
+                "render_live_chat_video = false\n"
+                "stream_event_detection_enabled = true\n"
+                '[streamers."OUMB3rd".stream_event_detection]\n'
+                "enabled = false\n",
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            effective = post_stream_config_for_channel(config, "oumb")
+
+            changed = update_streamer_post_stream_config(
+                config_path,
+                "OUMB3rd",
+                PostStreamConfig(
+                    twitch_ad_repair_enabled=False,
+                    stream_event_detection_enabled=True,
+                ),
+            )
+            updated = load_config(config_path)
+            updated_text = config_path.read_text(encoding="utf-8")
+            removed = update_streamer_post_stream_config(
+                config_path,
+                "OUMB3rd",
+                None,
+            )
+            removed_text = config_path.read_text(encoding="utf-8")
+
+        self.assertTrue(effective.transcribe_subtitles)
+        self.assertFalse(effective.render_live_chat_video)
+        self.assertTrue(effective.stream_event_detection_enabled)
+        self.assertIsNotNone(effective.streamers["OUMB3rd"].stream_event_detection)
+        assert effective.streamers["OUMB3rd"].stream_event_detection is not None
+        self.assertIsNone(effective.streamers["OUMB3rd"].stream_event_detection.enabled)
+        self.assertTrue(changed)
+        post_stream = updated.streamers["OUMB3rd"].post_stream
+        self.assertIsNotNone(post_stream)
+        assert post_stream is not None
+        self.assertFalse(post_stream.twitch_ad_repair_enabled)
+        self.assertTrue(post_stream.stream_event_detection_enabled)
+        self.assertIsNone(post_stream.transcribe_subtitles)
+        self.assertIn('[streamers."OUMB3rd".post_stream]', updated_text)
+        self.assertTrue(removed)
+        self.assertNotIn('[streamers."OUMB3rd".post_stream]', removed_text)
 
     def test_streamer_shared_settings_update_writes_and_removes_tables(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -129,7 +129,10 @@ class PythonUpdateScriptTests(unittest.TestCase):
         self.assertIn('"setuptools<82"', script)
         self.assertIn("verify_python_dependencies", script)
         self.assertIn("-m pip check", script)
-        self.assertIn("config.voice_match_enabled", script)
+        self.assertIn(
+            'post_stream_setting_enabled_anywhere(config, "voice_match_enabled")',
+            script,
+        )
         self.assertIn('"${APP_DIR}[voice-match]"', script)
         self.assertIn("install_voice_match_if_needed", script)
         self.assertNotIn('--upgrade-strategy eager --editable "${APP_DIR}[voice-match]"', script)

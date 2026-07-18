@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 import json
@@ -76,6 +76,13 @@ class ConfigError(ValueError):
 
 
 VOICE_DETECTION_MODES = {"off", "auto", "range", "fixed"}
+POST_STREAM_FIELDS = (
+    "twitch_ad_repair_enabled",
+    "transcribe_subtitles",
+    "voice_match_enabled",
+    "stream_event_detection_enabled",
+    "render_live_chat_video",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,11 +126,21 @@ class StreamEventDetectionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class PostStreamConfig:
+    twitch_ad_repair_enabled: bool | None = None
+    transcribe_subtitles: bool | None = None
+    voice_match_enabled: bool | None = None
+    stream_event_detection_enabled: bool | None = None
+    render_live_chat_video: bool | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class StreamerConfig:
     sources: list[str] = field(default_factory=list)
     download_dir_name: str = ""
     powerchat_enabled: bool = False
     powerchat_username: str = ""
+    post_stream: PostStreamConfig | None = None
     voice_detection: VoiceDetectionConfig | None = None
     speaker_labels: dict[str, str] = field(default_factory=dict)
     voices: dict[str, VoiceProfileConfig] = field(default_factory=dict)
@@ -553,6 +570,63 @@ def download_group_name_for_channel(config: BotConfig, channel: str) -> str:
     return streamer.download_dir_name or name
 
 
+def post_stream_config_for_channel(config: BotConfig, channel: str) -> BotConfig:
+    """Return global processing settings with a streamer's explicit overrides."""
+
+    match = streamer_for_channel(config, channel)
+    if match is None:
+        return config
+    streamer_name, streamer = match
+    post_stream = streamer.post_stream or PostStreamConfig()
+    overrides = {
+        key: value
+        for key in POST_STREAM_FIELDS
+        if (value := getattr(post_stream, key)) is not None
+    }
+
+    legacy_detection = streamer.stream_event_detection
+    event_override = post_stream.stream_event_detection_enabled
+    if (
+        event_override is None
+        and legacy_detection is not None
+        and legacy_detection.enabled is not None
+    ):
+        overrides["stream_event_detection_enabled"] = legacy_detection.enabled
+    elif (
+        event_override is not None
+        and legacy_detection is not None
+        and legacy_detection.enabled is not None
+    ):
+        # The After a stream control is authoritative once explicitly set.
+        streamer = replace(
+            streamer,
+            stream_event_detection=replace(legacy_detection, enabled=None),
+        )
+        streamers = dict(config.streamers)
+        streamers[streamer_name] = streamer
+        overrides["streamers"] = streamers
+
+    return replace(config, **overrides) if overrides else config
+
+
+def post_stream_setting_enabled_anywhere(config: BotConfig, key: str) -> bool:
+    if key not in POST_STREAM_FIELDS:
+        raise ConfigError(f"Unknown post-stream setting: {key}")
+    if bool(getattr(config, key)):
+        return True
+    if any(
+        streamer.post_stream is not None
+        and getattr(streamer.post_stream, key) is True
+        for streamer in config.streamers.values()
+    ):
+        return True
+    return key == "stream_event_detection_enabled" and any(
+        streamer.stream_event_detection is not None
+        and streamer.stream_event_detection.enabled is True
+        for streamer in config.streamers.values()
+    )
+
+
 def source_display_name(source: str) -> str:
     target = source.strip().rstrip("/")
     if not target:
@@ -843,6 +917,45 @@ def update_streamer_config(
         prefix = current_text.rstrip()
         updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
 
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def update_streamer_post_stream_config(
+    config_path: str | Path,
+    streamer_name: str,
+    post_stream: PostStreamConfig | None,
+) -> bool:
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("streamer name is required")
+    _require_configured_streamer(current_text, streamer_name, target)
+
+    normalized_values: dict[str, bool | None] = {}
+    for key in POST_STREAM_FIELDS:
+        raw_value = getattr(post_stream, key) if post_stream is not None else None
+        normalized_values[key] = (
+            None
+            if raw_value is None
+            else _as_bool(raw_value, f"streamers.{streamer_name}.post_stream.{key}")
+        )
+    normalized = PostStreamConfig(**normalized_values)
+    table_name = f"streamers.{_toml_key(streamer_name)}.post_stream"
+    block = _streamer_post_stream_block(streamer_name, normalized)
+    updated_text = _replace_regular_table_block(current_text, table_name, block)
     _validate_generated_config(target, updated_text)
     _validate_generated_streamers(target, updated_text)
     try:
@@ -1434,6 +1547,18 @@ def _streamer_voice_detection_block(
     return "\n".join(lines)
 
 
+def _streamer_post_stream_block(
+    streamer_name: str,
+    post_stream: PostStreamConfig,
+) -> str:
+    lines = [f"[streamers.{_toml_key(streamer_name)}.post_stream]"]
+    for key in POST_STREAM_FIELDS:
+        value = getattr(post_stream, key)
+        if value is not None:
+            lines.append(f"{key} = {_toml_value(value, key)}")
+    return "\n".join(lines) if len(lines) > 1 else ""
+
+
 def _streamer_speaker_labels_block(streamer_name: str, labels: dict[str, str]) -> str:
     lines = [f"[streamers.{_toml_key(streamer_name)}.speaker_labels]"]
     for label, name in sorted(labels.items()):
@@ -1695,6 +1820,18 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             f"{name}.{streamer_name}.stream_event_rules",
         )
 
+        raw_post_stream = raw_config.get("post_stream")
+        post_stream = None
+        if raw_post_stream is not None:
+            if not isinstance(raw_post_stream, dict):
+                raise ConfigError(
+                    f"{name}.{streamer_name}.post_stream must be a TOML table"
+                )
+            post_stream = _as_post_stream_config(
+                raw_post_stream,
+                f"{name}.{streamer_name}.post_stream",
+            )
+
         streamers[streamer_name] = StreamerConfig(
             sources=sources,
             download_dir_name=_as_optional_str(
@@ -1709,6 +1846,7 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
                 raw_config.get("powerchat_username", ""),
                 f"{name}.{streamer_name}.powerchat_username",
             ),
+            post_stream=post_stream,
             voice_detection=voice_detection,
             speaker_labels=speaker_labels,
             voices=voices,
@@ -1716,6 +1854,17 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             stream_event_rules=stream_event_rules,
         )
     return streamers
+
+
+def _as_post_stream_config(value: dict[str, Any], name: str) -> PostStreamConfig:
+    unknown = sorted(str(key) for key in value if key not in POST_STREAM_FIELDS)
+    if unknown:
+        raise ConfigError(f"Unknown {name} setting: {unknown[0]}")
+    values = {
+        key: _as_bool(value[key], f"{name}.{key}") if key in value else None
+        for key in POST_STREAM_FIELDS
+    }
+    return PostStreamConfig(**values)
 
 
 def _as_voice_profiles(value: Any, name: str) -> dict[str, VoiceProfileConfig]:

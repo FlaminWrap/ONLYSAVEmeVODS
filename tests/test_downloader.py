@@ -5,7 +5,12 @@ import asyncio
 import json
 import unittest
 
-from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS, StreamerConfig
+from onlysavemevods.config import (
+    BotConfig,
+    DEFAULT_POST_EXIT_CHECK_SECONDS,
+    PostStreamConfig,
+    StreamerConfig,
+)
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs
 from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.chat_timing import read_chat_timing
@@ -1162,6 +1167,42 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.status, "done")
         self.assertEqual(job.progress, 1.0)
         self.assertIn("Late Night Stream", job.item)
+
+    async def test_streamer_can_enable_transcription_over_global_default(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=False,
+                streamers={
+                    "Example": StreamerConfig(
+                        sources=["@Example"],
+                        post_stream=PostStreamConfig(transcribe_subtitles=True),
+                    )
+                },
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example",
+            )
+            segment_dir = config.download_dir / "Example" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            transcribe = AsyncMock(return_value=True)
+
+            try:
+                with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
+                    await manager.finish_ended_stream(stream, 1)
+            finally:
+                state.close()
+
+        transcribe.assert_awaited_once()
+        self.assertTrue(transcribe.await_args.args[0].transcribe_subtitles)
 
     async def test_finish_ended_stream_transcribes_named_media_file(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -184,6 +184,25 @@
     autosaveTimers.set(form, timer);
   };
 
+  const updatePostStreamStatuses = (form) => {
+    const effective = {};
+    form.querySelectorAll("[data-post-stream-select]").forEach((select) => {
+      if (!(select instanceof HTMLSelectElement)) return;
+      effective[select.name] = select.value === "inherit"
+        ? select.dataset.appDefault === "true"
+        : select.value === "enabled";
+    });
+    if (Object.hasOwn(effective, "voice_match_enabled")) {
+      effective.voice_match_enabled = Boolean(effective.voice_match_enabled && effective.transcribe_subtitles);
+    }
+    Object.entries(effective).forEach(([name, enabled]) => {
+      const status = form.querySelector(`[data-post-stream-status="${CSS.escape(name)}"]`);
+      if (!status) return;
+      status.textContent = enabled ? "Enabled" : "Disabled";
+      status.classList.toggle("good", enabled);
+    });
+  };
+
   document.querySelectorAll("form[data-autosave]").forEach((form, index) => {
     if (!form.id) form.id = `autosave-form-${index + 1}`;
     form.addEventListener("submit", (event) => {
@@ -203,6 +222,7 @@
         const stateLabel = target.closest(".switch-field")?.querySelector(":scope > span");
         if (stateLabel) stateLabel.textContent = target.checked ? "Enabled" : "Disabled";
       }
+      if (target.matches("[data-post-stream-select]")) updatePostStreamStatuses(form);
       markAutosaveDirty(form, ["checkbox", "radio"].includes(target.type) || target instanceof HTMLSelectElement);
     });
     form.addEventListener("focusout", (event) => {

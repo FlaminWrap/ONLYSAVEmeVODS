@@ -5,7 +5,12 @@ import logging
 from datetime import datetime, timezone
 
 from .chat_render import log_nvenc_environment
-from .config import BotConfig, ensure_config_dirs, monitored_sources
+from .config import (
+    BotConfig,
+    ensure_config_dirs,
+    monitored_sources,
+    post_stream_setting_enabled_anywhere,
+)
 from .downloader import DownloadManager
 from .models import LiveStream
 from .sources import SourceMonitor
@@ -68,7 +73,13 @@ class OnlySaveMeVodsDaemon:
             self.config.web_host,
             self.config.web_port,
         )
-        if self.config.render_live_chat_video or self.config.chat_render_use_nvenc:
+        if (
+            post_stream_setting_enabled_anywhere(
+                self.config,
+                "render_live_chat_video",
+            )
+            or self.config.chat_render_use_nvenc
+        ):
             await asyncio.to_thread(
                 log_nvenc_environment,
                 self.config.ffmpeg_path,

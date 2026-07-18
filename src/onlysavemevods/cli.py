@@ -22,6 +22,7 @@ from .config import (
     append_missing_config_values,
     load_config,
     monitored_sources,
+    post_stream_setting_enabled_anywhere,
     update_config_values,
 )
 from .daemon import OnlySaveMeVodsDaemon
@@ -564,7 +565,10 @@ def run_command(args: argparse.Namespace) -> int:
 def web_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     configure_logging(args.verbose, config.log_level)
-    if config.render_live_chat_video or config.chat_render_use_nvenc:
+    if (
+        post_stream_setting_enabled_anywhere(config, "render_live_chat_video")
+        or config.chat_render_use_nvenc
+    ):
         log_nvenc_environment(config.ffmpeg_path, config.chat_render_use_nvenc)
     server = StatusWebServer(config, host=args.host, port=args.port)
     server.start()

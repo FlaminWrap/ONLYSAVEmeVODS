@@ -11,7 +11,12 @@ import json
 import sqlite3
 import sys
 
-from .config import BotConfig, ConfigError, load_config
+from .config import (
+    BotConfig,
+    ConfigError,
+    load_config,
+    post_stream_setting_enabled_anywhere,
+)
 
 
 BUSY_STREAM_STATUSES = frozenset({"downloading", "checking_after_exit", "waiting_retry"})
@@ -148,7 +153,10 @@ def check_active_service_idle(config_path: str | Path, *, timeout: float = 5.0) 
 
 
 def config_enables_transcription(config_path: str | Path) -> bool:
-    return load_config(config_path).transcribe_subtitles
+    return post_stream_setting_enabled_anywhere(
+        load_config(config_path),
+        "transcribe_subtitles",
+    )
 
 
 def render_python_update_service_unit(

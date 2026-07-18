@@ -15,6 +15,7 @@ from onlysavemevods.web import (
     render_admin_settings,
     safe_return_to,
     update_app_config_from_json,
+    update_streamer_from_form,
     update_streamer_from_json,
 )
 
@@ -56,7 +57,6 @@ class DashboardUiTests(unittest.TestCase):
             snapshot = build_admin_static_snapshot(config)
 
             general = render_admin_settings(snapshot, "general")
-            after_stream = render_admin_settings(snapshot, "after_stream")
             advanced = render_admin_settings(snapshot, "advanced")
 
         self.assertIn('data-autosave="config"', general)
@@ -66,46 +66,70 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("Restart", general)
         self.assertIn("data-settings-search", advanced)
         self.assertIn("Additional yt-dlp arguments", advanced)
-        self.assertIn("Automatic workflow", after_stream)
-        self.assertIn("Finalization always on", after_stream)
-        self.assertIn('name="twitch_ad_repair_enabled"', after_stream)
-        self.assertIn('name="transcribe_subtitles"', after_stream)
-        self.assertIn('name="voice_match_enabled"', after_stream)
-        self.assertIn('name="stream_event_detection_enabled"', after_stream)
-        self.assertIn('name="render_live_chat_video"', after_stream)
-        self.assertLess(
-            after_stream.index('name="twitch_ad_repair_enabled"'),
-            after_stream.index('name="transcribe_subtitles"'),
-        )
-        self.assertNotIn('name="whisperx_model"', after_stream)
+        self.assertIn("Create subtitles automatically", advanced)
 
-    def test_after_stream_switches_save_with_existing_config_keys(self) -> None:
+    def test_after_stream_controls_are_per_streamer_and_inherit_defaults(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
-            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config_path.write_text(
+                BASE_CONFIG
+                + "\ntranscribe_subtitles = false\n"
+                + '[streamers."Example"]\n'
+                + 'sources = ["@Example"]\n',
+                encoding="utf-8",
+            )
             config = load_config(config_path)
 
-            result = update_app_config_from_json(
+            html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+
+            result = update_streamer_from_json(
                 config,
                 {
                     "revision": config_file_revision(config),
+                    "form_kind": "streamer-post-stream",
+                    "streamer_name": "Example",
                     "values": {
-                        "twitch_ad_repair_enabled": False,
-                        "transcribe_subtitles": True,
-                        "voice_match_enabled": False,
-                        "stream_event_detection_enabled": True,
-                        "render_live_chat_video": True,
+                        "twitch_ad_repair_enabled": "disabled",
+                        "transcribe_subtitles": "enabled",
+                        "voice_match_enabled": "inherit",
+                        "stream_event_detection_enabled": "enabled",
+                        "render_live_chat_video": "disabled",
                     },
                 },
             )
-            reloaded = load_config(config_path)
+            post_stream = load_config(config_path).streamers["Example"].post_stream
+            update_streamer_from_form(
+                config,
+                {
+                    "form_kind": ["streamer_post_stream"],
+                    "streamer_name": ["Example"],
+                    "twitch_ad_repair_enabled": ["inherit"],
+                    "transcribe_subtitles": ["inherit"],
+                    "voice_match_enabled": ["inherit"],
+                    "stream_event_detection_enabled": ["inherit"],
+                    "render_live_chat_video": ["inherit"],
+                },
+            )
+            inherited = load_config(config_path).streamers["Example"].post_stream
 
+        self.assertIn("After a stream", html)
+        self.assertIn('data-autosave="streamer-post-stream"', html)
+        self.assertIn("Use inherited default (off)", html)
+        self.assertIn("Always run for this streamer", html)
+        self.assertIn("Never run for this streamer", html)
         self.assertTrue(result["ok"])
-        self.assertFalse(reloaded.twitch_ad_repair_enabled)
-        self.assertTrue(reloaded.transcribe_subtitles)
-        self.assertFalse(reloaded.voice_match_enabled)
-        self.assertTrue(reloaded.stream_event_detection_enabled)
-        self.assertTrue(reloaded.render_live_chat_video)
+        self.assertIsNotNone(post_stream)
+        assert post_stream is not None
+        self.assertFalse(post_stream.twitch_ad_repair_enabled)
+        self.assertTrue(post_stream.transcribe_subtitles)
+        self.assertIsNone(post_stream.voice_match_enabled)
+        self.assertTrue(post_stream.stream_event_detection_enabled)
+        self.assertFalse(post_stream.render_live_chat_video)
+        self.assertIsNone(inherited)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:

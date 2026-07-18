@@ -371,11 +371,9 @@ button, a, input, select, textarea, summary { outline: none; }
 .settings-nav a.active { background: var(--accent-soft); color: var(--accent); }
 .settings-content { display: grid; gap: 15px; min-width: 0; }
 .settings-group { display: grid; gap: 15px; }
-.workflow-list { display: grid; gap: 10px; margin: 0; padding-left: 24px; }
-.workflow-list li { padding-left: 4px; }
-.workflow-list li::marker { color: var(--accent); font-weight: 750; }
-.workflow-list strong, .workflow-list span { display: block; }
-.workflow-list span { margin-top: 2px; color: var(--muted); font-size: 13px; }
+.post-stream-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
+.post-stream-option { align-content: start; padding: 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }
+.post-stream-option select { width: 100%; }
 .setting-card { display: grid; gap: 11px; }
 .setting-card[hidden] { display: none; }
 .setting-card-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }

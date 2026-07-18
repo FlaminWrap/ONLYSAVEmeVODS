@@ -627,14 +627,14 @@ install_deno_runtime() {
 
 config_enables_transcription() {
   sudo "${VENV_DIR}/bin/python" -c '
-from onlysavemevods.config import ConfigError, load_config
+from onlysavemevods.config import ConfigError, load_config, post_stream_setting_enabled_anywhere
 import sys
 try:
     config = load_config(sys.argv[1])
 except ConfigError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2)
-raise SystemExit(0 if config.transcribe_subtitles else 1)
+raise SystemExit(0 if post_stream_setting_enabled_anywhere(config, "transcribe_subtitles") else 1)
 ' "${CONFIG_FILE}"
 }
 
@@ -647,27 +647,27 @@ print(load_config("'"${CONFIG_FILE}"'").whisperx_path)
 
 config_enables_voice_match() {
   sudo "${VENV_DIR}/bin/python" -c '
-from onlysavemevods.config import ConfigError, load_config
+from onlysavemevods.config import ConfigError, load_config, post_stream_setting_enabled_anywhere
 import sys
 try:
     config = load_config(sys.argv[1])
 except ConfigError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2)
-raise SystemExit(0 if config.voice_match_enabled else 1)
+raise SystemExit(0 if post_stream_setting_enabled_anywhere(config, "voice_match_enabled") else 1)
 ' "${CONFIG_FILE}"
 }
 
 config_enables_stream_events() {
   sudo "${VENV_DIR}/bin/python" -c '
-from onlysavemevods.config import ConfigError, load_config
+from onlysavemevods.config import ConfigError, load_config, post_stream_setting_enabled_anywhere
 import sys
 try:
     config = load_config(sys.argv[1])
 except ConfigError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2)
-raise SystemExit(0 if config.stream_event_detection_enabled else 1)
+raise SystemExit(0 if post_stream_setting_enabled_anywhere(config, "stream_event_detection_enabled") else 1)
 ' "${CONFIG_FILE}"
 }
 

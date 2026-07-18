@@ -147,6 +147,12 @@ automatically. The header reports **Saving**, **Saved**, validation errors, or a
 config conflict; new records, uploads, processing jobs, and deletion remain
 explicit actions.
 
+Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
+voice identification, content events, and chat-video rendering, choose **Use
+inherited default**, **Always run for this streamer**, or **Never run for this
+streamer**. Recording finalization always runs. Streamer choices also apply to
+manual VOD imports, and disabling an action does not delete existing output.
+
 Recent streams use expandable sections:
 
 - **Files** lists finalized media and sidecars, with actions such as Download,
@@ -163,17 +169,11 @@ Recent streams use expandable sections:
 
 ![Config dashboard](docs/screenshots/dashboard-config.png)
 
-Settings presents common controls under General, Recording, After a stream,
-Processing, and System. Advanced provides a searchable view of every supported
-setting. Each control shows a plain-language label and description while
-keeping its exact `config.toml` key visible for technical reference.
-
-**After a stream** gathers the optional automatic workflow in execution order.
-The recording is always safely finalized first. Users can independently choose
-whether future streams repair Twitch ad slates, create subtitles, identify
-known voices, detect content events, or render a chat video. Turning an action
-off does not delete earlier output, and available actions can still be launched
-manually from a finalized recording.
+Settings presents common controls under General, Recording, Processing, and
+System. Advanced provides a searchable view of technical app defaults,
+including the defaults inherited by a streamer's automatic workflow. Each
+control shows a plain-language label and description while keeping its exact
+`config.toml` key visible for technical reference.
 
 Changes save automatically: switches and selects save immediately; text and
 number fields save after a short pause or when focus leaves the group. Related
@@ -646,7 +646,8 @@ scripts/uninstall-systemd.sh
   matches to `.srt`/`.vtt`, and leaves weak matches for review. Manual
   `[streamers."Name".speaker_labels]` and `[channel_speaker_labels."Channel Name"]`
   mappings still win because WhisperX `SPEAKER_00` IDs are per transcript.
-- Content event detection can be enabled from **Settings → After a stream**. It
+- Content event detection can be enabled per streamer from **Streamers → Manage
+  → After a stream**. It
   writes `<media>.stream-events.json`, adds a Content Events section to each stream, and can match
   AudioSet labels such as laughter/cheering/applause plus transcript keywords.
   For manual installs, use `.venv/bin/python -m pip install -e ".[stream-events]"`.

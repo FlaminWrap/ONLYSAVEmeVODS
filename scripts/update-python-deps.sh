@@ -115,10 +115,10 @@ config_enables_transcription() {
 config_enables_voice_match() {
   set +e
   "${PYTHON_BIN}" -c '
-from onlysavemevods.config import ConfigError, load_config
+from onlysavemevods.config import ConfigError, load_config, post_stream_setting_enabled_anywhere
 import sys
 try:
-    enabled = load_config(sys.argv[1]).voice_match_enabled
+    enabled = post_stream_setting_enabled_anywhere(load_config(sys.argv[1]), "voice_match_enabled")
 except ConfigError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2)
@@ -132,10 +132,10 @@ raise SystemExit(0 if enabled else 1)
 config_enables_stream_events() {
   set +e
   "${PYTHON_BIN}" -c '
-from onlysavemevods.config import ConfigError, load_config
+from onlysavemevods.config import ConfigError, load_config, post_stream_setting_enabled_anywhere
 import sys
 try:
-    enabled = load_config(sys.argv[1]).stream_event_detection_enabled
+    enabled = post_stream_setting_enabled_anywhere(load_config(sys.argv[1]), "stream_event_detection_enabled")
 except ConfigError as exc:
     print(exc, file=sys.stderr)
     raise SystemExit(2)

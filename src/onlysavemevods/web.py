@@ -55,6 +55,9 @@ from .content_events import (
 from .config import (
     BotConfig,
     ConfigError,
+    POST_STREAM_FIELDS,
+    PostStreamConfig,
+    StreamerConfig,
     StreamEventDetectionConfig,
     StreamEventRuleConfig,
     VoiceDetectionConfig,
@@ -64,6 +67,7 @@ from .config import (
     load_config_text,
     migrate_legacy_channels_to_streamer,
     monitored_sources,
+    post_stream_config_for_channel,
     remove_streamer_config,
     streamer_display_name_for_channel,
     update_channel_speaker_labels_config,
@@ -72,6 +76,7 @@ from .config import (
     updated_config_text,
     update_global_stream_event_rules_config,
     update_streamer_config,
+    update_streamer_post_stream_config,
     update_streamer_speaker_labels_config,
     update_streamer_stream_event_config,
     update_streamer_voice_detection_config,
@@ -644,6 +649,7 @@ class StreamerStatus:
     voices: list[VoiceProfileStatus]
     stream_event_detection: dict[str, Any]
     stream_event_rules: list[dict[str, Any]]
+    post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -677,6 +683,7 @@ class StreamerStatStatus:
     latest_activity_at: float | None
     jobs: list[JobStatus]
     streams: list[StreamStatus]
+    post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -935,6 +942,11 @@ CONFIG_FIELD_ADVANCED = {
     "chat_render_panel_workers",
     "chat_render_timeout_seconds",
     "chat_render_nvenc_devices",
+    "render_live_chat_video",
+    "transcribe_subtitles",
+    "voice_match_enabled",
+    "stream_event_detection_enabled",
+    "twitch_ad_repair_enabled",
     "whisperx_path",
     "whisperx_model",
     "whisperx_device",
@@ -978,25 +990,6 @@ CONFIG_FIELD_CATEGORIES = {
     "Watermark": "system",
 }
 
-# These switches describe work triggered by finalization, so keep them together
-# in the guided UI even though their tuning controls live in different technical
-# sections.  The underlying keys remain unchanged for config compatibility.
-CONFIG_FIELD_CATEGORY_OVERRIDES = {
-    "twitch_ad_repair_enabled": "after_stream",
-    "transcribe_subtitles": "after_stream",
-    "voice_match_enabled": "after_stream",
-    "stream_event_detection_enabled": "after_stream",
-    "render_live_chat_video": "after_stream",
-}
-
-AFTER_STREAM_FIELD_ORDER = {
-    "twitch_ad_repair_enabled": 10,
-    "transcribe_subtitles": 20,
-    "voice_match_enabled": 30,
-    "stream_event_detection_enabled": 40,
-    "render_live_chat_video": 50,
-}
-
 CONFIG_FIELD_UNITS = {
     "poll_interval_seconds": "seconds",
     "reconnect_interval_seconds": "seconds",
@@ -1026,10 +1019,7 @@ def enrich_config_form_field(field: ConfigFormField) -> ConfigFormField:
         field,
         label=label,
         help_text=help_text,
-        category=CONFIG_FIELD_CATEGORY_OVERRIDES.get(
-            field.key,
-            CONFIG_FIELD_CATEGORIES.get(field.section, "advanced"),
-        ),
+        category=CONFIG_FIELD_CATEGORIES.get(field.section, "advanced"),
         unit=CONFIG_FIELD_UNITS.get(field.key, ""),
         advanced=field.key in CONFIG_FIELD_ADVANCED,
         restart_required=field.key in CONFIG_RESTART_FIELDS,
@@ -2792,6 +2782,32 @@ def stream_event_detection_summary(
     }
 
 
+def post_stream_summary(
+    config: BotConfig,
+    streamer: StreamerConfig,
+) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for key in POST_STREAM_FIELDS:
+        app_default = bool(getattr(config, key))
+        if (
+            key == "stream_event_detection_enabled"
+            and streamer.stream_event_detection is not None
+            and streamer.stream_event_detection.enabled is not None
+        ):
+            app_default = streamer.stream_event_detection.enabled
+        override = (
+            getattr(streamer.post_stream, key)
+            if streamer.post_stream is not None
+            else None
+        )
+        summary[key] = {
+            "mode": "inherit" if override is None else ("enabled" if override else "disabled"),
+            "app_default": app_default,
+            "effective": app_default if override is None else override,
+        }
+    return summary
+
+
 def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
     return [
         StreamerStatus(
@@ -2800,6 +2816,7 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
             download_dir_name=streamer.download_dir_name,
             powerchat_enabled=streamer.powerchat_enabled,
             powerchat_username=streamer.powerchat_username,
+            post_stream=post_stream_summary(config, streamer),
             voice_detection=(
                 voice_detection_config_summary(streamer.voice_detection)
                 if streamer.voice_detection is not None
@@ -2854,6 +2871,7 @@ def build_streamer_stats(
                 download_dir_name=streamer.download_dir_name or name,
                 powerchat_enabled=streamer.powerchat_enabled,
                 powerchat_username=streamer.powerchat_username,
+                post_stream=post_stream_summary(config, streamer),
                 voice_detection=voice_detection,
                 speaker_label_count=len(streamer.speaker_labels),
                 voices=voice_profile_statuses(streamer.voices),
@@ -2892,6 +2910,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 powerchat_enabled=False,
                 powerchat_username="",
+                post_stream={},
                 voice_detection=voice_detection_summary_for_source_group(config, name, sources),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
                 voices=[],
@@ -2915,6 +2934,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 powerchat_enabled=False,
                 powerchat_username="",
+                post_stream={},
                 voice_detection=voice_detection_summary_for_source_group(config, name, []),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, []),
                 voices=[],
@@ -2936,6 +2956,7 @@ def streamer_stat_from_channel_status(
     download_dir_name: str,
     powerchat_enabled: bool,
     powerchat_username: str,
+    post_stream: dict[str, dict[str, Any]],
     voice_detection: str,
     speaker_label_count: int,
     voices: list[VoiceProfileStatus],
@@ -2956,6 +2977,7 @@ def streamer_stat_from_channel_status(
         download_dir_name=download_dir_name,
         powerchat_enabled=powerchat_enabled,
         powerchat_username=powerchat_username,
+        post_stream={key: dict(value) for key, value in post_stream.items()},
         configured=configured,
         needs_grouping=needs_grouping,
         voice_detection=voice_detection,
@@ -5113,10 +5135,15 @@ def queue_vod_post_processing_jobs(
         )
         return
 
-    if config.twitch_ad_repair_enabled and stream.platform == "twitch":
-        start_vod_twitch_ad_repair_job(config, stream, media_file)
-    if config.transcribe_subtitles:
-        ok, message = start_transcription_job(config, stream.video_id, media_file.name)
+    processing_config = post_stream_config_for_channel(config, stream.channel)
+    if processing_config.twitch_ad_repair_enabled and stream.platform == "twitch":
+        start_vod_twitch_ad_repair_job(processing_config, stream, media_file)
+    if processing_config.transcribe_subtitles:
+        ok, message = start_transcription_job(
+            processing_config,
+            stream.video_id,
+            media_file.name,
+        )
         if not ok:
             record_stream_event(
                 config,
@@ -5125,8 +5152,12 @@ def queue_vod_post_processing_jobs(
                 level="warning",
                 segment_index=1,
             )
-    if config.stream_event_detection_enabled:
-        ok, message = start_event_detection_job(config, stream.video_id, media_file.name)
+    if processing_config.stream_event_detection_enabled:
+        ok, message = start_event_detection_job(
+            processing_config,
+            stream.video_id,
+            media_file.name,
+        )
         if not ok:
             record_stream_event(
                 config,
@@ -5135,10 +5166,14 @@ def queue_vod_post_processing_jobs(
                 level="warning",
                 segment_index=1,
             )
-    if config.render_live_chat_video and stream.platform in {"youtube", "kick"}:
+    if processing_config.render_live_chat_video and stream.platform in {"youtube", "kick"}:
         chat_file = vod_chat_sidecar_for_media_file(media_file)
         if chat_file.is_file():
-            ok, message = start_render_chat_job(config, stream.video_id, chat_file.name)
+            ok, message = start_render_chat_job(
+                processing_config,
+                stream.video_id,
+                chat_file.name,
+            )
             if not ok:
                 record_stream_event(
                     config,
@@ -5958,11 +5993,12 @@ def event_detection_action_for_file(
 ) -> tuple[str | None, str | None, str | None]:
     if not is_transcribable_media_file(filename):
         return None, None, None
-    if not config.stream_event_detection_enabled:
+    resolved = resolve_transcription_source_file(config, video_id, filename)
+    if resolved is None:
         return None, None, None
-
-    media_file = directory / filename
-    if not media_file.is_file():
+    record, media_file = resolved
+    processing_config = post_stream_config_for_channel(config, record.channel)
+    if not processing_config.stream_event_detection_enabled:
         return None, None, None
 
     job = event_detection_job_for(video_id, filename)
@@ -6952,6 +6988,15 @@ def update_streamer_from_json(
     values = payload.get("values")
     if not isinstance(values, dict) or not values:
         raise ConfigError("values must contain streamer settings")
+    form_kind = str(payload.get("form_kind") or "streamer").strip()
+    if form_kind == "streamer-post-stream":
+        return update_streamer_post_stream_from_json(
+            config,
+            streamer_name,
+            configured,
+            values,
+            expected_revision=str(payload.get("revision") or ""),
+        )
     allowed = {"sources", "download_dir_name", "powerchat_enabled", "powerchat_username"}
     unknown = sorted(str(key) for key in values if key not in allowed)
     if unknown:
@@ -6987,6 +7032,57 @@ def update_streamer_from_json(
         revision=revision,
         saved=saved,
     )
+
+
+def update_streamer_post_stream_from_json(
+    config: BotConfig,
+    streamer_name: str,
+    configured: StreamerConfig,
+    values: dict[str, Any],
+    *,
+    expected_revision: str,
+) -> dict[str, Any]:
+    unknown = sorted(str(key) for key in values if key not in POST_STREAM_FIELDS)
+    if unknown:
+        raise ConfigError(f"Unknown post-stream setting: {unknown[0]}")
+    current = configured.post_stream or PostStreamConfig()
+    parsed = {
+        key: post_stream_override_value(values[key], key)
+        if key in values
+        else getattr(current, key)
+        for key in POST_STREAM_FIELDS
+    }
+    post_stream = PostStreamConfig(**parsed)
+    with CONFIG_UPDATE_LOCK:
+        current_revision = config_file_revision(config)
+        if expected_revision and expected_revision != current_revision:
+            raise ConfigRevisionConflict(current_revision)
+        changed = update_streamer_post_stream_config(
+            config.config_path,
+            streamer_name,
+            post_stream,
+        )
+        reload_running_config(config)
+        revision = config_file_revision(config)
+    return mutation_response(
+        ok=True,
+        message="Automatic workflow saved",
+        revision=revision,
+        saved=list(POST_STREAM_FIELDS) if changed else [],
+    )
+
+
+def post_stream_override_value(value: Any, key: str) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    if normalized in {"", "inherit", "default"}:
+        return None
+    if normalized in {"enabled", "true", "on", "1"}:
+        return True
+    if normalized in {"disabled", "false", "off", "0"}:
+        return False
+    raise ConfigError(f"{key} must use inherited default, always run, or never run")
 
 
 def app_config_updates_from_form(params: dict[str, list[str]]) -> dict[str, object]:
@@ -7156,6 +7252,28 @@ def _update_streamer_from_form_locked(
     form_kind = (first_query_value(params, "form_kind") or "streamer_form").strip()
     if form_kind == "streamer_wizard":
         update_streamer_from_wizard_form(config, params)
+        return
+    if form_kind == "streamer_post_stream":
+        streamer_name = first_query_value(params, "streamer_name").strip()
+        configured = config.streamers.get(streamer_name)
+        if configured is None:
+            raise ConfigError(f"streamer is not configured: {streamer_name}")
+        values = {
+            key: first_query_value(params, key)
+            for key in POST_STREAM_FIELDS
+        }
+        post_stream = PostStreamConfig(
+            **{
+                key: post_stream_override_value(value, key)
+                for key, value in values.items()
+            }
+        )
+        update_streamer_post_stream_config(
+            config.config_path,
+            streamer_name,
+            post_stream,
+        )
+        reload_running_config(config)
         return
 
     action = (first_query_value(params, "action") or "save").strip().lower()
@@ -7899,7 +8017,10 @@ def run_transcription_job(
     try:
         ok = asyncio.run(
             transcribe_media_file(
-                transcription_config_for_channel(config, channel),
+                transcription_config_for_channel(
+                    post_stream_config_for_channel(config, channel),
+                    channel,
+                ),
                 media_file,
                 overwrite=regenerate,
                 logger=LOGGER,
@@ -7996,13 +8117,14 @@ def start_event_detection_job(
     *,
     regenerate: bool = False,
 ) -> tuple[bool, str]:
-    if not config.stream_event_detection_enabled:
-        return False, "Content event detection is disabled in config"
     resolved = resolve_transcription_source_file(config, video_id, filename)
     if resolved is None:
         return False, "No matching finalized media file found"
 
     record, media_file = resolved
+    processing_config = post_stream_config_for_channel(config, record.channel)
+    if not processing_config.stream_event_detection_enabled:
+        return False, "Content event detection is disabled for this streamer"
     if content_events_exist(media_file) and not regenerate:
         return True, "Content events already detected"
 
@@ -8032,7 +8154,7 @@ def start_event_detection_job(
     )
     thread = Thread(
         target=run_event_detection_job,
-        args=(config, key, media_file, regenerate, record.channel),
+        args=(processing_config, key, media_file, regenerate, record.channel),
         name=f"onlysavemevods-events-{video_id}",
         daemon=True,
     )
@@ -8461,7 +8583,6 @@ ADMIN_PAGE_SUBTITLES = {
 SETTINGS_CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("general", "General", "Storage locations, source checks, and recording capacity."),
     ("recording", "Recording", "Capture, recovery, live chat, and encoding behavior."),
-    ("after_stream", "After a stream", "Choose which optional jobs start automatically when a recording is finalized."),
     ("processing", "Processing", "Tune transcription capacity and other processing details."),
     ("system", "System", "Dashboard, updates, tools, and watermarking."),
     ("advanced", "Advanced", "Search every available setting by name or config key."),
@@ -8739,6 +8860,7 @@ def render_admin_streamer_detail(snapshot: StatusSnapshot, selected: str) -> str
     <div class="card-header"><div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div><div class="button-row"><span class="status-badge {'warning' if streamer.attention_count else 'good'}">{'Needs attention' if streamer.attention_count else 'Configured'}</span>{delete_form}</div></div>
     {render_admin_streamer_basic_form(streamer, snapshot)}
   </section>
+  {render_admin_streamer_post_stream_form(streamer)}
   <section><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>
   <section class="section-stack" data-fragment-url="/streamers?selected={quote(streamer.name, safe='')}&amp;fragment=streams" data-fragment-revision="{escape(revision, quote=True)}">
     {render_admin_streamer_streams(streamer)}
@@ -8758,6 +8880,84 @@ def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: Sta
   </div>
   <noscript><div class="button-row"><button class="button" name="action" value="save" type="submit">Save streamer</button></div></noscript>
 </form>"""
+
+
+POST_STREAM_UI_FIELDS: tuple[tuple[str, str, str], ...] = (
+    (
+        "twitch_ad_repair_enabled",
+        "Repair Twitch ad slates",
+        "For Twitch recordings, detect commercial-break slates and create a repaired copy when matching VOD footage is available.",
+    ),
+    (
+        "transcribe_subtitles",
+        "Create subtitles",
+        "Run WhisperX and write subtitle and transcript sidecars after finalization.",
+    ),
+    (
+        "voice_match_enabled",
+        "Identify known voices",
+        "Match diarized speakers against this streamer's voice samples. Requires subtitle creation.",
+    ),
+    (
+        "stream_event_detection_enabled",
+        "Detect content events",
+        "Analyze the recording using this streamer's event rules.",
+    ),
+    (
+        "render_live_chat_video",
+        "Render a chat video",
+        "Create a separate video with captured chat beside the recording when chat is available.",
+    ),
+)
+
+
+def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:
+    streamer_key = quote(streamer.name, safe="")
+    fields = "".join(
+        render_admin_streamer_post_stream_field(streamer, key, label, help_text)
+        for key, label, help_text in POST_STREAM_UI_FIELDS
+    )
+    return f"""<section class="card section-stack">
+  <div class="card-header"><div><h2>After a stream</h2><p>Choose the optional work that starts automatically for {escape(streamer.name)} after its recording is safely finalized. Platform-specific actions are skipped when they do not apply.</p></div><span class="status-badge good">Finalization always on</span></div>
+  <form id="streamer-post-stream-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer-post-stream" data-streamer-name="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="form_kind" value="streamer_post_stream">
+    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}">
+    <div class="post-stream-grid">{fields}</div>
+    <noscript><div class="button-row"><button class="button" type="submit">Save automatic workflow</button></div></noscript>
+  </form>
+  <div class="notice info">Use inherited default keeps this streamer aligned with the technical defaults in <a href="/settings?section=advanced">Advanced settings</a>. Turning an action off does not delete existing output, and available actions can still be run manually.</div>
+</section>"""
+
+
+def render_admin_streamer_post_stream_field(
+    streamer: StreamerStatStatus,
+    key: str,
+    label: str,
+    help_text: str,
+) -> str:
+    setting = streamer.post_stream.get(key, {})
+    mode = str(setting.get("mode") or "inherit")
+    app_default = bool(setting.get("app_default"))
+    effective = bool(setting.get("effective"))
+    if key == "voice_match_enabled":
+        transcription = streamer.post_stream.get("transcribe_subtitles", {})
+        effective = effective and bool(transcription.get("effective"))
+    options = (
+        ("inherit", f"Use inherited default ({'on' if app_default else 'off'})"),
+        ("enabled", "Always run for this streamer"),
+        ("disabled", "Never run for this streamer"),
+    )
+    option_html = "".join(
+        f'<option value="{value}"{" selected" if value == mode else ""}>{escape(text)}</option>'
+        for value, text in options
+    )
+    return f"""<div class="post-stream-option form-field">
+  <div class="setting-card-header"><div><label for="post-stream-{streamer_dom_id(streamer.name)}-{escape(key, quote=True)}">{escape(label)}</label><span class="technical-key">{escape(key)}</span></div><span class="status-badge {'good' if effective else ''}" data-post-stream-status="{escape(key, quote=True)}">{'Enabled' if effective else 'Disabled'}</span></div>
+  <span class="help-text">{escape(help_text)}</span>
+  <select id="post-stream-{streamer_dom_id(streamer.name)}-{escape(key, quote=True)}" name="{escape(key, quote=True)}" data-post-stream-select data-app-default="{'true' if app_default else 'false'}">{option_html}</select>
+  <span class="field-error" data-field-error></span>
+</div>"""
 
 
 def render_admin_streamer_optional_cards(streamer: StreamerStatStatus) -> str:
@@ -8839,8 +9039,6 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
         field for field in CONFIG_FORM_FIELDS
         if (field.advanced if section == "advanced" else field.category == section and not field.advanced)
     ]
-    if section == "after_stream":
-        fields.sort(key=lambda field: AFTER_STREAM_FIELD_ORDER.get(field.key, 100))
     search = (
         '<div class="advanced-search"><label class="sr-only" for="settings-search">Search settings</label><input id="settings-search" data-settings-search type="search" placeholder="Search by setting name, config key, or description"></div>'
         if section == "advanced" else ""
@@ -8851,9 +9049,7 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
         grouped.append(render_admin_settings_group(snapshot, group_name, group_fields))
     extra = ""
     if section == "processing":
-        extra = '<div class="notice info">Choose which jobs start automatically under <a href="/settings?section=after_stream">After a stream</a>. Streamer-specific voices, speaker names, and event rules are managed from each streamer. <a href="/streamers">Open streamers</a></div>'
-    elif section == "after_stream":
-        extra = render_admin_after_stream_intro()
+        extra = '<div class="notice info">Automatic post-stream actions, voices, speaker names, and event rules are managed per streamer. <a href="/streamers">Open streamers</a></div>'
     return f"""<div class="settings-layout" data-settings-root>
   <nav class="settings-nav card" aria-label="Settings categories">{nav}</nav>
   <div class="settings-content">
@@ -8861,17 +9057,6 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
     {extra}{search}{''.join(grouped) if grouped else '<section class="card empty-state"><h2>No settings in this category</h2></section>'}
   </div>
 </div>"""
-
-
-def render_admin_after_stream_intro() -> str:
-    return """<section class="card section-stack">
-  <div class="card-header"><div><h3>Automatic workflow</h3><p>Optional jobs run in the order shown below after the recording has been safely finalized.</p></div><span class="status-badge good">Finalization always on</span></div>
-  <ol class="workflow-list">
-    <li><strong>Save and organize the recording</strong><span>Always runs, including media, chat, timing, and Powerchat sidecars that were captured.</span></li>
-    <li><strong>Run the enabled jobs below</strong><span>Platform-specific jobs are skipped when they do not apply.</span></li>
-  </ol>
-  <div class="notice info">Turning a switch off affects future stream finalizations. It does not delete existing outputs, and available jobs can still be started manually from a recording.</div>
-</section>"""
 
 
 def render_admin_settings_group(

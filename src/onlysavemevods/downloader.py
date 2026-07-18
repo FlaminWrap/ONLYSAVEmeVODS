@@ -40,7 +40,12 @@ from .chat_timing import (
     update_chat_timing,
     utc_now_iso,
 )
-from .config import BotConfig, download_group_name_for_channel, streamer_for_channel
+from .config import (
+    BotConfig,
+    download_group_name_for_channel,
+    post_stream_config_for_channel,
+    streamer_for_channel,
+)
 from .content_events import (
     ContentEventDetectorUnavailable,
     detect_content_events_for_media,
@@ -1020,13 +1025,22 @@ class DownloadManager:
         if should_record_chat_for_stream(self.config, stream):
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
-        if self.config.twitch_ad_repair_enabled and stream.platform == "twitch":
+        post_stream_config = post_stream_config_for_channel(self.config, stream.channel)
+        if post_stream_config.twitch_ad_repair_enabled and stream.platform == "twitch":
             await self.repair_finalized_twitch_ads(stream, finalized_files)
-        if self.config.transcribe_subtitles:
-            await self.transcribe_finalized_media(stream, finalized_files)
-        if self.config.stream_event_detection_enabled:
-            await self.detect_finalized_content_events(stream, finalized_files)
-        if self.config.render_live_chat_video and stream.platform == "youtube":
+        if post_stream_config.transcribe_subtitles:
+            await self.transcribe_finalized_media(
+                stream,
+                finalized_files,
+                post_stream_config=post_stream_config,
+            )
+        if post_stream_config.stream_event_detection_enabled:
+            await self.detect_finalized_content_events(
+                stream,
+                finalized_files,
+                post_stream_config=post_stream_config,
+            )
+        if post_stream_config.render_live_chat_video and stream.platform == "youtube":
             await self.render_finalized_chat_videos(stream, finalized_files)
 
     def rename_finalized_segments(
@@ -1208,7 +1222,10 @@ class DownloadManager:
         self,
         stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
+        *,
+        post_stream_config: BotConfig | None = None,
     ) -> None:
+        processing_config = post_stream_config or self.config
         for files in finalized_files:
             if files.media_file is None:
                 continue
@@ -1232,7 +1249,7 @@ class DownloadManager:
                         message="Running automatic transcription",
                     )
                     await transcribe_media_file(
-                        transcription_config_for_channel(self.config, files.channel),
+                        transcription_config_for_channel(processing_config, files.channel),
                         files.media_file,
                         logger=self.logger,
                         channel=files.channel,
@@ -1345,7 +1362,10 @@ class DownloadManager:
         self,
         stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
+        *,
+        post_stream_config: BotConfig | None = None,
     ) -> None:
+        processing_config = post_stream_config or self.config
         for files in finalized_files:
             if files.media_file is None:
                 continue
@@ -1369,7 +1389,7 @@ class DownloadManager:
                 )
                 ok = await asyncio.to_thread(
                     detect_content_events_for_media,
-                    self.config,
+                    processing_config,
                     files.media_file,
                     logger=self.logger,
                     channel=files.channel,
@@ -2254,7 +2274,8 @@ def should_record_chat(config: BotConfig) -> bool:
 
 
 def should_record_chat_for_stream(config: BotConfig, stream: LiveStream) -> bool:
-    return stream.platform == "youtube" and should_record_chat(config)
+    processing_config = post_stream_config_for_channel(config, stream.channel)
+    return stream.platform == "youtube" and should_record_chat(processing_config)
 
 
 def chat_render_timeout_seconds(config: BotConfig) -> float | None:

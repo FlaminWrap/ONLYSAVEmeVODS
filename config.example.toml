@@ -26,6 +26,15 @@ channels = []
 # powerchat_enabled = true
 # powerchat_username = "SomeStreamer"
 #
+# Optional post-stream overrides. Omit a key to inherit its top-level app
+# default. The dashboard manages these from Streamers > Manage > After a stream.
+# [streamers."Some Streamer".post_stream]
+# twitch_ad_repair_enabled = false
+# transcribe_subtitles = true
+# voice_match_enabled = true
+# stream_event_detection_enabled = true
+# render_live_chat_video = false
+#
 # [streamers."Some Streamer".voice_detection]
 # mode = "fixed"
 # speakers = 2
