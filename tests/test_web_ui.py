@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
 
 from onlysavemevods.config import load_config, migrate_legacy_channels_to_streamer
 from onlysavemevods.web import (
@@ -86,6 +87,31 @@ class DashboardUiTests(unittest.TestCase):
             self.assertEqual(result["saved"], ["poll_interval_seconds", "web_port"])
             self.assertEqual(result["restart_required"], ["web_port"])
             self.assertNotEqual(result["revision"], revision)
+
+    def test_config_preview_does_not_create_a_sibling_temp_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG.replace("channels = []", 'channels = ["@OUMB3rd"]'),
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            with patch(
+                "onlysavemevods.web.tempfile.NamedTemporaryFile",
+                side_effect=OSError(30, "Read-only file system"),
+            ):
+                result = update_app_config_from_json(
+                    config,
+                    {
+                        "revision": config_file_revision(config),
+                        "values": {"channels": ""},
+                    },
+                )
+            reloaded = load_config(config_path)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(reloaded.channels, [])
 
     def test_stale_config_revision_is_rejected_without_writing(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -217,15 +217,24 @@ class BotConfig:
 
 def load_config(path: str | Path) -> BotConfig:
     config_path = Path(path).expanduser()
-    base_dir = config_path.parent.resolve()
-
     if config_path.exists():
         try:
-            raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
-        except tomllib.TOMLDecodeError as exc:
-            raise ConfigError(f"Invalid TOML in {config_path}: {exc}") from exc
+            config_text = config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(f"Unable to read config file {config_path}: {exc}") from exc
     else:
-        raw = {}
+        config_text = ""
+
+    return load_config_text(config_text, config_path)
+
+
+def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
+    config_path = Path(config_path).expanduser()
+    base_dir = config_path.parent.resolve()
+    try:
+        raw = tomllib.loads(config_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML in {config_path}: {exc}") from exc
 
     if not isinstance(raw, dict):
         raise ConfigError("The config file root must be a TOML table")
@@ -726,10 +735,31 @@ def update_config_values(
     except OSError as exc:
         raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
 
+    updated_text, changed = updated_config_text(
+        current_text,
+        updates,
+        source_path=target,
+    )
+    if not changed:
+        return []
+
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return changed
+
+
+def updated_config_text(
+    current_text: str,
+    updates: dict[str, Any],
+    *,
+    source_path: str | Path = "configuration",
+) -> tuple[str, list[str]]:
     try:
         current = tomllib.loads(current_text)
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+        raise ConfigError(f"Invalid TOML in {source_path}: {exc}") from exc
     if not isinstance(current, dict):
         raise ConfigError("Config files must have TOML tables at the root")
 
@@ -757,14 +787,7 @@ def update_config_values(
         updated_text = _insert_root_config_block(updated_text, lines)
         changed.extend(missing)
 
-    if not changed:
-        return []
-
-    try:
-        target.write_text(updated_text, encoding="utf-8")
-    except OSError as exc:
-        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
-    return changed
+    return updated_text, changed
 
 
 def update_streamer_config(

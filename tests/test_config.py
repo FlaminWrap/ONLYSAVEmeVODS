@@ -12,6 +12,7 @@ from onlysavemevods.config import (
     append_missing_config_values,
     download_group_name_for_channel,
     load_config,
+    load_config_text,
     monitored_sources,
     streamer_display_name_for_channel,
     update_channel_speaker_labels_config,
@@ -29,6 +30,16 @@ from onlysavemevods.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_load_config_text_resolves_paths_from_original_config_location(self) -> None:
+        config = load_config_text(
+            'download_dir = "downloads"\nstate_dir = "state"\n',
+            Path("/opt/onlysavemevods/config.toml"),
+        )
+
+        self.assertEqual(config.download_dir, Path("/opt/onlysavemevods/downloads"))
+        self.assertEqual(config.state_dir, Path("/opt/onlysavemevods/state"))
+        self.assertEqual(config.config_path, Path("/opt/onlysavemevods/config.toml"))
+
     def test_append_missing_config_values_preserves_existing_options(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

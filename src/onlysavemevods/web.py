@@ -61,6 +61,7 @@ from .config import (
     VoiceProfileConfig,
     add_voice_sample_to_profile,
     load_config,
+    load_config_text,
     migrate_legacy_channels_to_streamer,
     monitored_sources,
     remove_streamer_config,
@@ -68,6 +69,7 @@ from .config import (
     update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
     update_config_values,
+    updated_config_text,
     update_global_stream_event_rules_config,
     update_streamer_config,
     update_streamer_speaker_labels_config,
@@ -7098,26 +7100,12 @@ def load_config_update_preview(
     except OSError as exc:
         raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
 
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            "w",
-            encoding="utf-8",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temp:
-            temp.write(current_text)
-            temp_path = Path(temp.name)
-        update_config_values(temp_path, updates)
-        return load_config(temp_path)
-    finally:
-        if temp_path is not None:
-            try:
-                temp_path.unlink()
-            except FileNotFoundError:
-                pass
+    preview_text, _changed = updated_config_text(
+        current_text,
+        updates,
+        source_path=target,
+    )
+    return load_config_text(preview_text, target)
 
 
 def reload_running_config(config: BotConfig) -> None:
