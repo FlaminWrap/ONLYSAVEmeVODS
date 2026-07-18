@@ -13,10 +13,12 @@ from onlysavemevods.web import (
     ConfigRevisionConflict,
     app_config_updates_from_json_values,
     build_admin_static_snapshot,
+    build_status_snapshot,
     config_file_revision,
     render_admin_fragment,
     render_admin_page,
     render_admin_settings,
+    render_admin_streamer_powerchat,
     safe_return_to,
     update_app_config_from_json,
     update_streamer_from_form,
@@ -225,6 +227,58 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("Optional features", settings)
         self.assertNotIn('data-autosave="streamer"', settings)
         self.assertIn('data-autosave="streamer-post-stream"', settings)
+
+    def test_streamer_powerchat_tab_has_charts_and_empty_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n'
+                + 'powerchat_enabled = true\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            snapshot = build_status_snapshot(config, include_speaker_scan=False)
+            streamer = snapshot.streamer_stats[0]
+            empty_page = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"], "tab": ["powerchat"]},
+            )
+            stats = {
+                "streamer_dashboards": [
+                    {
+                        "streamer": "Example",
+                        "event_count": 3,
+                        "stream_count": 1,
+                        "money_totals": [{"currency": "USD", "amount": 25.0}],
+                        "unit_totals": [],
+                        "money_rates": [{"currency": "USD", "amount_per_hour": 12.5}],
+                        "events_without_offset": 0,
+                        "top_donors": [
+                            {"donor": "Alice", "event_count": 2, "money_totals": [{"currency": "USD", "amount": 20.0}], "unit_totals": [], "latest_received_at": "2026-07-18T12:00:00+00:00"},
+                        ],
+                        "hourly_totals": [
+                            {"hour_label": "0:00-0:59", "event_count": 3, "money_totals": [{"currency": "USD", "amount": 25.0}], "unit_totals": []},
+                        ],
+                        "stream_totals": [],
+                    }
+                ],
+                "events": [
+                    {"streamer": "Example", "stream_title": "Launch stream", "donor": "Alice", "kind": "money", "money_amount": 20.0, "money_currency": "USD", "platform": "Powerchat", "message": "Great stream", "received_at": "2026-07-18T12:00:00+00:00"},
+                ],
+            }
+            dashboard = render_admin_streamer_powerchat(streamer, stats)
+
+        self.assertIn('class="active" href="/streamers?selected=Example&amp;tab=powerchat"', empty_page)
+        self.assertIn("No Powerchat activity yet", empty_page)
+        self.assertNotIn("fragment=streams", empty_page)
+        self.assertIn("Activity by stream hour", dashboard)
+        self.assertIn("Most active supporters", dashboard)
+        self.assertIn("Alice", dashboard)
+        self.assertIn("Launch stream", dashboard)
+        self.assertIn("Download CSV", dashboard)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:

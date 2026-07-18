@@ -147,10 +147,17 @@ automatically. The header reports **Saving**, **Saved**, validation errors, or a
 config conflict; new records, uploads, processing jobs, and deletion remain
 explicit actions.
 
+Streamer details are divided into **Overview**, **Settings**, and **Powerchat**.
+Overview contains identity, sources, listener configuration, and stream history.
+Settings contains the automatic workflow and optional feature setup. Powerchat
+shows streamer-specific totals, hourly activity and supporter charts, streams,
+recent events, and scoped JSON/CSV exports.
+
 Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
 voice identification, content events, and chat-video rendering, choose **App
-default**, **Always run**, or **Never run**. Recording finalization always runs. Streamer choices also apply to
-manual VOD imports, and disabling an action does not delete existing output.
+default**, **Always run**, or **Never run**. Recording finalization always
+runs. Streamer choices also apply to manual VOD imports, and disabling an action
+does not delete existing output.
 
 The complete stream history is available directly on the streamer page, with
 search, platform/date filters, page-size choices, and Previous/Next navigation.

@@ -501,6 +501,16 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
 .powerchat-export-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .powerchat-page-state, .powerchat-pagination { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .powerchat-ledger-footer, .stream-browser-pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.powerchat-chart-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.powerchat-chart { display: grid; align-content: start; gap: 14px; box-shadow: none; }
+.powerchat-chart h2 { margin: 0; font-size: 17px; }
+.powerchat-bars { display: grid; gap: 11px; }
+.powerchat-bar-row { display: grid; grid-template-columns: minmax(90px, .7fr) minmax(100px, 1.4fr) minmax(110px, 1fr); gap: 9px; align-items: center; }
+.powerchat-bar-label { min-width: 0; overflow: hidden; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.powerchat-bar-track { display: block; height: 10px; overflow: hidden; border-radius: 999px; background: var(--surface-strong); }
+.powerchat-bar-track > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+.powerchat-bar-value { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.streamer-powerchat-dashboard .table-wrap table { min-width: 760px; }
 
 @media (max-width: 1040px) {
   .metric-grid { grid-template-columns: repeat(2, minmax(145px, 1fr)); }
@@ -526,6 +536,7 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .post-stream-option { grid-template-columns: 1fr; gap: 11px; }
   .post-stream-option-control .status-badge { justify-self: start; }
   .post-stream-option-control select { min-height: 44px; }
+  .powerchat-chart-grid { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 620px) {
@@ -560,6 +571,8 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .stream-history-filters label:first-of-type, .stream-history-filters .button-row { grid-column: 1 / -1; }
   .stream-history-filters .button { min-height: 44px; flex: 1; }
   .stream-history-pagination .button { min-height: 44px; }
+  .powerchat-bar-row { grid-template-columns: minmax(82px, .8fr) minmax(90px, 1.2fr); }
+  .powerchat-bar-value { grid-column: 1 / -1; }
 }
 
 @media (prefers-reduced-motion: reduce) {

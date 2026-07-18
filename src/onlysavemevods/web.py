@@ -8718,18 +8718,24 @@ def render_admin_fragment(
         selected = first_query_value(params, "selected").strip()
         if selected:
             streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
-            stream_page = build_streamer_stream_page(
-                config,
-                admin_streamer_stream_params(params, selected),
-            )
-            body = (
-                render_admin_streamer_streams(streamer, stream_page)
-                if streamer is not None
-                else '<div class="notice warning">Streamer is no longer available.</div>'
-            )
+            tab = admin_streamer_tab(params)
+            if streamer is None:
+                body = '<div class="notice warning">Streamer is no longer available.</div>'
+            elif tab == "powerchat":
+                body = render_admin_streamer_powerchat(streamer, snapshot.powerchat_stats)
+            else:
+                stream_page = build_streamer_stream_page(
+                    config,
+                    admin_streamer_stream_params(params, selected),
+                )
+                body = render_admin_streamer_streams(streamer, stream_page)
         else:
             body = render_admin_streamer_list(snapshot)
-        revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+        revision = (
+            streamer_powerchat_revision(snapshot.powerchat_stats, selected)
+            if selected and tab == "powerchat" and streamer is not None
+            else f"{snapshot.stream_revision}:{snapshot.job_revision}"
+        )
     elif page == "activity":
         view = first_query_value(params, "view").strip().lower() or "jobs"
         body = render_admin_activity_records(snapshot, view)
@@ -8929,6 +8935,21 @@ def render_admin_streamer_detail(
     if tab == "settings":
         tab_content = f"""{render_admin_streamer_post_stream_form(streamer)}
   <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>"""
+    elif tab == "powerchat":
+        revision = streamer_powerchat_revision(snapshot.powerchat_stats, streamer.name)
+        powerchat_fragment_url = (
+            "/streamers?"
+            + urlencode(
+                {
+                    "selected": streamer.name,
+                    "tab": "powerchat",
+                    "fragment": "powerchat",
+                }
+            )
+        )
+        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(powerchat_fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
+    {render_admin_streamer_powerchat(streamer, snapshot.powerchat_stats)}
+  </section>"""
     else:
         if stream_page is None:
             raise ConfigError("stream page is required for the streamer overview")
@@ -8949,7 +8970,7 @@ def render_admin_streamer_detail(
 
 def admin_streamer_tab(params: dict[str, list[str]]) -> str:
     tab = first_query_value(params, "tab").strip().casefold()
-    return tab if tab in {"overview", "settings"} else "overview"
+    return tab if tab in {"overview", "settings", "powerchat"} else "overview"
 
 
 def render_admin_streamer_tabs(streamer_name: str, active: str) -> str:
@@ -8957,12 +8978,134 @@ def render_admin_streamer_tabs(streamer_name: str, active: str) -> str:
     items = (
         ("overview", "Overview", f"/streamers?selected={selected}"),
         ("settings", "Settings", f"/streamers?selected={selected}&amp;tab=settings"),
+        ("powerchat", "Powerchat", f"/streamers?selected={selected}&amp;tab=powerchat"),
     )
     links = "".join(
         f'<a class="{"active" if key == active else ""}" href="{href}"{" aria-current=\"page\"" if key == active else ""}>{label}</a>'
         for key, label, href in items
     )
     return f'<nav class="tabs streamer-detail-tabs" aria-label="Streamer sections">{links}</nav>'
+
+
+def streamer_powerchat_stats(
+    stats: dict[str, Any],
+    streamer_name: str,
+) -> dict[str, Any] | None:
+    key = channel_group_key(streamer_name)
+    dashboard = next(
+        (
+            row
+            for row in stats.get("streamer_dashboards", [])
+            if channel_group_key(str(row.get("streamer") or "")) == key
+        ),
+        None,
+    )
+    if dashboard is None:
+        return None
+    result = dict(dashboard)
+    result["events"] = [
+        row
+        for row in stats.get("events", [])
+        if channel_group_key(str(row.get("streamer") or "")) == key
+    ]
+    return result
+
+
+def streamer_powerchat_revision(stats: dict[str, Any], streamer_name: str) -> str:
+    payload = streamer_powerchat_stats(stats, streamer_name) or {}
+    return hashlib.sha256(json_script_payload(payload).encode()).hexdigest()[:20]
+
+
+def render_admin_streamer_powerchat(
+    streamer: StreamerStatStatus,
+    stats: dict[str, Any],
+) -> str:
+    dashboard = streamer_powerchat_stats(stats, streamer.name)
+    enabled_class = "good" if streamer.powerchat_enabled else "warning"
+    enabled_label = "Listening" if streamer.powerchat_enabled else "Not enabled"
+    selected = quote(streamer.name, safe="")
+    setup = f"""<section class="card">
+  <div class="card-header"><div><h2>Powerchat</h2><p>Support activity captured for {escape(streamer.name)} across all recorded streams.</p></div><span class="status-badge {enabled_class}">{enabled_label}</span></div>
+  <div class="button-row"><a class="button small secondary" href="/streamers?selected={selected}">Configure listener</a><a class="button small secondary" href="/powerchat">All streamers</a></div>
+</section>"""
+    if dashboard is None:
+        detail = (
+            "Enable the listener on Overview, then captured donations, gifts, and other support events will appear here."
+            if not streamer.powerchat_enabled
+            else "Powerchat is listening. Charts and donor history will appear after the first support event is captured."
+        )
+        return f"""<div class="section-stack">{setup}<section class="card empty-state"><h2>No Powerchat activity yet</h2><p>{escape(detail)}</p></section></div>"""
+
+    summary = render_powerchat_streamer_summary_cards(dashboard)
+    hourly_chart = render_streamer_powerchat_chart(
+        "Activity by stream hour",
+        dashboard.get("hourly_totals", []),
+        label_key="hour_label",
+    )
+    donor_chart = render_streamer_powerchat_chart(
+        "Most active supporters",
+        dashboard.get("top_donors", []),
+        label_key="donor",
+    )
+    exports = f"""<div class="powerchat-export-actions">
+  <a class="button small secondary" href="{escape(powerchat_export_url('json', streamer=streamer.name), quote=True)}">Download JSON</a>
+  <a class="button small secondary" href="{escape(powerchat_export_url('csv', streamer=streamer.name), quote=True)}">Download CSV</a>
+</div>"""
+    streams = render_powerchat_dashboard_stream_rows(dashboard.get("stream_totals", []))
+    events = render_streamer_powerchat_events(dashboard.get("events", [])[:25])
+    return f"""<div class="section-stack streamer-powerchat-dashboard">
+  {setup}
+  <section class="section-stack"><div class="section-heading"><h2>Summary</h2>{exports}</div><div class="powerchat-summary-grid">{summary}</div></section>
+  <section class="powerchat-chart-grid">{hourly_chart}{donor_chart}</section>
+  <section class="card section-stack"><div class="section-heading"><h2>Streams</h2><span class="muted">Highest activity first</span></div><div class="table-wrap"><table><thead><tr><th>Streamer</th><th>Stream</th><th>Events</th><th>Total</th><th>Duration</th><th>Per hour</th></tr></thead><tbody>{streams}</tbody></table></div></section>
+  <section class="card section-stack"><div class="section-heading"><h2>Recent support</h2><span class="muted">Latest 25 events</span></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Stream</th><th>Supporter</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead><tbody>{events}</tbody></table></div></section>
+</div>"""
+
+
+def render_streamer_powerchat_chart(
+    title: str,
+    rows: list[dict[str, Any]],
+    *,
+    label_key: str,
+) -> str:
+    chart_rows = rows[:10]
+    if not chart_rows:
+        bars = '<p class="muted">No timed activity available yet.</p>'
+    else:
+        maximum = max(int(row.get("event_count") or 0) for row in chart_rows) or 1
+        rendered: list[str] = []
+        for row in chart_rows:
+            label = str(row.get(label_key) or "Unknown")
+            count = int(row.get("event_count") or 0)
+            width = max(4, round((count / maximum) * 100))
+            total = format_powerchat_summary(
+                row.get("money_totals", []),
+                row.get("unit_totals", []),
+            )
+            value = f"{count} event{'s' if count != 1 else ''}"
+            if total:
+                value += f" · {total}"
+            rendered.append(
+                f'<div class="powerchat-bar-row"><span class="powerchat-bar-label">{escape(label)}</span><span class="powerchat-bar-track" aria-hidden="true"><span style="width:{width}%"></span></span><span class="powerchat-bar-value">{escape(value)}</span></div>'
+            )
+        bars = "".join(rendered)
+    return f'<article class="card powerchat-chart"><h2>{escape(title)}</h2><div class="powerchat-bars">{bars}</div></article>'
+
+
+def render_streamer_powerchat_events(rows: list[dict[str, Any]]) -> str:
+    if not rows:
+        return '<tr><td colspan="6" class="file-meta">No Powerchat events captured yet</td></tr>'
+    return "".join(
+        "<tr>"
+        f'<td>{escape(powerchat_dashboard_event_time(row))}</td>'
+        f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
+        f'<td>{escape(str(row.get("donor") or "Unknown supporter"))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_amount_text(row) or "-")}</td>'
+        f'<td>{escape(str(row.get("platform") or "Powerchat"))}</td>'
+        f'<td class="log-message">{escape(str(row.get("message") or "-"))}</td>'
+        "</tr>"
+        for row in rows
+    )
 
 
 def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
