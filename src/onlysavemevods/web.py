@@ -978,6 +978,25 @@ CONFIG_FIELD_CATEGORIES = {
     "Watermark": "system",
 }
 
+# These switches describe work triggered by finalization, so keep them together
+# in the guided UI even though their tuning controls live in different technical
+# sections.  The underlying keys remain unchanged for config compatibility.
+CONFIG_FIELD_CATEGORY_OVERRIDES = {
+    "twitch_ad_repair_enabled": "after_stream",
+    "transcribe_subtitles": "after_stream",
+    "voice_match_enabled": "after_stream",
+    "stream_event_detection_enabled": "after_stream",
+    "render_live_chat_video": "after_stream",
+}
+
+AFTER_STREAM_FIELD_ORDER = {
+    "twitch_ad_repair_enabled": 10,
+    "transcribe_subtitles": 20,
+    "voice_match_enabled": 30,
+    "stream_event_detection_enabled": 40,
+    "render_live_chat_video": 50,
+}
+
 CONFIG_FIELD_UNITS = {
     "poll_interval_seconds": "seconds",
     "reconnect_interval_seconds": "seconds",
@@ -1007,7 +1026,10 @@ def enrich_config_form_field(field: ConfigFormField) -> ConfigFormField:
         field,
         label=label,
         help_text=help_text,
-        category=CONFIG_FIELD_CATEGORIES.get(field.section, "advanced"),
+        category=CONFIG_FIELD_CATEGORY_OVERRIDES.get(
+            field.key,
+            CONFIG_FIELD_CATEGORIES.get(field.section, "advanced"),
+        ),
         unit=CONFIG_FIELD_UNITS.get(field.key, ""),
         advanced=field.key in CONFIG_FIELD_ADVANCED,
         restart_required=field.key in CONFIG_RESTART_FIELDS,
@@ -8439,7 +8461,8 @@ ADMIN_PAGE_SUBTITLES = {
 SETTINGS_CATEGORIES: tuple[tuple[str, str, str], ...] = (
     ("general", "General", "Storage locations, source checks, and recording capacity."),
     ("recording", "Recording", "Capture, recovery, live chat, and encoding behavior."),
-    ("processing", "Processing", "Transcription, voices, content events, and Twitch repair."),
+    ("after_stream", "After a stream", "Choose which optional jobs start automatically when a recording is finalized."),
+    ("processing", "Processing", "Tune transcription capacity and other processing details."),
     ("system", "System", "Dashboard, updates, tools, and watermarking."),
     ("advanced", "Advanced", "Search every available setting by name or config key."),
 )
@@ -8816,6 +8839,8 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
         field for field in CONFIG_FORM_FIELDS
         if (field.advanced if section == "advanced" else field.category == section and not field.advanced)
     ]
+    if section == "after_stream":
+        fields.sort(key=lambda field: AFTER_STREAM_FIELD_ORDER.get(field.key, 100))
     search = (
         '<div class="advanced-search"><label class="sr-only" for="settings-search">Search settings</label><input id="settings-search" data-settings-search type="search" placeholder="Search by setting name, config key, or description"></div>'
         if section == "advanced" else ""
@@ -8826,7 +8851,9 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
         grouped.append(render_admin_settings_group(snapshot, group_name, group_fields))
     extra = ""
     if section == "processing":
-        extra = '<div class="notice info">Streamer-specific voices, speaker names, and event rules are managed from each streamer. <a href="/streamers">Open streamers</a></div>'
+        extra = '<div class="notice info">Choose which jobs start automatically under <a href="/settings?section=after_stream">After a stream</a>. Streamer-specific voices, speaker names, and event rules are managed from each streamer. <a href="/streamers">Open streamers</a></div>'
+    elif section == "after_stream":
+        extra = render_admin_after_stream_intro()
     return f"""<div class="settings-layout" data-settings-root>
   <nav class="settings-nav card" aria-label="Settings categories">{nav}</nav>
   <div class="settings-content">
@@ -8834,6 +8861,17 @@ def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, sectio
     {extra}{search}{''.join(grouped) if grouped else '<section class="card empty-state"><h2>No settings in this category</h2></section>'}
   </div>
 </div>"""
+
+
+def render_admin_after_stream_intro() -> str:
+    return """<section class="card section-stack">
+  <div class="card-header"><div><h3>Automatic workflow</h3><p>Optional jobs run in the order shown below after the recording has been safely finalized.</p></div><span class="status-badge good">Finalization always on</span></div>
+  <ol class="workflow-list">
+    <li><strong>Save and organize the recording</strong><span>Always runs, including media, chat, timing, and Powerchat sidecars that were captured.</span></li>
+    <li><strong>Run the enabled jobs below</strong><span>Platform-specific jobs are skipped when they do not apply.</span></li>
+  </ol>
+  <div class="notice info">Turning a switch off affects future stream finalizations. It does not delete existing outputs, and available jobs can still be started manually from a recording.</div>
+</section>"""
 
 
 def render_admin_settings_group(

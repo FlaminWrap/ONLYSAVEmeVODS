@@ -56,6 +56,7 @@ class DashboardUiTests(unittest.TestCase):
             snapshot = build_admin_static_snapshot(config)
 
             general = render_admin_settings(snapshot, "general")
+            after_stream = render_admin_settings(snapshot, "after_stream")
             advanced = render_admin_settings(snapshot, "advanced")
 
         self.assertIn('data-autosave="config"', general)
@@ -65,6 +66,46 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("Restart", general)
         self.assertIn("data-settings-search", advanced)
         self.assertIn("Additional yt-dlp arguments", advanced)
+        self.assertIn("Automatic workflow", after_stream)
+        self.assertIn("Finalization always on", after_stream)
+        self.assertIn('name="twitch_ad_repair_enabled"', after_stream)
+        self.assertIn('name="transcribe_subtitles"', after_stream)
+        self.assertIn('name="voice_match_enabled"', after_stream)
+        self.assertIn('name="stream_event_detection_enabled"', after_stream)
+        self.assertIn('name="render_live_chat_video"', after_stream)
+        self.assertLess(
+            after_stream.index('name="twitch_ad_repair_enabled"'),
+            after_stream.index('name="transcribe_subtitles"'),
+        )
+        self.assertNotIn('name="whisperx_model"', after_stream)
+
+    def test_after_stream_switches_save_with_existing_config_keys(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+
+            result = update_app_config_from_json(
+                config,
+                {
+                    "revision": config_file_revision(config),
+                    "values": {
+                        "twitch_ad_repair_enabled": False,
+                        "transcribe_subtitles": True,
+                        "voice_match_enabled": False,
+                        "stream_event_detection_enabled": True,
+                        "render_live_chat_video": True,
+                    },
+                },
+            )
+            reloaded = load_config(config_path)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(reloaded.twitch_ad_repair_enabled)
+        self.assertTrue(reloaded.transcribe_subtitles)
+        self.assertFalse(reloaded.voice_match_enabled)
+        self.assertTrue(reloaded.stream_event_detection_enabled)
+        self.assertTrue(reloaded.render_live_chat_video)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:

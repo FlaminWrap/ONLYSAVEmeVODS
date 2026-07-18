@@ -371,6 +371,11 @@ button, a, input, select, textarea, summary { outline: none; }
 .settings-nav a.active { background: var(--accent-soft); color: var(--accent); }
 .settings-content { display: grid; gap: 15px; min-width: 0; }
 .settings-group { display: grid; gap: 15px; }
+.workflow-list { display: grid; gap: 10px; margin: 0; padding-left: 24px; }
+.workflow-list li { padding-left: 4px; }
+.workflow-list li::marker { color: var(--accent); font-weight: 750; }
+.workflow-list strong, .workflow-list span { display: block; }
+.workflow-list span { margin-top: 2px; color: var(--muted); font-size: 13px; }
 .setting-card { display: grid; gap: 11px; }
 .setting-card[hidden] { display: none; }
 .setting-card-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
