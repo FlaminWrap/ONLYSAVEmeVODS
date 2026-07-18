@@ -93,7 +93,7 @@ class DashboardUiTests(unittest.TestCase):
             html = render_admin_page(
                 config,
                 "streamers",
-                {"selected": ["Example"]},
+                {"selected": ["Example"], "tab": ["settings"]},
             )
 
             result = update_streamer_from_json(
@@ -131,6 +131,8 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("App default (Off)", html)
         self.assertIn("Always run", html)
         self.assertIn("Never run", html)
+        self.assertIn('class="active" href="/streamers?selected=Example&amp;tab=settings"', html)
+        self.assertNotIn('fragment=streams', html)
         self.assertTrue(result["ok"])
         self.assertIsNotNone(post_stream)
         assert post_stream is not None
@@ -190,6 +192,39 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("Page 2 of 2", second_page)
         self.assertIn('rel="prev"', second_page)
         self.assertIn("Showing 11–12 of 12", fragment)
+
+    def test_streamer_overview_and_settings_are_separate_tabs(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            overview = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+            settings = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"], "tab": ["settings"]},
+            )
+
+        self.assertIn('aria-label="Streamer sections"', overview)
+        self.assertIn('class="active" href="/streamers?selected=Example"', overview)
+        self.assertIn('data-autosave="streamer"', overview)
+        self.assertIn("Streams", overview)
+        self.assertNotIn("After a stream", overview)
+        self.assertNotIn("Optional features", overview)
+        self.assertIn("After a stream", settings)
+        self.assertIn("Optional features", settings)
+        self.assertNotIn('data-autosave="streamer"', settings)
+        self.assertIn('data-autosave="streamer-post-stream"', settings)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:

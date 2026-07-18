@@ -328,6 +328,8 @@ button, a, input, select, textarea, summary { outline: none; }
 .streamer-summary-actions { display: flex; justify-content: flex-end; gap: 7px; }
 .search-bar { display: flex; gap: 8px; align-items: center; }
 .search-bar input { min-width: min(360px, 62vw); }
+.streamer-detail-tabs { margin-top: -4px; }
+.streamer-detail-hero > .card-header:last-child { margin-bottom: 0; }
 
 .form-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 15px; }
 .form-field { display: grid; align-content: start; gap: 5px; min-width: 0; }

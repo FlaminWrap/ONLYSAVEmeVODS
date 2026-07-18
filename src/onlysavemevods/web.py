@@ -8664,18 +8664,20 @@ def render_admin_page(
         )
     elif page == "streamers":
         selected = first_query_value(params, "selected").strip()
+        streamer_tab = admin_streamer_tab(params)
         stream_page = (
             build_streamer_stream_page(
                 config,
                 admin_streamer_stream_params(params, selected),
             )
-            if selected
+            if selected and streamer_tab == "overview"
             else None
         )
         content = render_admin_streamers(
             snapshot,
             selected=selected,
             stream_page=stream_page,
+            tab=streamer_tab,
         )
         if not selected and snapshot_config_path(snapshot) != "-":
             actions = '<button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button>'
@@ -8834,9 +8836,10 @@ def render_admin_streamers(
     *,
     selected: str,
     stream_page: StreamerStreamPage | None = None,
+    tab: str = "overview",
 ) -> str:
     if selected:
-        return render_admin_streamer_detail(snapshot, selected, stream_page)
+        return render_admin_streamer_detail(snapshot, selected, stream_page, tab)
     list_html = render_admin_streamer_list(snapshot)
     revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
     return f"""<div class="section-stack">
@@ -8910,31 +8913,56 @@ def render_admin_streamer_detail(
     snapshot: StatusSnapshot,
     selected: str,
     stream_page: StreamerStreamPage | None,
+    tab: str,
 ) -> str:
     streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
     if streamer is None:
         return f'<section class="card empty-state"><h2>Streamer not found</h2><p>{escape(selected)} is not available in the current configuration or stream history.</p><a class="button secondary" href="/streamers">Back to streamers</a></section>'
     if streamer.needs_grouping:
         return f'<div class="section-stack"><a href="/streamers">← All streamers</a><section class="notice warning"><h2>{escape(streamer.name)} needs grouping</h2><p>Use the migration assistant to create a shared streamer identity for these legacy sources.</p><a class="button" href="/streamers#migrate-legacy">Open migration assistant</a></section></div>'
-    if stream_page is None:
-        raise ConfigError("stream page is required for a configured streamer")
     revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
-    fragment_url = admin_streamer_stream_url(stream_page, fragment=True)
     delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
       <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
     </form>"""
+    tabs = render_admin_streamer_tabs(streamer.name, tab)
+    basic_form = render_admin_streamer_basic_form(streamer, snapshot) if tab == "overview" else ""
+    if tab == "settings":
+        tab_content = f"""{render_admin_streamer_post_stream_form(streamer)}
+  <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>"""
+    else:
+        if stream_page is None:
+            raise ConfigError("stream page is required for the streamer overview")
+        fragment_url = admin_streamer_stream_url(stream_page, fragment=True)
+        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
+    {render_admin_streamer_streams(streamer, stream_page)}
+  </section>"""
     return f"""<div class="section-stack">
   <div><a href="/streamers">← All streamers</a></div>
-  <section class="card">
+  <section class="card streamer-detail-hero">
     <div class="card-header"><div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div><div class="button-row"><span class="status-badge {'warning' if streamer.attention_count else 'good'}">{'Needs attention' if streamer.attention_count else 'Configured'}</span>{delete_form}</div></div>
-    {render_admin_streamer_basic_form(streamer, snapshot)}
+    {basic_form}
   </section>
-  {render_admin_streamer_post_stream_form(streamer)}
-  <section><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>
-  <section class="section-stack" data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
-    {render_admin_streamer_streams(streamer, stream_page)}
-  </section>
+  {tabs}
+  {tab_content}
 </div>"""
+
+
+def admin_streamer_tab(params: dict[str, list[str]]) -> str:
+    tab = first_query_value(params, "tab").strip().casefold()
+    return tab if tab in {"overview", "settings"} else "overview"
+
+
+def render_admin_streamer_tabs(streamer_name: str, active: str) -> str:
+    selected = quote(streamer_name, safe="")
+    items = (
+        ("overview", "Overview", f"/streamers?selected={selected}"),
+        ("settings", "Settings", f"/streamers?selected={selected}&amp;tab=settings"),
+    )
+    links = "".join(
+        f'<a class="{"active" if key == active else ""}" href="{href}"{" aria-current=\"page\"" if key == active else ""}>{label}</a>'
+        for key, label, href in items
+    )
+    return f'<nav class="tabs streamer-detail-tabs" aria-label="Streamer sections">{links}</nav>'
 
 
 def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
@@ -8991,7 +9019,7 @@ def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:
   <form id="streamer-post-stream-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer-post-stream" data-streamer-name="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="form_kind" value="streamer_post_stream">
     <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
-    <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}">
+    <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}&amp;tab=settings">
     <div class="post-stream-grid">{fields}</div>
     <noscript><div class="button-row"><button class="button" type="submit">Save automatic workflow</button></div></noscript>
   </form>
