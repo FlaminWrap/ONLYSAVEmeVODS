@@ -243,6 +243,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.chat_render_timeout_seconds, 3600)
         self.assertFalse(config.chat_render_use_nvenc)
         self.assertEqual(config.chat_render_nvenc_devices, [])
+        self.assertEqual(config.chat_emoji_cache_dir, config.state_dir / "chat_emoji_cache")
         self.assertFalse(config.transcribe_subtitles)
         self.assertEqual(config.transcription_max_concurrent, 1)
         self.assertEqual(config.whisperx_path, "whisperx")

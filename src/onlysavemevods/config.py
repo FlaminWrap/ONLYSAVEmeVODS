@@ -210,6 +210,10 @@ class BotConfig:
     def db_path(self) -> Path:
         return self.state_dir / DEFAULT_DB_FILENAME
 
+    @property
+    def chat_emoji_cache_dir(self) -> Path:
+        return self.state_dir / "chat_emoji_cache"
+
 
 def load_config(path: str | Path) -> BotConfig:
     config_path = Path(path).expanduser()
@@ -737,11 +741,11 @@ def update_config_values(
         if key in current:
             if current[key] == value:
                 continue
-            pattern = re.compile(rf"(?m)^{re.escape(key)}\s*=.*$")
-            updated_text, count = pattern.subn(line, updated_text, count=1)
-            if count == 0:
+            replaced_text = _replace_root_assignment(updated_text, key, line)
+            if replaced_text == updated_text:
                 missing.append(key)
             else:
+                updated_text = replaced_text
                 changed.append(key)
         else:
             missing.append(key)
@@ -823,6 +827,133 @@ def update_streamer_config(
     except OSError as exc:
         raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
     return updated_text != current_text
+
+
+def migrate_legacy_channels_to_streamer(
+    config_path: str | Path,
+    streamer_name: str,
+    selected_sources: list[str],
+    download_dir_name: str = "",
+) -> bool:
+    """Atomically group existing top-level channels under a new streamer.
+
+    The generated file is fully validated before a single write, so a failed
+    migration never leaves a source removed from monitoring.
+    """
+
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+    try:
+        current = tomllib.loads(current_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+    if not isinstance(current, dict):
+        raise ConfigError("Config files must have TOML tables at the root")
+
+    normalized_name = streamer_name.strip()
+    if not normalized_name:
+        raise ConfigError("streamer name is required")
+    existing_streamers = current.get("streamers", {})
+    if isinstance(existing_streamers, dict) and normalized_name in existing_streamers:
+        raise ConfigError(f"streamer is already configured: {normalized_name}")
+
+    current_channels = _as_source_list(current.get("channels", []), "channels")
+    selected = [source.strip() for source in selected_sources if source.strip()]
+    if not selected:
+        raise ConfigError("Select at least one legacy source to migrate")
+    missing = [source for source in selected if source not in current_channels]
+    if missing:
+        raise ConfigError(f"Legacy source is no longer configured: {missing[0]}")
+    selected_set = set(selected)
+    remaining = [source for source in current_channels if source not in selected_set]
+    normalized_sources = _as_canonical_source_list(
+        selected,
+        f"streamers.{normalized_name}.sources",
+    )
+    normalized_download_dir_name = _as_optional_str(
+        download_dir_name,
+        f"streamers.{normalized_name}.download_dir_name",
+    )
+
+    updated_text = _replace_root_assignment(
+        current_text,
+        "channels",
+        f"channels = {_toml_value(remaining, 'channels')}",
+    )
+    block = _streamer_block(
+        normalized_name,
+        normalized_sources,
+        normalized_download_dir_name,
+    )
+    prefix = updated_text.rstrip()
+    updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return updated_text != current_text
+
+
+def _replace_root_assignment(current_text: str, key: str, replacement: str) -> str:
+    lines = current_text.splitlines(keepends=True)
+    assignment = re.compile(rf"^\s*{re.escape(key)}\s*=")
+    start: int | None = None
+    end: int | None = None
+    depth = 0
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*\[", line):
+            break
+        if start is None:
+            if not assignment.match(line):
+                continue
+            start = index
+            expression = line.split("=", 1)[1]
+            depth = _toml_collection_depth(expression)
+            if depth <= 0:
+                end = index + 1
+                break
+            continue
+        depth += _toml_collection_depth(line)
+        if depth <= 0:
+            end = index + 1
+            break
+    if start is None:
+        return _insert_root_config_block(current_text, ["", replacement])
+    if end is None:
+        end = start + 1
+    newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+    return "".join([*lines[:start], replacement + newline, *lines[end:]])
+
+
+def _toml_collection_depth(value: str) -> int:
+    depth = 0
+    quote_char = ""
+    escaped = False
+    for char in value:
+        if quote_char:
+            if escaped:
+                escaped = False
+            elif char == "\\" and quote_char == '"':
+                escaped = True
+            elif char == quote_char:
+                quote_char = ""
+            continue
+        if char in {'"', "'"}:
+            quote_char = char
+        elif char == "#":
+            break
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+    return depth
 
 
 def remove_streamer_config(

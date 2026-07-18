@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bisect import insort
 from collections import OrderedDict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -37,6 +37,7 @@ from .app_update import (
 )
 from .chat_render import (
     build_render_chat_file_process_command,
+    chat_render_platform_from_video_id,
     chat_video_output_file,
     choose_chat_render_nvenc_device,
     detect_nvidia_devices,
@@ -60,6 +61,7 @@ from .config import (
     VoiceProfileConfig,
     add_voice_sample_to_profile,
     load_config,
+    migrate_legacy_channels_to_streamer,
     monitored_sources,
     remove_streamer_config,
     streamer_display_name_for_channel,
@@ -144,6 +146,7 @@ from .watermark import (
     watermarked_output_name,
     watermark_secret,
 )
+from .web_ui import render_dashboard_shell
 
 
 LOGGER = logging.getLogger(__name__)
@@ -253,6 +256,7 @@ PLATFORM_DIR = first_existing_dir(
     PACKAGE_DIR / "assets" / "platforms",
     PACKAGE_DIR / "platforms",
 )
+WEB_ASSET_DIR = PACKAGE_DIR / "assets"
 FAVICON_ROUTES = {
     "/favicon.ico": FAVICON_DIR / "favicon.ico",
     "/favicon-16x16.png": FAVICON_DIR / "favicon-16x16.png",
@@ -283,7 +287,11 @@ PLATFORM_ICON_URLS = {
     route.rsplit("/", 1)[-1].removesuffix(".svg"): route
     for route in PLATFORM_ICON_ROUTES
 }
-ASSET_ROUTES = {**FAVICON_ROUTES, **PLATFORM_ICON_ROUTES}
+WEB_ASSET_ROUTES = {
+    "/assets/dashboard.css": WEB_ASSET_DIR / "dashboard.css",
+    "/assets/dashboard.js": WEB_ASSET_DIR / "dashboard.js",
+}
+ASSET_ROUTES = {**FAVICON_ROUTES, **PLATFORM_ICON_ROUTES, **WEB_ASSET_ROUTES}
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
 STREAM_EVENT_LIMIT = 8
@@ -686,6 +694,13 @@ class ConfigFormField:
     options: tuple[str, ...] = ()
     minimum: int | None = None
     rows: int = 1
+    label: str = ""
+    help_text: str = ""
+    category: str = ""
+    unit: str = ""
+    advanced: bool = False
+    restart_required: bool = False
+    dependencies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -718,6 +733,16 @@ class StatusSnapshot:
     jobs: list[JobStatus]
     job_limit: int
     streams: list[StreamStatus]
+
+
+@dataclass(frozen=True, slots=True)
+class AdminStaticSnapshot:
+    app: AppInfo
+    app_update: dict[str, Any]
+    download_dir: str
+    state_db: str
+    stream_limit: int
+    configuration: dict[str, dict[str, Any]]
 
 
 CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
@@ -787,6 +812,210 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("watermark_detect_upload_max_bytes", "Watermark", "int", minimum=1),
 )
 CONFIG_FORM_SECTIONS = tuple(dict.fromkeys(field.section for field in CONFIG_FORM_FIELDS))
+
+CONFIG_FIELD_HELP: dict[str, str] = {
+    "channels": "Legacy ungrouped sources. New sources should normally be added to a streamer.",
+    "download_dir": "Folder where completed and in-progress recordings are stored.",
+    "state_dir": "Folder containing the database, managed voice samples, and processing state.",
+    "poll_interval_seconds": "How often the service checks configured sources for a live stream.",
+    "channel_scan_limit": "Maximum recent entries inspected while checking one source.",
+    "discovery_probe_concurrency": "Number of source checks that may run at the same time.",
+    "max_concurrent_downloads": "Maximum live recordings allowed to download simultaneously.",
+    "live_from_start": "Ask supported platforms for the stream from its earliest available point.",
+    "keep_fragments_for_resume": "Keep media fragments so interrupted or mixed-format downloads can resume safely.",
+    "reconnect_interval_seconds": "Periodically reconnect an active recording; zero disables planned reconnects.",
+    "post_exit_check_seconds": "Offsets used to verify that a stream really ended before finalizing it.",
+    "retry_backoff_seconds": "Wait times used between retries after source or download failures.",
+    "extra_yt_dlp_args": "Expert yt-dlp arguments. Existing sensitive values remain hidden unless replaced.",
+    "record_live_chat": "Capture supported live chat as a sidecar next to the recording.",
+    "render_live_chat_video": "After finalization, create a separate video with rendered chat beside the stream. Kick uses 60 fps; other platforms use 30 fps for faster rendering.",
+    "chat_render_panel_workers": "Chat panel rendering workers; zero uses the available CPU cores.",
+    "chat_render_timeout_seconds": "Maximum time allowed for the final chat-video FFmpeg step; zero disables the timeout.",
+    "chat_render_use_nvenc": "Use NVIDIA NVENC for chat-video encoding when supported.",
+    "chat_render_nvenc_devices": "Optional NVIDIA device identifiers used for concurrent chat renders.",
+    "transcribe_subtitles": "Run WhisperX after finalization to create subtitle and transcript sidecars.",
+    "transcription_max_concurrent": "Maximum WhisperX jobs that may run simultaneously.",
+    "whisperx_model": "WhisperX speech-recognition model name.",
+    "whisperx_device": "Processing device such as cuda or cpu.",
+    "whisperx_compute_type": "WhisperX numeric precision, such as float16 or int8.",
+    "whisperx_batch_size": "Number of transcript chunks processed in a batch.",
+    "whisperx_language": "Optional language code; leave blank to detect it automatically.",
+    "voice_match_enabled": "Match diarized speakers against managed voice samples.",
+    "voice_match_threshold": "Minimum similarity required to identify a known voice.",
+    "voice_match_min_margin": "Minimum lead over the next-best voice match.",
+    "stream_event_detection_enabled": "Analyze finalized media for configured audio and transcript events.",
+    "stream_event_device": "Processing device for content-event detection; auto chooses an available backend.",
+    "stream_event_min_confidence": "Minimum classifier confidence for a content event.",
+    "twitch_ad_repair_enabled": "Detect Twitch ad slates and create repaired copies from a matching VOD.",
+    "web_enabled": "Start this local administration dashboard with the service.",
+    "web_host": "Network address used by the dashboard. Non-loopback addresses need private-network protection.",
+    "web_port": "TCP port used by the dashboard.",
+    "app_update_mode": "Choose whether releases are checked or installed manually or automatically.",
+    "app_update_repository": "GitHub repository used for release update checks.",
+    "log_level": "Use DEBUG temporarily when diagnosing discovery, download, or dashboard problems.",
+    "yt_dlp_path": "yt-dlp executable or absolute path.",
+    "ffmpeg_path": "FFmpeg executable or absolute path.",
+    "watermark_enabled": "Allow private per-recipient watermark copies and watermark detection.",
+    "watermark_secret_env": "Environment variable containing the watermark secret; never enter the secret itself.",
+    "watermark_strength": "Trade visibility for resilience to re-encoding and light edits.",
+    "watermark_detect_upload_max_bytes": "Largest suspect video accepted by the local detector.",
+}
+
+CONFIG_FIELD_LABELS: dict[str, str] = {
+    "channels": "Legacy channels",
+    "download_dir": "Recording folder",
+    "state_dir": "State folder",
+    "poll_interval_seconds": "Check for live streams every",
+    "channel_scan_limit": "Entries checked per source",
+    "discovery_probe_concurrency": "Concurrent source checks",
+    "max_concurrent_downloads": "Concurrent recordings",
+    "live_from_start": "Record from the available start",
+    "keep_fragments_for_resume": "Keep fragments for recovery",
+    "reconnect_interval_seconds": "Planned reconnect interval",
+    "post_exit_check_seconds": "Post-exit verification schedule",
+    "retry_backoff_seconds": "Retry schedule",
+    "extra_yt_dlp_args": "Additional yt-dlp arguments",
+    "record_live_chat": "Record live chat",
+    "render_live_chat_video": "Render a chat video",
+    "chat_render_panel_workers": "Chat rendering workers",
+    "chat_render_timeout_seconds": "Chat render timeout",
+    "chat_render_use_nvenc": "Use NVIDIA encoding",
+    "chat_render_nvenc_devices": "NVIDIA devices",
+    "transcribe_subtitles": "Create subtitles automatically",
+    "transcription_max_concurrent": "Concurrent transcriptions",
+    "whisperx_path": "WhisperX executable",
+    "whisperx_model": "Transcription model",
+    "whisperx_device": "Transcription device",
+    "whisperx_compute_type": "Compute type",
+    "whisperx_batch_size": "Batch size",
+    "whisperx_language": "Language",
+    "voice_match_enabled": "Identify known voices",
+    "voice_match_model": "Voice matching model",
+    "voice_match_threshold": "Voice match threshold",
+    "voice_match_min_margin": "Voice match margin",
+    "voice_sample_max_bytes": "Maximum voice sample size",
+    "stream_event_detection_enabled": "Detect content events",
+    "stream_event_model": "Content-event model",
+    "stream_event_device": "Content-event device",
+    "stream_event_window_seconds": "Analysis window",
+    "stream_event_hop_seconds": "Analysis step",
+    "stream_event_min_confidence": "Minimum confidence",
+    "stream_event_max_events_per_media": "Events kept per recording",
+    "twitch_ad_repair_enabled": "Repair Twitch ad slates",
+    "twitch_ad_repair_tesseract_path": "Tesseract executable",
+    "twitch_ad_repair_scan_seconds": "Scan duration",
+    "twitch_ad_repair_sample_seconds": "Sample interval",
+    "twitch_ad_repair_max_seconds": "Maximum repair duration",
+    "twitch_ad_repair_vod_search_limit": "VODs checked",
+    "web_enabled": "Enable dashboard",
+    "web_host": "Dashboard address",
+    "web_port": "Dashboard port",
+    "app_update_mode": "Update behavior",
+    "app_update_repository": "Release repository",
+    "app_update_include_prereleases": "Include prereleases",
+    "app_update_github_token_env": "GitHub token variable",
+    "log_level": "Log detail",
+    "yt_dlp_path": "yt-dlp executable",
+    "ffmpeg_path": "FFmpeg executable",
+    "watermark_enabled": "Enable watermarking",
+    "watermark_secret_env": "Watermark secret variable",
+    "watermark_strength": "Watermark strength",
+    "watermark_detect_upload_max_bytes": "Detector upload limit",
+}
+
+CONFIG_FIELD_ADVANCED = {
+    "channels",
+    "channel_scan_limit",
+    "discovery_probe_concurrency",
+    "post_exit_check_seconds",
+    "retry_backoff_seconds",
+    "extra_yt_dlp_args",
+    "chat_render_panel_workers",
+    "chat_render_timeout_seconds",
+    "chat_render_nvenc_devices",
+    "whisperx_path",
+    "whisperx_model",
+    "whisperx_device",
+    "whisperx_compute_type",
+    "whisperx_batch_size",
+    "voice_match_model",
+    "voice_match_threshold",
+    "voice_match_min_margin",
+    "voice_sample_max_bytes",
+    "stream_event_model",
+    "stream_event_device",
+    "stream_event_window_seconds",
+    "stream_event_hop_seconds",
+    "stream_event_min_confidence",
+    "stream_event_max_events_per_media",
+    "twitch_ad_repair_tesseract_path",
+    "twitch_ad_repair_scan_seconds",
+    "twitch_ad_repair_sample_seconds",
+    "twitch_ad_repair_max_seconds",
+    "twitch_ad_repair_vod_search_limit",
+    "app_update_repository",
+    "app_update_github_token_env",
+    "yt_dlp_path",
+    "ffmpeg_path",
+    "watermark_secret_env",
+    "watermark_detect_upload_max_bytes",
+}
+
+CONFIG_FIELD_CATEGORIES = {
+    "Channels": "general",
+    "Paths": "general",
+    "Discovery": "general",
+    "Download": "recording",
+    "Live Chat": "recording",
+    "Transcription": "processing",
+    "Content Events": "processing",
+    "Twitch Ads": "processing",
+    "Web": "system",
+    "App Updates": "system",
+    "Tools": "system",
+    "Watermark": "system",
+}
+
+CONFIG_FIELD_UNITS = {
+    "poll_interval_seconds": "seconds",
+    "reconnect_interval_seconds": "seconds",
+    "chat_render_timeout_seconds": "seconds",
+    "stream_event_window_seconds": "seconds",
+    "stream_event_hop_seconds": "seconds",
+    "twitch_ad_repair_scan_seconds": "seconds",
+    "twitch_ad_repair_sample_seconds": "seconds",
+    "twitch_ad_repair_max_seconds": "seconds",
+    "voice_sample_max_bytes": "bytes",
+    "watermark_detect_upload_max_bytes": "bytes",
+}
+
+CONFIG_RESTART_FIELDS = {"state_dir", "web_enabled", "web_host", "web_port"}
+CONFIG_FIELD_DEPENDENCIES = {
+    "render_live_chat_video": ("record_live_chat",),
+    "chat_render_use_nvenc": ("ffmpeg_path",),
+    "voice_match_enabled": ("transcribe_subtitles",),
+    "watermark_strength": ("watermark_enabled",),
+}
+
+
+def enrich_config_form_field(field: ConfigFormField) -> ConfigFormField:
+    label = CONFIG_FIELD_LABELS.get(field.key, field.key.replace("_", " ").title())
+    help_text = CONFIG_FIELD_HELP.get(field.key, f"Advanced configuration value for {label.lower()}.")
+    return replace(
+        field,
+        label=label,
+        help_text=help_text,
+        category=CONFIG_FIELD_CATEGORIES.get(field.section, "advanced"),
+        unit=CONFIG_FIELD_UNITS.get(field.key, ""),
+        advanced=field.key in CONFIG_FIELD_ADVANCED,
+        restart_required=field.key in CONFIG_RESTART_FIELDS,
+        dependencies=CONFIG_FIELD_DEPENDENCIES.get(field.key, ()),
+    )
+
+
+CONFIG_FORM_FIELDS = tuple(enrich_config_form_field(field) for field in CONFIG_FORM_FIELDS)
+CONFIG_FORM_FIELD_BY_KEY = {field.key: field for field in CONFIG_FORM_FIELDS}
+CONFIG_UPDATE_LOCK = Lock()
 
 
 class StatusWebServer:
@@ -872,8 +1101,22 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             parts = urlsplit(self.path)
             path = parts.path
             try:
-                if path in ("", "/", "/status"):
+                if path in ("", "/"):
+                    self._send_admin_page("overview", parts.query)
+                    return
+                if path == "/status":
                     self._send_html(render_status_html(build_status_snapshot(config, include_speaker_scan=False)))
+                    return
+                admin_pages = {
+                    "/streamers": "streamers",
+                    "/settings": "settings",
+                    "/powerchat": "powerchat",
+                    "/activity": "activity",
+                    "/tools": "tools",
+                    "/about": "about",
+                }
+                if path in admin_pages:
+                    self._send_admin_page(admin_pages[path], parts.query)
                     return
                 if path == "/status.json":
                     self._send_status_json(parts.query)
@@ -913,6 +1156,35 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     path=path or "/",
                     query="yes" if parts.query else "no",
                 )
+
+        def _send_admin_page(self, page: str, query: str) -> None:
+            params = parse_qs(query, keep_blank_values=True)
+            if self.headers.get("X-Dashboard-Fragment") == "1":
+                body, revision = render_admin_fragment(config, page, params)
+                encoded = body.encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Fragment-Revision", revision)
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
+            self._send_html(render_admin_page(config, page, params))
+
+        def _return_location(self, default: str) -> str:
+            referer = self.headers.get("Referer", "")
+            if not referer:
+                return default
+            parts = urlsplit(referer)
+            host = self.headers.get("Host", "")
+            if parts.netloc and parts.netloc != host:
+                return default
+            allowed = {"/", "/streamers", "/settings", "/powerchat", "/activity", "/tools", "/about", "/status"}
+            if parts.path not in allowed:
+                return default
+            return parts.path + (f"?{parts.query}" if parts.query else "") + (f"#{parts.fragment}" if parts.fragment else "")
 
         def do_POST(self) -> None:
             started_at = time.perf_counter()
@@ -1047,6 +1319,21 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 bytes=len(body.encode("utf-8")),
                 encode=f"{encode_elapsed:.3f}s",
             )
+
+        def _send_json_response(
+            self,
+            payload: dict[str, Any],
+            status: HTTPStatus = HTTPStatus.OK,
+        ) -> None:
+            body = json.dumps(payload, sort_keys=True) + "\n"
+            encoded = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(encoded)
 
         def _send_package_asset(self, path: Path) -> None:
             if path not in ASSET_ROUTES.values():
@@ -1183,7 +1470,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1199,7 +1486,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1225,7 +1512,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1247,7 +1534,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 bytes_removed,
             )
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1269,7 +1556,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1306,7 +1593,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1332,7 +1619,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1343,13 +1630,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
             try:
                 params = parse_qs(body.decode("utf-8", "replace"))
-                update_voice_detection_from_form(config, params)
+                with CONFIG_UPDATE_LOCK:
+                    update_voice_detection_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#config")
+            self.send_header("Location", self._return_location("/#config"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1363,13 +1651,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     body.decode("utf-8", "replace"),
                     keep_blank_values=True,
                 )
-                update_stream_event_rules_from_form(config, params)
+                with CONFIG_UPDATE_LOCK:
+                    update_stream_event_rules_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#config")
+            self.send_header("Location", self._return_location("/#config"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1383,13 +1672,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     body.decode("utf-8", "replace"),
                     keep_blank_values=True,
                 )
-                update_speaker_labels_from_form(config, params)
+                with CONFIG_UPDATE_LOCK:
+                    update_speaker_labels_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#config")
+            self.send_header("Location", self._return_location("/#config"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1410,7 +1700,8 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                         return
                     body = self.rfile.read(length)
                     fields, files = parse_multipart_form(content_type, body)
-                    update_streamer_voice_with_optional_sample(config, fields, files)
+                    with CONFIG_UPDATE_LOCK:
+                        update_streamer_voice_with_optional_sample(config, fields, files)
                 else:
                     body = self._read_request_body(128 * 1024)
                     if body is None:
@@ -1419,13 +1710,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                         body.decode("utf-8", "replace"),
                         keep_blank_values=True,
                     )
-                    update_streamer_voice_from_form(config, params)
+                    with CONFIG_UPDATE_LOCK:
+                        update_streamer_voice_from_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1452,13 +1744,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             body = self.rfile.read(length)
             try:
                 fields, files = parse_multipart_form(content_type, body)
-                store_streamer_voice_sample_upload(config, fields, files)
+                with CONFIG_UPDATE_LOCK:
+                    store_streamer_voice_sample_upload(config, fields, files)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1472,13 +1765,14 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     body.decode("utf-8", "replace"),
                     keep_blank_values=True,
                 )
-                create_streamer_voice_sample_from_transcript_form(config, params)
+                with CONFIG_UPDATE_LOCK:
+                    create_streamer_voice_sample_from_transcript_form(config, params)
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1498,7 +1792,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1506,6 +1800,36 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
         def _update_config(self) -> None:
             body = self._read_request_body(256 * 1024)
             if body is None:
+                return
+            if self.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("Expected a JSON object")
+                    result = update_app_config_from_json(config, payload)
+                except ConfigRevisionConflict as exc:
+                    self._send_json_response(
+                        mutation_response(
+                            ok=False,
+                            message=str(exc),
+                            revision=exc.current_revision,
+                        ),
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                except (ConfigError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    field_errors = config_error_fields(str(exc), payload if 'payload' in locals() else {})
+                    self._send_json_response(
+                        mutation_response(
+                            ok=False,
+                            message=str(exc),
+                            revision=config_file_revision(config),
+                            field_errors=field_errors,
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                self._send_json_response(result)
                 return
             try:
                 params = parse_qs(
@@ -1518,7 +1842,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#config")
+            self.send_header("Location", safe_return_to(first_query_value(params, "return_to"), "/settings"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1532,7 +1856,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#about")
+            self.send_header("Location", self._return_location("/#about"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1550,7 +1874,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#about")
+            self.send_header("Location", self._return_location("/#about"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1558,6 +1882,35 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
         def _update_streamers(self) -> None:
             body = self._read_request_body(64 * 1024)
             if body is None:
+                return
+            if self.headers.get("Content-Type", "").startswith("application/json"):
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ConfigError("Expected a JSON object")
+                    result = update_streamer_from_json(config, payload)
+                except ConfigRevisionConflict as exc:
+                    self._send_json_response(
+                        mutation_response(
+                            ok=False,
+                            message=str(exc),
+                            revision=exc.current_revision,
+                        ),
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                except (ConfigError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    self._send_json_response(
+                        mutation_response(
+                            ok=False,
+                            message=str(exc),
+                            revision=config_file_revision(config),
+                            field_errors=config_error_fields(str(exc), payload if 'payload' in locals() else {}),
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
+                    return
+                self._send_json_response(result)
                 return
             try:
                 params = parse_qs(
@@ -1569,8 +1922,10 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
 
+            streamer_name = first_query_value(params, "streamer_name").strip()
+            default_location = f"/streamers?selected={quote(streamer_name, safe='')}" if streamer_name else "/streamers"
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", safe_return_to(first_query_value(params, "return_to"), default_location))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1598,7 +1953,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -1619,7 +1974,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/#streamers")
+            self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -2235,6 +2590,19 @@ def build_app_info() -> AppInfo:
         python_version=platform.python_version(),
         executable=sys.executable,
         platform=platform.platform(),
+    )
+
+
+def build_admin_static_snapshot(config: BotConfig) -> AdminStaticSnapshot:
+    """Build settings/tools/about data without scanning recordings or transcripts."""
+
+    return AdminStaticSnapshot(
+        app=build_app_info(),
+        app_update=app_update_status(config, current_version=APP_VERSION),
+        download_dir=str(config.download_dir),
+        state_db=str(config.db_path),
+        stream_limit=STREAM_LIMIT,
+        configuration=build_config_summary(config),
     )
 
 
@@ -5899,6 +6267,7 @@ def run_render_chat_process_job(
     regenerate: bool = False,
 ) -> None:
     assert config.config_path is not None
+    platform = chat_render_platform_from_video_id(video_id_from_job_key(key))
     progress_file = create_isolated_render_progress_file(output_file)
     command = build_render_chat_file_process_command(
         sys.executable,
@@ -5908,6 +6277,7 @@ def run_render_chat_process_job(
         output_file,
         overwrite=regenerate,
         progress_file=progress_file,
+        platform=platform,
     )
     LOGGER.info(
         "Starting isolated manual chat render process media=%s chat=%s output=%s",
@@ -6247,6 +6617,7 @@ def run_render_chat_in_process_job(
     output_file: Path,
     regenerate: bool = False,
 ) -> None:
+    platform = chat_render_platform_from_video_id(video_id_from_job_key(key))
     nvenc_device = choose_chat_render_nvenc_device(
         config.chat_render_nvenc_devices,
         output_file,
@@ -6287,6 +6658,8 @@ def run_render_chat_in_process_job(
             timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
+            platform=platform,
+            emoji_cache_dir=config.chat_emoji_cache_dir,
             progress_callback=report_progress,
         )
     except Exception as exc:  # noqa: BLE001 - web job should capture renderer failures.
@@ -6410,10 +6783,186 @@ def update_app_config_from_form(
     updates = app_config_updates_from_form(params)
     if not updates:
         return
+    with CONFIG_UPDATE_LOCK:
+        load_config_update_preview(config.config_path, updates)
+        update_config_values(config.config_path, updates)
+        reload_running_config(config)
 
-    load_config_update_preview(config.config_path, updates)
-    update_config_values(config.config_path, updates)
-    reload_running_config(config)
+
+class ConfigRevisionConflict(ConfigError):
+    def __init__(self, current_revision: str) -> None:
+        super().__init__("Configuration changed in another tab or outside the dashboard")
+        self.current_revision = current_revision
+
+
+def mutation_response(
+    *,
+    ok: bool,
+    message: str,
+    revision: str,
+    saved: list[str] | None = None,
+    restart_required: list[str] | None = None,
+    field_errors: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    return {
+        "ok": ok,
+        "message": message,
+        "revision": revision,
+        "saved": saved or [],
+        "restart_required": restart_required or [],
+        "field_errors": field_errors or {},
+    }
+
+
+def safe_return_to(value: str, default: str) -> str:
+    candidate = value.strip()
+    if not candidate.startswith("/") or candidate.startswith("//"):
+        return default
+    parts = urlsplit(candidate)
+    if parts.scheme or parts.netloc:
+        return default
+    return candidate
+
+
+def config_error_fields(message: str, payload: dict[str, Any]) -> dict[str, str]:
+    values = payload.get("values", {}) if isinstance(payload, dict) else {}
+    keys = list(values) if isinstance(values, dict) else []
+    for key in keys:
+        if key in message:
+            return {str(key): message}
+    if len(keys) == 1:
+        return {str(keys[0]): message}
+    return {"_form": message}
+
+
+def update_app_config_from_json(
+    config: BotConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    values = payload.get("values")
+    if not isinstance(values, dict) or not values:
+        raise ConfigError("values must contain at least one setting")
+    expected_revision = str(payload.get("revision") or "")
+    updates = app_config_updates_from_json_values(values)
+    if not updates:
+        return mutation_response(
+            ok=True,
+            message="No configuration changes were needed",
+            revision=config_file_revision(config),
+        )
+    with CONFIG_UPDATE_LOCK:
+        current_revision = config_file_revision(config)
+        if expected_revision and expected_revision != current_revision:
+            raise ConfigRevisionConflict(current_revision)
+        load_config_update_preview(config.config_path, updates)
+        changed = update_config_values(config.config_path, updates)
+        reload_running_config(config)
+        revision = config_file_revision(config)
+    restart_required = sorted(key for key in changed if key in CONFIG_RESTART_FIELDS)
+    return mutation_response(
+        ok=True,
+        message="Settings saved",
+        revision=revision,
+        saved=changed,
+        restart_required=restart_required,
+    )
+
+
+def app_config_updates_from_json_values(values: dict[str, Any]) -> dict[str, object]:
+    allowed = set(CONFIG_FORM_FIELD_BY_KEY) | {"extra_yt_dlp_args_mode"}
+    unknown = sorted(str(key) for key in values if key not in allowed)
+    if unknown:
+        raise ConfigError(f"Unknown configuration setting: {unknown[0]}")
+    updates: dict[str, object] = {}
+    for key, raw_value in values.items():
+        if key == "extra_yt_dlp_args_mode":
+            continue
+        field = CONFIG_FORM_FIELD_BY_KEY[key]
+        if field.kind == "extra_args":
+            mode = str(values.get("extra_yt_dlp_args_mode") or "keep").strip()
+            if mode == "keep":
+                continue
+            if mode == "clear":
+                updates[key] = []
+                continue
+            if mode != "replace":
+                raise ConfigError("extra_yt_dlp_args_mode must be keep, replace, or clear")
+            if isinstance(raw_value, list):
+                updates[key] = [str(item).strip() for item in raw_value if str(item).strip()]
+            else:
+                updates[key] = form_string_list(str(raw_value), key, split_commas=False)
+            continue
+        params = {key: [json_config_form_value(field, raw_value)]}
+        updates[key] = config_form_value_from_params(field, params)
+    return updates
+
+
+def json_config_form_value(field: ConfigFormField, value: Any) -> str:
+    if field.kind == "bool":
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+    if field.kind in {"str_list", "int_list"} and isinstance(value, list):
+        return "\n".join(str(item) for item in value)
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        raise ConfigError(f"{field.key} must be a simple value")
+    return str(value)
+
+
+def update_streamer_from_json(
+    config: BotConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config.config_path is None:
+        raise ConfigError("Config path is not available")
+    streamer_name = str(payload.get("streamer_name") or "").strip()
+    if not streamer_name:
+        raise ConfigError("streamer_name is required")
+    configured = config.streamers.get(streamer_name)
+    if configured is None:
+        raise ConfigError(f"streamer is not configured: {streamer_name}")
+    values = payload.get("values")
+    if not isinstance(values, dict) or not values:
+        raise ConfigError("values must contain streamer settings")
+    allowed = {"sources", "download_dir_name", "powerchat_enabled", "powerchat_username"}
+    unknown = sorted(str(key) for key in values if key not in allowed)
+    if unknown:
+        raise ConfigError(f"Unknown streamer setting: {unknown[0]}")
+    raw_sources = values.get("sources", configured.sources)
+    if isinstance(raw_sources, list):
+        sources = [str(item).strip() for item in raw_sources if str(item).strip()]
+    else:
+        sources = form_string_list(str(raw_sources), "sources")
+    download_dir_name = str(values.get("download_dir_name", configured.download_dir_name)).strip()
+    raw_enabled = values.get("powerchat_enabled", configured.powerchat_enabled)
+    powerchat_enabled = raw_enabled if isinstance(raw_enabled, bool) else form_bool(str(raw_enabled), "powerchat_enabled")
+    powerchat_username = str(values.get("powerchat_username", configured.powerchat_username)).strip()
+    expected_revision = str(payload.get("revision") or "")
+    with CONFIG_UPDATE_LOCK:
+        current_revision = config_file_revision(config)
+        if expected_revision and expected_revision != current_revision:
+            raise ConfigRevisionConflict(current_revision)
+        changed = update_streamer_config(
+            config.config_path,
+            streamer_name,
+            sources,
+            download_dir_name,
+            powerchat_enabled,
+            powerchat_username,
+        )
+        reload_running_config(config)
+        revision = config_file_revision(config)
+    saved = ["sources", "download_dir_name", "powerchat_enabled", "powerchat_username"] if changed else []
+    return mutation_response(
+        ok=True,
+        message="Streamer saved",
+        revision=revision,
+        saved=saved,
+    )
 
 
 def app_config_updates_from_form(params: dict[str, list[str]]) -> dict[str, object]:
@@ -6584,6 +7133,14 @@ def update_streamer_from_form(
     config: BotConfig,
     params: dict[str, list[str]],
 ) -> None:
+    with CONFIG_UPDATE_LOCK:
+        _update_streamer_from_form_locked(config, params)
+
+
+def _update_streamer_from_form_locked(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> None:
     if config.config_path is None:
         raise ConfigError("Config path is not available")
     form_kind = (first_query_value(params, "form_kind") or "streamer_form").strip()
@@ -6593,6 +7150,20 @@ def update_streamer_from_form(
 
     action = (first_query_value(params, "action") or "save").strip().lower()
     streamer_name = first_query_value(params, "streamer_name").strip()
+    if action == "migrate":
+        selected_sources = [
+            value.strip()
+            for value in params.get("legacy_source", [])
+            if value.strip()
+        ]
+        migrate_legacy_channels_to_streamer(
+            config.config_path,
+            streamer_name,
+            selected_sources,
+            first_query_value(params, "download_dir_name").strip(),
+        )
+        reload_running_config(config)
+        return
     if action == "delete":
         remove_streamer_config(config.config_path, streamer_name)
         reload_running_config(config)
@@ -7855,6 +8426,580 @@ def json_script_payload(value: Any) -> str:
         .replace("<", "\\u003c")
         .replace(">", "\\u003e")
     )
+
+
+ADMIN_PAGE_TITLES = {
+    "overview": "Overview",
+    "streamers": "Streamers",
+    "settings": "Settings",
+    "powerchat": "Powerchat",
+    "activity": "Activity",
+    "tools": "Tools",
+    "about": "About",
+}
+
+ADMIN_PAGE_SUBTITLES = {
+    "overview": "Recording health and anything that needs your attention.",
+    "streamers": "Add people once, group their platform sources, and manage shared behavior.",
+    "settings": "Plain-language controls for recording, processing, and the local service.",
+    "powerchat": "Support events, donation rates, donors, and exports across captured streams.",
+    "activity": "Processing work and operational logs in one place.",
+    "tools": "Diagnostics, watermark detection, raw configuration, and compatibility tools.",
+    "about": "Version, runtime, and update information for this installation.",
+}
+
+SETTINGS_CATEGORIES: tuple[tuple[str, str, str], ...] = (
+    ("general", "General", "Storage locations, source checks, and recording capacity."),
+    ("recording", "Recording", "Capture, recovery, live chat, and encoding behavior."),
+    ("processing", "Processing", "Transcription, voices, content events, and Twitch repair."),
+    ("system", "System", "Dashboard, updates, tools, and watermarking."),
+    ("advanced", "Advanced", "Search every available setting by name or config key."),
+)
+
+
+def config_file_revision(config: BotConfig) -> str:
+    path = config.config_path
+    if path is None:
+        return "-"
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()[:20]
+    except OSError:
+        return "-"
+
+
+def render_admin_page(
+    config: BotConfig,
+    page: str,
+    params: dict[str, list[str]],
+) -> str:
+    if page not in ADMIN_PAGE_TITLES:
+        raise ConfigError(f"Unknown dashboard page: {page}")
+    title = ADMIN_PAGE_TITLES[page]
+    subtitle = ADMIN_PAGE_SUBTITLES[page]
+    actions = ""
+    if page in {"settings", "tools", "about"}:
+        snapshot: StatusSnapshot | AdminStaticSnapshot = build_admin_static_snapshot(config)
+        extra_attributes = ""
+    else:
+        snapshot = build_status_snapshot(config, include_speaker_scan=False)
+        extra_attributes = (
+            f'data-stream-revision="{escape(snapshot.stream_revision, quote=True)}" '
+            f'data-job-revision="{escape(snapshot.job_revision, quote=True)}"'
+        )
+    if page == "overview":
+        content = render_admin_overview(snapshot)
+        actions = (
+            '<span class="muted" data-last-refreshed>'
+            f'Updated {escape(format_optional_epoch(snapshot.generated_at))}</span>'
+            '<button class="button secondary" type="button" onclick="location.reload()">Refresh</button>'
+        )
+    elif page == "streamers":
+        selected = first_query_value(params, "selected").strip()
+        content = render_admin_streamers(snapshot, selected=selected)
+        if not selected and snapshot_config_path(snapshot) != "-":
+            actions = '<button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button>'
+    elif page == "settings":
+        section = first_query_value(params, "section").strip().lower() or "general"
+        content = render_admin_settings(snapshot, section)
+    elif page == "powerchat":
+        content = render_admin_powerchat(snapshot)
+    elif page == "activity":
+        view = first_query_value(params, "view").strip().lower() or "jobs"
+        content = render_admin_activity(snapshot, view)
+    elif page == "tools":
+        content = render_admin_tools(snapshot)
+    else:
+        content = render_admin_about(snapshot)
+    return render_dashboard_shell(
+        active=page,
+        title=title,
+        subtitle=subtitle,
+        content=content,
+        app_version=APP_VERSION,
+        config_revision=config_file_revision(config),
+        page_actions=actions,
+        body_attributes=extra_attributes,
+    )
+
+
+def render_admin_fragment(
+    config: BotConfig,
+    page: str,
+    params: dict[str, list[str]],
+) -> tuple[str, str]:
+    snapshot = build_status_snapshot(config, include_speaker_scan=False)
+    if page == "overview":
+        body = render_admin_overview_dynamic(snapshot)
+        revision = f"{snapshot.stream_revision}:{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+    elif page == "streamers":
+        selected = first_query_value(params, "selected").strip()
+        if selected:
+            streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
+            body = render_admin_streamer_streams(streamer) if streamer is not None else '<div class="notice warning">Streamer is no longer available.</div>'
+        else:
+            body = render_admin_streamer_list(snapshot)
+        revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    elif page == "activity":
+        view = first_query_value(params, "view").strip().lower() or "jobs"
+        body = render_admin_activity_records(snapshot, view)
+        revision = f"{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+    elif page == "powerchat":
+        body = render_powerchat_dashboard(snapshot.powerchat_stats)
+        revision = hashlib.sha256(json_script_payload(snapshot.powerchat_stats).encode()).hexdigest()[:20]
+    else:
+        body = '<div class="notice">This page does not use live fragments.</div>'
+        revision = config_file_revision(config)
+    return body, revision
+
+
+def render_admin_overview(snapshot: StatusSnapshot) -> str:
+    setup = render_admin_setup_checklist(snapshot)
+    return f"""<div class="section-stack">
+  {setup}
+  <section data-fragment-url="/?fragment=status" data-fragment-revision="{escape(snapshot.stream_revision, quote=True)}">
+    {render_admin_overview_dynamic(snapshot)}
+  </section>
+</div>"""
+
+
+def render_admin_overview_dynamic(snapshot: StatusSnapshot) -> str:
+    active = [stream for stream in snapshot.streams if stream.status == "downloading"]
+    attention = [stream for stream in snapshot.streams if stream_needs_attention(stream)]
+    active_jobs = [job for job in snapshot.jobs if job.status in {"queued", "running"}]
+    health_class = "warning" if attention else "good"
+    health_text = "Needs attention" if attention else "Healthy"
+    streamer_names = {
+        stream.video_id: streamer.name
+        for streamer in snapshot.streamer_stats
+        for stream in streamer.streams
+    }
+    priority_streams = list(
+        {
+            stream.video_id: stream
+            for stream in [*attention, *active]
+        }.values()
+    )
+    activity_rows = "".join(
+        render_admin_stream_record(
+            stream,
+            streamer_name=streamer_names.get(stream.video_id, stream.channel),
+        )
+        for stream in priority_streams[:8]
+    )
+    if not activity_rows:
+        activity_rows = '<div class="empty-state card"><h2>Nothing needs attention</h2><p>Active recordings and recovery warnings will appear here.</p></div>'
+    return f"""<div class="section-stack">
+  <div class="metric-grid" aria-label="Service summary">
+    <article class="metric-card"><span class="metric-label">Service health</span><strong><span class="status-badge {health_class}">{health_text}</span></strong><span class="metric-detail">{len(attention)} attention item{'s' if len(attention) != 1 else ''}</span></article>
+    <article class="metric-card"><span class="metric-label">Recording now</span><strong>{len(active)}</strong><span class="metric-detail">of {len(snapshot.streams)} known streams</span></article>
+    <article class="metric-card"><span class="metric-label">Active processing</span><strong>{len(active_jobs)}</strong><span class="metric-detail">queued or running jobs</span></article>
+    <article class="metric-card"><span class="metric-label">Storage used</span><strong>{escape(format_bytes(snapshot.total_bytes))}</strong><span class="metric-detail">{escape(format_bytes(snapshot.part_bytes))} partial</span></article>
+  </div>
+  <section class="section-stack">
+    <div class="section-heading"><h2>Live and attention</h2><a href="/streamers">View all streamers</a></div>
+    <div class="record-list">{activity_rows}</div>
+  </section>
+  {render_admin_recent_jobs(active_jobs)}
+</div>"""
+
+
+def render_admin_setup_checklist(snapshot: StatusSnapshot) -> str:
+    configured = [streamer for streamer in snapshot.streamer_stats if streamer.configured]
+    legacy = [streamer for streamer in snapshot.streamer_stats if streamer.needs_grouping]
+    if configured and not legacy:
+        return ""
+    if not configured:
+        heading = "Finish the initial setup"
+        text = "Add a streamer and at least one platform source to begin monitoring."
+        action = '<a class="button" href="/streamers">Add your first streamer</a>'
+    else:
+        heading = "Group legacy sources"
+        text = f"{len(legacy)} legacy source group{'s' if len(legacy) != 1 else ''} can be migrated to shared streamer settings."
+        action = '<a class="button" href="/streamers#migrate-legacy">Open migration assistant</a>'
+    return f'<section class="notice info"><div class="card-header"><div><h2>{heading}</h2><p>{text}</p></div>{action}</div></section>'
+
+
+def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "") -> str:
+    platform, platform_label, platform_initial = stream_platform_details(stream)
+    status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
+    status_class = "warning" if stream_needs_attention(stream) else "good"
+    return f"""<article class="streamer-summary">
+  <div>
+    <h3>{escape(stream.title or stream.video_id)}</h3>
+    <div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(stream.channel or 'Unknown streamer')}</span><span class="muted">{escape(stream.video_id)}</span></div>
+  </div>
+  <div class="summary-stats"><div class="summary-stat"><strong>{escape(format_bytes(stream.total_bytes))}</strong><span>Stored</span></div><div class="summary-stat"><strong>{stream.file_count}</strong><span>Files</span></div></div>
+  <div class="streamer-summary-actions"><span class="status-badge {status_class}">{escape(status_label)}</span><a class="button small secondary" href="/streamers?selected={quote(streamer_name or stream.channel or '', safe='')}">Details</a></div>
+</article>"""
+
+
+def render_admin_recent_jobs(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        return """<section class="card"><div class="card-header"><div><h2>Processing</h2><p>No jobs are queued or running.</p></div><a href="/activity">Activity</a></div></section>"""
+    rows = "".join(render_admin_job_mobile(job) for job in jobs[:5])
+    return f'<section class="section-stack"><div class="section-heading"><h2>Processing</h2><a href="/activity">All activity</a></div><div class="mobile-records" style="display:grid">{rows}</div></section>'
+
+
+def render_admin_streamers(snapshot: StatusSnapshot, *, selected: str) -> str:
+    if selected:
+        return render_admin_streamer_detail(snapshot, selected)
+    list_html = render_admin_streamer_list(snapshot)
+    revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    return f"""<div class="section-stack">
+  <div class="search-bar"><label class="sr-only" for="streamer-search">Search streamers</label><input id="streamer-search" data-streamer-search type="search" placeholder="Search streamers or sources"></div>
+  <section data-fragment-url="/streamers?fragment=list" data-fragment-revision="{escape(revision, quote=True)}">{list_html}</section>
+  {render_admin_add_streamer_dialog(snapshot)}
+  {render_admin_legacy_migration(snapshot)}
+</div>"""
+
+
+def render_admin_streamer_list(snapshot: StatusSnapshot) -> str:
+    if not snapshot.streamer_stats:
+        return '<section class="card empty-state"><h2>No streamers yet</h2><p>Add a streamer and one or more platform sources to start monitoring.</p><button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button></section>'
+    return '<div class="streamer-list">' + "".join(
+        render_admin_streamer_summary(streamer) for streamer in snapshot.streamer_stats
+    ) + "</div>"
+
+
+def render_admin_streamer_summary(streamer: StreamerStatStatus) -> str:
+    status_class = "warning" if streamer.needs_grouping or streamer.attention_count else "good"
+    status = "Needs grouping" if streamer.needs_grouping else ("Needs attention" if streamer.attention_count else "Configured")
+    search_text = " ".join([streamer.name, *streamer.sources]).lower()
+    selected = quote(streamer.name, safe="")
+    return f"""<article class="streamer-summary" data-streamer-summary data-search-text="{escape(search_text, quote=True)}">
+  <div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div>
+  <div class="summary-stats">
+    <div class="summary-stat"><strong>{streamer.active_count}</strong><span>Active</span></div>
+    <div class="summary-stat"><strong>{streamer.stream_count}</strong><span>Streams</span></div>
+    <div class="summary-stat"><strong>{escape(format_bytes(streamer.total_bytes))}</strong><span>Storage</span></div>
+  </div>
+  <div class="streamer-summary-actions"><span class="status-badge {status_class}">{status}</span><a class="button small secondary" href="/streamers?selected={selected}">{'Migrate' if streamer.needs_grouping else 'Manage'}</a></div>
+</article>"""
+
+
+def render_admin_add_streamer_dialog(snapshot: StatusSnapshot) -> str:
+    if snapshot_config_path(snapshot) == "-":
+        return ""
+    return f"""<dialog id="add-streamer-dialog">
+  <div class="dialog-card">
+    <div class="card-header"><div><h2>Add streamer</h2><p>Start with the identity and sources. Optional features can be configured afterwards.</p></div><button class="icon-button" type="button" data-close-dialog aria-label="Close">×</button></div>
+    <form class="section-stack" method="post" action="/streamers">
+      <input type="hidden" name="form_kind" value="streamer_form">
+      <input type="hidden" name="action" value="save">
+      <input type="hidden" name="return_to" value="/streamers">
+      <div class="form-grid">
+        <div class="form-field"><label for="new-streamer-name">Name</label><input id="new-streamer-name" name="streamer_name" required autocomplete="off"><span class="help-text">The person or group shared by these sources.</span></div>
+        <div class="form-field"><label for="new-streamer-dir">Download folder name</label><input id="new-streamer-dir" name="download_dir_name" autocomplete="off"><span class="help-text">Optional; defaults to the streamer name.</span></div>
+        <div class="form-field wide"><span><strong>Sources</strong></span>{render_admin_source_manager([], "new-streamer")}</div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>Cancel</button><button class="button" type="submit">Create streamer</button></div>
+    </form>
+  </div>
+</dialog>"""
+
+
+def render_admin_source_manager(sources: list[str], key: str) -> str:
+    value = "\n".join(sources)
+    return f"""<div class="source-manager" data-source-manager>
+  <textarea name="sources" data-source-values hidden>{escape(value)}</textarea>
+  <div class="source-manager-list" data-source-manager-list></div>
+  <div class="source-adder">
+    <div class="form-field"><label for="{escape(key, quote=True)}-platform">Website</label><select id="{escape(key, quote=True)}-platform" data-source-platform><option value="auto">Auto-detect</option><option value="youtube">YouTube</option><option value="twitch">Twitch</option><option value="kick">Kick</option><option value="rumble">Rumble</option></select></div>
+    <div class="form-field"><label for="{escape(key, quote=True)}-source">Channel or URL</label><input id="{escape(key, quote=True)}-source" data-source-input placeholder="Paste a URL or channel name"></div>
+    <button class="button secondary" type="button" data-add-source>Add source</button>
+  </div>
+  <span class="help-text">YouTube, Twitch, Kick, and Rumble URLs are normalized automatically.</span>
+</div>"""
+
+
+def render_admin_streamer_detail(snapshot: StatusSnapshot, selected: str) -> str:
+    streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
+    if streamer is None:
+        return f'<section class="card empty-state"><h2>Streamer not found</h2><p>{escape(selected)} is not available in the current configuration or stream history.</p><a class="button secondary" href="/streamers">Back to streamers</a></section>'
+    if streamer.needs_grouping:
+        return f'<div class="section-stack"><a href="/streamers">← All streamers</a><section class="notice warning"><h2>{escape(streamer.name)} needs grouping</h2><p>Use the migration assistant to create a shared streamer identity for these legacy sources.</p><a class="button" href="/streamers#migrate-legacy">Open migration assistant</a></section></div>'
+    revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
+      <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
+    </form>"""
+    return f"""<div class="section-stack">
+  <div><a href="/streamers">← All streamers</a></div>
+  <section class="card">
+    <div class="card-header"><div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div><div class="button-row"><span class="status-badge {'warning' if streamer.attention_count else 'good'}">{'Needs attention' if streamer.attention_count else 'Configured'}</span>{delete_form}</div></div>
+    {render_admin_streamer_basic_form(streamer, snapshot)}
+  </section>
+  <section><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>
+  <section class="section-stack" data-fragment-url="/streamers?selected={quote(streamer.name, safe='')}&amp;fragment=streams" data-fragment-revision="{escape(revision, quote=True)}">
+    {render_admin_streamer_streams(streamer)}
+  </section>
+</div>"""
+
+
+def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
+    streamer_key = quote(streamer.name, safe="")
+    return f"""<form id="streamer-basic-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer" data-streamer-name="{escape(streamer.name, quote=True)}">
+  <div class="form-grid">
+    <div class="form-field"><label>Streamer name</label><input value="{escape(streamer.name, quote=True)}" readonly><span class="help-text">Names remain stable so existing folders and history stay linked.</span></div>
+    <div class="form-field"><label for="streamer-dir-{escape(streamer_key, quote=True)}">Download folder name</label><input id="streamer-dir-{escape(streamer_key, quote=True)}" name="download_dir_name" value="{escape(streamer.download_dir_name, quote=True)}"><span class="field-error" data-field-error></span></div>
+    <div class="form-field wide"><span><strong>Sources</strong></span>{render_admin_source_manager(streamer.sources, f'streamer-{streamer_dom_id(streamer.name)}')}<span class="field-error" data-field-error></span></div>
+    <div class="form-field switch-field"><div class="switch-copy"><strong>Powerchat</strong><span class="help-text">Listen for live support events.</span></div><label class="switch"><input name="powerchat_enabled" type="checkbox"{' checked' if streamer.powerchat_enabled else ''}><span aria-hidden="true"></span><span class="sr-only">Enable Powerchat</span></label></div>
+    <div class="form-field"><label for="powerchat-user-{escape(streamer_key, quote=True)}">Powerchat username</label><input id="powerchat-user-{escape(streamer_key, quote=True)}" name="powerchat_username" value="{escape(streamer.powerchat_username, quote=True)}" placeholder="Username"><span class="field-error" data-field-error></span></div>
+  </div>
+  <noscript><div class="button-row"><button class="button" name="action" value="save" type="submit">Save streamer</button></div></noscript>
+</form>"""
+
+
+def render_admin_streamer_optional_cards(streamer: StreamerStatStatus) -> str:
+    legacy_url = f"/status#streamers"
+    cards = [
+        ("Voices", f"{len(streamer.voices)} known voice{'s' if len(streamer.voices) != 1 else ''}", "Manage voice profiles, samples, and attribution review."),
+        ("Speaker names", f"{streamer.speaker_label_count} label{'s' if streamer.speaker_label_count != 1 else ''}", "Map diarized speaker labels to readable names."),
+        ("Content events", "Configured" if streamer.stream_event_detection else "Uses app default", "Flag moments using audio labels, transcript keywords, and known voices."),
+        ("Manual VOD", "Add an existing recording", "Download a VOD into this streamer and run enabled post-processing."),
+    ]
+    return '<div class="optional-grid">' + "".join(
+        f'<article class="setup-card"><div><h3>{escape(title)}</h3><span class="status-badge">{escape(status)}</span></div><p>{escape(text)}</p><a class="button small secondary" href="{legacy_url}">Open manager</a></article>'
+        for title, status, text in cards
+    ) + "</div>"
+
+
+def render_admin_streamer_streams(streamer: StreamerStatStatus) -> str:
+    if not streamer.streams:
+        return '<section class="card empty-state"><h2>Streams</h2><p>No streams have been seen for this streamer yet.</p></section>'
+    cards = "".join(render_admin_stream_detail(stream) for stream in streamer.streams[:10])
+    more = (
+        f'<div class="notice">Showing the 10 most recent of {streamer.stream_count} streams. Use the compatibility workspace for the complete paginated history. <a href="/status#streamers">Open complete history</a></div>'
+        if streamer.stream_count > 10 else ""
+    )
+    return f'<div class="section-heading"><h2>Recent streams</h2><span class="muted">{streamer.stream_count} total</span></div><div class="record-list">{cards}</div>{more}'
+
+
+def render_admin_stream_detail(stream: StreamStatus) -> str:
+    platform, platform_label, platform_initial = stream_platform_details(stream)
+    status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
+    files = "".join(render_file_row(file) for file in stream.files[:20]) or '<tr><td colspan="7">No files found</td></tr>'
+    return f"""<details class="card stream-detail">
+  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at))}</span><span class="muted">{escape(stream.video_id)}</span></div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
+  <div class="section-stack">
+    {render_stream_signals(stream)}
+    <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at))}</dd></dl>
+    <div class="button-row">{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
+    <details open><summary><strong>Files and actions</strong></summary><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></details>
+    <details><summary><strong>Content events ({stream.content_event_count})</strong></summary>{render_content_events(stream.content_events)}</details>
+    <details><summary><strong>Powerchat ({stream.powerchat_event_count})</strong></summary>{render_powerchat_events(stream)}</details>
+    <details><summary><strong>Processing jobs</strong></summary>{render_stream_jobs(stream.jobs)}</details>
+    <details><summary><strong>Stream log</strong></summary>{render_stream_event_timeline(stream.events)}</details>
+  </div>
+</details>"""
+
+
+def render_admin_legacy_migration(snapshot: StatusSnapshot) -> str:
+    legacy_sources = list(snapshot.configured_channels)
+    if not legacy_sources or snapshot_config_path(snapshot) == "-":
+        return ""
+    options = "".join(
+        f'<label class="source-row"><input type="checkbox" name="legacy_source" value="{escape(source, quote=True)}"><span><strong>{escape(source)}</strong><small>Currently monitored as a legacy channel</small></span></label>'
+        for source in legacy_sources
+    )
+    return f"""<section class="card section-stack" id="migrate-legacy">
+  <div class="card-header"><div><h2>Migration assistant</h2><p>Group legacy channels into a streamer without interrupting monitoring.</p></div><span class="status-badge warning">{len(legacy_sources)} to review</span></div>
+  <form class="section-stack" method="post" action="/streamers">
+    <input type="hidden" name="action" value="migrate">
+    <input type="hidden" name="return_to" value="/streamers">
+    <div class="source-manager-list">{options}</div>
+    <div class="form-grid"><div class="form-field"><label>Streamer name</label><input name="streamer_name" required></div><div class="form-field"><label>Download folder name</label><input name="download_dir_name"><span class="help-text">Optional; defaults to the streamer name.</span></div></div>
+    <div><button class="button" type="submit">Create streamer and migrate selected sources</button></div>
+  </form>
+</section>"""
+
+
+def render_admin_settings(snapshot: StatusSnapshot | AdminStaticSnapshot, section: str) -> str:
+    if snapshot_config_path(snapshot) == "-":
+        return '<section class="card empty-state"><h2>Configuration is read-only</h2><p>The service was started without a config file path, so dashboard settings cannot be saved.</p></section>'
+    allowed = {key for key, _label, _description in SETTINGS_CATEGORIES}
+    if section not in allowed:
+        section = "general"
+    nav = "".join(
+        f'<a href="/settings?section={key}" class="{"active" if key == section else ""}"{" aria-current=\"page\"" if key == section else ""}>{escape(label)}</a>'
+        for key, label, _description in SETTINGS_CATEGORIES
+    )
+    title, description = next((label, desc) for key, label, desc in SETTINGS_CATEGORIES if key == section)
+    fields = [
+        field for field in CONFIG_FORM_FIELDS
+        if (field.advanced if section == "advanced" else field.category == section and not field.advanced)
+    ]
+    search = (
+        '<div class="advanced-search"><label class="sr-only" for="settings-search">Search settings</label><input id="settings-search" data-settings-search type="search" placeholder="Search by setting name, config key, or description"></div>'
+        if section == "advanced" else ""
+    )
+    grouped: list[str] = []
+    for group_name in dict.fromkeys(field.section for field in fields):
+        group_fields = [field for field in fields if field.section == group_name]
+        grouped.append(render_admin_settings_group(snapshot, group_name, group_fields))
+    extra = ""
+    if section == "processing":
+        extra = '<div class="notice info">Streamer-specific voices, speaker names, and event rules are managed from each streamer. <a href="/streamers">Open streamers</a></div>'
+    return f"""<div class="settings-layout" data-settings-root>
+  <nav class="settings-nav card" aria-label="Settings categories">{nav}</nav>
+  <div class="settings-content">
+    <div><h2>{escape(title)}</h2><p class="muted">{escape(description)} Changes save automatically.</p></div>
+    {extra}{search}{''.join(grouped) if grouped else '<section class="card empty-state"><h2>No settings in this category</h2></section>'}
+  </div>
+</div>"""
+
+
+def render_admin_settings_group(
+    snapshot: StatusSnapshot | AdminStaticSnapshot,
+    group_name: str,
+    fields: list[ConfigFormField],
+) -> str:
+    cards = "".join(render_admin_setting_card(snapshot, field) for field in fields)
+    key = re.sub(r"[^a-z0-9]+", "-", group_name.lower()).strip("-")
+    return f"""<section class="settings-group" data-settings-group>
+  <div class="section-heading"><h2>{escape(group_name)}</h2><span class="muted">{len(fields)} setting{'s' if len(fields) != 1 else ''}</span></div>
+  <form id="settings-{escape(key, quote=True)}" class="autosave-form" data-autosave="config" method="post" action="/config">
+    {cards}
+  </form>
+</section>"""
+
+
+def render_admin_setting_card(snapshot: StatusSnapshot | AdminStaticSnapshot, field: ConfigFormField) -> str:
+    value = app_config_field_value(snapshot, field)
+    control = render_admin_setting_control(field, value)
+    restart = '<span class="status-badge warning">Restart</span>' if field.restart_required else ""
+    unit = f' <span class="muted">({escape(field.unit)})</span>' if field.unit else ""
+    dependency_labels = [
+        CONFIG_FORM_FIELD_BY_KEY[key].label
+        for key in field.dependencies
+        if key in CONFIG_FORM_FIELD_BY_KEY
+    ]
+    dependencies = (
+        f'<div class="notice info"><strong>Related setting:</strong> {escape(", ".join(dependency_labels))}</div>'
+        if dependency_labels else ""
+    )
+    search_text = " ".join((field.label, field.key, field.help_text, field.section))
+    return f"""<article class="setting-card card" data-setting-card data-search-text="{escape(search_text, quote=True)}">
+  <div class="setting-card-header"><div><h3>{escape(field.label)}{unit}</h3><span class="technical-key">{escape(field.key)}</span></div>{restart}</div>
+  <p class="help-text">{escape(field.help_text)}</p>
+  {dependencies}
+  {control}
+  <span class="field-error" data-field-error></span>
+</article>"""
+
+
+def render_admin_setting_control(field: ConfigFormField, value: Any) -> str:
+    name = escape(field.key, quote=True)
+    if field.kind == "bool":
+        checked = " checked" if bool(value) else ""
+        return f'<div class="switch-field"><span>{"Enabled" if bool(value) else "Disabled"}</span><label class="switch"><input name="{name}" type="checkbox"{checked}><span aria-hidden="true"></span><span class="sr-only">{escape(field.label)}</span></label></div>'
+    if field.kind == "choice":
+        options = "".join(
+            f'<option value="{escape(option, quote=True)}"{" selected" if option == str(value) else ""}>{escape(option.replace("_", " ").title())}</option>'
+            for option in field.options
+        )
+        return f'<div class="form-field"><label class="sr-only" for="setting-{name}">{escape(field.label)}</label><select id="setting-{name}" name="{name}">{options}</select></div>'
+    if field.kind == "extra_args":
+        return f"""<div class="form-grid"><div class="form-field"><label>Update behavior</label><select name="extra_yt_dlp_args_mode"><option value="keep">Keep current hidden arguments</option><option value="replace">Replace arguments</option><option value="clear">Clear arguments</option></select></div><div class="form-field wide"><label>Replacement arguments</label><textarea name="{name}" rows="4" placeholder="One argument per line"></textarea></div></div>"""
+    if field.kind in {"str_list", "int_list"}:
+        if isinstance(value, list):
+            separator = "\n" if field.kind == "str_list" else ", "
+            text_value = separator.join(str(item) for item in value)
+        else:
+            text_value = str(value)
+        return f'<div class="form-field"><label class="sr-only" for="setting-{name}">{escape(field.label)}</label><textarea id="setting-{name}" name="{name}" rows="{field.rows}">{escape(text_value)}</textarea></div>'
+    input_type = "number" if field.kind in {"int", "float"} else "text"
+    step = ' step="0.001"' if field.kind == "float" else ""
+    minimum = f' min="{field.minimum}"' if field.minimum is not None else ""
+    return f'<div class="form-field"><label class="sr-only" for="setting-{name}">{escape(field.label)}</label><input id="setting-{name}" name="{name}" type="{input_type}"{step}{minimum} value="{escape(str(value), quote=True)}"></div>'
+
+
+def render_admin_powerchat(snapshot: StatusSnapshot) -> str:
+    stats_json = json_script_payload(snapshot.powerchat_stats)
+    return f"""<div class="section-stack">
+  <section data-fragment-url="/powerchat?fragment=dashboard">{render_powerchat_dashboard(snapshot.powerchat_stats)}</section>
+  <script type="application/json" id="powerchat-stats-json">{stats_json}</script>
+  {dashboard_script()}
+</div>"""
+
+
+def render_admin_activity(snapshot: StatusSnapshot, view: str) -> str:
+    if view not in {"jobs", "logs"}:
+        view = "jobs"
+    revision = f"{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+    tabs = f"""<nav class="tabs" aria-label="Activity type"><a href="/activity?view=jobs" class="{'active' if view == 'jobs' else ''}">Jobs</a><a href="/activity?view=logs" class="{'active' if view == 'logs' else ''}">Logs</a></nav>"""
+    states = (
+        '<option value="">All statuses</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Done</option><option value="failed">Failed</option>'
+        if view == "jobs"
+        else '<option value="">All levels</option><option value="DEBUG">Debug</option><option value="INFO">Info</option><option value="WARNING">Warning</option><option value="ERROR">Error</option><option value="CRITICAL">Critical</option>'
+    )
+    filters = f'<div class="filter-bar" data-activity-filters><label>Search<input type="search" data-activity-search placeholder="Search messages, items, or video IDs"></label><label>{"Status" if view == "jobs" else "Level"}<select data-activity-state>{states}</select></label></div>'
+    return f'<div class="section-stack">{tabs}{filters}<section data-activity-records data-fragment-url="/activity?view={view}&amp;fragment=records" data-fragment-revision="{escape(revision, quote=True)}">{render_admin_activity_records(snapshot, view)}</section></div>'
+
+
+def render_admin_activity_records(snapshot: StatusSnapshot, view: str) -> str:
+    if view == "logs":
+        return render_admin_logs(snapshot.recent_logs)
+    return render_admin_jobs(snapshot.jobs)
+
+
+def render_admin_jobs(jobs: list[JobStatus]) -> str:
+    if not jobs:
+        return '<section class="card empty-state"><h2>No processing jobs yet</h2><p>Dashboard-triggered processing and watermark jobs will appear here.</p></section>'
+    table = f'<div class="table-wrap desktop-table"><table><thead><tr><th>Status</th><th>Progress</th><th>Job</th><th>Phase</th><th>Video</th><th>Item</th><th>Started</th><th>Duration</th><th>Message</th></tr></thead><tbody>{"".join(render_admin_job_row(job) for job in jobs)}</tbody></table></div>'
+    mobile = '<div class="mobile-records">' + "".join(render_admin_job_mobile(job) for job in jobs) + "</div>"
+    return table + mobile
+
+
+def render_admin_job_row(job: JobStatus) -> str:
+    search = " ".join(
+        str(value or "")
+        for value in (job.kind, job.phase, job.video_id, job.item, job.message)
+    ).lower()
+    return f'<tr data-activity-record data-state="{escape(job.status, quote=True)}" data-search-text="{escape(search, quote=True)}"><td><span class="status-badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span></td><td>{render_job_progress(job.progress)}</td><td>{escape(job.kind or "-")}</td><td>{escape(job.phase or "-")}</td><td class="file-name">{escape(job.video_id or "-")}</td><td class="file-name">{escape(job.item or "-")}</td><td>{escape(format_optional_epoch(job.started_at))}</td><td>{escape(format_job_duration(job))}</td><td class="log-message">{escape(job.message or "-")}</td></tr>'
+
+
+def render_admin_job_mobile(job: JobStatus) -> str:
+    search = " ".join(
+        str(value or "")
+        for value in (job.kind, job.phase, job.video_id, job.item, job.message)
+    ).lower()
+    return f'<article class="mobile-record" data-activity-record data-state="{escape(job.status, quote=True)}" data-search-text="{escape(search, quote=True)}"><div class="card-header"><strong>{escape(job.kind or "Job")}</strong><span class="status-badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span></div><dl><dt>Phase</dt><dd>{escape(job.phase or "-")}</dd><dt>Item</dt><dd>{escape(job.item or job.video_id or "-")}</dd><dt>Progress</dt><dd>{render_job_progress(job.progress)}</dd><dt>Message</dt><dd>{escape(job.message or "-")}</dd></dl></article>'
+
+
+def render_admin_logs(logs: list[LogEntry]) -> str:
+    if not logs:
+        return '<section class="card empty-state"><h2>No logs captured yet</h2><p>Recent in-process service logs will appear here.</p></section>'
+    ordered = list(reversed(logs))
+    table_rows = "".join(
+        f'<tr data-activity-record data-state="{escape(entry.level, quote=True)}" data-search-text="{escape((entry.logger + " " + entry.message).lower(), quote=True)}"><td>{escape(format_optional_epoch(entry.created_at))}</td><td>{escape(entry.level)}</td><td class="file-name">{escape(entry.logger)}</td><td class="log-message">{escape(entry.message)}</td></tr>'
+        for entry in ordered
+    )
+    table = f'<div class="table-wrap desktop-table"><table><thead><tr><th>Time</th><th>Level</th><th>Logger</th><th>Message</th></tr></thead><tbody>{table_rows}</tbody></table></div>'
+    mobile = '<div class="mobile-records">' + "".join(
+        f'<article class="mobile-record" data-activity-record data-state="{escape(entry.level, quote=True)}" data-search-text="{escape((entry.logger + " " + entry.message).lower(), quote=True)}"><div class="card-header"><strong>{escape(entry.logger)}</strong><span class="status-badge">{escape(entry.level)}</span></div><p>{escape(entry.message)}</p><span class="muted">{escape(format_optional_epoch(entry.created_at))}</span></article>'
+        for entry in ordered
+    ) + "</div>"
+    return table + mobile
+
+
+def render_admin_tools(snapshot: StatusSnapshot | AdminStaticSnapshot) -> str:
+    config_json = escape(json.dumps(snapshot.configuration, indent=2, sort_keys=True))
+    return f"""<div class="section-stack">
+  <div class="card-grid">
+    <section class="card"><div class="card-header"><div><h2>Runtime paths</h2><p>Resolved locations used by this process.</p></div></div><dl class="detail-list"><dt>Recordings</dt><dd>{escape(snapshot.download_dir)}</dd><dt>State database</dt><dd>{escape(snapshot.state_db)}</dd><dt>Stream limit</dt><dd>{snapshot.stream_limit}</dd><dt>File limit</dt><dd>{FILE_LIMIT_PER_STREAM} per stream</dd></dl></section>
+    <section class="card"><div class="card-header"><div><h2>Compatibility workspace</h2><p>The original dense dashboard remains available while external bookmarks and specialist workflows transition.</p></div></div><div class="button-row"><a class="button secondary" href="/status">Open legacy workspace</a><a class="button secondary" href="/status.json">Download status JSON</a></div></section>
+    {render_watermark_detection_panel(snapshot.configuration)}
+  </div>
+  <details class="card"><summary><strong>Raw configuration snapshot</strong></summary><p class="help-text">Sensitive yt-dlp arguments and secret values remain redacted.</p><pre class="raw-json">{config_json}</pre></details>
+</div>"""
+
+
+def render_admin_about(snapshot: StatusSnapshot | AdminStaticSnapshot) -> str:
+    return f"""<div class="section-stack">
+  <section class="card"><div class="card-header"><div><h2>ONLYSAVEmeVODS</h2><p>Local recording and post-processing administration.</p></div><span class="status-badge good">Version {escape(snapshot.app.version)}</span></div><dl class="detail-list"><dt>Python</dt><dd>{escape(snapshot.app.python_version)}</dd><dt>Platform</dt><dd>{escape(snapshot.app.platform)}</dd><dt>Executable</dt><dd>{escape(snapshot.app.executable)}</dd><dt>Config</dt><dd>{escape(snapshot_config_path(snapshot))}</dd></dl></section>
+  {render_app_update_panel(snapshot.app_update)}
+  <section class="notice warning"><strong>Trusted local interface</strong><div>This dashboard can change configuration, start jobs, and download recordings. Keep it on loopback, a private network, or behind authentication supplied by your network layer.</div></section>
+</div>"""
 
 
 def render_status_html(snapshot: StatusSnapshot) -> str:
@@ -12732,7 +13877,7 @@ def render_streamer_stream_platform_options(streams: list[StreamStatus]) -> str:
     return "".join(options)
 
 
-def snapshot_config_path(snapshot: StatusSnapshot) -> str:
+def snapshot_config_path(snapshot: StatusSnapshot | AdminStaticSnapshot) -> str:
     return str(snapshot.configuration.get("Paths", {}).get("config_path", "-"))
 
 
@@ -13081,7 +14226,7 @@ def render_form_select(name: str, selected: str, options: tuple[str, ...]) -> st
     return f'<select name="{name}">{"".join(rendered)}</select>'
 
 
-def app_config_field_value(snapshot: StatusSnapshot, field: ConfigFormField) -> Any:
+def app_config_field_value(snapshot: StatusSnapshot | AdminStaticSnapshot, field: ConfigFormField) -> Any:
     if field.key == "channels":
         return list(snapshot.configuration.get("Channels", {}).get("channels", []))
     if field.key == "extra_yt_dlp_args":
@@ -13351,29 +14496,25 @@ def render_watermark_detection_result(result: Any) -> str:
         f"<tr><td>{escape(name)}</td><td>{escape(value)}</td></tr>"
         for name, value in rows
     )
-    return f"""<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Watermark Detection</title></head>
-<body>
-  <h1>Watermark Detection</h1>
-  <table>{rendered_rows}</table>
-  <p><a href="/#streamers">Back to dashboard</a></p>
-</body>
-</html>
-"""
+    content = f'<section class="card section-stack"><div class="table-wrap"><table><tbody>{rendered_rows}</tbody></table></div><div><a class="button secondary" href="/tools">Back to tools</a></div></section>'
+    return render_dashboard_shell(
+        active="tools",
+        title="Watermark Detection",
+        subtitle="Attribution result for the uploaded media.",
+        content=content,
+        app_version=APP_VERSION,
+    )
 
 
 def render_watermark_detection_error(message: str) -> str:
-    return f"""<!doctype html>
-<html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Watermark Detection</title></head>
-<body>
-  <h1>Watermark Detection</h1>
-  <p>{escape(message)}</p>
-  <p><a href="/#streamers">Back to dashboard</a></p>
-</body>
-</html>
-"""
+    content = f'<section class="notice danger"><h2>Detection failed</h2><p>{escape(message)}</p><a class="button secondary" href="/tools">Back to tools</a></section>'
+    return render_dashboard_shell(
+        active="tools",
+        title="Watermark Detection",
+        subtitle="The uploaded media could not be analyzed.",
+        content=content,
+        app_version=APP_VERSION,
+    )
 
 
 def render_config_row(name: str, value: Any) -> str:
@@ -13795,7 +14936,7 @@ def render_cleanup_fragments_action(stream: StreamStatus) -> str:
     )
 
 
-def render_delete_stream_action(stream: StreamStatus) -> str:
+def render_delete_stream_action(stream: StreamStatus, *, use_dialog: bool = False) -> str:
     if stream.status in STREAM_DELETE_BLOCKED_STATUSES:
         return ""
     confirmation = (
@@ -13803,9 +14944,14 @@ def render_delete_stream_action(stream: StreamStatus) -> str:
         if stream.status == "detected"
         else "Delete this stream and all downloaded files? This cannot be undone."
     )
+    confirmation_attr = (
+        f'data-confirm="{escape(confirmation, quote=True)}" data-confirm-label="Delete stream"'
+        if use_dialog
+        else f'onsubmit="return confirm(\'{escape(confirmation, quote=True)}\');"'
+    )
     return (
         '<form class="inline-form stream-delete-form" method="post" action="/delete-stream" '
-        f'onsubmit="return confirm(\'{escape(confirmation, quote=True)}\');">'
+        f'{confirmation_attr}>'
         f'<input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">'
         f'<input type="hidden" name="confirm_delete" value="{STREAM_DELETE_CONFIRM_VALUE}">'
         '<button class="download action-button danger-action" type="submit" '
@@ -14018,7 +15164,7 @@ def render_file_action(file: FileStatus) -> str:
             '<form class="inline-form" method="post" '
             f'action="{escape(file.watermark_delete_url, quote=True)}">'
             f'<input type="hidden" name="copy_id" value="{escape(file.watermark_copy_id, quote=True)}">'
-            '<button class="download action-button" type="submit">Delete</button>'
+            '<button class="download action-button" type="submit" data-confirm="Delete this watermarked copy?" data-confirm-label="Delete copy">Delete</button>'
             '</form>'
         )
     if file.refresh_chat_status == "running":
@@ -14162,7 +15308,7 @@ def render_file_action(file: FileStatus) -> str:
                 '<form class="inline-form" method="post" '
                 f'action="{escape(copy.delete_url, quote=True)}">'
                 f'<input type="hidden" name="copy_id" value="{escape(copy.copy_id, quote=True)}">'
-                '<button class="download action-button" type="submit">Delete copy</button>'
+                '<button class="download action-button" type="submit" data-confirm="Delete this watermarked copy?" data-confirm-label="Delete copy">Delete copy</button>'
                 '</form>'
             )
     if not actions:

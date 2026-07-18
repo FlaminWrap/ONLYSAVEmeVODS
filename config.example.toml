@@ -58,7 +58,8 @@ live_from_start = true
 record_live_chat = false
 
 # After a stream ends, create a separate MP4 with the original video on the left
-# and rendered live chat on the right. This implies record_live_chat.
+# and rendered live chat on the right. Kick renders use 60 fps; other platforms
+# use 30 fps to reduce render time. This implies record_live_chat.
 render_live_chat_video = false
 
 # Worker processes for chat panel frame rendering. 0 uses all CPU cores,

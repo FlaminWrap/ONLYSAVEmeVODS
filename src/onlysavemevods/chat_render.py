@@ -37,13 +37,32 @@ CHAT_MAX_MESSAGE_LENGTH = 280
 CHAT_MESSAGE_MAX_LINES = 6
 CHAT_PANEL_TEXT_SIZE = 26
 CHAT_PANEL_EMOJI_SIZE = 30
-CHAT_PANEL_FPS = 60
+DEFAULT_CHAT_RENDER_FPS = 30
+KICK_CHAT_RENDER_FPS = 60
+# Retained as the maximum animation cadence for compatibility with callers that
+# use this constant when preparing Kick emote animation steps.
+CHAT_PANEL_FPS = KICK_CHAT_RENDER_FPS
 CHAT_ANIMATION_FRAME_SECONDS = 1 / CHAT_PANEL_FPS
 EMOJI_ANIMATION_DEFAULT_DURATION_MS = 100
 EMOJI_ANIMATION_MIN_DURATION_MS = 17
 EMOJI_ANIMATION_MAX_FRAMES = 96
 KICK_EMOTE_RE = re.compile(r"\[emote:(?P<id>\d+):(?P<name>[^\]\r\n]+)\]")
 KICK_EMOTE_URL_TEMPLATE = "https://files.kick.com/emotes/{emote_id}/fullsize"
+
+
+def chat_render_fps_for_platform(platform: str) -> int:
+    return (
+        KICK_CHAT_RENDER_FPS
+        if platform.strip().casefold() == "kick"
+        else DEFAULT_CHAT_RENDER_FPS
+    )
+
+
+def chat_render_platform_from_video_id(video_id: str) -> str:
+    platform, separator, _raw_id = video_id.partition(":")
+    if separator and platform.strip():
+        return platform.strip().casefold()
+    return "youtube"
 
 CHAT_RENDERER_KEYS = {
     "liveChatMembershipItemRenderer",
@@ -924,6 +943,7 @@ def render_chat_panel_video(
     panel_workers: int = 0,
     use_nvenc: bool = False,
     nvenc_device: str = "",
+    frame_rate: int = DEFAULT_CHAT_RENDER_FPS,
     progress_callback: ProgressCallback | None = None,
 ) -> bool:
     def emit(phase: str, progress: float | None = None) -> None:
@@ -938,6 +958,8 @@ def render_chat_panel_video(
 
     if duration_seconds <= 0:
         raise ChatPanelRenderError("Chat panel duration must be positive")
+    if frame_rate <= 0:
+        raise ChatPanelRenderError("Chat panel frame rate must be positive")
 
     emit("Preparing chat panel", 0.02)
     started_at = time.monotonic()
@@ -945,7 +967,7 @@ def render_chat_panel_video(
     LOGGER.info(
         "Rendering chat panel video output=%s entries=%d duration=%.2fs "
         "panel=%sx%s configured_workers=%d resolved_workers=%d encoder=%s "
-        "nvenc_device=%s",
+        "nvenc_device=%s fps=%d",
         output_file,
         len(entries),
         duration_seconds,
@@ -955,6 +977,7 @@ def render_chat_panel_video(
         resolved_workers,
         chat_render_video_encoder_name(use_nvenc),
         nvenc_device or "default",
+        frame_rate,
     )
     resolved_cache_dir = cache_dir or output_file.parent / ".emoji-cache"
     cache = EmojiImageCache(resolved_cache_dir)
@@ -975,8 +998,17 @@ def render_chat_panel_video(
                 segments,
                 clock_origin_us,
             )
-        animation_steps = chat_animation_steps_for_entries(entries, cache)
-        segments = split_chat_panel_segments_for_animations(segments, animation_steps=animation_steps)
+        animation_frame_seconds = 1 / frame_rate
+        animation_steps = chat_animation_steps_for_entries(
+            entries,
+            cache,
+            minimum_frame_seconds=animation_frame_seconds,
+        )
+        segments = split_chat_panel_segments_for_animations(
+            segments,
+            frame_seconds=animation_frame_seconds,
+            animation_steps=animation_steps,
+        )
         if not segments:
             segments = [(0.0, duration_seconds, [])]
         LOGGER.info(
@@ -1034,7 +1066,7 @@ def render_chat_panel_video(
             "-vf",
             "format=yuv420p",
             "-r",
-            str(CHAT_PANEL_FPS),
+            str(frame_rate),
             *chat_render_video_encoder_args(
                 use_nvenc=use_nvenc,
                 quality=18,
@@ -1296,6 +1328,8 @@ def prewarm_emoji_cache(entries: list[ChatEntry], cache: "EmojiImageCache") -> i
 def chat_animation_steps_for_entries(
     entries: list[ChatEntry],
     cache: "EmojiImageCache",
+    *,
+    minimum_frame_seconds: float = CHAT_ANIMATION_FRAME_SECONDS,
 ) -> dict[tuple[str, str], float]:
     steps: dict[tuple[str, str], float] = {}
     seen: set[tuple[str, str]] = set()
@@ -1309,7 +1343,7 @@ def chat_animation_steps_for_entries(
             seen.add(key)
             step_seconds = cache.frame_step_seconds(token.image_url, token.image_key)
             if step_seconds > 0:
-                steps[key] = step_seconds
+                steps[key] = max(minimum_frame_seconds, step_seconds)
     return steps
 
 
@@ -1877,7 +1911,7 @@ class EmojiImageCache:
     def get_frame(self, url: str, key: str = "", at_seconds: float = 0.0) -> Any | None:
         if not url:
             return None
-        cache_key = key or url
+        cache_key = url
         cached = self.memory.get(cache_key)
         if cached is None:
             cached = self._load(url, cache_key)
@@ -1890,7 +1924,7 @@ class EmojiImageCache:
     def frame_step_seconds(self, url: str, key: str = "") -> float:
         if not url:
             return 0.0
-        cache_key = key or url
+        cache_key = url
         cached = self.memory.get(cache_key)
         if cached is None:
             cached = self._load(url, cache_key)
@@ -1942,10 +1976,7 @@ class EmojiImageCache:
             return None
 
         if blob_path is not None:
-            try:
-                blob_path.write_bytes(data)
-            except OSError:
-                pass
+            self._write_cache_bytes(blob_path, data)
         return data
 
     def _decode_image(self, data: bytes) -> CachedEmojiImage | None:
@@ -1982,9 +2013,27 @@ class EmojiImageCache:
         if path is None:
             return
         try:
-            image.save(path)
+            payload = BytesIO()
+            image.save(payload, format="PNG")
         except OSError:
-            pass
+            return
+        self._write_cache_bytes(path, payload.getvalue())
+
+    def _write_cache_bytes(self, path: Path, data: bytes) -> None:
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                dir=path.parent,
+                delete=False,
+            ) as temporary:
+                temporary.write(data)
+                temporary_path = Path(temporary.name)
+            temporary_path.replace(path)
+        except OSError:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def _cache_path(self, cache_key: str) -> Path | None:
         if self.cache_dir is None:
@@ -2306,6 +2355,7 @@ def build_render_chat_file_process_command(
     overwrite: bool = False,
     nice: bool = True,
     progress_file: Path | None = None,
+    platform: str = "",
 ) -> list[str]:
     command = [
         python_executable,
@@ -2323,6 +2373,8 @@ def build_render_chat_file_process_command(
     ]
     if progress_file is not None:
         command.extend(["--progress-file", str(progress_file)])
+    if platform.strip():
+        command.extend(["--platform", platform.strip().casefold()])
     if overwrite:
         command.append("--overwrite")
     nice_path = shutil.which("nice") if nice else None
@@ -2550,6 +2602,8 @@ def render_chat_video_file(
     use_nvenc: bool = False,
     nvenc_device: str = "",
     nvenc_devices: Sequence[str] | None = None,
+    platform: str = "",
+    emoji_cache_dir: Path | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> Path:
     def emit(phase: str, progress: float | None = None) -> None:
@@ -2568,6 +2622,7 @@ def render_chat_video_file(
         candidate_devices,
         output_file,
     )
+    frame_rate = chat_render_fps_for_platform(platform)
     temp_output = output_file.with_name(
         f"{output_file.stem}.rendering{output_file.suffix}"
     )
@@ -2582,13 +2637,15 @@ def render_chat_video_file(
     emit("Parsing live chat", 0.04)
     LOGGER.info(
         "Starting chat video %s media=%s chat=%s output=%s encoder=%s "
-        "nvenc_device=%s",
+        "nvenc_device=%s platform=%s fps=%d",
         "regeneration" if overwrite else "render",
         media_file,
         chat_file,
         output_file,
         chat_render_video_encoder_name(use_nvenc),
         selected_nvenc_device or "default",
+        platform.strip().casefold() or "default",
+        frame_rate,
     )
     try:
         entries = parse_live_chat_file(chat_file)
@@ -2659,10 +2716,11 @@ def render_chat_video_file(
                     panel_file,
                     duration,
                     ffmpeg_path,
-                    output_file.parent / ".emoji-cache",
+                    emoji_cache_dir,
                     panel_workers,
                     use_nvenc,
                     selected_nvenc_device,
+                    frame_rate,
                     progress_callback=lambda phase, progress: emit(
                         phase,
                         0.18 + 0.52 * (progress if progress is not None else 0.0),
@@ -2676,6 +2734,7 @@ def render_chat_video_file(
                     layout,
                     use_nvenc=use_nvenc,
                     nvenc_device=selected_nvenc_device,
+                    frame_rate=frame_rate,
                 )
                 emit("Preparing final chat video merge", 0.72)
                 LOGGER.info(
@@ -2705,6 +2764,7 @@ def render_chat_video_file(
                     layout,
                     use_nvenc=use_nvenc,
                     nvenc_device=selected_nvenc_device,
+                    frame_rate=frame_rate,
                 )
         else:
             emit("Writing subtitle fallback", 0.45)
@@ -2722,6 +2782,7 @@ def render_chat_video_file(
                 layout,
                 use_nvenc=use_nvenc,
                 nvenc_device=selected_nvenc_device,
+                frame_rate=frame_rate,
             )
 
         emit("Encoding final chat video", 0.78)
@@ -2780,12 +2841,15 @@ def build_chat_video_command(
     *,
     use_nvenc: bool = False,
     nvenc_device: str = "",
+    frame_rate: int = DEFAULT_CHAT_RENDER_FPS,
 ) -> list[str]:
+    if frame_rate <= 0:
+        raise ValueError("chat render frame rate must be positive")
     layout = layout or default_chat_layout()
     escaped_ass = escape_ffmpeg_filter_path(str(ass_file))
     filter_complex = (
-        f"[0:v]setsar=1,pad={layout.video_width}:{layout.video_height}:0:0:black[v];"
-        f"color=c=0x111820:s={layout.panel_width}x{layout.video_height}:r=30[panel];"
+        f"[0:v]fps={frame_rate},setsar=1,pad={layout.video_width}:{layout.video_height}:0:0:black[v];"
+        f"color=c=0x111820:s={layout.panel_width}x{layout.video_height}:r={frame_rate}[panel];"
         "[v][panel]hstack=inputs=2[base];"
         f"[base]subtitles=filename='{escaped_ass}'[outv]"
     )
@@ -2803,6 +2867,8 @@ def build_chat_video_command(
         "[outv]",
         "-map",
         "0:a?",
+        "-r",
+        str(frame_rate),
         *chat_render_video_encoder_args(
             use_nvenc=use_nvenc,
             quality=23,
@@ -2826,11 +2892,14 @@ def build_chat_panel_merge_command(
     *,
     use_nvenc: bool = False,
     nvenc_device: str = "",
+    frame_rate: int = DEFAULT_CHAT_RENDER_FPS,
 ) -> list[str]:
+    if frame_rate <= 0:
+        raise ValueError("chat render frame rate must be positive")
     layout = layout or default_chat_layout()
     filter_complex = (
-        f"[0:v]setsar=1,pad={layout.video_width}:{layout.video_height}:0:0:black[v];"
-        "[1:v]setsar=1[panel];"
+        f"[0:v]fps={frame_rate},setsar=1,pad={layout.video_width}:{layout.video_height}:0:0:black[v];"
+        f"[1:v]fps={frame_rate},setsar=1[panel];"
         "[v][panel]hstack=inputs=2[outv]"
     )
     return [
@@ -2849,6 +2918,8 @@ def build_chat_panel_merge_command(
         "[outv]",
         "-map",
         "0:a?",
+        "-r",
+        str(frame_rate),
         *chat_render_video_encoder_args(
             use_nvenc=use_nvenc,
             quality=23,

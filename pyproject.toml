@@ -43,6 +43,8 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 onlysavemevods = [
+  "assets/*.css",
+  "assets/*.js",
   "assets/favicons/*",
   "assets/platforms/*.svg",
 ]

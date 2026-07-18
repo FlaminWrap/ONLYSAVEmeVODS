@@ -11,6 +11,7 @@ from onlysavemevods.chat_render import (
     ASS_CHAT_TEXT_COLOR,
     ASS_EMOJI_COLORS,
     build_chat_panel_merge_command,
+    build_render_chat_file_process_command,
     build_chat_video_command,
     ChatEntry,
     ChatToken,
@@ -18,6 +19,10 @@ from onlysavemevods.chat_render import (
     CHAT_PANEL_EMOJI_SIZE,
     CHAT_PANEL_FPS,
     CHAT_PANEL_TEXT_SIZE,
+    DEFAULT_CHAT_RENDER_FPS,
+    KICK_CHAT_RENDER_FPS,
+    chat_render_fps_for_platform,
+    chat_render_platform_from_video_id,
     choose_chat_render_nvenc_device,
     detect_nvidia_devices,
     EmojiImageCache,
@@ -52,6 +57,19 @@ from onlysavemevods.chat_render import (
 
 
 class ChatRenderTests(unittest.TestCase):
+    def test_chat_render_frame_rate_is_platform_aware(self) -> None:
+        self.assertEqual(chat_render_fps_for_platform("kick"), KICK_CHAT_RENDER_FPS)
+        self.assertEqual(chat_render_fps_for_platform("KICK"), KICK_CHAT_RENDER_FPS)
+        self.assertEqual(chat_render_fps_for_platform("youtube"), DEFAULT_CHAT_RENDER_FPS)
+        self.assertEqual(chat_render_fps_for_platform("twitch"), DEFAULT_CHAT_RENDER_FPS)
+        self.assertEqual(chat_render_fps_for_platform("rumble"), DEFAULT_CHAT_RENDER_FPS)
+        self.assertEqual(chat_render_fps_for_platform(""), DEFAULT_CHAT_RENDER_FPS)
+
+    def test_chat_render_platform_is_derived_from_video_id(self) -> None:
+        self.assertEqual(chat_render_platform_from_video_id("kick:stream-1"), "kick")
+        self.assertEqual(chat_render_platform_from_video_id("rumble:stream-1"), "rumble")
+        self.assertEqual(chat_render_platform_from_video_id("LIVEVIDEO01"), "youtube")
+
     def test_resolve_chat_render_panel_workers_uses_all_cpus(self) -> None:
         self.assertEqual(resolve_chat_render_panel_workers(0, cpu_count=16), 16)
         self.assertEqual(resolve_chat_render_panel_workers(0, cpu_count=2), 2)
@@ -501,6 +519,25 @@ class ChatRenderTests(unittest.TestCase):
         self.assertLess(second_pixel[0], 80)
         self.assertGreater(second_pixel[2], 200)
 
+    def test_emoji_cache_is_reused_across_render_instances(self) -> None:
+        with TemporaryDirectory() as tmp:
+            from PIL import Image
+
+            root = Path(tmp)
+            emoji_path = root / "emoji.png"
+            cache_dir = root / "global-cache"
+            Image.new("RGBA", (12, 12), (40, 180, 90, 255)).save(emoji_path)
+            emoji_url = emoji_path.as_uri()
+
+            first = EmojiImageCache(cache_dir).get(emoji_url, "stream-one-key")
+            emoji_path.unlink()
+            second = EmojiImageCache(cache_dir).get(emoji_url, "stream-two-key")
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        assert second is not None
+        self.assertEqual(second.getpixel((3, 3)), (40, 180, 90, 255))
+
     def test_render_chat_panel_frame_uses_animation_time_for_emoji_images(self) -> None:
         with TemporaryDirectory() as tmp:
             from PIL import Image
@@ -664,6 +701,7 @@ class ChatRenderTests(unittest.TestCase):
 
             concat_file = Path(command[command.index("-i") + 1])
             captured["concat"] = concat_file.read_text(encoding="utf-8")
+            captured["command"] = command
             Path(command[-1]).write_bytes(b"panel video")
 
             class Result:
@@ -696,6 +734,9 @@ class ChatRenderTests(unittest.TestCase):
             concat = str(captured["concat"])
             self.assertEqual(captured["workers"], 2)
             self.assertLess(concat.index("frame-000000.png"), concat.index("frame-000001.png"))
+            command = captured["command"]
+            assert isinstance(command, list)
+            self.assertEqual(command[command.index("-r") + 1], str(DEFAULT_CHAT_RENDER_FPS))
             self.assertEqual(output_file.read_bytes(), b"panel video")
 
     def test_panel_emoji_uses_fixed_30px_size(self) -> None:
@@ -811,6 +852,7 @@ class ChatRenderTests(unittest.TestCase):
         self.assertIn(str(output_file), command)
         self.assertIn("-filter_complex", command)
         filter_complex = command[command.index("-filter_complex") + 1]
+        self.assertIn(f"fps={DEFAULT_CHAT_RENDER_FPS}", filter_complex)
         self.assertNotIn("scale=", filter_complex)
         self.assertIn("pad=1280:720:0:0:black", filter_complex)
         self.assertIn("color=c=0x111820:s=480x720", filter_complex)
@@ -818,6 +860,21 @@ class ChatRenderTests(unittest.TestCase):
         self.assertIn("subtitles=filename=", filter_complex)
         self.assertIn("libx264", command)
         self.assertNotIn("h264_nvenc", command)
+        self.assertEqual(command[command.index("-r") + 1], str(DEFAULT_CHAT_RENDER_FPS))
+
+    def test_kick_chat_video_command_stays_at_60_fps(self) -> None:
+        command = build_chat_video_command(
+            "ffmpeg",
+            Path("/downloads/Kick/stream.mp4"),
+            Path("/downloads/Kick/stream.ass"),
+            Path("/downloads/Kick/stream - chat.mp4"),
+            frame_rate=KICK_CHAT_RENDER_FPS,
+        )
+
+        filter_complex = command[command.index("-filter_complex") + 1]
+        self.assertIn(f"fps={KICK_CHAT_RENDER_FPS}", filter_complex)
+        self.assertIn(f"r={KICK_CHAT_RENDER_FPS}", filter_complex)
+        self.assertEqual(command[command.index("-r") + 1], str(KICK_CHAT_RENDER_FPS))
 
     def test_chat_panel_merge_command_keeps_source_video_size(self) -> None:
         media_file = Path("/downloads/Example/LIVEVIDEO01/Live [ID].mp4")
@@ -836,9 +893,24 @@ class ChatRenderTests(unittest.TestCase):
         self.assertIn(str(media_file), command)
         self.assertIn(str(panel_file), command)
         filter_complex = command[command.index("-filter_complex") + 1]
+        self.assertEqual(filter_complex.count(f"fps={DEFAULT_CHAT_RENDER_FPS}"), 2)
         self.assertIn("pad=1920:1080:0:0:black", filter_complex)
         self.assertIn("hstack=inputs=2", filter_complex)
         self.assertNotIn("subtitles=filename=", filter_complex)
+
+    def test_isolated_render_command_carries_platform(self) -> None:
+        command = build_render_chat_file_process_command(
+            "python",
+            Path("/app/config.toml"),
+            Path("/downloads/stream.mp4"),
+            Path("/downloads/stream.live_chat.json"),
+            Path("/downloads/stream - chat.mp4"),
+            nice=False,
+            platform="KICK",
+        )
+
+        self.assertIn("--platform", command)
+        self.assertEqual(command[command.index("--platform") + 1], "kick")
 
     def test_chat_video_command_can_use_nvenc_device(self) -> None:
         media_file = Path("/downloads/Example/LIVEVIDEO01/Live [ID].mp4")
@@ -910,12 +982,14 @@ class ChatRenderTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            captured: dict[str, list[str]] = {}
 
             class FakeProcess:
                 returncode: int | None = None
 
                 def __init__(self, command: list[str], **_kwargs: object) -> None:
                     self.command = command
+                    captured["command"] = command
 
                 def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
                     self.returncode = 0
@@ -935,10 +1009,15 @@ class ChatRenderTests(unittest.TestCase):
                     chat_file,
                     output_file=output_file,
                     overwrite=True,
+                    platform="kick",
                 )
 
             self.assertEqual(result, output_file)
             self.assertEqual(output_file.read_text(encoding="utf-8"), "new chat render")
+            command = captured["command"]
+            filter_complex = command[command.index("-filter_complex") + 1]
+            self.assertIn(f"fps={KICK_CHAT_RENDER_FPS}", filter_complex)
+            self.assertEqual(command[command.index("-r") + 1], str(KICK_CHAT_RENDER_FPS))
 
     def test_render_chat_video_file_keeps_waiting_while_output_grows(self) -> None:
         with TemporaryDirectory() as tmp:

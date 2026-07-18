@@ -38,6 +38,8 @@ class CliRenderChatTests(unittest.TestCase):
             captured: dict[str, object] = {}
 
             def fake_render_chat_video_file(*_args: object, **kwargs: object) -> Path:
+                captured["platform"] = kwargs.get("platform")
+                captured["emoji_cache_dir"] = kwargs.get("emoji_cache_dir")
                 panel_file = output_file.with_name(f"{output_file.stem}.panel{output_file.suffix}")
                 panel_file.write_bytes(b"x" * 2048)
                 progress_callback = kwargs.get("progress_callback")
@@ -59,6 +61,8 @@ class CliRenderChatTests(unittest.TestCase):
                         str(chat_file),
                         "--output",
                         str(output_file),
+                        "--platform",
+                        "kick",
                         "--progress-file",
                         str(progress_file),
                     ]
@@ -74,6 +78,8 @@ class CliRenderChatTests(unittest.TestCase):
         self.assertEqual(during["chat_name"], "media.live_chat.json")
         self.assertEqual(during["output_name"], "media - chat.mp4")
         self.assertEqual(during["outputs"]["panel"]["size_bytes"], 2048)
+        self.assertEqual(captured["platform"], "kick")
+        self.assertEqual(captured["emoji_cache_dir"], root / "state" / "chat_emoji_cache")
         self.assertEqual(final["phase"], "Complete")
         self.assertEqual(final["progress"], 1.0)
 

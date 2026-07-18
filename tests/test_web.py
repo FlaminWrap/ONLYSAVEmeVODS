@@ -1766,6 +1766,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(job.status, "done")
         render.assert_called_once()
         self.assertEqual(render.call_args.kwargs["timeout_seconds"], 7200.0)
+        self.assertEqual(render.call_args.kwargs["platform"], "youtube")
+        self.assertEqual(
+            render.call_args.kwargs["emoji_cache_dir"],
+            config.chat_emoji_cache_dir,
+        )
 
     def test_inactive_configured_streamers_render_collapsed_by_default(self) -> None:
         with TemporaryDirectory() as tmp:

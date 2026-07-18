@@ -117,6 +117,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_chat.add_argument("--chat", required=True, help="Live chat JSON file.")
     render_chat.add_argument("--output", required=True, help="Output chat video file.")
     render_chat.add_argument(
+        "--platform",
+        default="",
+        help="Source platform used to select the chat render frame rate.",
+    )
+    render_chat.add_argument(
         "--progress-file",
         help="Internal JSON file used by the web UI to read isolated render progress.",
     )
@@ -332,6 +337,8 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
             timeout_seconds=chat_render_timeout_seconds(config),
             use_nvenc=config.chat_render_use_nvenc,
             nvenc_device=nvenc_device,
+            platform=args.platform,
+            emoji_cache_dir=config.chat_emoji_cache_dir,
             progress_callback=report_progress,
         )
     except Exception:  # noqa: BLE001 - command should return a process failure.

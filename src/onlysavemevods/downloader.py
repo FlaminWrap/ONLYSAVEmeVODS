@@ -19,6 +19,7 @@ from .chat_render import (
     build_chat_panel_merge_command,
     build_chat_video_command,
     chat_layout_for_video,
+    chat_render_fps_for_platform,
     chat_video_output_file,
     choose_chat_render_nvenc_device,
     ffprobe_path_for,
@@ -1475,6 +1476,7 @@ class DownloadManager:
             chat_file,
             output_file,
             segment_index,
+            stream.platform,
         )
         if subprocess_result is not None:
             finish_tracked_job(
@@ -1504,6 +1506,7 @@ class DownloadManager:
             self.config.chat_render_nvenc_devices,
             segment_index - 1,
         )
+        frame_rate = chat_render_fps_for_platform(stream.platform)
         if self.config.chat_render_use_nvenc:
             self.logger.info(
                 "Selected NVENC device for chat render segment=%03d device=%s",
@@ -1601,10 +1604,11 @@ class DownloadManager:
                     panel_file,
                     duration,
                     self.config.ffmpeg_path,
-                    output_file.parent / ".emoji-cache",
+                    self.config.chat_emoji_cache_dir,
                     self.config.chat_render_panel_workers,
                     self.config.chat_render_use_nvenc,
                     nvenc_device,
+                    frame_rate,
                 )
                 command = build_chat_panel_merge_command(
                     self.config.ffmpeg_path,
@@ -1614,6 +1618,7 @@ class DownloadManager:
                     layout,
                     use_nvenc=self.config.chat_render_use_nvenc,
                     nvenc_device=nvenc_device,
+                    frame_rate=frame_rate,
                 )
                 self.logger.info(
                     "Merging rendered chat panel segment=%03d media=%s panel=%s",
@@ -1660,6 +1665,7 @@ class DownloadManager:
                     layout,
                     use_nvenc=self.config.chat_render_use_nvenc,
                     nvenc_device=nvenc_device,
+                    frame_rate=frame_rate,
                 )
         else:
             try:
@@ -1687,6 +1693,7 @@ class DownloadManager:
                 layout,
                 use_nvenc=self.config.chat_render_use_nvenc,
                 nvenc_device=nvenc_device,
+                frame_rate=frame_rate,
             )
         self.logger.info(
             "Rendering chat video for segment=%03d as %s",
@@ -1788,6 +1795,7 @@ class DownloadManager:
         chat_file: Path,
         output_file: Path,
         segment_index: int,
+        platform: str = "",
     ) -> bool | None:
         if self.config.config_path is None:
             return None
@@ -1798,6 +1806,7 @@ class DownloadManager:
             media_file,
             chat_file,
             output_file,
+            platform=platform,
         )
         self.logger.info(
             "Starting isolated chat render process segment=%03d media=%s chat=%s "
