@@ -153,7 +153,9 @@ inherited default**, **Always run for this streamer**, or **Never run for this
 streamer**. Recording finalization always runs. Streamer choices also apply to
 manual VOD imports, and disabling an action does not delete existing output.
 
-Recent streams use expandable sections:
+The complete stream history is available directly on the streamer page, with
+search, platform/date filters, page-size choices, and Previous/Next navigation.
+Each stream uses an expandable section:
 
 - **Files** lists finalized media and sidecars, with actions such as Download,
   Transcribe/Retranscribe, Render chat, Refresh chat, Watermark, and Delete copy

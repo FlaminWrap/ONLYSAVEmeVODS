@@ -305,7 +305,7 @@ STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
 STREAMER_JOB_PAGE_SIZE = 5
-STREAMER_STREAM_PAGE_SIZE = 5
+STREAMER_STREAM_PAGE_SIZE = 10
 STREAMER_STREAM_PAGE_SIZE_OPTIONS = (5, 10, 25, 50)
 STREAMER_STREAM_SEARCH_MAX_LENGTH = 256
 CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
@@ -684,6 +684,22 @@ class StreamerStatStatus:
     jobs: list[JobStatus]
     streams: list[StreamStatus]
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StreamerStreamPage:
+    streamer: str
+    page: int
+    page_size: int
+    page_count: int
+    streamer_total: int
+    total: int
+    available_platforms: list[str]
+    platform: str
+    search: str
+    from_date: str
+    to_date: str
+    streams: list[StreamStatus]
 
 
 @dataclass(frozen=True, slots=True)
@@ -2197,6 +2213,23 @@ def build_streamer_stream_page_payload(
     config: BotConfig,
     params: dict[str, list[str]],
 ) -> dict[str, Any]:
+    stream_page = build_streamer_stream_page(config, params)
+    return {
+        "streamer": stream_page.streamer,
+        "page": stream_page.page,
+        "page_size": stream_page.page_size,
+        "page_count": stream_page.page_count,
+        "streamer_total": stream_page.streamer_total,
+        "total": stream_page.total,
+        "available_platforms": stream_page.available_platforms,
+        "streams": [asdict(stream) for stream in stream_page.streams],
+    }
+
+
+def build_streamer_stream_page(
+    config: BotConfig,
+    params: dict[str, list[str]],
+) -> StreamerStreamPage:
     streamer_name = first_query_value(params, "streamer").strip()
     if not streamer_name:
         raise ConfigError("streamer is required")
@@ -2289,16 +2322,20 @@ def build_streamer_stream_page_payload(
         )
         for record in page_records
     ]
-    return {
-        "streamer": streamer_name,
-        "page": page,
-        "page_size": page_size,
-        "page_count": page_count,
-        "streamer_total": len(streamer_records),
-        "total": total,
-        "available_platforms": available_platforms,
-        "streams": [asdict(stream) for stream in streams],
-    }
+    return StreamerStreamPage(
+        streamer=streamer_name,
+        page=page,
+        page_size=page_size,
+        page_count=page_count,
+        streamer_total=len(streamer_records),
+        total=total,
+        available_platforms=available_platforms,
+        platform=platform_filter,
+        search=search,
+        from_date=from_date,
+        to_date=to_date,
+        streams=streams,
+    )
 
 
 def stream_page_positive_int(
@@ -8627,7 +8664,19 @@ def render_admin_page(
         )
     elif page == "streamers":
         selected = first_query_value(params, "selected").strip()
-        content = render_admin_streamers(snapshot, selected=selected)
+        stream_page = (
+            build_streamer_stream_page(
+                config,
+                admin_streamer_stream_params(params, selected),
+            )
+            if selected
+            else None
+        )
+        content = render_admin_streamers(
+            snapshot,
+            selected=selected,
+            stream_page=stream_page,
+        )
         if not selected and snapshot_config_path(snapshot) != "-":
             actions = '<button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button>'
     elif page == "settings":
@@ -8667,7 +8716,15 @@ def render_admin_fragment(
         selected = first_query_value(params, "selected").strip()
         if selected:
             streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
-            body = render_admin_streamer_streams(streamer) if streamer is not None else '<div class="notice warning">Streamer is no longer available.</div>'
+            stream_page = build_streamer_stream_page(
+                config,
+                admin_streamer_stream_params(params, selected),
+            )
+            body = (
+                render_admin_streamer_streams(streamer, stream_page)
+                if streamer is not None
+                else '<div class="notice warning">Streamer is no longer available.</div>'
+            )
         else:
             body = render_admin_streamer_list(snapshot)
         revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
@@ -8772,9 +8829,14 @@ def render_admin_recent_jobs(jobs: list[JobStatus]) -> str:
     return f'<section class="section-stack"><div class="section-heading"><h2>Processing</h2><a href="/activity">All activity</a></div><div class="mobile-records" style="display:grid">{rows}</div></section>'
 
 
-def render_admin_streamers(snapshot: StatusSnapshot, *, selected: str) -> str:
+def render_admin_streamers(
+    snapshot: StatusSnapshot,
+    *,
+    selected: str,
+    stream_page: StreamerStreamPage | None = None,
+) -> str:
     if selected:
-        return render_admin_streamer_detail(snapshot, selected)
+        return render_admin_streamer_detail(snapshot, selected, stream_page)
     list_html = render_admin_streamer_list(snapshot)
     revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
     return f"""<div class="section-stack">
@@ -8844,13 +8906,20 @@ def render_admin_source_manager(sources: list[str], key: str) -> str:
 </div>"""
 
 
-def render_admin_streamer_detail(snapshot: StatusSnapshot, selected: str) -> str:
+def render_admin_streamer_detail(
+    snapshot: StatusSnapshot,
+    selected: str,
+    stream_page: StreamerStreamPage | None,
+) -> str:
     streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
     if streamer is None:
         return f'<section class="card empty-state"><h2>Streamer not found</h2><p>{escape(selected)} is not available in the current configuration or stream history.</p><a class="button secondary" href="/streamers">Back to streamers</a></section>'
     if streamer.needs_grouping:
         return f'<div class="section-stack"><a href="/streamers">← All streamers</a><section class="notice warning"><h2>{escape(streamer.name)} needs grouping</h2><p>Use the migration assistant to create a shared streamer identity for these legacy sources.</p><a class="button" href="/streamers#migrate-legacy">Open migration assistant</a></section></div>'
+    if stream_page is None:
+        raise ConfigError("stream page is required for a configured streamer")
     revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    fragment_url = admin_streamer_stream_url(stream_page, fragment=True)
     delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
       <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
     </form>"""
@@ -8862,8 +8931,8 @@ def render_admin_streamer_detail(snapshot: StatusSnapshot, selected: str) -> str
   </section>
   {render_admin_streamer_post_stream_form(streamer)}
   <section><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>
-  <section class="section-stack" data-fragment-url="/streamers?selected={quote(streamer.name, safe='')}&amp;fragment=streams" data-fragment-revision="{escape(revision, quote=True)}">
-    {render_admin_streamer_streams(streamer)}
+  <section class="section-stack" data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
+    {render_admin_streamer_streams(streamer, stream_page)}
   </section>
 </div>"""
 
@@ -8974,15 +9043,91 @@ def render_admin_streamer_optional_cards(streamer: StreamerStatStatus) -> str:
     ) + "</div>"
 
 
-def render_admin_streamer_streams(streamer: StreamerStatStatus) -> str:
-    if not streamer.streams:
-        return '<section class="card empty-state"><h2>Streams</h2><p>No streams have been seen for this streamer yet.</p></section>'
-    cards = "".join(render_admin_stream_detail(stream) for stream in streamer.streams[:10])
-    more = (
-        f'<div class="notice">Showing the 10 most recent of {streamer.stream_count} streams. Use the compatibility workspace for the complete paginated history. <a href="/status#streamers">Open complete history</a></div>'
-        if streamer.stream_count > 10 else ""
+def admin_streamer_stream_params(
+    params: dict[str, list[str]],
+    streamer_name: str,
+) -> dict[str, list[str]]:
+    stream_params = {
+        key: list(params[key])
+        for key in ("page", "page_size", "platform", "search", "from", "to")
+        if key in params
+    }
+    stream_params["streamer"] = [streamer_name]
+    return stream_params
+
+
+def admin_streamer_stream_url(
+    stream_page: StreamerStreamPage,
+    *,
+    page: int | None = None,
+    fragment: bool = False,
+) -> str:
+    query: list[tuple[str, str | int]] = [
+        ("selected", stream_page.streamer),
+        ("page", page if page is not None else stream_page.page),
+        ("page_size", stream_page.page_size),
+    ]
+    if stream_page.platform != "all":
+        query.append(("platform", stream_page.platform))
+    if stream_page.search:
+        query.append(("search", stream_page.search))
+    if stream_page.from_date:
+        query.append(("from", stream_page.from_date))
+    if stream_page.to_date:
+        query.append(("to", stream_page.to_date))
+    if fragment:
+        query.append(("fragment", "streams"))
+    return f"/streamers?{urlencode(query)}"
+
+
+def render_admin_streamer_streams(
+    streamer: StreamerStatStatus,
+    stream_page: StreamerStreamPage,
+) -> str:
+    platform_options = ['<option value="all">All platforms</option>']
+    platform_options.extend(
+        f'<option value="{escape(platform, quote=True)}"{" selected" if platform == stream_page.platform else ""}>{escape(SOURCE_PLATFORM_LABELS.get(platform, platform.title()))}</option>'
+        for platform in stream_page.available_platforms
     )
-    return f'<div class="section-heading"><h2>Recent streams</h2><span class="muted">{streamer.stream_count} total</span></div><div class="record-list">{cards}</div>{more}'
+    page_size_options = "".join(
+        f'<option value="{size}"{" selected" if size == stream_page.page_size else ""}>{size}</option>'
+        for size in STREAMER_STREAM_PAGE_SIZE_OPTIONS
+    )
+    filters = f"""<form class="card filter-bar stream-history-filters" method="get" action="/streamers">
+  <input type="hidden" name="selected" value="{escape(streamer.name, quote=True)}">
+  <label>Search<input type="search" name="search" maxlength="{STREAMER_STREAM_SEARCH_MAX_LENGTH}" value="{escape(stream_page.search, quote=True)}" placeholder="Title or stream ID"></label>
+  <label>Platform<select name="platform">{"".join(platform_options)}</select></label>
+  <label>From<input type="date" name="from" value="{escape(stream_page.from_date, quote=True)}"></label>
+  <label>To<input type="date" name="to" value="{escape(stream_page.to_date, quote=True)}"></label>
+  <label>Per page<select name="page_size">{page_size_options}</select></label>
+  <div class="button-row"><button class="button small secondary" type="submit">Apply filters</button><a class="button small ghost" href="/streamers?selected={quote(streamer.name, safe='')}">Reset</a></div>
+</form>"""
+    heading = f'<div class="section-heading"><h2>Streams</h2><span class="muted">{stream_page.streamer_total} total</span></div>'
+    if stream_page.streamer_total == 0:
+        return f'{heading}<section class="card empty-state"><p>No streams have been seen for this streamer yet.</p></section>'
+
+    if stream_page.total == 0:
+        return f'{heading}{filters}<section class="card empty-state"><p>No streams match these filters.</p><a class="button secondary" href="/streamers?selected={quote(streamer.name, safe='')}">Clear filters</a></section>'
+
+    start = (stream_page.page - 1) * stream_page.page_size + 1
+    end = min(stream_page.page * stream_page.page_size, stream_page.total)
+    cards = "".join(render_admin_stream_detail(stream) for stream in stream_page.streams)
+    previous = (
+        f'<a class="button small secondary" rel="prev" href="{escape(admin_streamer_stream_url(stream_page, page=stream_page.page - 1), quote=True)}">Previous</a>'
+        if stream_page.page > 1
+        else '<button class="button small secondary" type="button" disabled>Previous</button>'
+    )
+    following = (
+        f'<a class="button small secondary" rel="next" href="{escape(admin_streamer_stream_url(stream_page, page=stream_page.page + 1), quote=True)}">Next</a>'
+        if stream_page.page < stream_page.page_count
+        else '<button class="button small secondary" type="button" disabled>Next</button>'
+    )
+    pagination = f"""<nav class="stream-history-pagination" aria-label="Stream history pages">
+  <span class="muted">Showing {start}–{end} of {stream_page.total}</span>
+  <span class="muted">Page {stream_page.page} of {stream_page.page_count}</span>
+  <div class="button-row">{previous}{following}</div>
+</nav>"""
+    return f'{heading}{filters}{pagination}<div class="record-list">{cards}</div>{pagination}'
 
 
 def render_admin_stream_detail(stream: StreamStatus) -> str:

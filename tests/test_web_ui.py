@@ -6,11 +6,14 @@ import unittest
 from unittest.mock import patch
 
 from onlysavemevods.config import load_config, migrate_legacy_channels_to_streamer
+from onlysavemevods.models import LiveStream
+from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
     ConfigRevisionConflict,
     app_config_updates_from_json_values,
     build_admin_static_snapshot,
     config_file_revision,
+    render_admin_fragment,
     render_admin_page,
     render_admin_settings,
     safe_return_to,
@@ -130,6 +133,56 @@ class DashboardUiTests(unittest.TestCase):
         self.assertTrue(post_stream.stream_event_detection_enabled)
         self.assertFalse(post_stream.render_live_chat_video)
         self.assertIsNone(inherited)
+
+    def test_streamer_history_is_paginated_in_the_new_dashboard(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            state = StateStore(config.db_path)
+            for index in range(12):
+                state.upsert_vod_stream(
+                    LiveStream(
+                        video_id=f"kick:example:{index:02d}",
+                        url=f"https://kick.com/example?stream={index}",
+                        title=f"Example stream {index:02d}",
+                        channel="example",
+                        platform="kick",
+                        source="kick:example",
+                    )
+                )
+            state.close()
+
+            first_page = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+            second_page = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"], "page": ["2"]},
+            )
+            fragment, _revision = render_admin_fragment(
+                config,
+                "streamers",
+                {"selected": ["Example"], "page": ["2"]},
+            )
+
+        self.assertIn("Showing 1–10 of 12", first_page)
+        self.assertIn("Page 1 of 2", first_page)
+        self.assertIn('rel="next"', first_page)
+        self.assertNotIn("Open complete history", first_page)
+        self.assertNotIn("compatibility workspace for the complete", first_page)
+        self.assertIn("Showing 11–12 of 12", second_page)
+        self.assertIn("Page 2 of 2", second_page)
+        self.assertIn('rel="prev"', second_page)
+        self.assertIn("Showing 11–12 of 12", fragment)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:

@@ -394,6 +394,16 @@ button, a, input, select, textarea, summary { outline: none; }
 
 .filter-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: end; }
 .filter-bar label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+.stream-history-filters { box-shadow: none; }
+.stream-history-filters label:first-of-type { flex: 1 1 230px; }
+.stream-history-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 14px;
+  min-height: 40px;
+}
 .table-wrap { max-width: 100%; overflow: auto; border: 1px solid var(--border); border-radius: 9px; }
 table { width: 100%; border-collapse: collapse; background: var(--surface); }
 th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: left; vertical-align: top; }
@@ -524,6 +534,10 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .mobile-record dt { color: var(--muted); }
   .mobile-record dd { margin: 0; overflow-wrap: anywhere; }
   .dialog-actions .button { flex: 1; }
+  .stream-history-filters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stream-history-filters label:first-of-type, .stream-history-filters .button-row { grid-column: 1 / -1; }
+  .stream-history-filters .button { min-height: 44px; flex: 1; }
+  .stream-history-pagination .button { min-height: 44px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
