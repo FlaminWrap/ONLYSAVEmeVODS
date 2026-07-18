@@ -36,6 +36,7 @@ sources = [
 download_dir_name = "OUMB3rd"
 powerchat_enabled = true
 powerchat_username = "OUMB3rd"
+timezone = "Europe/London"
 
 [streamers."OUMB3rd".voice_detection]
 mode = "fixed"
@@ -148,10 +149,12 @@ config conflict; new records, uploads, processing jobs, and deletion remain
 explicit actions.
 
 Streamer details are divided into **Overview**, **Settings**, and **Powerchat**.
-Overview contains identity, sources, listener configuration, and stream history.
-Settings contains the automatic workflow and optional feature setup. Powerchat
-shows streamer-specific totals, hourly activity and supporter charts, streams,
-recent events, and scoped JSON/CSV exports.
+Overview contains identity, sources, and stream history. Settings contains the
+automatic workflow and optional feature setup. Powerchat contains the editable
+listener username, enabled state, and streamer time zone alongside
+streamer-specific totals, hourly activity and supporter charts, streams, recent
+events, and scoped JSON/CSV exports. **Use mine** fills the browser's IANA time
+zone; absolute support-event timestamps use the saved zone.
 
 Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
 voice identification, content events, and chat-video rendering, choose **App
@@ -217,8 +220,9 @@ override automatic voice matches.
 
 Powerchat aggregates every captured support event across all
 streams. Enable Powerchat per streamer first by setting `powerchat_enabled =
-true` and `powerchat_username = "name"` in the streamer Settings panel or in
-`config.toml`.
+true` and `powerchat_username = "name"` in the streamer **Powerchat** tab or in
+`config.toml`. The same tab accepts a validated IANA `timezone`, such as
+`Europe/London`, and saves changes without leaving the page.
 
 The dashboard shows:
 
@@ -572,11 +576,13 @@ scripts/uninstall-systemd.sh
   `twitch_ad_repair_scan_seconds = 0` to scan the whole file, or set
   `twitch_ad_repair_enabled = false` to disable the automatic job.
 - Powerchat support-event listening is a streamer setting. Enable
-  `powerchat_enabled = true` and set `powerchat_username` in the streamer manager
-  or in `[streamers."Name"]` to listen to both Powerchat websocket feeds while
-  that streamer is being recorded. Captured rows are written beside the media as
-  `<media>.powerchat-events.json`, shown in the stream Powerchat section, and tallied
-  as separate money totals and platform-unit totals such as Kick gifts. This is a
+  `powerchat_enabled = true` and set `powerchat_username` in the streamer
+  **Powerchat** tab or in `[streamers."Name"]` to listen to both Powerchat websocket
+  feeds while that streamer is being recorded. Set `timezone` to an IANA name to
+  control how its support-event dates are displayed. Captured rows are written
+  beside the media as `<media>.powerchat-events.json`, shown in the stream
+  Powerchat section, and tallied as separate money totals and platform-unit totals
+  such as Kick gifts. This is a
   best-effort unofficial integration, so unknown payloads are preserved in the
   sidecar for later parser fixes but are not counted. The top-level Powerchat
   dashboard has per-streamer cards, an overall breakdown, donations per hour,

@@ -10,6 +10,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from datetime import datetime
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -650,6 +651,7 @@ class StreamerStatus:
     stream_event_detection: dict[str, Any]
     stream_event_rules: list[dict[str, Any]]
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
+    timezone: str = "UTC"
 
 
 @dataclass(frozen=True, slots=True)
@@ -684,6 +686,7 @@ class StreamerStatStatus:
     jobs: list[JobStatus]
     streams: list[StreamStatus]
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
+    timezone: str = "UTC"
 
 
 @dataclass(frozen=True, slots=True)
@@ -2853,6 +2856,7 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
             download_dir_name=streamer.download_dir_name,
             powerchat_enabled=streamer.powerchat_enabled,
             powerchat_username=streamer.powerchat_username,
+            timezone=streamer.timezone,
             post_stream=post_stream_summary(config, streamer),
             voice_detection=(
                 voice_detection_config_summary(streamer.voice_detection)
@@ -2908,6 +2912,7 @@ def build_streamer_stats(
                 download_dir_name=streamer.download_dir_name or name,
                 powerchat_enabled=streamer.powerchat_enabled,
                 powerchat_username=streamer.powerchat_username,
+                timezone=streamer.timezone,
                 post_stream=post_stream_summary(config, streamer),
                 voice_detection=voice_detection,
                 speaker_label_count=len(streamer.speaker_labels),
@@ -2947,6 +2952,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 powerchat_enabled=False,
                 powerchat_username="",
+                timezone="UTC",
                 post_stream={},
                 voice_detection=voice_detection_summary_for_source_group(config, name, sources),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, sources),
@@ -2971,6 +2977,7 @@ def build_streamer_stats(
                 download_dir_name=name,
                 powerchat_enabled=False,
                 powerchat_username="",
+                timezone="UTC",
                 post_stream={},
                 voice_detection=voice_detection_summary_for_source_group(config, name, []),
                 speaker_label_count=speaker_label_count_for_source_group(config, name, []),
@@ -2993,6 +3000,7 @@ def streamer_stat_from_channel_status(
     download_dir_name: str,
     powerchat_enabled: bool,
     powerchat_username: str,
+    timezone: str,
     post_stream: dict[str, dict[str, Any]],
     voice_detection: str,
     speaker_label_count: int,
@@ -3014,6 +3022,7 @@ def streamer_stat_from_channel_status(
         download_dir_name=download_dir_name,
         powerchat_enabled=powerchat_enabled,
         powerchat_username=powerchat_username,
+        timezone=timezone,
         post_stream={key: dict(value) for key, value in post_stream.items()},
         configured=configured,
         needs_grouping=needs_grouping,
@@ -7034,7 +7043,13 @@ def update_streamer_from_json(
             values,
             expected_revision=str(payload.get("revision") or ""),
         )
-    allowed = {"sources", "download_dir_name", "powerchat_enabled", "powerchat_username"}
+    allowed = {
+        "sources",
+        "download_dir_name",
+        "powerchat_enabled",
+        "powerchat_username",
+        "timezone",
+    }
     unknown = sorted(str(key) for key in values if key not in allowed)
     if unknown:
         raise ConfigError(f"Unknown streamer setting: {unknown[0]}")
@@ -7047,6 +7062,7 @@ def update_streamer_from_json(
     raw_enabled = values.get("powerchat_enabled", configured.powerchat_enabled)
     powerchat_enabled = raw_enabled if isinstance(raw_enabled, bool) else form_bool(str(raw_enabled), "powerchat_enabled")
     powerchat_username = str(values.get("powerchat_username", configured.powerchat_username)).strip()
+    timezone = str(values.get("timezone", configured.timezone)).strip()
     expected_revision = str(payload.get("revision") or "")
     with CONFIG_UPDATE_LOCK:
         current_revision = config_file_revision(config)
@@ -7059,10 +7075,17 @@ def update_streamer_from_json(
             download_dir_name,
             powerchat_enabled,
             powerchat_username,
+            timezone,
         )
         reload_running_config(config)
         revision = config_file_revision(config)
-    saved = ["sources", "download_dir_name", "powerchat_enabled", "powerchat_username"] if changed else []
+    saved = [
+        "sources",
+        "download_dir_name",
+        "powerchat_enabled",
+        "powerchat_username",
+        "timezone",
+    ] if changed else []
     return mutation_response(
         ok=True,
         message="Streamer saved",
@@ -7335,13 +7358,33 @@ def _update_streamer_from_form_locked(
         return
     if action != "save":
         raise ConfigError("Unknown streamer action")
+    configured = config.streamers.get(streamer_name)
     sources = form_string_list(
-        first_query_value(params, "sources"),
+        first_query_value(params, "sources")
+        if "sources" in params
+        else "\n".join(configured.sources if configured is not None else []),
         "sources",
     )
-    download_dir_name = first_query_value(params, "download_dir_name").strip()
-    powerchat_enabled = query_flag(params, "powerchat_enabled")
-    powerchat_username = first_query_value(params, "powerchat_username").strip()
+    download_dir_name = (
+        first_query_value(params, "download_dir_name").strip()
+        if "download_dir_name" in params
+        else (configured.download_dir_name if configured is not None else "")
+    )
+    powerchat_enabled = (
+        query_flag(params, "powerchat_enabled")
+        if "powerchat_enabled" in params
+        else (configured.powerchat_enabled if configured is not None else False)
+    )
+    powerchat_username = (
+        first_query_value(params, "powerchat_username").strip()
+        if "powerchat_username" in params
+        else (configured.powerchat_username if configured is not None else "")
+    )
+    timezone = (
+        first_query_value(params, "timezone").strip()
+        if "timezone" in params
+        else (configured.timezone if configured is not None else "UTC")
+    )
     update_streamer_config(
         config.config_path,
         streamer_name,
@@ -7349,6 +7392,7 @@ def _update_streamer_from_form_locked(
         download_dir_name,
         powerchat_enabled,
         powerchat_username,
+        timezone,
     )
     reload_running_config(config)
 
@@ -8732,7 +8776,7 @@ def render_admin_fragment(
         else:
             body = render_admin_streamer_list(snapshot)
         revision = (
-            streamer_powerchat_revision(snapshot.powerchat_stats, selected)
+            streamer_powerchat_revision(snapshot.powerchat_stats, selected, streamer)
             if selected and tab == "powerchat" and streamer is not None
             else f"{snapshot.stream_revision}:{snapshot.job_revision}"
         )
@@ -8936,7 +8980,11 @@ def render_admin_streamer_detail(
         tab_content = f"""{render_admin_streamer_post_stream_form(streamer)}
   <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>"""
     elif tab == "powerchat":
-        revision = streamer_powerchat_revision(snapshot.powerchat_stats, streamer.name)
+        revision = streamer_powerchat_revision(
+            snapshot.powerchat_stats,
+            streamer.name,
+            streamer,
+        )
         powerchat_fragment_url = (
             "/streamers?"
             + urlencode(
@@ -9011,8 +9059,20 @@ def streamer_powerchat_stats(
     return result
 
 
-def streamer_powerchat_revision(stats: dict[str, Any], streamer_name: str) -> str:
-    payload = streamer_powerchat_stats(stats, streamer_name) or {}
+def streamer_powerchat_revision(
+    stats: dict[str, Any],
+    streamer_name: str,
+    streamer: StreamerStatStatus | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "dashboard": streamer_powerchat_stats(stats, streamer_name) or {},
+    }
+    if streamer is not None:
+        payload["listener"] = {
+            "enabled": streamer.powerchat_enabled,
+            "username": streamer.powerchat_username,
+            "timezone": streamer.timezone,
+        }
     return hashlib.sha256(json_script_payload(payload).encode()).hexdigest()[:20]
 
 
@@ -9024,13 +9084,45 @@ def render_admin_streamer_powerchat(
     enabled_class = "good" if streamer.powerchat_enabled else "warning"
     enabled_label = "Listening" if streamer.powerchat_enabled else "Not enabled"
     selected = quote(streamer.name, safe="")
-    setup = f"""<section class="card">
-  <div class="card-header"><div><h2>Powerchat</h2><p>Support activity captured for {escape(streamer.name)} across all recorded streams.</p></div><span class="status-badge {enabled_class}">{enabled_label}</span></div>
-  <div class="button-row"><a class="button small secondary" href="/streamers?selected={selected}">Configure listener</a><a class="button small secondary" href="/powerchat">All streamers</a></div>
+    dom_id = streamer_dom_id(streamer.name)
+    return_to = escape(
+        f"/streamers?selected={selected}&tab=powerchat",
+        quote=True,
+    )
+    timezone_options = "".join(
+        f'<option value="{escape(value, quote=True)}"></option>'
+        for value in (
+            "UTC",
+            "Europe/London",
+            "Europe/Paris",
+            "America/New_York",
+            "America/Chicago",
+            "America/Denver",
+            "America/Los_Angeles",
+            "Asia/Tokyo",
+            "Australia/Sydney",
+        )
+    )
+    setup = f"""<section class="card section-stack powerchat-listener-card">
+  <div class="card-header"><div><h2>Powerchat listener</h2><p>Configure support-event capture and local timestamps for {escape(streamer.name)}. Changes save here automatically.</p></div><div class="button-row"><span class="status-badge {enabled_class}" data-powerchat-listener-status>{enabled_label}</span><a class="button small secondary" href="/powerchat">All streamers</a></div></div>
+  <form id="streamer-powerchat-config-{escape(dom_id, quote=True)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer" data-streamer-name="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="form_kind" value="streamer_form">
+    <input type="hidden" name="action" value="save">
+    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="return_to" value="{return_to}">
+    <textarea name="sources" hidden>{escape(chr(10).join(streamer.sources))}</textarea>
+    <input type="hidden" name="download_dir_name" value="{escape(streamer.download_dir_name, quote=True)}">
+    <div class="powerchat-listener-grid">
+      <div class="form-field switch-field"><div class="switch-copy"><strong>Listen for support events</strong><span class="help-text">Capture donations, gifts, and other Powerchat activity while this streamer is live.</span></div><label class="switch"><input name="powerchat_enabled" type="checkbox" value="true"{' checked' if streamer.powerchat_enabled else ''}><span aria-hidden="true"></span><span class="sr-only">Enable the Powerchat listener</span></label><input type="hidden" name="powerchat_enabled" value="false" data-form-fallback="true"></div>
+      <div class="form-field"><label for="powerchat-user-{escape(dom_id, quote=True)}">Powerchat username</label><input id="powerchat-user-{escape(dom_id, quote=True)}" name="powerchat_username" value="{escape(streamer.powerchat_username, quote=True)}" placeholder="Username" autocomplete="off"><span class="help-text">The username Powerchat should follow for this streamer.</span><span class="field-error" data-field-error></span></div>
+      <div class="form-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><div class="field-action-row"><input id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone" value="{escape(streamer.timezone, quote=True)}" list="streamer-timezones-{escape(dom_id, quote=True)}" placeholder="Europe/London" required autocomplete="off"><button class="button small secondary" type="button" data-use-browser-timezone>Use mine</button></div><datalist id="streamer-timezones-{escape(dom_id, quote=True)}">{timezone_options}</datalist><span class="help-text">Use an IANA name. Support-event dates are shown in this time zone.</span><span class="field-error" data-field-error></span></div>
+    </div>
+    <noscript><div class="button-row"><button class="button" type="submit">Save listener settings</button></div></noscript>
+  </form>
 </section>"""
     if dashboard is None:
         detail = (
-            "Enable the listener on Overview, then captured donations, gifts, and other support events will appear here."
+            "Enable the listener above, then captured donations, gifts, and other support events will appear here."
             if not streamer.powerchat_enabled
             else "Powerchat is listening. Charts and donor history will appear after the first support event is captured."
         )
@@ -9052,13 +9144,16 @@ def render_admin_streamer_powerchat(
   <a class="button small secondary" href="{escape(powerchat_export_url('csv', streamer=streamer.name), quote=True)}">Download CSV</a>
 </div>"""
     streams = render_powerchat_dashboard_stream_rows(dashboard.get("stream_totals", []))
-    events = render_streamer_powerchat_events(dashboard.get("events", [])[:25])
+    events = render_streamer_powerchat_events(
+        dashboard.get("events", [])[:25],
+        streamer.timezone,
+    )
     return f"""<div class="section-stack streamer-powerchat-dashboard">
   {setup}
   <section class="section-stack"><div class="section-heading"><h2>Summary</h2>{exports}</div><div class="powerchat-summary-grid">{summary}</div></section>
   <section class="powerchat-chart-grid">{hourly_chart}{donor_chart}</section>
   <section class="card section-stack"><div class="section-heading"><h2>Streams</h2><span class="muted">Highest activity first</span></div><div class="table-wrap"><table><thead><tr><th>Streamer</th><th>Stream</th><th>Events</th><th>Total</th><th>Duration</th><th>Per hour</th></tr></thead><tbody>{streams}</tbody></table></div></section>
-  <section class="card section-stack"><div class="section-heading"><h2>Recent support</h2><span class="muted">Latest 25 events</span></div><div class="table-wrap"><table><thead><tr><th>Time</th><th>Stream</th><th>Supporter</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead><tbody>{events}</tbody></table></div></section>
+  <section class="card section-stack"><div class="section-heading"><h2>Recent support</h2><span class="muted">Latest 25 events</span></div><div class="table-wrap"><table><thead><tr><th>Received ({escape(streamer.timezone)})</th><th>Stream time</th><th>Stream</th><th>Supporter</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead><tbody>{events}</tbody></table></div></section>
 </div>"""
 
 
@@ -9092,12 +9187,16 @@ def render_streamer_powerchat_chart(
     return f'<article class="card powerchat-chart"><h2>{escape(title)}</h2><div class="powerchat-bars">{bars}</div></article>'
 
 
-def render_streamer_powerchat_events(rows: list[dict[str, Any]]) -> str:
+def render_streamer_powerchat_events(
+    rows: list[dict[str, Any]],
+    timezone: str,
+) -> str:
     if not rows:
-        return '<tr><td colspan="6" class="file-meta">No Powerchat events captured yet</td></tr>'
+        return '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>'
     return "".join(
         "<tr>"
-        f'<td>{escape(powerchat_dashboard_event_time(row))}</td>'
+        f'<td>{escape(format_optional_iso_timezone(str(row.get("received_at") or ""), timezone))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_offset(row))}</td>'
         f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
         f'<td>{escape(str(row.get("donor") or "Unknown supporter"))}</td>'
         f'<td>{escape(powerchat_dashboard_event_amount_text(row) or "-")}</td>'
@@ -9111,12 +9210,13 @@ def render_streamer_powerchat_events(rows: list[dict[str, Any]]) -> str:
 def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: StatusSnapshot) -> str:
     streamer_key = quote(streamer.name, safe="")
     return f"""<form id="streamer-basic-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer" data-streamer-name="{escape(streamer.name, quote=True)}">
+  <input type="hidden" name="form_kind" value="streamer_form">
+  <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+  <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}">
   <div class="form-grid">
     <div class="form-field"><label>Streamer name</label><input value="{escape(streamer.name, quote=True)}" readonly><span class="help-text">Names remain stable so existing folders and history stay linked.</span></div>
     <div class="form-field"><label for="streamer-dir-{escape(streamer_key, quote=True)}">Download folder name</label><input id="streamer-dir-{escape(streamer_key, quote=True)}" name="download_dir_name" value="{escape(streamer.download_dir_name, quote=True)}"><span class="field-error" data-field-error></span></div>
     <div class="form-field wide"><span><strong>Sources</strong></span>{render_admin_source_manager(streamer.sources, f'streamer-{streamer_dom_id(streamer.name)}')}<span class="field-error" data-field-error></span></div>
-    <div class="form-field switch-field"><div class="switch-copy"><strong>Powerchat</strong><span class="help-text">Listen for live support events.</span></div><label class="switch"><input name="powerchat_enabled" type="checkbox"{' checked' if streamer.powerchat_enabled else ''}><span aria-hidden="true"></span><span class="sr-only">Enable Powerchat</span></label></div>
-    <div class="form-field"><label for="powerchat-user-{escape(streamer_key, quote=True)}">Powerchat username</label><input id="powerchat-user-{escape(streamer_key, quote=True)}" name="powerchat_username" value="{escape(streamer.powerchat_username, quote=True)}" placeholder="Username"><span class="field-error" data-field-error></span></div>
   </div>
   <noscript><div class="button-row"><button class="button" name="action" value="save" type="submit">Save streamer</button></div></noscript>
 </form>"""
@@ -15325,6 +15425,16 @@ def powerchat_dashboard_event_time(row: dict[str, Any]) -> str:
     return format_optional_iso(str(row.get("received_at") or ""))
 
 
+def powerchat_dashboard_event_offset(row: dict[str, Any]) -> str:
+    value = row.get("offset_seconds")
+    if value is None:
+        return "-"
+    try:
+        return format_event_offset(float(value))
+    except (TypeError, ValueError):
+        return "-"
+
+
 def powerchat_dashboard_event_amount_text(row: dict[str, Any]) -> str:
     kind = str(row.get("kind") or "")
     if kind == "money" and row.get("money_amount") is not None and row.get("money_currency"):
@@ -15964,6 +16074,22 @@ def format_optional_iso(value: str | None) -> str:
     except ValueError:
         return value
     return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(timestamp))
+
+
+def format_optional_iso_timezone(value: str | None, timezone: str) -> str:
+    if not value:
+        return "-"
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    try:
+        zone = ZoneInfo(timezone or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        zone = ZoneInfo("UTC")
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
+    return timestamp.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
 def format_optional_epoch(value: float | None) -> str:

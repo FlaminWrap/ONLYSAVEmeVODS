@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
 import re
 import tomllib
@@ -140,6 +141,7 @@ class StreamerConfig:
     download_dir_name: str = ""
     powerchat_enabled: bool = False
     powerchat_username: str = ""
+    timezone: str = "UTC"
     post_stream: PostStreamConfig | None = None
     voice_detection: VoiceDetectionConfig | None = None
     speaker_labels: dict[str, str] = field(default_factory=dict)
@@ -871,6 +873,7 @@ def update_streamer_config(
     download_dir_name: str = "",
     powerchat_enabled: bool = False,
     powerchat_username: str = "",
+    timezone: str = "UTC",
 ) -> bool:
     target = Path(config_path).expanduser()
     try:
@@ -901,6 +904,10 @@ def update_streamer_config(
         powerchat_username,
         f"streamers.{streamer_name}.powerchat_username",
     )
+    normalized_timezone = _as_timezone(
+        timezone,
+        f"streamers.{streamer_name}.timezone",
+    )
 
     table_name = f"streamers.{_toml_key(streamer_name)}"
     pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
@@ -910,6 +917,7 @@ def update_streamer_config(
         normalized_download_dir_name,
         normalized_powerchat_enabled,
         normalized_powerchat_username,
+        normalized_timezone,
     )
     if pattern.search(current_text):
         updated_text = pattern.sub(block + "\n", current_text, count=1)
@@ -1513,6 +1521,7 @@ def _streamer_block(
     download_dir_name: str,
     powerchat_enabled: bool = False,
     powerchat_username: str = "",
+    timezone: str = "UTC",
 ) -> str:
     lines = [f"[streamers.{_toml_key(streamer_name)}]"]
     lines.append(f"sources = {_toml_value(sources, 'sources')}")
@@ -1526,6 +1535,8 @@ def _streamer_block(
         lines.append(
             f"powerchat_username = {_toml_value(powerchat_username, 'powerchat_username')}"
         )
+    if timezone != "UTC":
+        lines.append(f"timezone = {_toml_value(timezone, 'timezone')}")
     return "\n".join(lines)
 
 
@@ -1845,6 +1856,10 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
             powerchat_username=_as_optional_str(
                 raw_config.get("powerchat_username", ""),
                 f"{name}.{streamer_name}.powerchat_username",
+            ),
+            timezone=_as_timezone(
+                raw_config.get("timezone", "UTC"),
+                f"{name}.{streamer_name}.timezone",
             ),
             post_stream=post_stream,
             voice_detection=voice_detection,
@@ -2175,6 +2190,19 @@ def _as_optional_str(value: Any, name: str) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"{name} must be a string")
     return value.strip()
+
+
+def _as_timezone(value: Any, name: str) -> str:
+    timezone = _as_optional_str(value, name) or "UTC"
+    if timezone == "UTC":
+        return timezone
+    try:
+        ZoneInfo(timezone)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ConfigError(
+            f"{name} must be a valid IANA time zone such as Europe/London"
+        ) from exc
+    return timezone
 
 
 def _as_env_var_name(value: Any, name: str) -> str:

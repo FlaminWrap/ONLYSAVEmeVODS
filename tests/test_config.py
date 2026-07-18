@@ -631,7 +631,8 @@ class ConfigTests(unittest.TestCase):
                 '[streamers."OUMB3rd"]\n'
                 'sources = ["kick:oumb"]\n'
                 "powerchat_enabled = true\n"
-                'powerchat_username = "oumb"\n',
+                'powerchat_username = "oumb"\n'
+                'timezone = "America/New_York"\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -643,17 +644,30 @@ class ConfigTests(unittest.TestCase):
                 "OUMB3rd Shared",
                 powerchat_enabled=False,
                 powerchat_username="",
+                timezone="Europe/London",
             )
             updated_config = load_config(config_path)
             updated_text = config_path.read_text(encoding="utf-8")
 
         self.assertTrue(config.streamers["OUMB3rd"].powerchat_enabled)
         self.assertEqual(config.streamers["OUMB3rd"].powerchat_username, "oumb")
+        self.assertEqual(config.streamers["OUMB3rd"].timezone, "America/New_York")
         self.assertTrue(updated)
         self.assertFalse(updated_config.streamers["OUMB3rd"].powerchat_enabled)
         self.assertEqual(updated_config.streamers["OUMB3rd"].powerchat_username, "")
+        self.assertEqual(updated_config.streamers["OUMB3rd"].timezone, "Europe/London")
         self.assertNotIn("powerchat_enabled", updated_text)
         self.assertNotIn("powerchat_username", updated_text)
+        self.assertIn('timezone = "Europe/London"', updated_text)
+
+    def test_streamer_timezone_must_be_a_valid_iana_name(self) -> None:
+        with self.assertRaisesRegex(ConfigError, "valid IANA time zone"):
+            load_config_text(
+                '[streamers."Example"]\n'
+                'sources = ["kick:example"]\n'
+                'timezone = "London-ish"\n',
+                Path("/tmp/config.toml"),
+            )
 
     def test_streamer_post_stream_overrides_inherit_write_and_remove(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from onlysavemevods.config import load_config, migrate_legacy_channels_to_streamer
+from onlysavemevods.config import ConfigError, load_config, migrate_legacy_channels_to_streamer
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
 from onlysavemevods.web_ui import dashboard_asset_revision
@@ -220,6 +220,8 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('aria-label="Streamer sections"', overview)
         self.assertIn('class="active" href="/streamers?selected=Example"', overview)
         self.assertIn('data-autosave="streamer"', overview)
+        self.assertNotIn('name="powerchat_username"', overview)
+        self.assertNotIn('name="timezone"', overview)
         self.assertIn("Streams", overview)
         self.assertNotIn("After a stream", overview)
         self.assertNotIn("Optional features", overview)
@@ -235,7 +237,9 @@ class DashboardUiTests(unittest.TestCase):
                 BASE_CONFIG
                 + '\n[streamers."Example"]\n'
                 + 'sources = ["kick:example"]\n'
-                + 'powerchat_enabled = true\n',
+                + 'powerchat_enabled = true\n'
+                + 'powerchat_username = "example"\n'
+                + 'timezone = "Europe/London"\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -266,7 +270,7 @@ class DashboardUiTests(unittest.TestCase):
                     }
                 ],
                 "events": [
-                    {"streamer": "Example", "stream_title": "Launch stream", "donor": "Alice", "kind": "money", "money_amount": 20.0, "money_currency": "USD", "platform": "Powerchat", "message": "Great stream", "received_at": "2026-07-18T12:00:00+00:00"},
+                    {"streamer": "Example", "stream_title": "Launch stream", "donor": "Alice", "kind": "money", "money_amount": 20.0, "money_currency": "USD", "platform": "Powerchat", "message": "Great stream", "received_at": "2026-07-18T12:00:00+00:00", "offset_seconds": 90.0},
                 ],
             }
             dashboard = render_admin_streamer_powerchat(streamer, stats)
@@ -274,11 +278,19 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('class="active" href="/streamers?selected=Example&amp;tab=powerchat"', empty_page)
         self.assertIn("No Powerchat activity yet", empty_page)
         self.assertNotIn("fragment=streams", empty_page)
+        self.assertIn('data-autosave="streamer"', empty_page)
+        self.assertIn('name="powerchat_username" value="example"', empty_page)
+        self.assertIn('name="timezone" value="Europe/London"', empty_page)
+        self.assertIn("Use mine", empty_page)
+        self.assertNotIn("Configure listener", empty_page)
         self.assertIn("Activity by stream hour", dashboard)
         self.assertIn("Most active supporters", dashboard)
         self.assertIn("Alice", dashboard)
         self.assertIn("Launch stream", dashboard)
         self.assertIn("Download CSV", dashboard)
+        self.assertIn("Received (Europe/London)", dashboard)
+        self.assertIn("2026-07-18 13:00:00 BST", dashboard)
+        self.assertIn("<td>1:30</td>", dashboard)
 
     def test_partial_config_update_validates_and_reports_restart(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -412,6 +424,7 @@ retry_backoff_seconds = [30, 60, 120]
                         "download_dir_name": "Example VODs",
                         "powerchat_enabled": True,
                         "powerchat_username": "example",
+                        "timezone": "Europe/London",
                     },
                 },
             )
@@ -421,7 +434,65 @@ retry_backoff_seconds = [30, 60, 120]
             self.assertEqual(streamer.download_dir_name, "Example VODs")
             self.assertTrue(streamer.powerchat_enabled)
             self.assertEqual(streamer.powerchat_username, "example")
+            self.assertEqual(streamer.timezone, "Europe/London")
             self.assertTrue(result["ok"])
+
+    def test_invalid_streamer_timezone_does_not_modify_configuration(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            before = config_path.read_text(encoding="utf-8")
+
+            with self.assertRaisesRegex(ConfigError, "valid IANA time zone"):
+                update_streamer_from_json(
+                    config,
+                    {
+                        "revision": config_file_revision(config),
+                        "streamer_name": "Example",
+                        "values": {"timezone": "Not/A_Real_Zone"},
+                    },
+                )
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), before)
+            self.assertEqual(config.streamers["Example"].timezone, "UTC")
+
+    def test_listener_form_fallback_saves_without_overwriting_streamer_sources(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n'
+                + 'download_dir_name = "Example VODs"\n'
+                + 'powerchat_enabled = true\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            update_streamer_from_form(
+                config,
+                {
+                    "form_kind": ["streamer_form"],
+                    "action": ["save"],
+                    "streamer_name": ["Example"],
+                    "powerchat_enabled": ["false"],
+                    "powerchat_username": ["example"],
+                    "timezone": ["America/New_York"],
+                },
+            )
+
+            streamer = load_config(config_path).streamers["Example"]
+            self.assertEqual(streamer.sources, ["kick:example"])
+            self.assertEqual(streamer.download_dir_name, "Example VODs")
+            self.assertFalse(streamer.powerchat_enabled)
+            self.assertEqual(streamer.powerchat_username, "example")
+            self.assertEqual(streamer.timezone, "America/New_York")
 
     def test_legacy_migration_is_single_valid_config_write(self) -> None:
         with TemporaryDirectory() as temp_dir:

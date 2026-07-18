@@ -25,6 +25,7 @@ channels = []
 # download_dir_name = "Some Streamer"
 # powerchat_enabled = true
 # powerchat_username = "SomeStreamer"
+# timezone = "Europe/London"
 #
 # Optional post-stream overrides. Omit a key to inherit its top-level app
 # default. The dashboard manages these from Streamers > Manage > After a stream.

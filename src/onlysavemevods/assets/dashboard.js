@@ -81,7 +81,8 @@
     form.querySelectorAll("[name]").forEach((control) => {
       if (!(control instanceof HTMLInputElement || control instanceof HTMLSelectElement || control instanceof HTMLTextAreaElement)) return;
       if (control.disabled || control.type === "submit" || control.type === "button" || control.type === "file") return;
-      if (["_revision", "action", "form_kind", "streamer_name"].includes(control.name)) return;
+      if (control.dataset.formFallback === "true") return;
+      if (["_revision", "action", "form_kind", "streamer_name", "return_to"].includes(control.name)) return;
       if (control instanceof HTMLInputElement && control.type === "checkbox") {
         values[control.name] = control.checked;
         return;
@@ -221,6 +222,14 @@
       if (target instanceof HTMLInputElement && target.type === "checkbox") {
         const stateLabel = target.closest(".switch-field")?.querySelector(":scope > span");
         if (stateLabel) stateLabel.textContent = target.checked ? "Enabled" : "Disabled";
+        if (target.name === "powerchat_enabled") {
+          const status = form.closest(".powerchat-listener-card")?.querySelector("[data-powerchat-listener-status]");
+          if (status) {
+            status.textContent = target.checked ? "Listening" : "Not enabled";
+            status.classList.toggle("good", target.checked);
+            status.classList.toggle("warning", !target.checked);
+          }
+        }
       }
       if (target.matches("[data-post-stream-select]")) updatePostStreamStatuses(form);
       markAutosaveDirty(form, ["checkbox", "radio"].includes(target.type) || target instanceof HTMLSelectElement);
@@ -232,6 +241,18 @@
   });
 
   document.addEventListener("click", (event) => {
+    const timezoneButton = event.target.closest("[data-use-browser-timezone]");
+    if (timezoneButton) {
+      const form = timezoneButton.closest("form[data-autosave]");
+      const input = form?.querySelector('[name="timezone"]');
+      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      if (form && input instanceof HTMLInputElement && timezone) {
+        input.value = timezone;
+        markAutosaveDirty(form, true);
+        input.focus();
+      }
+      return;
+    }
     const reloadButton = event.target.closest("[data-reload-page]");
     if (reloadButton) {
       window.location.reload();
