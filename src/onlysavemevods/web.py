@@ -8954,28 +8954,28 @@ def render_admin_streamer_basic_form(streamer: StreamerStatStatus, snapshot: Sta
 POST_STREAM_UI_FIELDS: tuple[tuple[str, str, str], ...] = (
     (
         "twitch_ad_repair_enabled",
-        "Repair Twitch ad slates",
-        "For Twitch recordings, detect commercial-break slates and create a repaired copy when matching VOD footage is available.",
+        "Repair Twitch ad breaks",
+        "Create a repaired copy when matching Twitch VOD footage is available.",
     ),
     (
         "transcribe_subtitles",
         "Create subtitles",
-        "Run WhisperX and write subtitle and transcript sidecars after finalization.",
+        "Create WhisperX subtitle and transcript files.",
     ),
     (
         "voice_match_enabled",
         "Identify known voices",
-        "Match diarized speakers against this streamer's voice samples. Requires subtitle creation.",
+        "Match speakers against this streamer's saved voice samples. Requires subtitles.",
     ),
     (
         "stream_event_detection_enabled",
         "Detect content events",
-        "Analyze the recording using this streamer's event rules.",
+        "Find moments matching this streamer's event rules.",
     ),
     (
         "render_live_chat_video",
         "Render a chat video",
-        "Create a separate video with captured chat beside the recording when chat is available.",
+        "Create a separate video of the captured live chat.",
     ),
 )
 
@@ -8987,7 +8987,7 @@ def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:
         for key, label, help_text in POST_STREAM_UI_FIELDS
     )
     return f"""<section class="card section-stack post-stream-card">
-  <div class="card-header"><div><h2>After a stream</h2><p>Choose the optional work that starts automatically for {escape(streamer.name)} after its recording is safely finalized. Platform-specific actions are skipped when they do not apply.</p></div><span class="status-badge good">Finalization always on</span></div>
+  <div class="card-header"><div><h2>After a stream</h2><p>Choose which optional jobs run after {escape(streamer.name)} finishes recording. Changes save automatically.</p></div><span class="status-badge good">Recording is always finalized</span></div>
   <form id="streamer-post-stream-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer-post-stream" data-streamer-name="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="form_kind" value="streamer_post_stream">
     <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
@@ -8995,7 +8995,7 @@ def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:
     <div class="post-stream-grid">{fields}</div>
     <noscript><div class="button-row"><button class="button" type="submit">Save automatic workflow</button></div></noscript>
   </form>
-  <div class="notice info">Use inherited default keeps this streamer aligned with the technical defaults in <a href="/settings?section=advanced">Advanced settings</a>. Turning an action off does not delete existing output, and available actions can still be run manually.</div>
+  <p class="post-stream-note">App default follows <a href="/settings?section=advanced">Advanced settings</a>. Choosing Never does not remove existing output, and every job can still be started manually.</p>
 </section>"""
 
 
@@ -9013,9 +9013,9 @@ def render_admin_streamer_post_stream_field(
         transcription = streamer.post_stream.get("transcribe_subtitles", {})
         effective = effective and bool(transcription.get("effective"))
     options = (
-        ("inherit", f"Use inherited default ({'on' if app_default else 'off'})"),
-        ("enabled", "Always run for this streamer"),
-        ("disabled", "Never run for this streamer"),
+        ("inherit", f"App default ({'On' if app_default else 'Off'})"),
+        ("enabled", "Always run"),
+        ("disabled", "Never run"),
     )
     option_html = "".join(
         f'<option value="{value}"{" selected" if value == mode else ""}>{escape(text)}</option>'
@@ -9026,10 +9026,9 @@ def render_admin_streamer_post_stream_field(
   <div class="post-stream-option-copy">
     <label for="{escape(field_id, quote=True)}">{escape(label)}</label>
     <span class="help-text">{escape(help_text)}</span>
-    <span class="technical-key">{escape(key)}</span>
   </div>
   <div class="post-stream-option-control">
-    <span class="status-badge {'good' if effective else ''}" data-post-stream-status="{escape(key, quote=True)}">{'Enabled' if effective else 'Disabled'}</span>
+    <span class="status-badge {'good' if effective else ''}" data-post-stream-status="{escape(key, quote=True)}">{'Currently on' if effective else 'Currently off'}</span>
     <select id="{escape(field_id, quote=True)}" name="{escape(key, quote=True)}" data-post-stream-select data-app-default="{'true' if app_default else 'false'}">{option_html}</select>
     <span class="field-error" data-field-error></span>
   </div>

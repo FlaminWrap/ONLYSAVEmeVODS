@@ -198,7 +198,7 @@
     Object.entries(effective).forEach(([name, enabled]) => {
       const status = form.querySelector(`[data-post-stream-status="${CSS.escape(name)}"]`);
       if (!status) return;
-      status.textContent = enabled ? "Enabled" : "Disabled";
+      status.textContent = enabled ? "Currently on" : "Currently off";
       status.classList.toggle("good", enabled);
     });
   };

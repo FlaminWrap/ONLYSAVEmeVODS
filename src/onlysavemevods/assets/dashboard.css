@@ -388,6 +388,7 @@ button, a, input, select, textarea, summary { outline: none; }
 .post-stream-option-control { justify-items: stretch; }
 .post-stream-option-control .status-badge { justify-self: end; }
 .post-stream-option-control select { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); }
+.post-stream-note { margin: 0; color: var(--muted); font-size: 13px; }
 .setting-card { display: grid; gap: 11px; }
 .setting-card[hidden] { display: none; }
 .setting-card-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }

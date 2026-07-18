@@ -8,6 +8,7 @@ from unittest.mock import patch
 from onlysavemevods.config import load_config, migrate_legacy_channels_to_streamer
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
+from onlysavemevods.web_ui import dashboard_asset_revision
 from onlysavemevods.web import (
     ConfigRevisionConflict,
     app_config_updates_from_json_values,
@@ -50,6 +51,10 @@ class DashboardUiTests(unittest.TestCase):
             self.assertIn('class="app-sidebar"', html)
             self.assertIn('/assets/dashboard.css', html)
             self.assertIn('/assets/dashboard.js', html)
+            self.assertIn(
+                f'/assets/dashboard.css?v={dashboard_asset_revision()}',
+                html,
+            )
             self.assertIn('aria-current="page"', html)
 
     def test_settings_are_guided_searchable_and_autosaved(self) -> None:
@@ -121,9 +126,9 @@ class DashboardUiTests(unittest.TestCase):
 
         self.assertIn("After a stream", html)
         self.assertIn('data-autosave="streamer-post-stream"', html)
-        self.assertIn("Use inherited default (off)", html)
-        self.assertIn("Always run for this streamer", html)
-        self.assertIn("Never run for this streamer", html)
+        self.assertIn("App default (Off)", html)
+        self.assertIn("Always run", html)
+        self.assertIn("Never run", html)
         self.assertTrue(result["ok"])
         self.assertIsNotNone(post_stream)
         assert post_stream is not None

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
 from html import escape
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +23,19 @@ NAVIGATION_ITEMS: tuple[NavigationItem, ...] = (
     NavigationItem("tools", "Tools", "/tools", "◇"),
     NavigationItem("about", "About", "/about", "i"),
 )
+
+
+def dashboard_asset_revision() -> str:
+    """Fingerprint packaged UI assets so HTML and CSS/JS cannot drift apart."""
+
+    digest = sha256()
+    asset_dir = Path(__file__).resolve().parent / "assets"
+    try:
+        for name in ("dashboard.css", "dashboard.js"):
+            digest.update((asset_dir / name).read_bytes())
+    except OSError:
+        return ""
+    return digest.hexdigest()[:16]
 
 
 def render_dashboard_shell(
@@ -49,6 +64,7 @@ def render_dashboard_shell(
         else ""
     )
     extra_body_attributes = f" {body_attributes.strip()}" if body_attributes.strip() else ""
+    asset_revision = dashboard_asset_revision() or app_version
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -58,7 +74,7 @@ def render_dashboard_shell(
   <link rel="icon" href="/favicon.ico?v={escape(app_version, quote=True)}" sizes="any">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png?v={escape(app_version, quote=True)}">
   <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png?v={escape(app_version, quote=True)}">
-  <link rel="stylesheet" href="/assets/dashboard.css?v={escape(app_version, quote=True)}">
+  <link rel="stylesheet" href="/assets/dashboard.css?v={escape(asset_revision, quote=True)}">
   <title>{escape(title)} · ONLYSAVEmeVODS</title>
 </head>
 <body data-page="{escape(active, quote=True)}"{revision_attr}{extra_body_attributes}>
@@ -103,7 +119,7 @@ def render_dashboard_shell(
       </div>
     </form>
   </dialog>
-  <script src="/assets/dashboard.js?v={escape(app_version, quote=True)}" defer></script>
+  <script src="/assets/dashboard.js?v={escape(asset_revision, quote=True)}" defer></script>
 </body>
 </html>
 """

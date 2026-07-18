@@ -148,9 +148,8 @@ config conflict; new records, uploads, processing jobs, and deletion remain
 explicit actions.
 
 Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
-voice identification, content events, and chat-video rendering, choose **Use
-inherited default**, **Always run for this streamer**, or **Never run for this
-streamer**. Recording finalization always runs. Streamer choices also apply to
+voice identification, content events, and chat-video rendering, choose **App
+default**, **Always run**, or **Never run**. Recording finalization always runs. Streamer choices also apply to
 manual VOD imports, and disabling an action does not delete existing output.
 
 The complete stream history is available directly on the streamer page, with
