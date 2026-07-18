@@ -371,9 +371,23 @@ button, a, input, select, textarea, summary { outline: none; }
 .settings-nav a.active { background: var(--accent-soft); color: var(--accent); }
 .settings-content { display: grid; gap: 15px; min-width: 0; }
 .settings-group { display: grid; gap: 15px; }
-.post-stream-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }
-.post-stream-option { align-content: start; padding: 13px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-subtle); }
-.post-stream-option select { width: 100%; }
+.post-stream-grid { display: grid; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; }
+.post-stream-option {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(250px, 320px);
+  gap: 20px;
+  align-items: center;
+  padding: 15px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.post-stream-option:last-child { border-bottom: 0; }
+.post-stream-option-copy, .post-stream-option-control { display: grid; min-width: 0; gap: 5px; }
+.post-stream-option-copy label { font-size: 15px; font-weight: 700; }
+.post-stream-option-copy .technical-key { display: block; margin-top: 2px; }
+.post-stream-option-control { justify-items: stretch; }
+.post-stream-option-control .status-badge { justify-self: end; }
+.post-stream-option-control select { width: 100%; min-height: 42px; padding: 8px 10px; border: 1px solid var(--border-strong); border-radius: 8px; background: var(--surface); color: var(--text); }
 .setting-card { display: grid; gap: 11px; }
 .setting-card[hidden] { display: none; }
 .setting-card-header { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
@@ -504,6 +518,10 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .settings-nav { position: static; display: flex; overflow-x: auto; }
   .settings-nav a { white-space: nowrap; }
   .advanced-search { top: 58px; }
+  .post-stream-card > .card-header { flex-direction: column; align-items: flex-start; }
+  .post-stream-option { grid-template-columns: 1fr; gap: 11px; }
+  .post-stream-option-control .status-badge { justify-self: start; }
+  .post-stream-option-control select { min-height: 44px; }
 }
 
 @media (max-width: 620px) {

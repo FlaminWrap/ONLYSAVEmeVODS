@@ -8986,7 +8986,7 @@ def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:
         render_admin_streamer_post_stream_field(streamer, key, label, help_text)
         for key, label, help_text in POST_STREAM_UI_FIELDS
     )
-    return f"""<section class="card section-stack">
+    return f"""<section class="card section-stack post-stream-card">
   <div class="card-header"><div><h2>After a stream</h2><p>Choose the optional work that starts automatically for {escape(streamer.name)} after its recording is safely finalized. Platform-specific actions are skipped when they do not apply.</p></div><span class="status-badge good">Finalization always on</span></div>
   <form id="streamer-post-stream-{streamer_dom_id(streamer.name)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer-post-stream" data-streamer-name="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="form_kind" value="streamer_post_stream">
@@ -9021,11 +9021,18 @@ def render_admin_streamer_post_stream_field(
         f'<option value="{value}"{" selected" if value == mode else ""}>{escape(text)}</option>'
         for value, text in options
     )
-    return f"""<div class="post-stream-option form-field">
-  <div class="setting-card-header"><div><label for="post-stream-{streamer_dom_id(streamer.name)}-{escape(key, quote=True)}">{escape(label)}</label><span class="technical-key">{escape(key)}</span></div><span class="status-badge {'good' if effective else ''}" data-post-stream-status="{escape(key, quote=True)}">{'Enabled' if effective else 'Disabled'}</span></div>
-  <span class="help-text">{escape(help_text)}</span>
-  <select id="post-stream-{streamer_dom_id(streamer.name)}-{escape(key, quote=True)}" name="{escape(key, quote=True)}" data-post-stream-select data-app-default="{'true' if app_default else 'false'}">{option_html}</select>
-  <span class="field-error" data-field-error></span>
+    field_id = f"post-stream-{streamer_dom_id(streamer.name)}-{key}"
+    return f"""<div class="post-stream-option">
+  <div class="post-stream-option-copy">
+    <label for="{escape(field_id, quote=True)}">{escape(label)}</label>
+    <span class="help-text">{escape(help_text)}</span>
+    <span class="technical-key">{escape(key)}</span>
+  </div>
+  <div class="post-stream-option-control">
+    <span class="status-badge {'good' if effective else ''}" data-post-stream-status="{escape(key, quote=True)}">{'Enabled' if effective else 'Disabled'}</span>
+    <select id="{escape(field_id, quote=True)}" name="{escape(key, quote=True)}" data-post-stream-select data-app-default="{'true' if app_default else 'false'}">{option_html}</select>
+    <span class="field-error" data-field-error></span>
+  </div>
 </div>"""
 
 
