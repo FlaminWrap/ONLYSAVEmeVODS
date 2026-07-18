@@ -201,7 +201,8 @@ class DashboardUiTests(unittest.TestCase):
             config_path.write_text(
                 BASE_CONFIG
                 + '\n[streamers."Example"]\n'
-                + 'sources = ["kick:example"]\n',
+                + 'sources = ["kick:example"]\n'
+                + 'timezone = "Europe/London"\n',
                 encoding="utf-8",
             )
             config = load_config(config_path)
@@ -227,7 +228,11 @@ class DashboardUiTests(unittest.TestCase):
         self.assertNotIn("Optional features", overview)
         self.assertIn("After a stream", settings)
         self.assertIn("Optional features", settings)
-        self.assertNotIn('data-autosave="streamer"', settings)
+        self.assertIn("Streamer settings", settings)
+        self.assertIn('data-autosave="streamer"', settings)
+        self.assertIn('<select id="streamer-timezone-Example" name="timezone">', settings)
+        self.assertIn('<option value="Europe/London" selected>Europe/London</option>', settings)
+        self.assertIn('label="Europe"', settings)
         self.assertIn('data-autosave="streamer-post-stream"', settings)
 
     def test_streamer_powerchat_tab_has_charts_and_empty_state(self) -> None:
@@ -280,8 +285,8 @@ class DashboardUiTests(unittest.TestCase):
         self.assertNotIn("fragment=streams", empty_page)
         self.assertIn('data-autosave="streamer"', empty_page)
         self.assertIn('name="powerchat_username" value="example"', empty_page)
-        self.assertIn('name="timezone" value="Europe/London"', empty_page)
-        self.assertIn("Use mine", empty_page)
+        self.assertNotIn('name="timezone"', empty_page)
+        self.assertNotIn("Use mine", empty_page)
         self.assertNotIn("Configure listener", empty_page)
         self.assertIn("Activity by stream hour", dashboard)
         self.assertIn("Most active supporters", dashboard)

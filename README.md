@@ -150,11 +150,11 @@ explicit actions.
 
 Streamer details are divided into **Overview**, **Settings**, and **Powerchat**.
 Overview contains identity, sources, and stream history. Settings contains the
-automatic workflow and optional feature setup. Powerchat contains the editable
-listener username, enabled state, and streamer time zone alongside
+streamer time-zone dropdown, automatic workflow, and optional feature setup.
+Powerchat contains the editable listener username and enabled state alongside
 streamer-specific totals, hourly activity and supporter charts, streams, recent
-events, and scoped JSON/CSV exports. **Use mine** fills the browser's IANA time
-zone; absolute support-event timestamps use the saved zone.
+events, and scoped JSON/CSV exports. Absolute support-event timestamps use the
+time zone selected under Settings.
 
 Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
 voice identification, content events, and chat-video rendering, choose **App
@@ -221,8 +221,8 @@ override automatic voice matches.
 Powerchat aggregates every captured support event across all
 streams. Enable Powerchat per streamer first by setting `powerchat_enabled =
 true` and `powerchat_username = "name"` in the streamer **Powerchat** tab or in
-`config.toml`. The same tab accepts a validated IANA `timezone`, such as
-`Europe/London`, and saves changes without leaving the page.
+`config.toml`. Choose a validated IANA `timezone`, such as `Europe/London`, from
+the streamer **Settings** tab. Both forms save changes without leaving their tab.
 
 The dashboard shows:
 

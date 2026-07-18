@@ -3,6 +3,7 @@ from __future__ import annotations
 from bisect import insort
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
+from functools import lru_cache
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,7 +11,7 @@ from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from datetime import datetime
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -8977,7 +8978,8 @@ def render_admin_streamer_detail(
     tabs = render_admin_streamer_tabs(streamer.name, tab)
     basic_form = render_admin_streamer_basic_form(streamer, snapshot) if tab == "overview" else ""
     if tab == "settings":
-        tab_content = f"""{render_admin_streamer_post_stream_form(streamer)}
+        tab_content = f"""{render_admin_streamer_preferences_form(streamer)}
+  {render_admin_streamer_post_stream_form(streamer)}
   <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>"""
     elif tab == "powerchat":
         revision = streamer_powerchat_revision(
@@ -9089,33 +9091,16 @@ def render_admin_streamer_powerchat(
         f"/streamers?selected={selected}&tab=powerchat",
         quote=True,
     )
-    timezone_options = "".join(
-        f'<option value="{escape(value, quote=True)}"></option>'
-        for value in (
-            "UTC",
-            "Europe/London",
-            "Europe/Paris",
-            "America/New_York",
-            "America/Chicago",
-            "America/Denver",
-            "America/Los_Angeles",
-            "Asia/Tokyo",
-            "Australia/Sydney",
-        )
-    )
     setup = f"""<section class="card section-stack powerchat-listener-card">
-  <div class="card-header"><div><h2>Powerchat listener</h2><p>Configure support-event capture and local timestamps for {escape(streamer.name)}. Changes save here automatically.</p></div><div class="button-row"><span class="status-badge {enabled_class}" data-powerchat-listener-status>{enabled_label}</span><a class="button small secondary" href="/powerchat">All streamers</a></div></div>
+  <div class="card-header"><div><h2>Powerchat listener</h2><p>Configure support-event capture for {escape(streamer.name)}. Changes save here automatically.</p></div><div class="button-row"><span class="status-badge {enabled_class}" data-powerchat-listener-status>{enabled_label}</span><a class="button small secondary" href="/powerchat">All streamers</a></div></div>
   <form id="streamer-powerchat-config-{escape(dom_id, quote=True)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer" data-streamer-name="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="form_kind" value="streamer_form">
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="return_to" value="{return_to}">
-    <textarea name="sources" hidden>{escape(chr(10).join(streamer.sources))}</textarea>
-    <input type="hidden" name="download_dir_name" value="{escape(streamer.download_dir_name, quote=True)}">
     <div class="powerchat-listener-grid">
       <div class="form-field switch-field"><div class="switch-copy"><strong>Listen for support events</strong><span class="help-text">Capture donations, gifts, and other Powerchat activity while this streamer is live.</span></div><label class="switch"><input name="powerchat_enabled" type="checkbox" value="true"{' checked' if streamer.powerchat_enabled else ''}><span aria-hidden="true"></span><span class="sr-only">Enable the Powerchat listener</span></label><input type="hidden" name="powerchat_enabled" value="false" data-form-fallback="true"></div>
       <div class="form-field"><label for="powerchat-user-{escape(dom_id, quote=True)}">Powerchat username</label><input id="powerchat-user-{escape(dom_id, quote=True)}" name="powerchat_username" value="{escape(streamer.powerchat_username, quote=True)}" placeholder="Username" autocomplete="off"><span class="help-text">The username Powerchat should follow for this streamer.</span><span class="field-error" data-field-error></span></div>
-      <div class="form-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><div class="field-action-row"><input id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone" value="{escape(streamer.timezone, quote=True)}" list="streamer-timezones-{escape(dom_id, quote=True)}" placeholder="Europe/London" required autocomplete="off"><button class="button small secondary" type="button" data-use-browser-timezone>Use mine</button></div><datalist id="streamer-timezones-{escape(dom_id, quote=True)}">{timezone_options}</datalist><span class="help-text">Use an IANA name. Support-event dates are shown in this time zone.</span><span class="field-error" data-field-error></span></div>
     </div>
     <noscript><div class="button-row"><button class="button" type="submit">Save listener settings</button></div></noscript>
   </form>
@@ -9249,6 +9234,70 @@ POST_STREAM_UI_FIELDS: tuple[tuple[str, str, str], ...] = (
         "Create a separate video of the captured live chat.",
     ),
 )
+
+
+COMMON_STREAMER_TIMEZONES: tuple[str, ...] = (
+    "UTC",
+    "Europe/London",
+    "Europe/Paris",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+)
+
+
+@lru_cache(maxsize=1)
+def streamer_timezone_names() -> tuple[str, ...]:
+    try:
+        names = available_timezones()
+    except OSError:
+        names = set()
+    names.add("UTC")
+    return tuple(sorted(names, key=lambda value: (value.casefold(), value)))
+
+
+def render_admin_streamer_timezone_options(selected: str) -> str:
+    names = set(streamer_timezone_names())
+    names.add(selected)
+    common = [name for name in COMMON_STREAMER_TIMEZONES if name in names]
+
+    def options(values: list[str]) -> str:
+        return "".join(
+            f'<option value="{escape(value, quote=True)}"{" selected" if value == selected else ""}>{escape(value)}</option>'
+            for value in values
+        )
+
+    groups: dict[str, list[str]] = {}
+    for name in names.difference(common):
+        group = name.split("/", 1)[0] if "/" in name else "Other / aliases"
+        groups.setdefault(group, []).append(name)
+    group_options = "".join(
+        f'<optgroup label="{escape(group, quote=True)}">{options(sorted(values, key=lambda value: (value.casefold(), value)))}</optgroup>'
+        for group, values in sorted(
+            groups.items(),
+            key=lambda item: (item[0] == "Other / aliases", item[0].casefold()),
+        )
+    )
+    return f'<optgroup label="Common time zones">{options(common)}</optgroup>{group_options}'
+
+
+def render_admin_streamer_preferences_form(streamer: StreamerStatStatus) -> str:
+    dom_id = streamer_dom_id(streamer.name)
+    streamer_key = quote(streamer.name, safe="")
+    return f"""<section class="card section-stack streamer-preferences-card">
+  <div class="card-header"><div><h2>Streamer settings</h2><p>Preferences shared across this streamer's sources. Changes save automatically.</p></div></div>
+  <form id="streamer-preferences-{escape(dom_id, quote=True)}" class="autosave-form" method="post" action="/streamers" data-autosave="streamer" data-streamer-name="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="form_kind" value="streamer_form">
+    <input type="hidden" name="action" value="save">
+    <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
+    <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}&amp;tab=settings">
+    <div class="form-field streamer-timezone-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><select id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone">{render_admin_streamer_timezone_options(streamer.timezone)}</select><span class="help-text">Controls how calendar dates and support-event timestamps are displayed for this streamer.</span><span class="technical-key">timezone</span><span class="field-error" data-field-error></span></div>
+    <noscript><div class="button-row"><button class="button" type="submit">Save streamer settings</button></div></noscript>
+  </form>
+</section>"""
 
 
 def render_admin_streamer_post_stream_form(streamer: StreamerStatStatus) -> str:

@@ -241,18 +241,6 @@
   });
 
   document.addEventListener("click", (event) => {
-    const timezoneButton = event.target.closest("[data-use-browser-timezone]");
-    if (timezoneButton) {
-      const form = timezoneButton.closest("form[data-autosave]");
-      const input = form?.querySelector('[name="timezone"]');
-      const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-      if (form && input instanceof HTMLInputElement && timezone) {
-        input.value = timezone;
-        markAutosaveDirty(form, true);
-        input.focus();
-      }
-      return;
-    }
     const reloadButton = event.target.closest("[data-reload-page]");
     if (reloadButton) {
       window.location.reload();
