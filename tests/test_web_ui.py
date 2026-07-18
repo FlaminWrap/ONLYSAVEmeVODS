@@ -38,6 +38,18 @@ web_port = 8080
 
 
 class DashboardUiTests(unittest.TestCase):
+    def test_autosave_uses_form_action_attribute_not_named_control(self) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('form.getAttribute("action")', script)
+        self.assertNotIn("fetch(form.action", script)
+
     def test_static_pages_use_sidebar_shell_and_packaged_assets(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"

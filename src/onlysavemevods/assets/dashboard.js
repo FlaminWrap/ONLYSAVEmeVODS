@@ -133,19 +133,29 @@
     if (form.dataset.streamerName) payload.streamer_name = form.dataset.streamerName;
 
     let response;
-    let result;
     try {
-      response = await fetch(form.action, {
+      const action = form.getAttribute("action") || window.location.pathname;
+      response = await fetch(action, {
         method: "POST",
         headers: { "Accept": "application/json", "Content-Type": "application/json" },
         cache: "no-store",
         body: JSON.stringify(payload),
       });
-      result = await response.json();
     } catch (error) {
       form.dataset.saving = "false";
       form.dataset.dirty = "true";
       setSaveStatus("Save failed — check connection", "error", ` <button class="button small secondary" type="button" data-retry-form="${escapeHtml(form.id)}">Retry</button>`);
+      return;
+    }
+
+    let result;
+    try {
+      result = await response.json();
+    } catch (error) {
+      form.dataset.saving = "false";
+      form.dataset.dirty = "true";
+      const message = response.ok ? "Save failed — invalid server response" : `Save failed — server returned ${response.status}`;
+      setSaveStatus(message, "error", ` <button class="button small secondary" type="button" data-retry-form="${escapeHtml(form.id)}">Retry</button>`);
       return;
     }
 
