@@ -125,14 +125,15 @@ button, a, input, select, textarea, summary { outline: none; }
 .nav-item.active { background: var(--accent-soft); color: var(--accent); }
 .nav-icon {
   display: inline-grid;
-  width: 25px;
-  height: 25px;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
   place-items: center;
   border: 1px solid currentColor;
   border-radius: 7px;
-  font-size: 13px;
-  line-height: 1;
 }
+.nav-icon svg, .menu-button svg { display: block; width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.menu-button > span[aria-hidden="true"] { display: grid; place-items: center; }
 .sidebar-footer {
   display: grid;
   gap: 5px;

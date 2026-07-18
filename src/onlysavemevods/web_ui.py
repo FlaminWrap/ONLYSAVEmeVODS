@@ -15,14 +15,26 @@ class NavigationItem:
 
 
 NAVIGATION_ITEMS: tuple[NavigationItem, ...] = (
-    NavigationItem("overview", "Overview", "/", "⌂"),
-    NavigationItem("streamers", "Streamers", "/streamers", "◉"),
-    NavigationItem("settings", "Settings", "/settings", "⚙"),
-    NavigationItem("powerchat", "Powerchat", "/powerchat", "$"),
-    NavigationItem("activity", "Activity", "/activity", "≋"),
-    NavigationItem("tools", "Tools", "/tools", "◇"),
-    NavigationItem("about", "About", "/about", "i"),
+    NavigationItem("overview", "Overview", "/", "home"),
+    NavigationItem("streamers", "Streamers", "/streamers", "person"),
+    NavigationItem("settings", "Settings", "/settings", "sliders"),
+    NavigationItem("powerchat", "Powerchat", "/powerchat", "currency"),
+    NavigationItem("activity", "Activity", "/activity", "activity"),
+    NavigationItem("tools", "Tools", "/tools", "tools"),
+    NavigationItem("about", "About", "/about", "info"),
 )
+
+NAVIGATION_ICONS: dict[str, str] = {
+    "home": '<svg viewBox="0 0 24 24" focusable="false"><path d="M3.5 10.5 12 3.5l8.5 7"/><path d="M5.5 9v11h13V9"/><path d="M9.5 20v-6h5v6"/></svg>',
+    "person": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="8" r="3.25"/><path d="M5.5 20c.5-4 2.7-6 6.5-6s6 2 6.5 6"/></svg>',
+    "sliders": '<svg viewBox="0 0 24 24" focusable="false"><path d="M4 7h7m4 0h5M4 17h5m4 0h7"/><circle cx="13" cy="7" r="2"/><circle cx="11" cy="17" r="2"/></svg>',
+    "currency": '<svg viewBox="0 0 24 24" focusable="false"><path d="M15.5 8.5c-.8-.7-1.9-1-3.2-1-1.8 0-3.1.9-3.1 2.3 0 3.4 6.4 1.7 6.4 5.2 0 1.5-1.4 2.5-3.5 2.5-1.5 0-2.8-.5-3.7-1.4M12 5.5v14"/></svg>',
+    "activity": '<svg viewBox="0 0 24 24" focusable="false"><path d="M3 12h4l2.2-5 4.2 10 2.2-5H21"/></svg>',
+    "tools": '<svg viewBox="0 0 24 24" focusable="false"><path d="M14.7 6.3a4 4 0 0 0-5-5l2.1 2.1L9 6.2 6.9 4.1a4 4 0 0 0 5 5l-7.3 7.3a2.1 2.1 0 0 0 3 3l7.2-7.2a4 4 0 0 0 5-5l-2.1 2.1-2.8-2.8 2.1-2.1Z"/></svg>',
+    "info": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>',
+}
+
+MENU_ICON = '<svg viewBox="0 0 24 24" focusable="false"><path d="M4 7h16M4 12h16M4 17h16"/></svg>'
 
 
 def dashboard_asset_revision() -> str:
@@ -95,7 +107,7 @@ def render_dashboard_shell(
     <div class="app-workspace">
       <header class="app-topbar">
         <button class="icon-button menu-button" type="button" data-open-navigation aria-controls="app-sidebar" aria-expanded="false">
-          <span aria-hidden="true">☰</span><span class="sr-only">Open navigation</span>
+          <span aria-hidden="true">{MENU_ICON}</span><span class="sr-only">Open navigation</span>
         </button>
         <div class="topbar-context"><span class="topbar-product">ONLYSAVEmeVODS</span><span aria-hidden="true">/</span><span>{escape(title)}</span></div>
         <div class="save-status" data-save-status role="status" aria-live="polite" aria-atomic="true"></div>
@@ -130,6 +142,6 @@ def _render_navigation_item(item: NavigationItem, active: str) -> str:
     active_class = " active" if item.key == active else ""
     return (
         f'<a class="nav-item{active_class}" href="{escape(item.href, quote=True)}"{current}>'
-        f'<span class="nav-icon" aria-hidden="true">{escape(item.icon)}</span>'
+        f'<span class="nav-icon" aria-hidden="true">{NAVIGATION_ICONS[item.icon]}</span>'
         f'<span>{escape(item.label)}</span></a>'
     )

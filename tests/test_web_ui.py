@@ -51,6 +51,8 @@ class DashboardUiTests(unittest.TestCase):
             self.assertIn('class="app-sidebar"', html)
             self.assertIn('/assets/dashboard.css', html)
             self.assertIn('/assets/dashboard.js', html)
+            self.assertIn('class="nav-icon"', html)
+            self.assertIn('<svg viewBox="0 0 24 24"', html)
             self.assertIn(
                 f'/assets/dashboard.css?v={dashboard_asset_revision()}',
                 html,
