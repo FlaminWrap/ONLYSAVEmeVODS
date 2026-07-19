@@ -42,11 +42,12 @@ web_port = 8080
 
 
 class DashboardUiTests(unittest.TestCase):
-    def test_tools_navigation_uses_hammer_icon(self) -> None:
+    def test_tools_navigation_uses_pipe_wrench_icon(self) -> None:
         tools_item = next(item for item in NAVIGATION_ITEMS if item.key == "tools")
 
-        self.assertEqual(tools_item.icon, "hammer")
-        self.assertIn('viewBox="0 0 24 24"', NAVIGATION_ICONS[tools_item.icon])
+        self.assertEqual(tools_item.icon, "pipe_wrench")
+        self.assertIn('viewBox="0 0 194.799 194.799"', NAVIGATION_ICONS[tools_item.icon])
+        self.assertIn('data-tool-style="pipe-wrench"', NAVIGATION_ICONS[tools_item.icon])
 
     def test_autosave_uses_form_action_attribute_not_named_control(self) -> None:
         script = (
