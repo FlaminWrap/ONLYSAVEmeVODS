@@ -20,7 +20,7 @@ NAVIGATION_ITEMS: tuple[NavigationItem, ...] = (
     NavigationItem("settings", "Settings", "/settings", "sliders"),
     NavigationItem("powerchat", "Powerchat", "/powerchat", "currency"),
     NavigationItem("activity", "Activity", "/activity", "activity"),
-    NavigationItem("tools", "Tools", "/tools", "tools"),
+    NavigationItem("tools", "Tools", "/tools", "hammer"),
     NavigationItem("about", "About", "/about", "info"),
 )
 
@@ -30,7 +30,7 @@ NAVIGATION_ICONS: dict[str, str] = {
     "sliders": '<svg viewBox="0 0 24 24" focusable="false"><path d="M4 7h7m4 0h5M4 17h5m4 0h7"/><circle cx="13" cy="7" r="2"/><circle cx="11" cy="17" r="2"/></svg>',
     "currency": '<svg viewBox="0 0 24 24" focusable="false"><path d="M15.5 8.5c-.8-.7-1.9-1-3.2-1-1.8 0-3.1.9-3.1 2.3 0 3.4 6.4 1.7 6.4 5.2 0 1.5-1.4 2.5-3.5 2.5-1.5 0-2.8-.5-3.7-1.4M12 5.5v14"/></svg>',
     "activity": '<svg viewBox="0 0 24 24" focusable="false"><path d="M3 12h4l2.2-5 4.2 10 2.2-5H21"/></svg>',
-    "tools": '<svg viewBox="0 0 24 24" focusable="false"><path d="M14.7 6.3a4 4 0 0 0-5-5l2.1 2.1L9 6.2 6.9 4.1a4 4 0 0 0 5 5l-7.3 7.3a2.1 2.1 0 0 0 3 3l7.2-7.2a4 4 0 0 0 5-5l-2.1 2.1-2.8-2.8 2.1-2.1Z"/></svg>',
+    "hammer": '<svg viewBox="0 0 24 24" focusable="false"><path d="M6.5 21a2.1 2.1 0 0 1-3-3L13 8.5l3 3Z"/><path d="m11 5 3-3 8 8-3 3-3-3-2 2-5-5Z"/></svg>',
     "info": '<svg viewBox="0 0 24 24" focusable="false"><circle cx="12" cy="12" r="8.5"/><path d="M12 11v5"/><path d="M12 8h.01"/></svg>',
 }
 

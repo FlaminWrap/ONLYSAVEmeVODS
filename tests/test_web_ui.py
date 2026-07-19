@@ -8,7 +8,11 @@ from unittest.mock import patch
 from onlysavemevods.config import ConfigError, load_config, migrate_legacy_channels_to_streamer
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
-from onlysavemevods.web_ui import dashboard_asset_revision
+from onlysavemevods.web_ui import (
+    NAVIGATION_ICONS,
+    NAVIGATION_ITEMS,
+    dashboard_asset_revision,
+)
 from onlysavemevods.web import (
     ConfigRevisionConflict,
     app_config_updates_from_json_values,
@@ -38,6 +42,12 @@ web_port = 8080
 
 
 class DashboardUiTests(unittest.TestCase):
+    def test_tools_navigation_uses_hammer_icon(self) -> None:
+        tools_item = next(item for item in NAVIGATION_ITEMS if item.key == "tools")
+
+        self.assertEqual(tools_item.icon, "hammer")
+        self.assertIn('viewBox="0 0 24 24"', NAVIGATION_ICONS[tools_item.icon])
+
     def test_autosave_uses_form_action_attribute_not_named_control(self) -> None:
         script = (
             Path(__file__).parents[1]
