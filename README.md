@@ -266,8 +266,8 @@ Successfully completed automatic jobs remain visible for five minutes; failed or
 interrupted jobs remain available for diagnosis.
 
 Tools contains runtime paths, watermark detection, redacted raw configuration,
-the status JSON link, and the compatibility workspace at `/status`. About shows
-the app/runtime versions and release update controls.
+and the status JSON link. About shows the app/runtime versions and release
+update controls. Old `/status` bookmarks redirect to the current dashboard.
 
 Use stream logs when you need to understand what happened to a specific stream:
 segment switches, yt-dlp exits, post-exit checks, finalization, retries, chat

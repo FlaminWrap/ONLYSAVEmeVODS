@@ -1076,7 +1076,7 @@ class StatusWebServer:
 
         mark_stale_watermark_jobs(self.config)
         self.logger.info(
-            "Starting status web interface on %s:%s",
+            "Starting administration dashboard on %s:%s",
             self.host,
             self.port,
         )
@@ -1090,7 +1090,7 @@ class StatusWebServer:
         self._thread = thread
         actual_host, actual_port = server.server_address[:2]
         self.logger.info(
-            "Status web interface listening on http://%s:%s",
+            "Administration dashboard listening on http://%s:%s",
             actual_host,
             actual_port,
         )
@@ -1100,7 +1100,7 @@ class StatusWebServer:
             raise RuntimeError("Status web server already started")
         mark_stale_watermark_jobs(self.config)
         self.logger.info(
-            "Starting status web interface on %s:%s",
+            "Starting administration dashboard on %s:%s",
             self.host,
             self.port,
         )
@@ -1109,7 +1109,7 @@ class StatusWebServer:
             server.daemon_threads = True
             actual_host, actual_port = server.server_address[:2]
             self.logger.info(
-                "Status web interface listening on http://%s:%s",
+                "Administration dashboard listening on http://%s:%s",
                 actual_host,
                 actual_port,
             )
@@ -1130,7 +1130,7 @@ class StatusWebServer:
 
 def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
     class StatusRequestHandler(BaseHTTPRequestHandler):
-        server_version = "ONLYSAVEmeVODSStatus/1.0"
+        server_version = "ONLYSAVEmeVODSDashboard/1.0"
 
         def do_GET(self) -> None:
             started_at = time.perf_counter()
@@ -1141,7 +1141,11 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     self._send_admin_page("overview", parts.query)
                     return
                 if path == "/status":
-                    self._send_html(render_status_html(build_status_snapshot(config, include_speaker_scan=False)))
+                    self.send_response(HTTPStatus.PERMANENT_REDIRECT)
+                    self.send_header("Location", "/")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
                     return
                 admin_pages = {
                     "/streamers": "streamers",
@@ -1217,7 +1221,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             host = self.headers.get("Host", "")
             if parts.netloc and parts.netloc != host:
                 return default
-            allowed = {"/", "/streamers", "/settings", "/powerchat", "/activity", "/tools", "/about", "/status"}
+            allowed = {"/", "/streamers", "/settings", "/powerchat", "/activity", "/tools", "/about"}
             if parts.path not in allowed:
                 return default
             return parts.path + (f"?{parts.query}" if parts.query else "") + (f"#{parts.fragment}" if parts.fragment else "")
@@ -1302,7 +1306,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 )
 
         def log_message(self, fmt: str, *args: Any) -> None:
-            LOGGER.debug("status web: " + fmt, *args)
+            LOGGER.debug("dashboard web: " + fmt, *args)
 
         def _send_html(self, body: str) -> None:
             self._send_text(body, "text/html; charset=utf-8")
@@ -8700,7 +8704,7 @@ ADMIN_PAGE_SUBTITLES = {
     "settings": "Plain-language controls for recording, processing, and the local service.",
     "powerchat": "Support events, donation rates, donors, and exports across captured streams.",
     "activity": "Processing work and operational logs in one place.",
-    "tools": "Diagnostics, watermark detection, raw configuration, and compatibility tools.",
+    "tools": "Diagnostics, watermark detection, raw configuration, and status data.",
     "about": "Version, runtime, and update information for this installation.",
 }
 
@@ -8832,7 +8836,11 @@ def render_admin_fragment(
         body = render_admin_activity_records(snapshot, view)
         revision = f"{snapshot.job_revision}:{len(snapshot.recent_logs)}"
     elif page == "powerchat":
-        body = render_powerchat_dashboard(snapshot.powerchat_stats)
+        body = render_powerchat_dashboard(snapshot.powerchat_stats) + (
+            '<script type="application/json" id="powerchat-stats-json">'
+            + json_script_payload(snapshot.powerchat_stats)
+            + "</script>"
+        )
         revision = hashlib.sha256(json_script_payload(snapshot.powerchat_stats).encode()).hexdigest()[:20]
     else:
         body = '<div class="notice">This page does not use live fragments.</div>'
@@ -9028,7 +9036,7 @@ def render_admin_streamer_detail(
     if tab == "settings":
         tab_content = f"""{render_admin_streamer_preferences_form(streamer)}
   {render_admin_streamer_post_stream_form(streamer)}
-  <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer)}</section>"""
+  <section class="section-stack"><div class="section-heading"><h2>Optional features</h2><span class="muted">Configure these when you need them.</span></div>{render_admin_streamer_optional_cards(streamer, snapshot)}</section>"""
     elif tab == "powerchat":
         revision = streamer_powerchat_revision(
             snapshot.powerchat_stats,
@@ -9403,18 +9411,75 @@ def render_admin_streamer_post_stream_field(
 </div>"""
 
 
-def render_admin_streamer_optional_cards(streamer: StreamerStatStatus) -> str:
-    legacy_url = f"/status#streamers"
-    cards = [
-        ("Voices", f"{len(streamer.voices)} known voice{'s' if len(streamer.voices) != 1 else ''}", "Manage voice profiles, samples, and attribution review."),
-        ("Speaker names", f"{streamer.speaker_label_count} label{'s' if streamer.speaker_label_count != 1 else ''}", "Map diarized speaker labels to readable names."),
-        ("Content events", "Configured" if streamer.stream_event_detection else "Uses app default", "Flag moments using audio labels, transcript keywords, and known voices."),
-        ("Manual VOD", "Add an existing recording", "Download a VOD into this streamer and run enabled post-processing."),
-    ]
-    return '<div class="optional-grid">' + "".join(
-        f'<article class="setup-card"><div><h3>{escape(title)}</h3><span class="status-badge">{escape(status)}</span></div><p>{escape(text)}</p><a class="button small secondary" href="{legacy_url}">Open manager</a></article>'
-        for title, status, text in cards
+def render_admin_streamer_optional_cards(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    managers = (
+        (
+            "voices",
+            "Voices",
+            f"{len(streamer.voices)} known voice{'s' if len(streamer.voices) != 1 else ''}",
+            "Manage voice profiles, samples, and attribution review.",
+            render_streamer_voice_settings(streamer, snapshot),
+        ),
+        (
+            "speaker-names",
+            "Speaker names",
+            f"{streamer.speaker_label_count} label{'s' if streamer.speaker_label_count != 1 else ''}",
+            "Map diarized speaker labels to readable names.",
+            render_admin_streamer_speaker_names(streamer, snapshot),
+        ),
+        (
+            "content-events",
+            "Content events",
+            "Configured" if streamer.stream_event_detection else "Uses app default",
+            "Flag moments using audio labels, transcript keywords, and known voices.",
+            render_streamer_event_settings_form(streamer),
+        ),
+        (
+            "manual-vod",
+            "Manual VOD",
+            "Add an existing recording",
+            "Download a VOD into this streamer and run enabled post-processing.",
+            render_manual_vod_form(streamer),
+        ),
+    )
+    return '<div class="optional-managers">' + "".join(
+        f'''<details class="card optional-manager" id="{anchor}">
+  <summary><span><strong>{escape(title)}</strong><span class="muted">{escape(text)}</span></span><span class="status-badge">{escape(status)}</span></summary>
+  <div class="optional-manager-body">{body}</div>
+</details>'''
+        for anchor, title, status, text, body in managers
     ) + "</div>"
+
+
+def render_admin_streamer_speaker_names(
+    streamer: StreamerStatStatus,
+    snapshot: StatusSnapshot,
+) -> str:
+    streamer_key = channel_group_key(streamer.name)
+    status = next(
+        (
+            item
+            for item in snapshot.speaker_labels
+            if channel_group_key(item.channel) == streamer_key
+        ),
+        None,
+    )
+    if status is None:
+        status = SpeakerLabelStatus(
+            channel=streamer.name,
+            configured_sources=list(streamer.sources),
+            detected_labels=[],
+            labels={},
+            transcript_count=0,
+        )
+    detected = ", ".join(status.detected_labels) or "No diarized labels detected yet"
+    return f'''<div class="speaker-manager section-stack">
+  <p class="help-text">Detected labels: {escape(detected)}. Add friendly names now or return after a diarized transcript is available.</p>
+  {render_speaker_label_form(status)}
+</div>'''
 
 
 def admin_streamer_stream_params(
@@ -9651,9 +9716,7 @@ def render_admin_setting_control(field: ConfigFormField, value: Any) -> str:
 def render_admin_powerchat(snapshot: StatusSnapshot) -> str:
     stats_json = json_script_payload(snapshot.powerchat_stats)
     return f"""<div class="section-stack">
-  <section data-fragment-url="/powerchat?fragment=dashboard">{render_powerchat_dashboard(snapshot.powerchat_stats)}</section>
-  <script type="application/json" id="powerchat-stats-json">{stats_json}</script>
-  {dashboard_script()}
+  <section data-fragment-url="/powerchat?fragment=dashboard">{render_powerchat_dashboard(snapshot.powerchat_stats)}<script type="application/json" id="powerchat-stats-json">{stats_json}</script></section>
 </div>"""
 
 
@@ -9722,7 +9785,7 @@ def render_admin_tools(snapshot: StatusSnapshot | AdminStaticSnapshot) -> str:
     return f"""<div class="section-stack">
   <div class="card-grid">
     <section class="card"><div class="card-header"><div><h2>Runtime paths</h2><p>Resolved locations used by this process.</p></div></div><dl class="detail-list"><dt>Recordings</dt><dd>{escape(snapshot.download_dir)}</dd><dt>State database</dt><dd>{escape(snapshot.state_db)}</dd><dt>Stream limit</dt><dd>{snapshot.stream_limit}</dd><dt>File limit</dt><dd>{FILE_LIMIT_PER_STREAM} per stream</dd></dl></section>
-    <section class="card"><div class="card-header"><div><h2>Compatibility workspace</h2><p>The original dense dashboard remains available while external bookmarks and specialist workflows transition.</p></div></div><div class="button-row"><a class="button secondary" href="/status">Open legacy workspace</a><a class="button secondary" href="/status.json">Download status JSON</a></div></section>
+    <section class="card"><div class="card-header"><div><h2>Status data</h2><p>Download the complete machine-readable runtime snapshot for diagnostics or integrations.</p></div></div><div class="button-row"><a class="button secondary" href="/status.json">Download status JSON</a></div></section>
     {render_watermark_detection_panel(snapshot.configuration)}
   </div>
   <details class="card"><summary><strong>Raw configuration snapshot</strong></summary><p class="help-text">Sensitive yt-dlp arguments and secret values remain redacted.</p><pre class="raw-json">{config_json}</pre></details>

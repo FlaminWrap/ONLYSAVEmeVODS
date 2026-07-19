@@ -202,7 +202,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Environment variable name containing the Hugging Face token.",
     )
 
-    web = subparsers.add_parser("web", help="Run the read-only status web interface.")
+    web = subparsers.add_parser("web", help="Run the local administration dashboard.")
     web.add_argument("--config", default="config.toml", help="Path to config TOML.")
     web.add_argument("--host", help="Host/IP to bind. Defaults to config web_host.")
     web.add_argument("--port", type=int, help="Port to bind. Defaults to config web_port.")

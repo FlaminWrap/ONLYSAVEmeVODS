@@ -90,13 +90,13 @@ class OnlySaveMeVodsDaemon:
                 self.web.start()
             except OSError as exc:
                 LOGGER.warning(
-                    "Unable to start status web interface on %s:%s: %s",
+                    "Unable to start administration dashboard on %s:%s: %s",
                     self.config.web_host,
                     self.config.web_port,
                     exc,
                 )
         else:
-            LOGGER.info("Status web interface disabled by config")
+            LOGGER.info("Administration dashboard disabled by config")
         if not monitored_sources(self.config):
             LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
         self.resume_stale_post_exit_checks(stale_post_exit_records)

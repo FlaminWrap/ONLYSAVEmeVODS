@@ -143,7 +143,7 @@ def fetch_status_snapshot(url: str, *, timeout: float = 5.0) -> Mapping[str, Any
 def check_active_service_idle(config_path: str | Path, *, timeout: float = 5.0) -> IdleCheckResult:
     config = load_config(config_path)
     if not config.web_enabled:
-        return IdleCheckResult(False, False, ("status web interface is disabled",))
+        return IdleCheckResult(False, False, ("administration dashboard is disabled",))
     url = status_url_for_config(config)
     try:
         snapshot = fetch_status_snapshot(url, timeout=timeout)

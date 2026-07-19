@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from onlysavemevods.config import ConfigError, load_config, migrate_legacy_channels_to_streamer
+from onlysavemevods.config import BotConfig, ConfigError, load_config, migrate_legacy_channels_to_streamer
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
 from onlysavemevods.web_ui import (
@@ -17,6 +18,7 @@ from onlysavemevods.web import (
     ConfigRevisionConflict,
     app_config_updates_from_json_values,
     build_admin_static_snapshot,
+    build_handler,
     build_status_snapshot,
     config_file_revision,
     render_admin_fragment,
@@ -42,6 +44,35 @@ web_port = 8080
 
 
 class DashboardUiTests(unittest.TestCase):
+    def test_old_status_route_redirects_to_current_dashboard(self) -> None:
+        class NonClosingBuffer(BytesIO):
+            def close(self) -> None:
+                pass
+
+        class Request:
+            def __init__(self) -> None:
+                self.input = NonClosingBuffer(
+                    b"GET /status HTTP/1.1\r\nHost: localhost\r\n\r\n"
+                )
+                self.output = NonClosingBuffer()
+
+            def makefile(self, mode: str, buffering: int | None = None) -> NonClosingBuffer:
+                return self.input
+
+            def sendall(self, data: bytes) -> None:
+                self.output.write(data)
+
+        class Server:
+            server_name = "localhost"
+            server_port = 8080
+
+        request = Request()
+        build_handler(BotConfig())(request, ("127.0.0.1", 1), Server())
+        response = request.output.getvalue().decode("latin-1")
+
+        self.assertIn(" 308 Permanent Redirect\r\n", response)
+        self.assertIn("Location: /\r\n", response)
+
     def test_tools_navigation_uses_pipe_wrench_icon(self) -> None:
         tools_item = next(item for item in NAVIGATION_ITEMS if item.key == "tools")
 
@@ -167,6 +198,45 @@ class DashboardUiTests(unittest.TestCase):
         self.assertTrue(post_stream.stream_event_detection_enabled)
         self.assertFalse(post_stream.render_live_chat_video)
         self.assertIsNone(inherited)
+
+    def test_optional_streamer_managers_are_migrated_into_current_dashboard(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+
+            html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"], "tab": ["settings"]},
+            )
+
+        self.assertIn('id="voices"', html)
+        self.assertIn('action="/streamer-voices"', html)
+        self.assertIn('id="speaker-names"', html)
+        self.assertIn('action="/speaker-labels"', html)
+        self.assertIn('id="content-events"', html)
+        self.assertIn('action="/stream-event-rules"', html)
+        self.assertIn('id="manual-vod"', html)
+        self.assertIn('action="/vod-download"', html)
+        self.assertNotIn('/status#streamers', html)
+
+    def test_powerchat_uses_packaged_dashboard_script(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+
+            html = render_admin_page(config, "powerchat", {})
+
+        self.assertIn('/assets/dashboard.js', html)
+        self.assertIn('id="powerchat-stats-json"', html)
+        self.assertNotIn('const tabKey = "onlysavemevods.dashboardTab"', html)
 
     def test_streamer_history_is_paginated_in_the_new_dashboard(self) -> None:
         with TemporaryDirectory() as temp_dir:

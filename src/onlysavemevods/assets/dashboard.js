@@ -436,6 +436,297 @@
     pendingConfirmation = null;
   });
 
+  let powerchatPage = 1;
+  const powerchatStats = () => {
+    const payload = document.getElementById("powerchat-stats-json");
+    if (!payload) return { events: [], stream_totals: [] };
+    try { return JSON.parse(payload.textContent || "{}"); } catch (_) { return { events: [], stream_totals: [] }; }
+  };
+  const powerchatNumber = (value, decimals = 0) => {
+    const number = Number(value || 0);
+    if (!decimals && Number.isInteger(number)) return String(number);
+    return decimals ? number.toFixed(decimals) : String(number);
+  };
+  const powerchatSummary = (money = [], units = []) => [
+    ...money.map((row) => row.currency && row.amount != null ? `${String(row.currency).toUpperCase()} ${powerchatNumber(row.amount, 2)}` : ""),
+    ...units.map((row) => row.unit && row.amount != null ? `${row.platform ? `${row.platform}: ` : ""}${powerchatNumber(row.amount)} ${row.unit}` : ""),
+  ].filter(Boolean).join(", ");
+  const powerchatRates = (rows = []) => rows.map((row) => row.currency && row.amount_per_hour != null ? `${String(row.currency).toUpperCase()} ${powerchatNumber(row.amount_per_hour, 2)}/hr` : "").filter(Boolean).join(", ");
+  const powerchatDuration = (value) => {
+    let seconds = Math.max(0, Math.trunc(Number(value) || 0));
+    const hours = Math.trunc(seconds / 3600);
+    const minutes = Math.trunc((seconds % 3600) / 60);
+    seconds %= 60;
+    return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}` : `${minutes}:${String(seconds).padStart(2, "0")}`;
+  };
+  const powerchatDateTime = (value) => {
+    if (!value) return "-";
+    const date = new Date(value);
+    return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
+  };
+  const newPowerchatBucket = () => ({ event_count: 0, money: {}, money_counts: {}, units: {} });
+  const addPowerchatEvent = (bucket, event) => {
+    bucket.event_count += 1;
+    if (event.kind === "money" && event.money_amount != null && event.money_currency) {
+      const currency = String(event.money_currency).toUpperCase();
+      bucket.money[currency] = Number(bucket.money[currency] || 0) + Number(event.money_amount || 0);
+      bucket.money_counts[currency] = Number(bucket.money_counts[currency] || 0) + 1;
+    } else if (event.kind === "unit" && event.unit_amount != null && event.unit) {
+      const key = `${event.platform || ""}::${event.unit}`;
+      bucket.units[key] = Number(bucket.units[key] || 0) + Number(event.unit_amount || 0);
+    }
+  };
+  const powerchatMoney = (bucket) => Object.entries(bucket.money).sort(([a], [b]) => a.localeCompare(b)).map(([currency, amount]) => ({ currency, amount: Math.round(Number(amount) * 100) / 100 }));
+  const powerchatUnits = (bucket) => Object.entries(bucket.units).sort(([a], [b]) => a.localeCompare(b)).map(([key, amount]) => {
+    const [platform, unit] = key.split("::");
+    return { platform, unit, amount: Math.round(Number(amount) * 100) / 100 };
+  });
+  const powerchatAverages = (bucket) => powerchatMoney(bucket).map((row) => ({ currency: row.currency, amount: Math.round((row.amount / Number(bucket.money_counts[row.currency] || 1)) * 100) / 100 }));
+  const powerchatRateRows = (bucket, duration) => duration > 0 ? powerchatMoney(bucket).map((row) => ({ ...row, amount_per_hour: Math.round((row.amount / (duration / 3600)) * 100) / 100 })) : [];
+  const powerchatSortAmount = (bucket) => Object.values(bucket.money).reduce((total, amount) => total + Number(amount || 0), 0);
+  const finishPowerchatDonors = (donors) => [...donors.values()].map((row) => ({
+    donor: row.donor,
+    event_count: row.bucket.event_count,
+    latest_received_at: row.latest,
+    money_totals: powerchatMoney(row.bucket),
+    unit_totals: powerchatUnits(row.bucket),
+    sort_amount: powerchatSortAmount(row.bucket),
+  })).sort((a, b) => b.sort_amount - a.sort_amount || b.event_count - a.event_count || a.donor.localeCompare(b.donor));
+  const finishPowerchatHours = (hours) => [...hours.values()].map((row) => ({
+    hour_index: row.hour_index,
+    hour_label: row.hour_label,
+    event_count: row.bucket.event_count,
+    money_totals: powerchatMoney(row.bucket),
+    unit_totals: powerchatUnits(row.bucket),
+    average_money: powerchatAverages(row.bucket),
+  })).sort((a, b) => a.hour_index - b.hour_index);
+  const addPowerchatDonor = (donors, event) => {
+    const name = event.donor || "Unknown donor";
+    if (!donors.has(name)) donors.set(name, { donor: name, latest: "", bucket: newPowerchatBucket() });
+    const donor = donors.get(name);
+    addPowerchatEvent(donor.bucket, event);
+    if (event.received_at && event.received_at > donor.latest) donor.latest = event.received_at;
+  };
+  const addPowerchatHour = (hours, event) => {
+    if (event.hour_index == null) return false;
+    const index = Number(event.hour_index || 0);
+    if (!hours.has(index)) hours.set(index, { hour_index: index, hour_label: event.hour_label || `${index}:00-${index}:59`, bucket: newPowerchatBucket() });
+    addPowerchatEvent(hours.get(index).bucket, event);
+    return true;
+  };
+  const aggregatePowerchat = (events, sourceStats) => {
+    const durations = new Map((sourceStats.stream_totals || []).map((row) => [row.video_id, Number(row.duration_seconds || 0)]));
+    const total = newPowerchatBucket();
+    const donors = new Map();
+    const hours = new Map();
+    const streams = new Map();
+    const streamers = new Map();
+    let withoutOffset = 0;
+    events.forEach((event) => {
+      addPowerchatEvent(total, event);
+      addPowerchatDonor(donors, event);
+      if (!addPowerchatHour(hours, event)) withoutOffset += 1;
+      const streamKey = event.video_id || event.stream_title || "unknown";
+      if (!streams.has(streamKey)) streams.set(streamKey, { streamer: event.streamer || "", video_id: event.video_id || "", title: event.stream_title || "-", duration_seconds: durations.get(event.video_id) || 0, bucket: newPowerchatBucket() });
+      addPowerchatEvent(streams.get(streamKey).bucket, event);
+      const streamerName = event.streamer || "Unknown streamer";
+      if (!streamers.has(streamerName)) streamers.set(streamerName, { streamer: streamerName, bucket: newPowerchatBucket(), donors: new Map(), hours: new Map(), streams: new Map(), without_offset: 0 });
+      const streamer = streamers.get(streamerName);
+      addPowerchatEvent(streamer.bucket, event);
+      addPowerchatDonor(streamer.donors, event);
+      if (!addPowerchatHour(streamer.hours, event)) streamer.without_offset += 1;
+      if (!streamer.streams.has(streamKey)) streamer.streams.set(streamKey, streams.get(streamKey));
+    });
+    const finishStreams = (rows) => [...rows.values()].map((row) => ({
+      streamer: row.streamer,
+      video_id: row.video_id,
+      title: row.title,
+      event_count: row.bucket.event_count,
+      duration_seconds: row.duration_seconds,
+      money_totals: powerchatMoney(row.bucket),
+      unit_totals: powerchatUnits(row.bucket),
+      money_rates: powerchatRateRows(row.bucket, row.duration_seconds),
+      sort_amount: powerchatSortAmount(row.bucket),
+    })).sort((a, b) => b.sort_amount - a.sort_amount || b.event_count - a.event_count);
+    const streamRows = finishStreams(streams);
+    const duration = streamRows.reduce((totalDuration, row) => totalDuration + row.duration_seconds, 0);
+    const streamerRows = [...streamers.values()].map((row) => {
+      const childStreams = finishStreams(row.streams);
+      const childDuration = childStreams.reduce((totalDuration, stream) => totalDuration + stream.duration_seconds, 0);
+      return {
+        streamer: row.streamer,
+        event_count: row.bucket.event_count,
+        stream_count: childStreams.length,
+        duration_seconds: childDuration,
+        events_without_offset: row.without_offset,
+        money_totals: powerchatMoney(row.bucket),
+        unit_totals: powerchatUnits(row.bucket),
+        money_rates: powerchatRateRows(row.bucket, childDuration),
+        top_donors: finishPowerchatDonors(row.donors).slice(0, 10),
+        hourly_totals: finishPowerchatHours(row.hours),
+        stream_totals: childStreams,
+        sort_amount: powerchatSortAmount(row.bucket),
+      };
+    }).sort((a, b) => b.sort_amount - a.sort_amount || b.event_count - a.event_count || a.streamer.localeCompare(b.streamer));
+    return {
+      event_count: events.length,
+      streams_with_powerchat: streamRows.length,
+      events_without_offset: withoutOffset,
+      money_totals: powerchatMoney(total),
+      unit_totals: powerchatUnits(total),
+      money_rates: powerchatRateRows(total, duration),
+      top_donors: finishPowerchatDonors(donors).slice(0, 25),
+      hourly_totals: finishPowerchatHours(hours),
+      stream_totals: streamRows,
+      streamer_dashboards: streamerRows,
+    };
+  };
+  const readPowerchatFilters = () => {
+    const value = (selector, fallback = "") => document.querySelector(selector)?.value || fallback;
+    const pageSize = Number(value("[data-powerchat-page-size]", "50"));
+    return {
+      streamer: value("[data-powerchat-filter-streamer]", "all"),
+      platform: value("[data-powerchat-filter-platform]", "all"),
+      kind: value("[data-powerchat-filter-kind]", "all"),
+      from: value("[data-powerchat-filter-from]"),
+      to: value("[data-powerchat-filter-to]"),
+      search: value("[data-powerchat-filter-search]"),
+      page_size: [25, 50, 100].includes(pageSize) ? pageSize : 50,
+    };
+  };
+  const powerchatEventMatches = (event, filters) => {
+    if (filters.streamer !== "all" && event.streamer !== filters.streamer) return false;
+    if (filters.platform !== "all" && event.platform !== filters.platform) return false;
+    if (filters.kind !== "all" && event.kind !== filters.kind) return false;
+    const date = String(event.received_at || "").slice(0, 10);
+    if (filters.from && date && date < filters.from) return false;
+    if (filters.to && date && date > filters.to) return false;
+    const query = filters.search.trim().toLowerCase();
+    return !query || [event.donor, event.message, event.stream_title, event.streamer, event.video_id, event.platform].join(" ").toLowerCase().includes(query);
+  };
+  const powerchatExportUrl = (format, filters = {}) => {
+    const params = new URLSearchParams({ format });
+    ["streamer", "video_id", "platform", "kind", "from", "to", "search"].forEach((key) => {
+      const value = String(filters[key] || "").trim();
+      if (value && value !== "all") params.set(key, value);
+    });
+    return `/powerchat-events?${params}`;
+  };
+  const renderPowerchatSummaryCards = (stats, streamer = false) => {
+    const donor = stats.top_donors?.[0]?.donor || "-";
+    const cards = [
+      ["Total", powerchatSummary(stats.money_totals, stats.unit_totals) || "-"],
+      ["Per hour", powerchatRates(stats.money_rates) || "-"],
+      ["Events", String(stats.event_count || 0)],
+      [streamer ? "Streams" : "Top donor", streamer ? String(stats.stream_count || 0) : donor],
+      [streamer ? "Top donor" : "Streams", streamer ? donor : String(stats.streams_with_powerchat || 0)],
+      ["No offset", String(stats.events_without_offset || 0)],
+    ];
+    return cards.map(([label, value]) => `<div class="powerchat-summary-card"><strong>${escapeHtml(value)}</strong><span class="muted">${escapeHtml(label)}</span></div>`).join("");
+  };
+  const renderPowerchatHours = (rows = []) => rows.length ? rows.map((row) => `<tr><td>${escapeHtml(row.hour_label || "-")}</td><td>${row.event_count || 0}</td><td>${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</td><td>${escapeHtml(powerchatSummary(row.average_money, []) || "-")}</td></tr>`).join("") : '<tr><td colspan="4" class="file-meta">No hourly Powerchat events captured yet</td></tr>';
+  const renderPowerchatStreams = (rows = []) => rows.length ? rows.slice(0, 50).map((row) => `<tr><td>${escapeHtml(row.streamer || "-")}</td><td class="file-name">${escapeHtml(row.title || row.video_id || "-")}</td><td>${row.event_count || 0}</td><td>${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</td><td>${escapeHtml(powerchatDuration(row.duration_seconds))}</td><td>${escapeHtml(powerchatRates(row.money_rates) || "-")}</td></tr>`).join("") : '<tr><td colspan="6" class="file-meta">No streams with Powerchat events yet</td></tr>';
+  const renderPowerchatDonors = (rows = []) => rows.length ? rows.slice(0, 25).map((row) => `<tr><td>${escapeHtml(row.donor || "Unknown donor")}</td><td>${row.event_count || 0}</td><td>${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</td><td>${escapeHtml(powerchatDateTime(row.latest_received_at))}</td></tr>`).join("") : '<tr><td colspan="4" class="file-meta">No Powerchat donors yet</td></tr>';
+  const powerchatAmount = (event) => event.kind === "money" && event.money_currency ? `${String(event.money_currency).toUpperCase()} ${powerchatNumber(event.money_amount, 2)}` : event.kind === "unit" && event.unit ? `${event.platform ? `${event.platform}: ` : ""}${powerchatNumber(event.unit_amount)} ${event.unit}` : "-";
+  const renderPowerchatLedger = (events = []) => events.length ? events.map((event) => `<tr><td>${escapeHtml(event.offset_seconds == null ? powerchatDateTime(event.received_at) : powerchatDuration(event.offset_seconds))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatAmount(event))}</td><td>${escapeHtml(event.platform || "Powerchat")}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("") : '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>';
+  const renderPowerchatStreamers = (rows = []) => rows.length ? rows.map((row, index) => `<details class="powerchat-streamer-card"${index === 0 ? " open" : ""}><summary><strong>${escapeHtml(row.streamer)}</strong><span>Total: ${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</span><span>Rate: ${escapeHtml(powerchatRates(row.money_rates) || "-")}</span><span>${row.stream_count || 0} streams</span><span>${row.event_count || 0} events</span></summary><div class="powerchat-streamer-card-body"><div class="powerchat-export-actions"><a class="download action-button" href="${escapeHtml(powerchatExportUrl("json", { streamer: row.streamer }))}">Download JSON</a><a class="download action-button" href="${escapeHtml(powerchatExportUrl("csv", { streamer: row.streamer }))}">Download CSV</a></div><div class="powerchat-summary-grid">${renderPowerchatSummaryCards(row, true)}</div><div class="powerchat-dashboard-section"><h4>Donations Per Hour</h4><div class="table-wrap"><table><thead><tr><th>Stream Hour</th><th>Events</th><th>Total</th><th>Average</th></tr></thead><tbody>${renderPowerchatHours(row.hourly_totals)}</tbody></table></div></div><div class="powerchat-dashboard-section"><h4>Streams</h4><div class="table-wrap"><table><thead><tr><th>Streamer</th><th>Stream</th><th>Events</th><th>Total</th><th>Duration</th><th>Per hour</th></tr></thead><tbody>${renderPowerchatStreams(row.stream_totals)}</tbody></table></div></div><div class="powerchat-dashboard-section"><h4>Top Donors</h4><div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead><tbody>${renderPowerchatDonors(row.top_donors)}</tbody></table></div></div></div></details>`).join("") : '<div class="file-meta">No streamers with Powerchat events yet.</div>';
+  const renderPowerchatDashboard = () => {
+    if (!document.getElementById("powerchat-dashboard")) return;
+    const sourceStats = powerchatStats();
+    const filters = readPowerchatFilters();
+    const events = (sourceStats.events || []).filter((event) => powerchatEventMatches(event, filters));
+    const stats = aggregatePowerchat(events, sourceStats);
+    document.querySelectorAll("[data-powerchat-export]").forEach((link) => { link.href = powerchatExportUrl(link.dataset.powerchatExport || "json", filters); });
+    const maxPage = Math.max(1, Math.ceil(events.length / filters.page_size));
+    powerchatPage = Math.min(Math.max(1, powerchatPage), maxPage);
+    const start = (powerchatPage - 1) * filters.page_size;
+    const pageEvents = events.slice(start, start + filters.page_size);
+    const setHtml = (id, html) => { const element = document.getElementById(id); if (element) element.innerHTML = html; };
+    setHtml("powerchat-summary-cards", renderPowerchatSummaryCards(stats));
+    setHtml("powerchat-streamer-rows", renderPowerchatStreamers(stats.streamer_dashboards));
+    setHtml("powerchat-hourly-rows", renderPowerchatHours(stats.hourly_totals));
+    setHtml("powerchat-stream-rows", renderPowerchatStreams(stats.stream_totals));
+    setHtml("powerchat-donor-rows", renderPowerchatDonors(stats.top_donors));
+    setHtml("powerchat-ledger-rows", renderPowerchatLedger(pageEvents));
+    const state = document.getElementById("powerchat-ledger-state");
+    if (state) state.textContent = events.length ? `Showing ${start + 1}–${Math.min(start + pageEvents.length, events.length)} of ${events.length} events` : "Showing 0 events";
+    const previous = document.querySelector("[data-powerchat-page-prev]");
+    const next = document.querySelector("[data-powerchat-page-next]");
+    if (previous) previous.disabled = powerchatPage <= 1;
+    if (next) next.disabled = powerchatPage >= maxPage;
+  };
+  document.addEventListener("input", (event) => {
+    if (!event.target.closest("[data-powerchat-filter-control]")) return;
+    powerchatPage = 1;
+    renderPowerchatDashboard();
+  });
+  document.addEventListener("change", (event) => {
+    if (!event.target.closest("[data-powerchat-filter-control]")) return;
+    powerchatPage = 1;
+    renderPowerchatDashboard();
+  });
+  document.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-powerchat-page-prev], [data-powerchat-page-next]");
+    if (!button) return;
+    event.preventDefault();
+    powerchatPage += button.hasAttribute("data-powerchat-page-next") ? 1 : -1;
+    renderPowerchatDashboard();
+  });
+
+  const loadVoiceDetails = async (button) => {
+    const root = button.closest(".voice-settings");
+    const panel = button.closest("[data-voice-details]");
+    const streamer = panel?.dataset.streamerName || "";
+    const state = panel?.querySelector("[data-voice-details-state]");
+    if (!root || !panel || !streamer) return;
+    button.disabled = true;
+    if (state) state.textContent = "Loading voice details…";
+    try {
+      const response = await fetch(`/streamer-voice-details?streamer=${encodeURIComponent(streamer)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      const review = root.querySelector("[data-voice-review]");
+      if (review) review.innerHTML = payload.review || '<div class="file-meta">No voice matches found.</div>';
+    } catch (error) {
+      button.disabled = false;
+      if (state) state.textContent = `Unable to load voice details: ${error.message || error}`;
+    }
+  };
+
+  const loadStreamSpeakers = async (button) => {
+    const panel = button.closest("[data-stream-speakers]");
+    const streamer = panel?.dataset.streamerName || "";
+    const videoId = panel?.dataset.videoId || "";
+    const state = panel?.querySelector("[data-stream-speakers-state]");
+    if (!panel || !streamer || !videoId) return;
+    button.disabled = true;
+    if (state) state.textContent = "Loading detected speakers…";
+    try {
+      const query = new URLSearchParams({ streamer, video_id: videoId });
+      const response = await fetch(`/stream-voice-speakers?${query}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const payload = await response.json();
+      panel.innerHTML = payload.speakers || '<div class="file-meta">No diarized transcript speakers found yet.</div>';
+    } catch (error) {
+      button.disabled = false;
+      if (state) state.textContent = `Unable to load detected speakers: ${error.message || error}`;
+    }
+  };
+
+  document.addEventListener("click", (event) => {
+    const voiceButton = event.target.closest("[data-load-voice-details]");
+    if (voiceButton) {
+      event.preventDefault();
+      loadVoiceDetails(voiceButton);
+      return;
+    }
+    const speakerButton = event.target.closest("[data-load-stream-speakers]");
+    if (speakerButton) {
+      event.preventDefault();
+      loadStreamSpeakers(speakerButton);
+    }
+  });
+
   const refreshFragment = async (region) => {
     if (document.hidden || region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
     try {
@@ -446,6 +737,7 @@
       const html = await response.text();
       if (region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
       region.innerHTML = html;
+      if (region.querySelector("#powerchat-dashboard")) powerchatPage = 1;
       if (revision) region.dataset.fragmentRevision = revision;
       applyActivityFilters();
       const stamp = document.querySelector("[data-last-refreshed]");
