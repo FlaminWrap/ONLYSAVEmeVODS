@@ -1729,7 +1729,21 @@ class WebStatusTests(unittest.TestCase):
                 download_dir=Path(tmp) / "downloads",
                 state_dir=Path(tmp) / "state",
                 chat_render_timeout_seconds=7200,
+                streamers={
+                    "Example": StreamerConfig(
+                        sources=["@example"],
+                        timezone="America/New_York",
+                    )
+                },
             )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="@example",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.close()
             media_file = config.download_dir / "Live Status [LIVEVIDEO01].mp4"
             chat_file = config.download_dir / "Live Status [LIVEVIDEO01].live_chat.json"
             output_file = config.download_dir / "Live Status [LIVEVIDEO01] - chat.mp4"
@@ -1767,6 +1781,10 @@ class WebStatusTests(unittest.TestCase):
         render.assert_called_once()
         self.assertEqual(render.call_args.kwargs["timeout_seconds"], 7200.0)
         self.assertEqual(render.call_args.kwargs["platform"], "youtube")
+        self.assertEqual(
+            render.call_args.kwargs["timezone_name"],
+            "America/New_York",
+        )
         self.assertEqual(
             render.call_args.kwargs["emoji_cache_dir"],
             config.chat_emoji_cache_dir,

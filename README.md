@@ -154,7 +154,8 @@ streamer time-zone dropdown, automatic workflow, and optional feature setup.
 Powerchat contains the editable listener username and enabled state alongside
 streamer-specific totals, hourly activity and supporter charts, streams, recent
 events, and scoped JSON/CSV exports. Absolute stream, file, processing-job, log,
-and support-event timestamps use the time zone selected under Settings. Date
+support-event, and rendered-chat clock timestamps use the time zone selected
+under Settings. Date
 filters use that same local calendar date; relative durations and stream offsets
 remain unchanged. Historical dates use the IANA database's DST rule for the date
 being displayed, rather than today's offset.
@@ -318,6 +319,8 @@ Create a chat video:
    or click **Render chat** / **Regenerate chat video** from the Files section.
 3. Watch Activity or the stream's Processing Jobs section for progress. The output is a separate
    `Title [VIDEOID] - chat.mp4`; the original media is not modified.
+   Its chat-panel clock uses the streamer's selected IANA time zone and the DST
+   rules that applied on the stream date.
 
 Transcribe and attribute speakers:
 
@@ -602,7 +605,9 @@ scripts/uninstall-systemd.sh
   media file is left untouched; the chat version is re-encoded with the video on
   the left and a rendered chat panel on the right. New chat messages appear at
   the bottom, older messages move upward, and messages leave only when pushed
-  off the panel by newer chat. Emoji images referenced by the live chat JSON are
+  off the panel by newer chat. The panel clock uses the streamer's configured
+  IANA time zone, including historical daylight-saving transitions. Emoji images
+  referenced by the live chat JSON are
   cached globally under `state_dir/chat_emoji_cache` and reused by later streams.
   The cache is keyed by image URL, so a platform-provided replacement URL creates
   a fresh entry without colliding with similarly named emoji from another

@@ -18,6 +18,7 @@ from onlysavemevods.downloader import (
     DownloadManager,
     build_chat_download_command,
     build_download_command,
+    chat_render_timezone_for_stream,
     choose_restart_segment,
     CatchupTracker,
     command_for_log,
@@ -52,6 +53,28 @@ NULL_LOGGER = NullLogger()
 
 
 class DownloaderCommandTests(unittest.TestCase):
+    def test_chat_render_uses_streamer_timezone(self) -> None:
+        config = BotConfig(
+            streamers={
+                "Example": StreamerConfig(
+                    sources=["kick:example"],
+                    timezone="America/New_York",
+                )
+            }
+        )
+        stream = LiveStream(
+            video_id="kick:example-stream",
+            url="https://kick.com/example",
+            channel="Example",
+            source="kick:example",
+            platform="kick",
+        )
+
+        self.assertEqual(
+            chat_render_timezone_for_stream(config, stream),
+            "America/New_York",
+        )
+
     def test_download_command_includes_live_resume_flags_without_keep_video(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(download_dir=Path(tmp) / "downloads")

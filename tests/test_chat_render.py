@@ -38,6 +38,7 @@ from onlysavemevods.chat_render import (
     chat_video_output_file,
     ass_color_from_rgb,
     format_ass_time,
+    format_chat_time,
     load_chat_panel_fonts,
     log_chat_media_sync_diagnostics,
     panel_emoji_size,
@@ -407,7 +408,7 @@ class ChatRenderTests(unittest.TestCase):
         self.assertIn(alice_color, CHAT_AUTHOR_COLORS)
         self.assertRegex(ass_color_from_rgb(alice_color), r"^&H[0-9A-F]{6}&$")
 
-    def test_render_chat_ass_places_kirkland_time_in_header(self) -> None:
+    def test_render_chat_ass_uses_selected_timezone_in_header(self) -> None:
         timestamp_us = int(
             datetime(2026, 5, 17, 21, 45, tzinfo=timezone.utc).timestamp()
             * 1_000_000
@@ -423,17 +424,37 @@ class ChatRenderTests(unittest.TestCase):
                 )
             ],
             layout,
+            "Europe/London",
         )
 
-        self.assertIn("2:45 PM", ass)
-        self.assertIn("2:46 PM", ass)
+        self.assertIn("10:45 PM", ass)
+        self.assertIn("10:46 PM", ass)
         self.assertIn("Dialogue: 5,0:00:00.00,0:01:00.00", ass)
         self.assertNotIn("Kirkland, WA", ass)
         self.assertIn(
             rf"\an9\pos({layout.output_width - layout.panel_padding_x},{layout.title_y})",
             ass,
         )
-        self.assertIn(rf"\fs{layout.title_font_size}\b1}}2:45 PM", ass)
+        self.assertIn(rf"\fs{layout.title_font_size}\b1}}10:45 PM", ass)
+
+    def test_rendered_chat_time_uses_historical_dst(self) -> None:
+        winter_timestamp_us = int(
+            datetime(2026, 1, 17, 21, 45, tzinfo=timezone.utc).timestamp()
+            * 1_000_000
+        )
+        summer_timestamp_us = int(
+            datetime(2026, 7, 17, 21, 45, tzinfo=timezone.utc).timestamp()
+            * 1_000_000
+        )
+
+        self.assertEqual(
+            format_chat_time(winter_timestamp_us, "America/Los_Angeles"),
+            "1:45 PM",
+        )
+        self.assertEqual(
+            format_chat_time(summer_timestamp_us, "America/Los_Angeles"),
+            "2:45 PM",
+        )
 
     def test_render_chat_ass_tints_standard_unicode_emoji(self) -> None:
         ass = render_chat_ass(
@@ -907,10 +928,16 @@ class ChatRenderTests(unittest.TestCase):
             Path("/downloads/stream - chat.mp4"),
             nice=False,
             platform="KICK",
+            timezone_name="America/New_York",
         )
 
         self.assertIn("--platform", command)
         self.assertEqual(command[command.index("--platform") + 1], "kick")
+        self.assertIn("--timezone", command)
+        self.assertEqual(
+            command[command.index("--timezone") + 1],
+            "America/New_York",
+        )
 
     def test_chat_video_command_can_use_nvenc_device(self) -> None:
         media_file = Path("/downloads/Example/LIVEVIDEO01/Live [ID].mp4")

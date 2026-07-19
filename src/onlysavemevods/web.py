@@ -9342,7 +9342,7 @@ def render_admin_streamer_preferences_form(streamer: StreamerStatStatus) -> str:
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}&amp;tab=settings">
-    <div class="form-field streamer-timezone-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><select id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone">{render_admin_streamer_timezone_options(streamer.timezone)}</select><span class="help-text">Controls stream, file, job, log, and support-event timestamps. Historical dates use the DST rules in effect at that time.</span><span class="technical-key">timezone</span><span class="field-error" data-field-error></span></div>
+    <div class="form-field streamer-timezone-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><select id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone">{render_admin_streamer_timezone_options(streamer.timezone)}</select><span class="help-text">Controls stream, file, job, log, support-event, and rendered-chat clock timestamps. Historical dates use the DST rules in effect at that time.</span><span class="technical-key">timezone</span><span class="field-error" data-field-error></span></div>
     <noscript><div class="button-row"><button class="button" type="submit">Save streamer settings</button></div></noscript>
   </form>
 </section>"""
