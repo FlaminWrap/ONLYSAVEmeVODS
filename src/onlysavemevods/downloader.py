@@ -14,6 +14,7 @@ import time
 
 from .chat_render import (
     ChatPanelRenderError,
+    DEFAULT_CHAT_TIME_ZONE,
     VideoProbeError,
     build_render_chat_file_process_command,
     build_chat_panel_merge_command,
@@ -113,6 +114,14 @@ def powerchat_settings_for_stream(
         if streamer.powerchat_enabled and username:
             return streamer_name, username
     return None
+
+
+def chat_render_timezone_for_stream(config: BotConfig, stream: LiveStream) -> str:
+    for target in (stream.source, stream.channel):
+        match = streamer_for_channel(config, target)
+        if match is not None:
+            return match[1].timezone
+    return DEFAULT_CHAT_TIME_ZONE
 
 
 def powerchat_segment_sidecar_file(
@@ -1464,6 +1473,7 @@ class DownloadManager:
             f"{output_file.stem}.rendering{output_file.suffix}"
         )
         ass_file = output_file.with_name(f"{output_file.stem}.ass")
+        timezone_name = chat_render_timezone_for_stream(self.config, stream)
         if output_file.exists():
             self.logger.info(
                 "Chat render output already exists for segment=%03d: %s",
@@ -1497,6 +1507,7 @@ class DownloadManager:
             output_file,
             segment_index,
             stream.platform,
+            timezone_name,
         )
         if subprocess_result is not None:
             finish_tracked_job(
@@ -1629,6 +1640,7 @@ class DownloadManager:
                     self.config.chat_render_use_nvenc,
                     nvenc_device,
                     frame_rate,
+                    timezone_name=timezone_name,
                 )
                 command = build_chat_panel_merge_command(
                     self.config.ffmpeg_path,
@@ -1658,7 +1670,12 @@ class DownloadManager:
                     "Unable to render image chat panel; falling back to subtitle renderer"
                 )
                 try:
-                    write_chat_ass_file(ass_file, entries, layout)
+                    write_chat_ass_file(
+                        ass_file,
+                        entries,
+                        layout,
+                        timezone_name,
+                    )
                 except OSError as exc:
                     self.logger.exception(
                         "Unable to write live chat subtitle file %s",
@@ -1689,7 +1706,12 @@ class DownloadManager:
                 )
         else:
             try:
-                write_chat_ass_file(ass_file, entries, layout)
+                write_chat_ass_file(
+                    ass_file,
+                    entries,
+                    layout,
+                    timezone_name,
+                )
             except OSError as exc:
                 self.logger.exception("Unable to write live chat subtitle file %s", ass_file)
                 finish_tracked_job(
@@ -1816,6 +1838,7 @@ class DownloadManager:
         output_file: Path,
         segment_index: int,
         platform: str = "",
+        timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
     ) -> bool | None:
         if self.config.config_path is None:
             return None
@@ -1827,6 +1850,7 @@ class DownloadManager:
             chat_file,
             output_file,
             platform=platform,
+            timezone_name=timezone_name,
         )
         self.logger.info(
             "Starting isolated chat render process segment=%03d media=%s chat=%s "

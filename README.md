@@ -153,8 +153,11 @@ Overview contains identity, sources, and stream history. Settings contains the
 streamer time-zone dropdown, automatic workflow, and optional feature setup.
 Powerchat contains the editable listener username and enabled state alongside
 streamer-specific totals, hourly activity and supporter charts, streams, recent
-events, and scoped JSON/CSV exports. Absolute support-event timestamps use the
-time zone selected under Settings.
+events, and scoped JSON/CSV exports. Absolute stream, file, processing-job, log,
+and support-event timestamps use the time zone selected under Settings. Date
+filters use that same local calendar date; relative durations and stream offsets
+remain unchanged. Historical dates use the IANA database's DST rule for the date
+being displayed, rather than today's offset.
 
 Each streamer has an **After a stream** workflow. For Twitch repair, subtitles,
 voice identification, content events, and chat-video rendering, choose **App
@@ -579,7 +582,8 @@ scripts/uninstall-systemd.sh
   `powerchat_enabled = true` and set `powerchat_username` in the streamer
   **Powerchat** tab or in `[streamers."Name"]` to listen to both Powerchat websocket
   feeds while that streamer is being recorded. Set `timezone` to an IANA name to
-  control how its support-event dates are displayed. Captured rows are written
+  control how its streamer-specific dates are displayed, including historical
+  daylight-saving changes. Captured rows are written
   beside the media as `<media>.powerchat-events.json`, shown in the stream
   Powerchat section, and tallied as separate money totals and platform-unit totals
   such as Kick gifts. This is a

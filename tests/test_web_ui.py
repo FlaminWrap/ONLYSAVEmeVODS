@@ -207,6 +207,67 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('rel="prev"', second_page)
         self.assertIn("Showing 11–12 of 12", fragment)
 
+    def test_streamer_history_uses_historical_timezone_and_dst(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["kick:example"]\n'
+                + 'timezone = "America/Los_Angeles"\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            state = StateStore(config.db_path)
+            streams = (
+                ("winter", "Winter stream", "2026-01-15T12:00:00+00:00"),
+                ("summer", "Summer stream", "2026-07-15T12:00:00+00:00"),
+                ("previous-day", "Previous local day", "2026-01-15T07:30:00+00:00"),
+            )
+            for video_id, title, timestamp in streams:
+                state.upsert_vod_stream(
+                    LiveStream(
+                        video_id=video_id,
+                        url=f"https://kick.com/example?stream={video_id}",
+                        title=title,
+                        channel="example",
+                        platform="kick",
+                        source="kick:example",
+                    )
+                )
+                state.conn.execute(
+                    """
+                    UPDATE streams
+                    SET first_seen_at = ?, updated_at = ?, last_started_at = ?,
+                        last_exit_at = ?
+                    WHERE video_id = ?
+                    """,
+                    (timestamp, timestamp, timestamp, timestamp, video_id),
+                )
+                state.conn.execute(
+                    "UPDATE stream_events SET created_at = ? WHERE video_id = ?",
+                    (timestamp, video_id),
+                )
+            state.conn.commit()
+            state.close()
+
+            html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+            filtered = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"], "from": ["2026-01-15"]},
+            )
+
+        self.assertIn("Times in America/Los_Angeles", html)
+        self.assertIn("2026-01-15 04:00:00 PST", html)
+        self.assertIn("2026-07-15 05:00:00 PDT", html)
+        self.assertIn("Winter stream", filtered)
+        self.assertNotIn("Previous local day", filtered)
+
     def test_streamer_overview_and_settings_are_separate_tabs(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"

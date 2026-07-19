@@ -191,7 +191,9 @@ CHAT_AUTHOR_COLORS = (
 )
 DEFAULT_CHAT_RENDER_TIMEOUT_SECONDS = 60 * 60
 FFMPEG_OUTPUT_PROGRESS_POLL_SECONDS = 2.0
-KIRKLAND_TIME_ZONE = "America/Los_Angeles"
+DEFAULT_CHAT_TIME_ZONE = "America/Los_Angeles"
+# Kept for compatibility with integrations that imported the old constant.
+KIRKLAND_TIME_ZONE = DEFAULT_CHAT_TIME_ZONE
 CHAT_SYNC_WARNING_THRESHOLD_SECONDS = 10.0
 
 
@@ -945,6 +947,7 @@ def render_chat_panel_video(
     nvenc_device: str = "",
     frame_rate: int = DEFAULT_CHAT_RENDER_FPS,
     progress_callback: ProgressCallback | None = None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> bool:
     def emit(phase: str, progress: float | None = None) -> None:
         if progress_callback is None:
@@ -967,7 +970,7 @@ def render_chat_panel_video(
     LOGGER.info(
         "Rendering chat panel video output=%s entries=%d duration=%.2fs "
         "panel=%sx%s configured_workers=%d resolved_workers=%d encoder=%s "
-        "nvenc_device=%s fps=%d",
+        "nvenc_device=%s fps=%d timezone=%s",
         output_file,
         len(entries),
         duration_seconds,
@@ -978,6 +981,7 @@ def render_chat_panel_video(
         chat_render_video_encoder_name(use_nvenc),
         nvenc_device or "default",
         frame_rate,
+        timezone_name,
     )
     resolved_cache_dir = cache_dir or output_file.parent / ".emoji-cache"
     cache = EmojiImageCache(resolved_cache_dir)
@@ -1021,7 +1025,12 @@ def render_chat_panel_video(
             resolved_workers,
         )
 
-        frame_jobs = chat_panel_frame_jobs(segments, frame_dir, clock_origin_us)
+        frame_jobs = chat_panel_frame_jobs(
+            segments,
+            frame_dir,
+            clock_origin_us,
+            timezone_name,
+        )
         if resolved_workers > 1 and len(frame_jobs) > 1:
             prewarmed = prewarm_emoji_cache(entries, cache)
             LOGGER.debug(
@@ -1150,6 +1159,7 @@ def chat_panel_frame_jobs(
     segments: list[tuple[float, float, list[tuple[ChatEntry, int]]]],
     frame_dir: Path,
     clock_origin_us: int | None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> list[ChatPanelFrameJob]:
     jobs: list[ChatPanelFrameJob] = []
     for index, (start, end, stack) in enumerate(segments):
@@ -1164,7 +1174,11 @@ def chat_panel_frame_jobs(
                 end=end,
                 path=frame_dir / f"frame-{index:06d}.png",
                 stack=stack,
-                header_time_text=kirkland_time_for_offset(clock_origin_us, start),
+                header_time_text=chat_time_for_offset(
+                    clock_origin_us,
+                    start,
+                    timezone_name,
+                ),
                 duration=duration,
             )
         )
@@ -1489,22 +1503,44 @@ def chat_clock_origin_us(entries: list[ChatEntry]) -> int | None:
     return min(origins, default=None)
 
 
-def kirkland_time_for_offset(
+def chat_time_for_offset(
     clock_origin_us: int | None,
     offset_seconds: float,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> str:
     if clock_origin_us is None:
         return ""
-    return format_kirkland_time(clock_origin_us + round(offset_seconds * 1_000_000))
+    return format_chat_time(
+        clock_origin_us + round(offset_seconds * 1_000_000),
+        timezone_name,
+    )
 
 
-def format_kirkland_time(timestamp_us: int) -> str:
+def format_chat_time(
+    timestamp_us: int,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
+) -> str:
     try:
-        time_zone = ZoneInfo(KIRKLAND_TIME_ZONE)
+        time_zone = ZoneInfo(timezone_name)
         moment = datetime.fromtimestamp(timestamp_us / 1_000_000, time_zone)
     except (OSError, OverflowError, ValueError, ZoneInfoNotFoundError):
         return ""
     return moment.strftime("%I:%M %p").lstrip("0")
+
+
+def kirkland_time_for_offset(
+    clock_origin_us: int | None,
+    offset_seconds: float,
+) -> str:
+    """Compatibility wrapper for the renderer's former fixed clock."""
+
+    return chat_time_for_offset(clock_origin_us, offset_seconds)
+
+
+def format_kirkland_time(timestamp_us: int) -> str:
+    """Compatibility wrapper for the renderer's former fixed clock."""
+
+    return format_chat_time(timestamp_us)
 
 
 def render_chat_panel_frame(
@@ -2056,13 +2092,18 @@ def write_chat_ass_file(
     path: Path,
     entries: list[ChatEntry],
     layout: ChatLayout | None = None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> None:
-    path.write_text(render_chat_ass(entries, layout), encoding="utf-8")
+    path.write_text(
+        render_chat_ass(entries, layout, timezone_name),
+        encoding="utf-8",
+    )
 
 
 def render_chat_ass(
     entries: list[ChatEntry],
     layout: ChatLayout | None = None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> str:
     layout = layout or default_chat_layout()
     sorted_entries = sorted(entries, key=lambda entry: entry.offset_seconds)
@@ -2092,7 +2133,14 @@ def render_chat_ass(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
     ]
     lines.extend(render_chat_stack_dialogues(sorted_entries, title_end, layout))
-    lines.extend(render_chat_header_dialogues(title_end, layout, sorted_entries))
+    lines.extend(
+        render_chat_header_dialogues(
+            title_end,
+            layout,
+            sorted_entries,
+            timezone_name,
+        )
+    )
 
     return "\n".join(lines) + "\n"
 
@@ -2176,6 +2224,7 @@ def render_chat_header_dialogues(
     final_end: float,
     layout: ChatLayout | None = None,
     entries: list[ChatEntry] | None = None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> list[str]:
     layout = layout or default_chat_layout()
     end = format_ass_time(final_end)
@@ -2203,7 +2252,12 @@ def render_chat_header_dialogues(
             f"{{\\pos({layout.panel_x},{layout.title_y})"
             f"\\fs{layout.title_font_size}\\b1}}Live Chat"
         ),
-        *render_chat_header_time_dialogues(final_end, layout, entries or []),
+        *render_chat_header_time_dialogues(
+            final_end,
+            layout,
+            entries or [],
+            timezone_name,
+        ),
     ]
 
 
@@ -2211,6 +2265,7 @@ def render_chat_header_time_dialogues(
     final_end: float,
     layout: ChatLayout,
     entries: list[ChatEntry],
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> list[str]:
     clock_origin_us = chat_clock_origin_us(entries)
     if clock_origin_us is None:
@@ -2222,7 +2277,7 @@ def render_chat_header_time_dialogues(
         end = min(next_clock_minute_offset_seconds(clock_origin_us, start), final_end)
         if end <= start:
             end = min(start + 60, final_end)
-        time_label = kirkland_time_for_offset(clock_origin_us, start)
+        time_label = chat_time_for_offset(clock_origin_us, start, timezone_name)
         if time_label:
             lines.append(
                 f"Dialogue: 5,{format_ass_time(start)},{format_ass_time(end)},"
@@ -2356,6 +2411,7 @@ def build_render_chat_file_process_command(
     nice: bool = True,
     progress_file: Path | None = None,
     platform: str = "",
+    timezone_name: str = "",
 ) -> list[str]:
     command = [
         python_executable,
@@ -2375,6 +2431,8 @@ def build_render_chat_file_process_command(
         command.extend(["--progress-file", str(progress_file)])
     if platform.strip():
         command.extend(["--platform", platform.strip().casefold()])
+    if timezone_name.strip():
+        command.extend(["--timezone", timezone_name.strip()])
     if overwrite:
         command.append("--overwrite")
     nice_path = shutil.which("nice") if nice else None
@@ -2605,6 +2663,7 @@ def render_chat_video_file(
     platform: str = "",
     emoji_cache_dir: Path | None = None,
     progress_callback: ProgressCallback | None = None,
+    timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
 ) -> Path:
     def emit(phase: str, progress: float | None = None) -> None:
         if progress_callback is None:
@@ -2637,7 +2696,7 @@ def render_chat_video_file(
     emit("Parsing live chat", 0.04)
     LOGGER.info(
         "Starting chat video %s media=%s chat=%s output=%s encoder=%s "
-        "nvenc_device=%s platform=%s fps=%d",
+        "nvenc_device=%s platform=%s fps=%d timezone=%s",
         "regeneration" if overwrite else "render",
         media_file,
         chat_file,
@@ -2646,6 +2705,7 @@ def render_chat_video_file(
         selected_nvenc_device or "default",
         platform.strip().casefold() or "default",
         frame_rate,
+        timezone_name,
     )
     try:
         entries = parse_live_chat_file(chat_file)
@@ -2725,6 +2785,7 @@ def render_chat_video_file(
                         phase,
                         0.18 + 0.52 * (progress if progress is not None else 0.0),
                     ),
+                    timezone_name=timezone_name,
                 )
                 command = build_chat_panel_merge_command(
                     ffmpeg_path,
@@ -2750,7 +2811,12 @@ def render_chat_video_file(
                     "Unable to render image chat panel; falling back to subtitle renderer"
                 )
                 emit("Writing subtitle fallback", 0.45)
-                write_chat_ass_file(ass_file, entries, layout)
+                write_chat_ass_file(
+                    ass_file,
+                    entries,
+                    layout,
+                    timezone_name,
+                )
                 LOGGER.info(
                     "Writing subtitle fallback for chat render ass=%s output=%s",
                     ass_file,
@@ -2768,7 +2834,12 @@ def render_chat_video_file(
                 )
         else:
             emit("Writing subtitle fallback", 0.45)
-            write_chat_ass_file(ass_file, entries, layout)
+            write_chat_ass_file(
+                ass_file,
+                entries,
+                layout,
+                timezone_name,
+            )
             LOGGER.info(
                 "Writing subtitle fallback for chat render ass=%s output=%s",
                 ass_file,

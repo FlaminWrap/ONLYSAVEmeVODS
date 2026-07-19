@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import __version__ as APP_VERSION
 from .chat_render import (
+    DEFAULT_CHAT_TIME_ZONE,
     choose_chat_render_nvenc_device,
     log_nvenc_environment,
     render_chat_video_file,
@@ -121,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--platform",
         default="",
         help="Source platform used to select the chat render frame rate.",
+    )
+    render_chat.add_argument(
+        "--timezone",
+        default=DEFAULT_CHAT_TIME_ZONE,
+        help="IANA time zone used for the rendered chat clock.",
     )
     render_chat.add_argument(
         "--progress-file",
@@ -341,6 +347,7 @@ def render_chat_file_command(args: argparse.Namespace) -> int:
             platform=args.platform,
             emoji_cache_dir=config.chat_emoji_cache_dir,
             progress_callback=report_progress,
+            timezone_name=args.timezone,
         )
     except Exception:  # noqa: BLE001 - command should return a process failure.
         report_progress("Failed", None)

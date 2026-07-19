@@ -38,6 +38,7 @@ from .app_update import (
     update_status as app_update_status,
 )
 from .chat_render import (
+    DEFAULT_CHAT_TIME_ZONE,
     build_render_chat_file_process_command,
     chat_render_platform_from_video_id,
     chat_video_output_file,
@@ -72,6 +73,7 @@ from .config import (
     post_stream_config_for_channel,
     remove_streamer_config,
     streamer_display_name_for_channel,
+    streamer_for_channel,
     update_channel_speaker_labels_config,
     update_channel_voice_detection_config,
     update_config_values,
@@ -2256,6 +2258,15 @@ def build_streamer_stream_page(
         )
     from_date = stream_page_date(params, "from")
     to_date = stream_page_date(params, "to")
+    configured_streamer = next(
+        (
+            streamer
+            for name, streamer in config.streamers.items()
+            if channel_group_key(name) == channel_group_key(streamer_name)
+        ),
+        None,
+    )
+    timezone_name = configured_streamer.timezone if configured_streamer else None
 
     state = StateStore(config.db_path)
     try:
@@ -2283,7 +2294,7 @@ def build_streamer_stream_page(
                 continue
             if query and query not in f"{record.title} {record.video_id}".casefold():
                 continue
-            date = stream_record_filter_date(record)
+            date = stream_record_filter_date(record, timezone_name)
             if from_date and (not date or date < from_date):
                 continue
             if to_date and (not date or date > to_date):
@@ -2370,10 +2381,17 @@ def stream_page_date(params: dict[str, list[str]], key: str) -> str:
     return value
 
 
-def stream_record_filter_date(record: StreamRecord) -> str:
+def stream_record_filter_date(
+    record: StreamRecord,
+    timezone_name: str | None = None,
+) -> str:
     for value in (record.last_started_at, record.updated_at):
         if value and len(value) >= 10:
-            return value[:10]
+            return (
+                iso_date_in_timezone(value, timezone_name)
+                if timezone_name
+                else value[:10]
+            )
     return ""
 
 
@@ -6100,6 +6118,20 @@ def video_id_from_job_key(key: str) -> str:
     return key.partition("\0")[0]
 
 
+def chat_render_timezone_for_video_id(config: BotConfig, video_id: str) -> str:
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+    finally:
+        state.close()
+    if record is None:
+        return DEFAULT_CHAT_TIME_ZONE
+    match = streamer_for_channel(config, record.channel)
+    if match is None:
+        return DEFAULT_CHAT_TIME_ZONE
+    return match[1].timezone
+
+
 def chat_render_timeout_seconds(config: BotConfig) -> float | None:
     if config.chat_render_timeout_seconds <= 0:
         return None
@@ -6375,6 +6407,10 @@ def run_render_chat_process_job(
 ) -> None:
     assert config.config_path is not None
     platform = chat_render_platform_from_video_id(video_id_from_job_key(key))
+    timezone_name = chat_render_timezone_for_video_id(
+        config,
+        video_id_from_job_key(key),
+    )
     progress_file = create_isolated_render_progress_file(output_file)
     command = build_render_chat_file_process_command(
         sys.executable,
@@ -6385,6 +6421,7 @@ def run_render_chat_process_job(
         overwrite=regenerate,
         progress_file=progress_file,
         platform=platform,
+        timezone_name=timezone_name,
     )
     LOGGER.info(
         "Starting isolated manual chat render process media=%s chat=%s output=%s",
@@ -6725,6 +6762,10 @@ def run_render_chat_in_process_job(
     regenerate: bool = False,
 ) -> None:
     platform = chat_render_platform_from_video_id(video_id_from_job_key(key))
+    timezone_name = chat_render_timezone_for_video_id(
+        config,
+        video_id_from_job_key(key),
+    )
     nvenc_device = choose_chat_render_nvenc_device(
         config.chat_render_nvenc_devices,
         output_file,
@@ -6768,6 +6809,7 @@ def run_render_chat_in_process_job(
             platform=platform,
             emoji_cache_dir=config.chat_emoji_cache_dir,
             progress_callback=report_progress,
+            timezone_name=timezone_name,
         )
     except Exception as exc:  # noqa: BLE001 - web job should capture renderer failures.
         LOGGER.exception(
@@ -8779,7 +8821,11 @@ def render_admin_fragment(
         revision = (
             streamer_powerchat_revision(snapshot.powerchat_stats, selected, streamer)
             if selected and tab == "powerchat" and streamer is not None
-            else f"{snapshot.stream_revision}:{snapshot.job_revision}"
+            else (
+                f"{snapshot.stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
+                if selected and streamer is not None
+                else f"{snapshot.stream_revision}:{snapshot.job_revision}"
+            )
         )
     elif page == "activity":
         view = first_query_value(params, "view").strip().lower() or "jobs"
@@ -8971,7 +9017,9 @@ def render_admin_streamer_detail(
         return f'<section class="card empty-state"><h2>Streamer not found</h2><p>{escape(selected)} is not available in the current configuration or stream history.</p><a class="button secondary" href="/streamers">Back to streamers</a></section>'
     if streamer.needs_grouping:
         return f'<div class="section-stack"><a href="/streamers">← All streamers</a><section class="notice warning"><h2>{escape(streamer.name)} needs grouping</h2><p>Use the migration assistant to create a shared streamer identity for these legacy sources.</p><a class="button" href="/streamers#migrate-legacy">Open migration assistant</a></section></div>'
-    revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    revision = (
+        f"{snapshot.stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
+    )
     delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
       <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
     </form>"""
@@ -9294,7 +9342,7 @@ def render_admin_streamer_preferences_form(streamer: StreamerStatStatus) -> str:
     <input type="hidden" name="action" value="save">
     <input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">
     <input type="hidden" name="return_to" value="/streamers?selected={escape(streamer_key, quote=True)}&amp;tab=settings">
-    <div class="form-field streamer-timezone-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><select id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone">{render_admin_streamer_timezone_options(streamer.timezone)}</select><span class="help-text">Controls how calendar dates and support-event timestamps are displayed for this streamer.</span><span class="technical-key">timezone</span><span class="field-error" data-field-error></span></div>
+    <div class="form-field streamer-timezone-field"><label for="streamer-timezone-{escape(dom_id, quote=True)}">Time zone</label><select id="streamer-timezone-{escape(dom_id, quote=True)}" name="timezone">{render_admin_streamer_timezone_options(streamer.timezone)}</select><span class="help-text">Controls stream, file, job, log, and support-event timestamps. Historical dates use the DST rules in effect at that time.</span><span class="technical-key">timezone</span><span class="field-error" data-field-error></span></div>
     <noscript><div class="button-row"><button class="button" type="submit">Save streamer settings</button></div></noscript>
   </form>
 </section>"""
@@ -9428,7 +9476,7 @@ def render_admin_streamer_streams(
   <label>Per page<select name="page_size">{page_size_options}</select></label>
   <div class="button-row"><button class="button small secondary" type="submit">Apply filters</button><a class="button small ghost" href="/streamers?selected={quote(streamer.name, safe='')}">Reset</a></div>
 </form>"""
-    heading = f'<div class="section-heading"><h2>Streams</h2><span class="muted">{stream_page.streamer_total} total</span></div>'
+    heading = f'<div class="section-heading"><h2>Streams</h2><span class="muted">{stream_page.streamer_total} total · Times in {escape(streamer.timezone)}</span></div>'
     if stream_page.streamer_total == 0:
         return f'{heading}<section class="card empty-state"><p>No streams have been seen for this streamer yet.</p></section>'
 
@@ -9437,7 +9485,10 @@ def render_admin_streamer_streams(
 
     start = (stream_page.page - 1) * stream_page.page_size + 1
     end = min(stream_page.page * stream_page.page_size, stream_page.total)
-    cards = "".join(render_admin_stream_detail(stream) for stream in stream_page.streams)
+    cards = "".join(
+        render_admin_stream_detail(stream, streamer.timezone)
+        for stream in stream_page.streams
+    )
     previous = (
         f'<a class="button small secondary" rel="prev" href="{escape(admin_streamer_stream_url(stream_page, page=stream_page.page - 1), quote=True)}">Previous</a>'
         if stream_page.page > 1
@@ -9456,21 +9507,23 @@ def render_admin_streamer_streams(
     return f'{heading}{filters}{pagination}<div class="record-list">{cards}</div>{pagination}'
 
 
-def render_admin_stream_detail(stream: StreamStatus) -> str:
+def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     platform, platform_label, platform_initial = stream_platform_details(stream)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
-    files = "".join(render_file_row(file) for file in stream.files[:20]) or '<tr><td colspan="7">No files found</td></tr>'
+    files = "".join(
+        render_file_row(file, timezone_name) for file in stream.files[:20]
+    ) or '<tr><td colspan="7">No files found</td></tr>'
     return f"""<details class="card stream-detail">
-  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at))}</span><span class="muted">{escape(stream.video_id)}</span></div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
+  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span></div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
   <div class="section-stack">
     {render_stream_signals(stream)}
-    <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at))}</dd></dl>
+    <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
     <div class="button-row">{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
     <details open><summary><strong>Files and actions</strong></summary><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></details>
     <details><summary><strong>Content events ({stream.content_event_count})</strong></summary>{render_content_events(stream.content_events)}</details>
-    <details><summary><strong>Powerchat ({stream.powerchat_event_count})</strong></summary>{render_powerchat_events(stream)}</details>
-    <details><summary><strong>Processing jobs</strong></summary>{render_stream_jobs(stream.jobs)}</details>
-    <details><summary><strong>Stream log</strong></summary>{render_stream_event_timeline(stream.events)}</details>
+    <details><summary><strong>Powerchat ({stream.powerchat_event_count})</strong></summary>{render_powerchat_events(stream, timezone_name)}</details>
+    <details><summary><strong>Processing jobs</strong></summary>{render_stream_jobs(stream.jobs, timezone_name)}</details>
+    <details><summary><strong>Stream log</strong></summary>{render_stream_event_timeline(stream.events, timezone_name)}</details>
   </div>
 </details>"""
 
@@ -13887,7 +13940,10 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
     settings = render_streamer_settings_area(streamer, snapshot)
     jobs = render_streamer_jobs_summary(streamer.jobs)
     streams = render_streamer_streams(streamer)
-    latest_activity = format_optional_epoch(streamer.latest_activity_at)
+    latest_activity = format_optional_epoch(
+        streamer.latest_activity_at,
+        streamer.timezone if streamer.configured else None,
+    )
     latest_activity_age = format_epoch_age(streamer.latest_activity_at)
     streamer_key = escape(streamer.name, quote=True)
     return f"""<section class="streamer-section{needs_class}{collapsed_class}" data-streamer-key="{streamer_key}" data-streamer-name="{streamer_key}" data-streamer-active="{streamer.active_count}" data-streamer-attention="{streamer.attention_count}" data-streamer-active-jobs="{active_jobs}" data-streamer-needs-grouping="{'true' if streamer.needs_grouping else 'false'}">
@@ -14386,7 +14442,10 @@ def render_streamer_jobs_summary(jobs: list[JobStatus]) -> str:
 </div>"""
 
 
-def render_streamer_job_row(job: JobStatus) -> str:
+def render_streamer_job_row(
+    job: JobStatus,
+    timezone_name: str | None = None,
+) -> str:
     return (
         '<div class="streamer-job-row">'
         f'<span class="badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span>'
@@ -14397,7 +14456,7 @@ def render_streamer_job_row(job: JobStatus) -> str:
         '</div>'
         f'<div class="streamer-job-progress">{render_job_progress(job.progress)}</div>'
         f'<div class="streamer-job-detail streamer-job-meta file-meta">{render_job_compact_meta(job)}</div>'
-        f'{render_job_detail_toggle(job)}'
+        f'{render_job_detail_toggle(job, timezone_name)}'
         '</div>'
         '</div>'
     )
@@ -14425,8 +14484,11 @@ def render_job_compact_meta(job: JobStatus) -> str:
     return '<span>' + '</span><span>'.join(escape(part) for part in parts) + '</span>'
 
 
-def render_job_detail_toggle(job: JobStatus) -> str:
-    rows = render_job_detail_rows(job)
+def render_job_detail_toggle(
+    job: JobStatus,
+    timezone_name: str | None = None,
+) -> str:
+    rows = render_job_detail_rows(job, timezone_name)
     if not rows:
         return ""
     return (
@@ -14437,7 +14499,10 @@ def render_job_detail_toggle(job: JobStatus) -> str:
     )
 
 
-def render_job_detail_rows(job: JobStatus) -> str:
+def render_job_detail_rows(
+    job: JobStatus,
+    timezone_name: str | None = None,
+) -> str:
     details = job.details or {}
     fields = [
         ("Media", details.get("media_name")),
@@ -14446,7 +14511,7 @@ def render_job_detail_rows(job: JobStatus) -> str:
         ("Current file", details.get("current_name")),
         ("Current size", job_detail_current_size(details)),
         ("Elapsed", job_detail_elapsed(job)),
-        ("Updated", format_optional_epoch(job.updated_at)),
+        ("Updated", format_optional_epoch(job.updated_at, timezone_name)),
         ("Message", details.get("diagnostic") or job.message),
     ]
     rows: list[str] = []
@@ -14486,12 +14551,27 @@ def stream_platform_details(stream: StreamStatus) -> tuple[str, str, str]:
     return platform, SOURCE_PLATFORM_LABELS[platform], SOURCE_PLATFORM_INITIALS[platform]
 
 
-def stream_filter_date_value(stream: StreamStatus) -> str:
+def stream_filter_date_value(
+    stream: StreamStatus,
+    timezone_name: str | None = None,
+) -> str:
     for value in (stream.last_started_at, stream.updated_at):
         if value and len(value) >= 10:
-            return value[:10]
+            return (
+                iso_date_in_timezone(value, timezone_name)
+                if timezone_name
+                else value[:10]
+            )
     if stream.latest_file_modified_at is not None:
-        return time.strftime("%Y-%m-%d", time.localtime(stream.latest_file_modified_at))
+        if timezone_name:
+            return datetime.fromtimestamp(
+                stream.latest_file_modified_at,
+                display_timezone(timezone_name),
+            ).date().isoformat()
+        return time.strftime(
+            "%Y-%m-%d",
+            time.localtime(stream.latest_file_modified_at),
+        )
     return ""
 
 
@@ -15222,10 +15302,15 @@ def format_config_value(value: Any) -> str:
     return str(value)
 
 
-def render_stream_jobs(jobs: list[JobStatus]) -> str:
+def render_stream_jobs(
+    jobs: list[JobStatus],
+    timezone_name: str | None = None,
+) -> str:
     if not jobs:
         return '<div class="file-meta">No jobs have been seen for this stream.</div>'
-    rows = "".join(render_streamer_job_row(job) for job in jobs[:8])
+    rows = "".join(
+        render_streamer_job_row(job, timezone_name) for job in jobs[:8]
+    )
     return f'<div class="stream-job-list">{rows}</div>'
 
 
@@ -15437,7 +15522,10 @@ def render_powerchat_dashboard_stream_rows(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def render_powerchat_donor_rows(rows: list[dict[str, Any]]) -> str:
+def render_powerchat_donor_rows(
+    rows: list[dict[str, Any]],
+    timezone_name: str | None = None,
+) -> str:
     if not rows:
         return '<tr><td colspan="4" class="file-meta">No Powerchat donors yet</td></tr>'
     return "".join(
@@ -15445,18 +15533,21 @@ def render_powerchat_donor_rows(rows: list[dict[str, Any]]) -> str:
         f'<td>{escape(str(row.get("donor") or "Unknown donor"))}</td>'
         f'<td>{escape(str(row.get("event_count") or 0))}</td>'
         f'<td>{escape(format_powerchat_summary(row.get("money_totals", []), row.get("unit_totals", [])) or "-")}</td>'
-        f'<td>{escape(format_optional_iso(str(row.get("latest_received_at") or "")))}</td>'
+        f'<td>{escape(format_optional_iso(str(row.get("latest_received_at") or ""), timezone_name))}</td>'
         "</tr>"
         for row in rows[:25]
     )
 
 
-def render_powerchat_ledger_rows(rows: list[dict[str, Any]]) -> str:
+def render_powerchat_ledger_rows(
+    rows: list[dict[str, Any]],
+    timezone_name: str | None = None,
+) -> str:
     if not rows:
         return '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>'
     return "".join(
         "<tr>"
-        f'<td>{escape(powerchat_dashboard_event_time(row))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_time(row, timezone_name))}</td>'
         f'<td>{escape(str(row.get("streamer") or "-"))}</td>'
         f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
         f'<td>{escape(str(row.get("donor") or "Unknown donor"))}</td>'
@@ -15468,10 +15559,13 @@ def render_powerchat_ledger_rows(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def powerchat_dashboard_event_time(row: dict[str, Any]) -> str:
+def powerchat_dashboard_event_time(
+    row: dict[str, Any],
+    timezone_name: str | None = None,
+) -> str:
     if row.get("offset_seconds") is not None:
         return format_event_offset(float(row.get("offset_seconds") or 0.0))
-    return format_optional_iso(str(row.get("received_at") or ""))
+    return format_optional_iso(str(row.get("received_at") or ""), timezone_name)
 
 
 def powerchat_dashboard_event_offset(row: dict[str, Any]) -> str:
@@ -15522,7 +15616,10 @@ def render_stream_powerchat_summary_cards(stats: dict[str, Any]) -> str:
     )
 
 
-def render_powerchat_events(stream: StreamStatus) -> str:
+def render_powerchat_events(
+    stream: StreamStatus,
+    timezone_name: str | None = None,
+) -> str:
     if not stream.powerchat_events:
         return '<div class="file-meta">No Powerchat support events captured yet.</div>'
     stats = build_stream_powerchat_stats(stream)
@@ -15541,12 +15638,12 @@ def render_powerchat_events(stream: StreamStatus) -> str:
         '<div class="powerchat-dashboard-section">'
         '<h4>Top Donors</h4>'
         '<div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead>'
-        f'<tbody>{render_powerchat_donor_rows(stats.get("top_donors", []))}</tbody></table></div>'
+        f'<tbody>{render_powerchat_donor_rows(stats.get("top_donors", []), timezone_name)}</tbody></table></div>'
         '</div>'
         '<div class="powerchat-dashboard-section">'
         '<h4>Event Ledger</h4>'
         '<div class="table-wrap"><table><thead><tr><th>Time</th><th>Streamer</th><th>Stream</th><th>Donor</th><th>Amount</th><th>Platform</th><th>Message</th></tr></thead>'
-        f'<tbody>{render_powerchat_ledger_rows(stats.get("events", [])[:100])}</tbody></table></div>'
+        f'<tbody>{render_powerchat_ledger_rows(stats.get("events", [])[:100], timezone_name)}</tbody></table></div>'
         '</div>'
         '</div>'
     )
@@ -15691,7 +15788,8 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     title = stream.title or stream.video_id
     platform, platform_label, platform_initial = stream_platform_details(stream)
     mixed = "yes" if stream.has_mixed_formats else "no"
-    latest_file = format_optional_epoch(stream.latest_file_modified_at)
+    timezone_name = streamer.timezone if streamer and streamer.configured else None
+    latest_file = format_optional_epoch(stream.latest_file_modified_at, timezone_name)
     latest_age = format_epoch_age(stream.latest_file_modified_at)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
     signals = render_stream_signals(stream)
@@ -15699,19 +15797,21 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     collapsed_class = " collapsed" if collapsed else ""
     toggle_label = "Expand" if collapsed else "Collapse"
     expanded = "false" if collapsed else "true"
-    files = "\n".join(render_file_row(file) for file in stream.files[:20])
+    files = "\n".join(
+        render_file_row(file, timezone_name) for file in stream.files[:20]
+    )
     if not files:
         files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
-    events = render_stream_event_timeline(stream.events)
+    events = render_stream_event_timeline(stream.events, timezone_name)
     content_events = render_content_events(stream.content_events)
-    powerchat = render_powerchat_events(stream)
+    powerchat = render_powerchat_events(stream, timezone_name)
     powerchat_summary = format_powerchat_summary(
         stream.powerchat_money_totals,
         stream.powerchat_unit_totals,
     )
-    date_value = stream_filter_date_value(stream)
+    date_value = stream_filter_date_value(stream, timezone_name)
     speakers = render_stream_speakers_panel(streamer, stream)
-    jobs = render_stream_jobs(stream.jobs)
+    jobs = render_stream_jobs(stream.jobs, timezone_name)
     vod_redownload = render_stream_vod_redownload_form(stream)
     tab_key = escape(stream.video_id, quote=True)
     files_tab_id = f"stream-tab-{tab_key}-files"
@@ -15752,9 +15852,9 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
       <div>Powerchat: {stream.powerchat_event_count} <span class="muted">{escape(powerchat_summary)}</span></div>
       <div>Mixed formats: {mixed}</div>
       <div>Exit code: {escape(format_optional_int(stream.exit_code))}</div>
-      <div>Started: {escape(format_optional_iso(stream.last_started_at))}</div>
-      <div>Exited: {escape(format_optional_iso(stream.last_exit_at))}</div>
-      <div>Updated: {escape(format_optional_iso(stream.updated_at))}</div>
+      <div>Started: {escape(format_optional_iso(stream.last_started_at, timezone_name))}</div>
+      <div>Exited: {escape(format_optional_iso(stream.last_exit_at, timezone_name))}</div>
+      <div>Updated: {escape(format_optional_iso(stream.updated_at, timezone_name))}</div>
       <div>Latest file: {escape(latest_file)} <span class="muted">{escape(latest_age)}</span></div>
       <div class="wide">Kinds: {escape(format_kind_counts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: {escape(stream.directory)}</div>
@@ -15795,19 +15895,27 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
 </section>"""
 
 
-def render_stream_event_timeline(events: list[StreamEventStatus]) -> str:
+def render_stream_event_timeline(
+    events: list[StreamEventStatus],
+    timezone_name: str | None = None,
+) -> str:
     if not events:
         return '<div class="file-meta">No stream log entries yet.</div>'
-    rows = "".join(render_stream_event(event) for event in reversed(events))
+    rows = "".join(
+        render_stream_event(event, timezone_name) for event in reversed(events)
+    )
     return f'<div class="stream-events">{rows}</div>'
 
 
-def render_stream_event(event: StreamEventStatus) -> str:
+def render_stream_event(
+    event: StreamEventStatus,
+    timezone_name: str | None = None,
+) -> str:
     segment = f"seg {event.segment_index:03d}" if event.segment_index else "-"
     level = event.level if event.level in {"debug", "info", "warning", "error"} else "info"
     return (
         f'<div class="stream-event {escape(level, quote=True)}">'
-        f'<div class="stream-event-time">{escape(format_optional_iso(event.created_at))}</div>'
+        f'<div class="stream-event-time">{escape(format_optional_iso(event.created_at, timezone_name))}</div>'
         f'<div class="stream-event-level">{escape(level.upper())}</div>'
         f'<div class="stream-event-segment">{escape(segment)}</div>'
         f'<div class="stream-event-message">{escape(event.message)}</div>'
@@ -15815,7 +15923,10 @@ def render_stream_event(event: StreamEventStatus) -> str:
     )
 
 
-def render_file_row(file: FileStatus) -> str:
+def render_file_row(
+    file: FileStatus,
+    timezone_name: str | None = None,
+) -> str:
     action = render_file_action(file)
     return (
         "<tr>"
@@ -15823,7 +15934,7 @@ def render_file_row(file: FileStatus) -> str:
         f"<td>{escape(file.segment or '-')}</td>"
         f"<td>{escape(file.format_id or '-')}</td>"
         f'<td class="kind">{escape(file.kind)}</td>'
-        f"<td>{escape(format_optional_epoch(file.modified_at))}</td>"
+        f"<td>{escape(format_optional_epoch(file.modified_at, timezone_name))}</td>"
         f"<td>{escape(format_bytes(file.size_bytes))}</td>"
         f"<td>{action}</td>"
         "</tr>"
@@ -16115,9 +16226,11 @@ def format_optional_int(value: int | None) -> str:
     return "-" if value is None else str(value)
 
 
-def format_optional_iso(value: str | None) -> str:
+def format_optional_iso(value: str | None, timezone_name: str | None = None) -> str:
     if not value:
         return "-"
+    if timezone_name:
+        return format_optional_iso_timezone(value, timezone_name)
     try:
         timestamp = datetime.fromisoformat(value).timestamp()
     except ValueError:
@@ -16125,25 +16238,56 @@ def format_optional_iso(value: str | None) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(timestamp))
 
 
-def format_optional_iso_timezone(value: str | None, timezone: str) -> str:
+@lru_cache(maxsize=128)
+def display_timezone(timezone_name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(timezone_name or "UTC")
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo("UTC")
+
+
+def iso_datetime_in_timezone(
+    value: str | None,
+    timezone_name: str,
+) -> datetime | None:
     if not value:
-        return "-"
+        return None
     try:
         timestamp = datetime.fromisoformat(value)
     except ValueError:
-        return value
-    try:
-        zone = ZoneInfo(timezone or "UTC")
-    except (ZoneInfoNotFoundError, ValueError):
-        zone = ZoneInfo("UTC")
+        return None
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=ZoneInfo("UTC"))
-    return timestamp.astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+    return timestamp.astimezone(display_timezone(timezone_name))
 
 
-def format_optional_epoch(value: float | None) -> str:
+def format_optional_iso_timezone(value: str | None, timezone_name: str) -> str:
+    if not value:
+        return "-"
+    timestamp = iso_datetime_in_timezone(value, timezone_name)
+    if timestamp is None:
+        return value
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def iso_date_in_timezone(value: str | None, timezone_name: str) -> str:
+    timestamp = iso_datetime_in_timezone(value, timezone_name)
+    if timestamp is not None:
+        return timestamp.date().isoformat()
+    return value[:10] if value and len(value) >= 10 else ""
+
+
+def format_optional_epoch(
+    value: float | None,
+    timezone_name: str | None = None,
+) -> str:
     if value is None:
         return "-"
+    if timezone_name:
+        return datetime.fromtimestamp(
+            value,
+            display_timezone(timezone_name),
+        ).strftime("%Y-%m-%d %H:%M:%S %Z")
     return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(value))
 
 
