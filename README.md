@@ -281,7 +281,9 @@ journalctl -u onlysavemevods.service -f
 For web performance issues, set `log_level = "DEBUG"`, restart the service, and
 look for `Slow web ...` warnings in the journal. Large stream folders with many
 fragments can slow dashboard scans; use **Clean fragments** on ended streams
-when the fragments are no longer needed for resume/debugging.
+when the fragments are no longer needed for resume/debugging, or set
+`fragment_retention_hours` under **Settings → Recording** to remove them
+automatically. The default `0` disables automatic cleanup.
 
 ### Common Tasks
 
@@ -357,6 +359,8 @@ Create and manage watermarked copies:
 Delete or clean up a stream:
 
 1. Use **Clean fragments** on ended streams to remove saved `.part-Frag` files.
+   To automate this, set `fragment_retention_hours` to the number of hours to
+   retain fragments after a stream is marked ended; `0` keeps them indefinitely.
 2. Use **Delete stream** to remove the stream record and downloaded stream
    folder. The UI asks for confirmation because this cannot be undone.
 3. Active/downloading streams cannot be deleted or cleaned up until they are no
@@ -561,7 +565,8 @@ scripts/uninstall-systemd.sh
   `live_from_start = true`; other platforms are left to yt-dlp's platform
   behavior. Keeping fragments costs extra disk space while a segment is active,
   but it gives the bot enough state to resume a format that yt-dlp accidentally
-  finalized.
+  finalized. `fragment_retention_hours` can remove those fragments automatically
+  after the stream has safely reached the `ended` state.
 - Set `record_live_chat = true` to ask yt-dlp to write YouTube live chat with
   `--write-subs --sub-langs live_chat`. The bot keeps it as a sidecar
   `.live_chat.json` file and renames it with the finalized stream title and ID

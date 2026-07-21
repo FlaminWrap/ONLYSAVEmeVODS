@@ -92,6 +92,22 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('form.getAttribute("action")', script)
         self.assertNotIn("fetch(form.action", script)
 
+    def test_fragment_refresh_preserves_expanded_details(self) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.js"
+        ).read_text(encoding="utf-8")
+
+        capture = script.index("const detailsState = captureDetailsState(region);")
+        replace = script.index("region.innerHTML = html;")
+        restore = script.index("restoreDetailsState(region, detailsState);")
+        self.assertLess(capture, replace)
+        self.assertLess(replace, restore)
+        self.assertIn('details[data-details-key]', script)
+
     def test_static_pages_use_sidebar_shell_and_packaged_assets(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"
@@ -123,6 +139,7 @@ class DashboardUiTests(unittest.TestCase):
             snapshot = build_admin_static_snapshot(config)
 
             general = render_admin_settings(snapshot, "general")
+            recording = render_admin_settings(snapshot, "recording")
             advanced = render_admin_settings(snapshot, "advanced")
 
         self.assertIn('data-autosave="config"', general)
@@ -130,6 +147,9 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("download_dir", general)
         self.assertIn("Changes save automatically", general)
         self.assertIn("Restart", general)
+        self.assertIn("Clear ended-stream fragments after", recording)
+        self.assertIn("fragment_retention_hours", recording)
+        self.assertIn("(hours)", recording)
         self.assertIn("data-settings-search", advanced)
         self.assertIn("Additional yt-dlp arguments", advanced)
         self.assertIn("Create subtitles automatically", advanced)
@@ -283,6 +303,9 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('rel="next"', first_page)
         self.assertNotIn("Open complete history", first_page)
         self.assertNotIn("compatibility workspace for the complete", first_page)
+        self.assertIn('data-details-key="stream:kick:example:00"', first_page)
+        self.assertIn('data-details-key="stream:kick:example:00:jobs"', first_page)
+        self.assertIn('class="stream-subsection processing-jobs-section"', first_page)
         self.assertIn("Showing 11–12 of 12", second_page)
         self.assertIn("Page 2 of 2", second_page)
         self.assertIn('rel="prev"', second_page)

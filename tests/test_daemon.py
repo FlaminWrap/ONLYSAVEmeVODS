@@ -93,6 +93,31 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake_sources.checked, ["twitch:OUMB3rd"])
         daemon.downloads.start_stream.assert_awaited_once_with(stream)
 
+    async def test_poll_once_runs_enabled_fragment_cleanup(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                fragment_retention_hours=24,
+                web_enabled=False,
+            )
+            daemon = OnlySaveMeVodsDaemon(config)
+            cleanup = Mock(return_value=(1, 2, 1024))
+
+            async def inline_to_thread(func, /, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            try:
+                with (
+                    patch("onlysavemevods.daemon.asyncio.to_thread", inline_to_thread),
+                    patch("onlysavemevods.daemon.cleanup_expired_stream_fragments", cleanup),
+                ):
+                    await daemon.poll_once()
+            finally:
+                daemon.state.close()
+
+        cleanup.assert_called_once_with(config)
+
 
 if __name__ == "__main__":
     unittest.main()

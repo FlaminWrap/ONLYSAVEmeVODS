@@ -662,24 +662,25 @@ class StateStore:
         self,
         statuses: list[str],
         *,
-        limit: int = 1000,
+        limit: int | None = 1000,
     ) -> list[StreamRecord]:
         normalized = [status.strip() for status in statuses if status.strip()]
         if not normalized:
             return []
         placeholders = ", ".join("?" for _status in normalized)
-        rows = self.conn.execute(
-            f"""
+        query = f"""
             SELECT video_id, title, channel, url, status, segment_index,
                    platform, source,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE status IN ({placeholders})
             ORDER BY updated_at DESC, first_seen_at DESC
-            LIMIT ?
-            """,
-            (*normalized, limit),
-        ).fetchall()
+        """
+        values: list[str | int] = list(normalized)
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(limit)
+        rows = self.conn.execute(query, values).fetchall()
         return [_record_from_row(row) for row in rows]
 
     def delete_stream(self, video_id: str) -> bool:

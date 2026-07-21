@@ -199,6 +199,7 @@ class BotConfig:
     twitch_ad_repair_max_seconds: int = DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS
     twitch_ad_repair_vod_search_limit: int = DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT
     keep_fragments_for_resume: bool = True
+    fragment_retention_hours: int = 0
     reconnect_interval_seconds: int = 0
     post_exit_check_seconds: list[int] = field(
         default_factory=lambda: list(DEFAULT_POST_EXIT_CHECK_SECONDS)
@@ -453,6 +454,10 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
         keep_fragments_for_resume=_as_bool(
             raw.get("keep_fragments_for_resume", True),
             "keep_fragments_for_resume",
+        ),
+        fragment_retention_hours=_as_non_negative_int(
+            raw.get("fragment_retention_hours", 0),
+            "fragment_retention_hours",
         ),
         reconnect_interval_seconds=_as_non_negative_int(
             raw.get("reconnect_interval_seconds", 0), "reconnect_interval_seconds"

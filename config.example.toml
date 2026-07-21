@@ -201,6 +201,10 @@ app_update_github_token_env = "GITHUB_TOKEN"
 # format back into a resumable .part file without dropping fragments.
 keep_fragments_for_resume = true
 
+# Automatically remove saved fragments from streams that have been marked ended
+# for this many hours. Zero keeps them until they are cleaned manually.
+fragment_retention_hours = 0
+
 # Planned reconnects are disabled by default. The mixed-format watchdog still
 # reconnects when one format finalizes while another remains partial. Set this
 # above 0 only if you also want periodic forced reconnects after catch-up.

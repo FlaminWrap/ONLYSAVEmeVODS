@@ -727,6 +727,21 @@
     }
   });
 
+  const captureDetailsState = (region) => new Map(
+    [...region.querySelectorAll("details[data-details-key]")].map((details) => [
+      details.dataset.detailsKey,
+      details.open,
+    ]),
+  );
+
+  const restoreDetailsState = (region, state) => {
+    region.querySelectorAll("details[data-details-key]").forEach((details) => {
+      if (state.has(details.dataset.detailsKey)) {
+        details.open = state.get(details.dataset.detailsKey);
+      }
+    });
+  };
+
   const refreshFragment = async (region) => {
     if (document.hidden || region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
     try {
@@ -736,7 +751,9 @@
       if (revision && revision === region.dataset.fragmentRevision) return;
       const html = await response.text();
       if (region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
+      const detailsState = captureDetailsState(region);
       region.innerHTML = html;
+      restoreDetailsState(region, detailsState);
       if (region.querySelector("#powerchat-dashboard")) powerchatPage = 1;
       if (revision) region.dataset.fragmentRevision = revision;
       applyActivityFilters();

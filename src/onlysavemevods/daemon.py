@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 from .chat_render import log_nvenc_environment
@@ -15,11 +16,12 @@ from .downloader import DownloadManager
 from .models import LiveStream
 from .sources import SourceMonitor
 from .state import StateStore, StreamRecord
-from .web import StatusWebServer
+from .web import StatusWebServer, cleanup_expired_stream_fragments
 from .youtube import YtDlpRunner
 
 
 LOGGER = logging.getLogger(__name__)
+FRAGMENT_CLEANUP_INTERVAL_SECONDS = 15 * 60
 
 
 class OnlySaveMeVodsDaemon:
@@ -35,6 +37,7 @@ class OnlySaveMeVodsDaemon:
         self.downloads = DownloadManager(config, self.state, self.sources)
         self.web = StatusWebServer(config) if config.web_enabled else None
         self._stop_event = asyncio.Event()
+        self._last_fragment_cleanup_monotonic: float | None = None
 
     async def run(self) -> None:
         stale_post_exit_records = self.state.list_streams_by_status(["checking_after_exit"])
@@ -50,6 +53,7 @@ class OnlySaveMeVodsDaemon:
         LOGGER.debug(
             "Daemon config: channel_scan_limit=%s discovery_probe_concurrency=%s "
             "live_from_start=%s keep_fragments_for_resume=%s "
+            "fragment_retention_hours=%s "
             "reconnect_interval_seconds=%s post_exit_check_seconds=%s "
             "render_live_chat_video=%s chat_render_use_nvenc=%s "
             "chat_render_nvenc_devices=%s transcribe_subtitles=%s "
@@ -59,6 +63,7 @@ class OnlySaveMeVodsDaemon:
             self.config.discovery_probe_concurrency,
             self.config.live_from_start,
             self.config.keep_fragments_for_resume,
+            self.config.fragment_retention_hours,
             self.config.reconnect_interval_seconds,
             self.config.post_exit_check_seconds,
             self.config.render_live_chat_video,
@@ -136,6 +141,7 @@ class OnlySaveMeVodsDaemon:
             )
 
     async def poll_once(self) -> None:
+        await self.cleanup_expired_fragments()
         for source in monitored_sources(self.config):
             LOGGER.info("Checking source %s", source)
             try:
@@ -160,6 +166,33 @@ class OnlySaveMeVodsDaemon:
                     stream.title,
                 )
                 await self._start_stream(stream)
+
+    async def cleanup_expired_fragments(self) -> None:
+        if self.config.fragment_retention_hours <= 0:
+            return
+        current_monotonic = time.monotonic()
+        if (
+            self._last_fragment_cleanup_monotonic is not None
+            and current_monotonic - self._last_fragment_cleanup_monotonic
+            < FRAGMENT_CLEANUP_INTERVAL_SECONDS
+        ):
+            return
+        self._last_fragment_cleanup_monotonic = current_monotonic
+        try:
+            streams, files, bytes_removed = await asyncio.to_thread(
+                cleanup_expired_stream_fragments,
+                self.config,
+            )
+        except Exception:
+            LOGGER.exception("Automatic fragment cleanup failed")
+            return
+        if files:
+            LOGGER.info(
+                "Automatic fragment cleanup removed streams=%s files=%s bytes=%s",
+                streams,
+                files,
+                bytes_removed,
+            )
 
     async def _start_stream(self, stream: LiveStream) -> None:
         self.state.upsert_detected(stream)

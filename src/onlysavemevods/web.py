@@ -12,7 +12,7 @@ from threading import Lock, Thread
 from typing import Any
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default as email_policy
 import asyncio
@@ -786,6 +786,7 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("max_concurrent_downloads", "Discovery", "int", minimum=1),
     ConfigFormField("live_from_start", "Download", "bool"),
     ConfigFormField("keep_fragments_for_resume", "Download", "bool"),
+    ConfigFormField("fragment_retention_hours", "Download", "int", minimum=0),
     ConfigFormField("reconnect_interval_seconds", "Download", "int", minimum=0),
     ConfigFormField("post_exit_check_seconds", "Download", "int_list", rows=3),
     ConfigFormField("retry_backoff_seconds", "Download", "int_list", rows=2),
@@ -854,6 +855,7 @@ CONFIG_FIELD_HELP: dict[str, str] = {
     "max_concurrent_downloads": "Maximum live recordings allowed to download simultaneously.",
     "live_from_start": "Ask supported platforms for the stream from its earliest available point.",
     "keep_fragments_for_resume": "Keep media fragments so interrupted or mixed-format downloads can resume safely.",
+    "fragment_retention_hours": "Automatically remove fragments from ended streams after this many hours. Zero keeps them until you clean them manually.",
     "reconnect_interval_seconds": "Periodically reconnect an active recording; zero disables planned reconnects.",
     "post_exit_check_seconds": "Offsets used to verify that a stream really ended before finalizing it.",
     "retry_backoff_seconds": "Wait times used between retries after source or download failures.",
@@ -902,6 +904,7 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "max_concurrent_downloads": "Concurrent recordings",
     "live_from_start": "Record from the available start",
     "keep_fragments_for_resume": "Keep fragments for recovery",
+    "fragment_retention_hours": "Clear ended-stream fragments after",
     "reconnect_interval_seconds": "Planned reconnect interval",
     "post_exit_check_seconds": "Post-exit verification schedule",
     "retry_backoff_seconds": "Retry schedule",
@@ -1014,6 +1017,7 @@ CONFIG_FIELD_CATEGORIES = {
 
 CONFIG_FIELD_UNITS = {
     "poll_interval_seconds": "seconds",
+    "fragment_retention_hours": "hours",
     "reconnect_interval_seconds": "seconds",
     "chat_render_timeout_seconds": "seconds",
     "stream_event_window_seconds": "seconds",
@@ -1027,6 +1031,7 @@ CONFIG_FIELD_UNITS = {
 
 CONFIG_RESTART_FIELDS = {"state_dir", "web_enabled", "web_host", "web_port"}
 CONFIG_FIELD_DEPENDENCIES = {
+    "fragment_retention_hours": ("keep_fragments_for_resume",),
     "render_live_chat_video": ("record_live_chat",),
     "chat_render_use_nvenc": ("ffmpeg_path",),
     "voice_match_enabled": ("transcribe_subtitles",),
@@ -2707,6 +2712,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
         "Download": {
             "live_from_start": config.live_from_start,
             "keep_fragments_for_resume": config.keep_fragments_for_resume,
+            "fragment_retention_hours": config.fragment_retention_hours,
             "reconnect_interval_seconds": config.reconnect_interval_seconds,
             "post_exit_check_seconds": list(config.post_exit_check_seconds),
             "retry_backoff_seconds": list(config.retry_backoff_seconds),
@@ -4757,13 +4763,71 @@ def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int
     state = StateStore(config.db_path)
     try:
         record = state.get_stream(video_id)
+        if record is None:
+            raise ConfigError("Stream was not found")
+        if record.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
+            raise ConfigError("Cannot clean fragments while the stream may still resume")
+        return cleanup_stream_fragment_files(config, state, record)
     finally:
         state.close()
-    if record is None:
-        raise ConfigError("Stream was not found")
-    if record.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
-        raise ConfigError("Cannot clean fragments while the stream may still resume")
 
+
+def cleanup_expired_stream_fragments(
+    config: BotConfig,
+    *,
+    now: datetime | None = None,
+) -> tuple[int, int, int]:
+    retention_hours = config.fragment_retention_hours
+    if retention_hours <= 0:
+        return 0, 0, 0
+
+    current_time = now or datetime.now(timezone.utc)
+    if current_time.tzinfo is None:
+        current_time = current_time.replace(tzinfo=timezone.utc)
+    cutoff = current_time.astimezone(timezone.utc) - timedelta(hours=retention_hours)
+    streams_cleaned = 0
+    files_removed = 0
+    bytes_removed = 0
+
+    state = StateStore(config.db_path)
+    try:
+        for record in state.list_streams_by_status(["ended"], limit=None):
+            current_record = state.get_stream(record.video_id)
+            if current_record is None or current_record.status != "ended":
+                continue
+            ended_at = parse_cleanup_timestamp(current_record.updated_at)
+            if ended_at is None or ended_at > cutoff:
+                continue
+            count, removed = cleanup_stream_fragment_files(
+                config,
+                state,
+                current_record,
+            )
+            if count <= 0:
+                continue
+            streams_cleaned += 1
+            files_removed += count
+            bytes_removed += removed
+    finally:
+        state.close()
+    return streams_cleaned, files_removed, bytes_removed
+
+
+def parse_cleanup_timestamp(value: str) -> datetime | None:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    return timestamp.astimezone(timezone.utc)
+
+
+def cleanup_stream_fragment_files(
+    config: BotConfig,
+    state: StateStore,
+    record: StreamRecord,
+) -> tuple[int, int]:
     directory = segment_directory(config, record.video_id, record.channel)
     try:
         directory_path = directory.resolve(strict=True)
@@ -4793,15 +4857,11 @@ def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int
         except OSError:
             continue
     cleanup_files(fragments, LOGGER)
-
-    state = StateStore(config.db_path)
-    try:
+    if fragments:
         state.add_stream_event(
             record.video_id,
             f"Cleaned {len(fragments)} fragment file(s), freed {format_bytes(bytes_removed)}",
         )
-    finally:
-        state.close()
     return len(fragments), bytes_removed
 
 
@@ -9575,20 +9635,21 @@ def render_admin_streamer_streams(
 def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     platform, platform_label, platform_initial = stream_platform_details(stream)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
+    details_key = escape(stream.video_id, quote=True)
     files = "".join(
         render_file_row(file, timezone_name) for file in stream.files[:20]
     ) or '<tr><td colspan="7">No files found</td></tr>'
-    return f"""<details class="card stream-detail">
+    return f"""<details class="card stream-detail" data-details-key="stream:{details_key}">
   <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span></div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
   <div class="section-stack">
     {render_stream_signals(stream)}
     <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
     <div class="button-row">{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
-    <details open><summary><strong>Files and actions</strong></summary><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></details>
-    <details><summary><strong>Content events ({stream.content_event_count})</strong></summary>{render_content_events(stream.content_events)}</details>
-    <details><summary><strong>Powerchat ({stream.powerchat_event_count})</strong></summary>{render_powerchat_events(stream, timezone_name)}</details>
-    <details><summary><strong>Processing jobs</strong></summary>{render_stream_jobs(stream.jobs, timezone_name)}</details>
-    <details><summary><strong>Stream log</strong></summary>{render_stream_event_timeline(stream.events, timezone_name)}</details>
+    <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></div></details>
+    <details class="stream-subsection" data-details-key="stream:{details_key}:events"><summary><strong>Content events</strong><span class="subsection-count">{stream.content_event_count}</span></summary><div class="stream-subsection-body">{render_content_events(stream.content_events)}</div></details>
+    <details class="stream-subsection" data-details-key="stream:{details_key}:powerchat"><summary><strong>Powerchat</strong><span class="subsection-count">{stream.powerchat_event_count}</span></summary><div class="stream-subsection-body">{render_powerchat_events(stream, timezone_name)}</div></details>
+    <details class="stream-subsection processing-jobs-section" data-details-key="stream:{details_key}:jobs"><summary><strong>Processing jobs</strong><span class="subsection-count">{len(stream.jobs)}</span></summary><div class="stream-subsection-body">{render_stream_jobs(stream.jobs, timezone_name)}</div></details>
+    <details class="stream-subsection" data-details-key="stream:{details_key}:log"><summary><strong>Stream log</strong><span class="subsection-count">{len(stream.events)}</span></summary><div class="stream-subsection-body">{render_stream_event_timeline(stream.events, timezone_name)}</div></details>
   </div>
 </details>"""
 
@@ -14555,7 +14616,8 @@ def render_job_detail_toggle(
     if not rows:
         return ""
     return (
-        '<details class="streamer-job-details file-meta">'
+        '<details class="streamer-job-details file-meta" '
+        f'data-details-key="job:{escape(job.job_id, quote=True)}">'
         '<summary>Details</summary>'
         f'<dl class="streamer-job-details-grid">{rows}</dl>'
         '</details>'

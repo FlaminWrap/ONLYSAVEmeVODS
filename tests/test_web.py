@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -51,6 +52,7 @@ from onlysavemevods.web import (
     resolve_refresh_chat_files,
     resolve_kick_chat_replay_files,
     cleanup_stream_fragments,
+    cleanup_expired_stream_fragments,
     delete_stream,
     resolve_watermark_download_file,
     start_vod_redownload_job,
@@ -113,6 +115,7 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "max_concurrent_downloads": "4",
         "live_from_start": "true",
         "keep_fragments_for_resume": "true",
+        "fragment_retention_hours": "0",
         "reconnect_interval_seconds": "0",
         "post_exit_check_seconds": "30, 60, 90",
         "retry_backoff_seconds": "30, 60, 120",
@@ -2284,6 +2287,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('data-streamer-job-page="2" hidden', html)
         self.assertIn('data-streamer-job-page-button="2"', html)
         self.assertIn('data-streamer-job-page-state>Page 1 of 2', html)
+        self.assertIn('data-details-key="job:job-1"', html)
         self.assertIn('part-1.live_chat.json', html)
         self.assertIn('part-6.live_chat.json', html)
 
@@ -2575,6 +2579,64 @@ class WebStatusTests(unittest.TestCase):
 
         self.assertNotIn("/cleanup-fragments?video_id=LIVEVIDEO01", html)
         self.assertTrue(fragment_exists)
+
+    def test_expired_fragment_cleanup_only_removes_old_ended_stream_fragments(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                fragment_retention_hours=24,
+            )
+            old_ended = LiveStream(
+                video_id="OLDENDED01",
+                url=video_url("OLDENDED01"),
+                title="Old Ended",
+                channel="Example Channel",
+            )
+            recent_ended = LiveStream(
+                video_id="RECENTEND01",
+                url=video_url("RECENTEND01"),
+                title="Recent Ended",
+                channel="Example Channel",
+            )
+            interrupted = LiveStream(
+                video_id="INTERRUPTED01",
+                url=video_url("INTERRUPTED01"),
+                title="Interrupted",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            for stream in (old_ended, recent_ended, interrupted):
+                state.mark_downloading(stream, 1)
+            state.mark_ended(old_ended.video_id)
+            state.mark_ended(recent_ended.video_id)
+            state.conn.execute(
+                "UPDATE streams SET updated_at = ? WHERE video_id = ?",
+                ("2026-07-18T12:00:00+00:00", old_ended.video_id),
+            )
+            state.conn.execute(
+                "UPDATE streams SET status = 'interrupted', updated_at = ? WHERE video_id = ?",
+                ("2026-07-18T12:00:00+00:00", interrupted.video_id),
+            )
+            state.conn.commit()
+            state.close()
+
+            fragments = []
+            for stream in (old_ended, recent_ended, interrupted):
+                directory = config.download_dir / "Example_Channel" / stream.video_id
+                directory.mkdir(parents=True)
+                fragment = directory / "segment-001.f137.mp4.part-Frag1"
+                fragment.write_text(stream.video_id, encoding="utf-8")
+                fragments.append(fragment)
+
+            result = cleanup_expired_stream_fragments(
+                config,
+                now=datetime(2026, 7, 21, 12, 0, tzinfo=timezone.utc),
+            )
+            fragment_exists = [fragment.exists() for fragment in fragments]
+
+        self.assertEqual(result, (1, 1, len(old_ended.video_id)))
+        self.assertEqual(fragment_exists, [False, True, True])
 
     def test_delete_stream_removes_directory_and_state_after_confirmation(self) -> None:
         clear_tracked_jobs()

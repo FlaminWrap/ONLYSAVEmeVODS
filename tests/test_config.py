@@ -251,6 +251,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.channel_scan_limit, 10)
         self.assertEqual(config.discovery_probe_concurrency, 4)
         self.assertTrue(config.keep_fragments_for_resume)
+        self.assertEqual(config.fragment_retention_hours, 0)
         self.assertFalse(config.record_live_chat)
         self.assertFalse(config.render_live_chat_video)
         self.assertEqual(config.chat_render_panel_workers, 0)
@@ -361,6 +362,18 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_path)
 
         self.assertFalse(config.keep_fragments_for_resume)
+
+    def test_fragment_retention_hours_can_be_enabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "fragment_retention_hours = 72\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.fragment_retention_hours, 72)
 
     def test_record_live_chat_can_be_enabled(self) -> None:
         with TemporaryDirectory() as tmp:
