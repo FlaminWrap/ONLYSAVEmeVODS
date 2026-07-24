@@ -571,6 +571,9 @@ class StreamStatus:
     url: str
     platform: str
     source: str
+    youtube_video_format_id: str
+    youtube_video_codec: str
+    youtube_video_format_selector: str
     status: str
     segment_index: int
     first_seen_at: str
@@ -785,6 +788,12 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("discovery_probe_concurrency", "Discovery", "int", minimum=1),
     ConfigFormField("max_concurrent_downloads", "Discovery", "int", minimum=1),
     ConfigFormField("live_from_start", "Download", "bool"),
+    ConfigFormField(
+        "youtube_preferred_video_codec",
+        "Download",
+        "choice",
+        options=("vp9", "av1", "h264", "auto"),
+    ),
     ConfigFormField("keep_fragments_for_resume", "Download", "bool"),
     ConfigFormField("fragment_retention_hours", "Download", "int", minimum=0),
     ConfigFormField("reconnect_interval_seconds", "Download", "int", minimum=0),
@@ -854,6 +863,7 @@ CONFIG_FIELD_HELP: dict[str, str] = {
     "discovery_probe_concurrency": "Number of source checks that may run at the same time.",
     "max_concurrent_downloads": "Maximum live recordings allowed to download simultaneously.",
     "live_from_start": "Ask supported platforms for the stream from its earliest available point.",
+    "youtube_preferred_video_codec": "Preferred codec when locking a YouTube stream to one exact video format. The chosen format is retained for every reconnect.",
     "keep_fragments_for_resume": "Keep media fragments so interrupted or mixed-format downloads can resume safely.",
     "fragment_retention_hours": "Automatically remove fragments from ended streams after this many hours. Zero keeps them until you clean them manually.",
     "reconnect_interval_seconds": "Periodically reconnect an active recording; zero disables planned reconnects.",
@@ -903,6 +913,7 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "discovery_probe_concurrency": "Concurrent source checks",
     "max_concurrent_downloads": "Concurrent recordings",
     "live_from_start": "Record from the available start",
+    "youtube_preferred_video_codec": "Preferred YouTube video codec",
     "keep_fragments_for_resume": "Keep fragments for recovery",
     "fragment_retention_hours": "Clear ended-stream fragments after",
     "reconnect_interval_seconds": "Planned reconnect interval",
@@ -2711,6 +2722,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
         },
         "Download": {
             "live_from_start": config.live_from_start,
+            "youtube_preferred_video_codec": config.youtube_preferred_video_codec,
             "keep_fragments_for_resume": config.keep_fragments_for_resume,
             "fragment_retention_hours": config.fragment_retention_hours,
             "reconnect_interval_seconds": config.reconnect_interval_seconds,
@@ -4116,6 +4128,9 @@ def stream_status_from_record(
         url=record.url,
         platform=record.platform,
         source=record.source,
+        youtube_video_format_id=record.youtube_video_format_id,
+        youtube_video_codec=record.youtube_video_codec,
+        youtube_video_format_selector=record.youtube_video_format_selector,
         status=record.status,
         segment_index=record.segment_index,
         first_seen_at=record.first_seen_at,

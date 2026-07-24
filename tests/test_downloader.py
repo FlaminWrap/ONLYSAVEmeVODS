@@ -13,12 +13,17 @@ from onlysavemevods.config import (
 )
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs
 from onlysavemevods.chat_refresh import ChatRefreshResult
+from onlysavemevods.chat_render import VideoProbeError
 from onlysavemevods.chat_timing import read_chat_timing
 from onlysavemevods.downloader import (
     DownloadManager,
+    FinalizeMediaStream,
+    FinalizeOutputValidation,
+    FinalizePlan,
     build_chat_download_command,
     build_download_command,
     chat_render_timezone_for_stream,
+    choose_youtube_video_format,
     choose_restart_segment,
     CatchupTracker,
     command_for_log,
@@ -29,10 +34,12 @@ from onlysavemevods.downloader import (
     rename_segment_chat_file,
     rename_segment_timing_file,
     restore_mixed_segment_for_resume,
+    select_finalize_media_streams,
     segment_has_final_files,
     segment_part_files,
     segment_timing_file,
     segment_directory,
+    validate_finalize_output,
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.powerchat import (
@@ -53,6 +60,87 @@ NULL_LOGGER = NullLogger()
 
 
 class DownloaderCommandTests(unittest.TestCase):
+    def test_youtube_format_choice_prefers_best_vp9_over_higher_av1(self) -> None:
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            raw={
+                "formats": [
+                    {
+                        "format_id": "399",
+                        "vcodec": "av01.0.12M.08",
+                        "acodec": "none",
+                        "height": 2160,
+                        "fps": 30,
+                        "tbr": 9000,
+                    },
+                    {
+                        "format_id": "302",
+                        "vcodec": "vp09.00.31.08",
+                        "acodec": "none",
+                        "height": 720,
+                        "fps": 60,
+                        "tbr": 2500,
+                    },
+                    {
+                        "format_id": "303",
+                        "vcodec": "vp9",
+                        "acodec": "none",
+                        "height": 1080,
+                        "fps": 60,
+                        "tbr": 5000,
+                    },
+                ]
+            },
+        )
+
+        choice = choose_youtube_video_format(stream, "vp9")
+
+        self.assertIsNotNone(choice)
+        assert choice is not None
+        self.assertEqual(choice.format_id, "303")
+        self.assertEqual(choice.codec, "vp9")
+        self.assertEqual(choice.selector, "303+bestaudio")
+        self.assertEqual(choice.height, 1080)
+
+    def test_download_command_forces_locked_youtube_format(self) -> None:
+        config = BotConfig()
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+        )
+
+        command = build_download_command(
+            config,
+            stream,
+            2,
+            youtube_video_format_selector="303+bestaudio",
+        )
+
+        format_index = command.index("--format")
+        self.assertEqual(command[format_index + 1], "303+bestaudio")
+        self.assertNotIn("bestvideo*+bestaudio/best", command)
+
+    def test_explicit_user_format_overrides_locked_youtube_format(self) -> None:
+        config = BotConfig(
+            extra_yt_dlp_args=["--format", "247+140"],
+        )
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+        )
+
+        command = build_download_command(
+            config,
+            stream,
+            1,
+            youtube_video_format_selector="303+bestaudio",
+        )
+
+        self.assertEqual(command.count("--format"), 1)
+        self.assertIn("247+140", command)
+        self.assertNotIn("303+bestaudio", command)
+
     def test_chat_render_uses_streamer_timezone(self) -> None:
         config = BotConfig(
             streamers={
@@ -733,7 +821,7 @@ class DownloaderCommandTests(unittest.TestCase):
             self.assertIn(fragment_file, plan.cleanup_files)
             self.assertNotIn(chat_file, plan.input_files)
             self.assertNotIn(chat_file, plan.cleanup_files)
-            self.assertFalse(plan.shortest)
+            self.assertFalse(plan.mixed_inputs)
             self.assertTrue(audio_part.exists())
             self.assertTrue(video_part.exists())
 
@@ -759,7 +847,109 @@ class DownloaderCommandTests(unittest.TestCase):
                     segment_dir / "segment-001.f140.mp4",
                 ],
             )
-            self.assertTrue(plan.shortest)
+            self.assertTrue(plan.mixed_inputs)
+
+    def test_finalize_selection_uses_longest_audio_and_video_candidates(self) -> None:
+        short_audio = FinalizeMediaStream(
+            path=Path("segment-001.f140.mp4"),
+            input_index=0,
+            stream_index=0,
+            codec_type="audio",
+            duration=13_279.3,
+            size=100,
+            partial=False,
+        )
+        long_audio = FinalizeMediaStream(
+            path=Path("segment-001.f140.mp4.part"),
+            input_index=1,
+            stream_index=0,
+            codec_type="audio",
+            duration=36_000.0,
+            size=300,
+            partial=True,
+        )
+        short_video = FinalizeMediaStream(
+            path=Path("segment-001.f248.webm"),
+            input_index=2,
+            stream_index=0,
+            codec_type="video",
+            duration=13_279.3,
+            size=1_000,
+            partial=False,
+        )
+        long_video = FinalizeMediaStream(
+            path=Path("segment-001.f303.webm.part"),
+            input_index=3,
+            stream_index=0,
+            codec_type="video",
+            duration=36_000.0,
+            size=3_000,
+            partial=True,
+        )
+
+        selected = select_finalize_media_streams(
+            [short_audio, long_audio, short_video, long_video]
+        )
+
+        self.assertEqual(
+            [(stream.codec_type, stream.path) for stream in selected],
+            [
+                ("video", long_video.path),
+                ("audio", long_audio.path),
+            ],
+        )
+
+    def test_finalize_validation_rejects_shortened_output(self) -> None:
+        output = Path("segment-001.mkv")
+        selected = [
+            FinalizeMediaStream(
+                path=Path("segment-001.f303.webm.part"),
+                input_index=0,
+                stream_index=0,
+                codec_type="video",
+                duration=36_000.0,
+                size=3_000,
+                partial=True,
+            ),
+            FinalizeMediaStream(
+                path=Path("segment-001.f140.mp4.part"),
+                input_index=1,
+                stream_index=0,
+                codec_type="audio",
+                duration=36_000.0,
+                size=300,
+                partial=True,
+            ),
+        ]
+        shortened_output = [
+            FinalizeMediaStream(
+                path=output,
+                input_index=0,
+                stream_index=0,
+                codec_type="video",
+                duration=13_279.3,
+                size=1_000,
+                partial=False,
+            ),
+            FinalizeMediaStream(
+                path=output,
+                input_index=0,
+                stream_index=1,
+                codec_type="audio",
+                duration=13_279.3,
+                size=100,
+                partial=False,
+            ),
+        ]
+
+        with (
+            patch(
+                "onlysavemevods.downloader.probe_finalize_media_streams",
+                return_value=shortened_output,
+            ),
+            self.assertRaises(VideoProbeError),
+        ):
+            validate_finalize_output(output, selected)
 
     def test_restore_mixed_segment_moves_final_format_back_to_resumable_part(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -848,6 +1038,204 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finalize_maps_only_longest_video_and_audio_streams(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = [
+                root / "segment-001.f140.mp4",
+                root / "segment-001.f140.mp4.part",
+                root / "segment-001.f248.webm",
+                root / "segment-001.f303.webm.part",
+            ]
+            for path in inputs:
+                path.write_text(path.name, encoding="utf-8")
+            media_streams = [
+                FinalizeMediaStream(
+                    path=inputs[0],
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="audio",
+                    duration=13_279.3,
+                    size=100,
+                    partial=False,
+                ),
+                FinalizeMediaStream(
+                    path=inputs[1],
+                    input_index=1,
+                    stream_index=0,
+                    codec_type="audio",
+                    duration=36_000.0,
+                    size=300,
+                    partial=True,
+                ),
+                FinalizeMediaStream(
+                    path=inputs[2],
+                    input_index=2,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=13_279.3,
+                    size=1_000,
+                    partial=False,
+                ),
+                FinalizeMediaStream(
+                    path=inputs[3],
+                    input_index=3,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=36_000.0,
+                    size=3_000,
+                    partial=True,
+                ),
+            ]
+            plan = FinalizePlan(
+                output_file=root / "segment-001.mkv",
+                input_files=inputs,
+                cleanup_files=[],
+                mixed_inputs=True,
+            )
+            config = BotConfig(
+                download_dir=root,
+                state_dir=root / "state",
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            process = AsyncMock()
+            process.returncode = 0
+            process.communicate.return_value = (b"", b"")
+
+            def successful_validation(
+                output_file: Path,
+                _selected_streams: list[FinalizeMediaStream],
+                _ffprobe_path: str,
+            ) -> FinalizeOutputValidation:
+                output_file.write_text("validated", encoding="utf-8")
+                return FinalizeOutputValidation(
+                    duration=36_000.0,
+                    audio_streams=1,
+                    video_streams=1,
+                )
+
+            with (
+                patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    return_value=media_streams,
+                ),
+                patch(
+                    "onlysavemevods.downloader.validate_finalize_output",
+                    side_effect=successful_validation,
+                ),
+                patch(
+                    "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                    new=AsyncMock(return_value=process),
+                ) as spawn,
+            ):
+                finalized = await manager._mux_finalize_inputs(plan)
+            command = list(spawn.await_args.args)
+            state.close()
+
+        self.assertTrue(finalized)
+        self.assertEqual(
+            [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "-map"
+            ],
+            ["3:0", "1:0"],
+        )
+        self.assertNotIn("0:0", command)
+        self.assertNotIn("2:0", command)
+
+    async def test_finalize_probe_failure_preserves_every_input(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inputs = [
+                root / "segment-001.f140.mp4",
+                root / "segment-001.f140.mp4.part",
+                root / "segment-001.f303.webm",
+                root / "segment-001.f303.webm.part",
+            ]
+            for path in inputs:
+                path.write_text(path.name, encoding="utf-8")
+            plan = FinalizePlan(
+                output_file=root / "segment-001.mkv",
+                input_files=inputs,
+                cleanup_files=[],
+                mixed_inputs=True,
+            )
+            config = BotConfig(
+                download_dir=root,
+                state_dir=root / "state",
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            finalized = await manager._mux_finalize_inputs(plan)
+            output_exists = plan.output_file.exists()
+            inputs_exist = all(path.exists() for path in inputs)
+            state.close()
+
+        self.assertFalse(finalized)
+        self.assertFalse(output_exists)
+        self.assertTrue(inputs_exist)
+
+    async def test_youtube_format_lock_survives_codec_change_on_reconnect(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                youtube_preferred_video_codec="vp9",
+            )
+            initial = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                raw={
+                    "formats": [
+                        {
+                            "format_id": "303",
+                            "vcodec": "vp9",
+                            "acodec": "none",
+                            "height": 1080,
+                        },
+                        {
+                            "format_id": "399",
+                            "vcodec": "av01.0.08M.08",
+                            "acodec": "none",
+                            "height": 1080,
+                        },
+                    ]
+                },
+            )
+            av1_only_reconnect = LiveStream(
+                video_id=initial.video_id,
+                url=initial.url,
+                raw={
+                    "formats": [
+                        {
+                            "format_id": "399",
+                            "vcodec": "av01.0.08M.08",
+                            "acodec": "none",
+                            "height": 1080,
+                        }
+                    ]
+                },
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(initial)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            first = manager._youtube_video_format_selector(initial)
+            second = manager._youtube_video_format_selector(av1_only_reconnect)
+            record = state.get_stream(initial.video_id)
+            state.close()
+
+        self.assertEqual(first, "303+bestaudio")
+        self.assertEqual(second, "303+bestaudio")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.youtube_video_format_id, "303")
+        self.assertEqual(record.youtube_video_codec, "vp9")
+        self.assertEqual(record.youtube_video_format_selector, "303+bestaudio")
+
     async def test_live_restart_restores_finalized_formats_with_kept_fragments(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(

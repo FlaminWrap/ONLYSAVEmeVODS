@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import sqlite3
 import unittest
 
 from onlysavemevods.models import LiveStream
@@ -7,6 +8,94 @@ from onlysavemevods.state import StateStore
 
 
 class StateWatermarkTests(unittest.TestCase):
+    def test_youtube_video_format_lock_persists_across_reopen(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite3"
+            state = StateStore(db_path)
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+            )
+            state.upsert_detected(stream)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="303",
+                codec="vp9",
+                selector="303+bestaudio",
+            )
+            state.close()
+
+            reopened = StateStore(db_path)
+            record = reopened.get_stream(stream.video_id)
+            events = reopened.list_stream_events(
+                [stream.video_id],
+                limit_per_stream=10,
+            )[stream.video_id]
+            reopened.close()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.youtube_video_format_id, "303")
+        self.assertEqual(record.youtube_video_codec, "vp9")
+        self.assertEqual(record.youtube_video_format_selector, "303+bestaudio")
+        self.assertTrue(
+            any("Locked YouTube video format" in event.message for event in events)
+        )
+
+    def test_existing_stream_database_migrates_video_format_columns(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                CREATE TABLE streams (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'youtube',
+                    source TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    segment_index INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_started_at TEXT,
+                    last_exit_at TEXT,
+                    exit_code INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO streams (
+                    video_id, url, status, first_seen_at, updated_at
+                ) VALUES (
+                    'youtube:LIVEVIDEO01',
+                    'https://www.youtube.com/watch?v=LIVEVIDEO01',
+                    'interrupted',
+                    '2026-07-24T00:00:00+00:00',
+                    '2026-07-24T00:00:00+00:00'
+                )
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            state = StateStore(db_path)
+            record = state.get_stream("youtube:LIVEVIDEO01")
+            columns = {
+                str(row[1])
+                for row in state.conn.execute("PRAGMA table_info(streams)").fetchall()
+            }
+            state.close()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.youtube_video_format_selector, "")
+        self.assertIn("youtube_video_format_id", columns)
+        self.assertIn("youtube_video_codec", columns)
+        self.assertIn("youtube_video_format_selector", columns)
+
     def test_stream_records_include_platform_and_source(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")

@@ -63,6 +63,7 @@ DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS = 2
 DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS = 180
 DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT = 5
 APP_UPDATE_MODES = {"disabled", "manual", "check_only", "auto_install"}
+YOUTUBE_VIDEO_CODEC_PREFERENCES = {"vp9", "av1", "h264", "auto"}
 DEFAULT_APP_UPDATE_REPOSITORY = "FlaminWrap/ONLYSAVEmeVODS"
 DEFAULT_APP_UPDATE_GITHUB_TOKEN_ENV = "GITHUB_TOKEN"
 CONFIG_UPDATE_COMMENT = (
@@ -159,6 +160,7 @@ class BotConfig:
     poll_interval_seconds: int = 60
     max_concurrent_downloads: int = 4
     live_from_start: bool = True
+    youtube_preferred_video_codec: str = "vp9"
     record_live_chat: bool = False
     render_live_chat_video: bool = False
     chat_render_panel_workers: int = 0
@@ -301,6 +303,11 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
             raw.get("max_concurrent_downloads", 4), "max_concurrent_downloads"
         ),
         live_from_start=_as_bool(raw.get("live_from_start", True), "live_from_start"),
+        youtube_preferred_video_codec=_as_choice(
+            raw.get("youtube_preferred_video_codec", "vp9"),
+            "youtube_preferred_video_codec",
+            YOUTUBE_VIDEO_CODEC_PREFERENCES,
+        ),
         record_live_chat=_as_bool(
             raw.get("record_live_chat", False),
             "record_live_chat",

@@ -62,6 +62,13 @@ channel_scan_limit = 10
 discovery_probe_concurrency = 4
 live_from_start = true
 
+# Prefer VP9 when a YouTube stream is first detected. The app records the exact
+# selected video format ID in its state database and forces that same format on
+# every reconnect and service restart. If that format is unavailable later,
+# yt-dlp retries instead of silently changing codec. Options: vp9, av1, h264,
+# or auto (lock yt-dlp's highest-ranked available video format).
+youtube_preferred_video_codec = "vp9"
+
 # Record YouTube live chat as a sidecar .live_chat.json file when available.
 # Non-YouTube sources are video-first for now; chat capture/rendering is
 # currently YouTube-only.

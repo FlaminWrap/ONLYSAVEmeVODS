@@ -52,7 +52,8 @@ class OnlySaveMeVodsDaemon:
         )
         LOGGER.debug(
             "Daemon config: channel_scan_limit=%s discovery_probe_concurrency=%s "
-            "live_from_start=%s keep_fragments_for_resume=%s "
+            "live_from_start=%s youtube_preferred_video_codec=%s "
+            "keep_fragments_for_resume=%s "
             "fragment_retention_hours=%s "
             "reconnect_interval_seconds=%s post_exit_check_seconds=%s "
             "render_live_chat_video=%s chat_render_use_nvenc=%s "
@@ -62,6 +63,7 @@ class OnlySaveMeVodsDaemon:
             self.config.channel_scan_limit,
             self.config.discovery_probe_concurrency,
             self.config.live_from_start,
+            self.config.youtube_preferred_video_codec,
             self.config.keep_fragments_for_resume,
             self.config.fragment_retention_hours,
             self.config.reconnect_interval_seconds,

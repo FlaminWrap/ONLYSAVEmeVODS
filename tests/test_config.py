@@ -250,6 +250,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.reconnect_interval_seconds, 0)
         self.assertEqual(config.channel_scan_limit, 10)
         self.assertEqual(config.discovery_probe_concurrency, 4)
+        self.assertEqual(config.youtube_preferred_video_codec, "vp9")
         self.assertTrue(config.keep_fragments_for_resume)
         self.assertEqual(config.fragment_retention_hours, 0)
         self.assertFalse(config.record_live_chat)
@@ -1181,6 +1182,24 @@ class ConfigTests(unittest.TestCase):
 
             with self.assertRaises(ConfigError):
                 load_config(config_path)
+
+    def test_youtube_video_codec_preference_is_configurable_and_validated(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                'youtube_preferred_video_codec = "av1"\n',
+                encoding="utf-8",
+            )
+
+            configured = load_config(config_path)
+            config_path.write_text(
+                'youtube_preferred_video_codec = "theora"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError):
+                load_config(config_path)
+
+        self.assertEqual(configured.youtube_preferred_video_codec, "av1")
 
     def test_extra_args_cannot_disable_media_downloads(self) -> None:
         with TemporaryDirectory() as tmp:

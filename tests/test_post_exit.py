@@ -1,11 +1,16 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 import asyncio
 import logging
 import unittest
 
 from onlysavemevods.config import BotConfig, DEFAULT_POST_EXIT_CHECK_SECONDS
-from onlysavemevods.downloader import DownloadManager
+from onlysavemevods.downloader import (
+    DownloadManager,
+    FinalizeMediaStream,
+    FinalizeOutputValidation,
+)
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
 from onlysavemevods.youtube import TerminalVideoUnavailableError
@@ -731,7 +736,41 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                 logger=NULL_LOGGER,
             )
 
-            await manager.handle_post_exit(stream, 1)
+            media_inputs = [
+                FinalizeMediaStream(
+                    path=segment_dir / "segment-001.f140.mp4.part",
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="audio",
+                    duration=100.0,
+                    size=5,
+                    partial=True,
+                ),
+                FinalizeMediaStream(
+                    path=segment_dir / "segment-001.f299.mp4.part",
+                    input_index=1,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=100.0,
+                    size=5,
+                    partial=True,
+                ),
+            ]
+            with (
+                patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    return_value=media_inputs,
+                ),
+                patch(
+                    "onlysavemevods.downloader.validate_finalize_output",
+                    return_value=FinalizeOutputValidation(
+                        duration=100.0,
+                        audio_streams=1,
+                        video_streams=1,
+                    ),
+                ),
+            ):
+                await manager.handle_post_exit(stream, 1)
             record = state.get_stream(stream.video_id)
             state.close()
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Protocol
+from typing import Awaitable, Callable, Mapping, Protocol
 import asyncio
 import json
 import logging
@@ -69,10 +69,12 @@ from .youtube import TerminalVideoUnavailableError
 LOGGER = logging.getLogger(__name__)
 RECONNECT_STOP_TIMEOUT_SECONDS = 20
 FINALIZE_MUX_TIMEOUT_SECONDS = 60 * 60
+FINALIZE_DURATION_TOLERANCE_SECONDS = 5.0
 CATCHUP_FRAGMENT_MARGIN = 2
 MIXED_SEGMENT_WATCH_SECONDS = 10
 DEFAULT_MEDIA_FORMAT = "bestvideo*+bestaudio/best"
 FORMAT_OPTIONS = {"-f", "--format"}
+YOUTUBE_FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 SENSITIVE_COMMAND_OPTIONS = {
     "--add-header",
     "--ap-password",
@@ -164,7 +166,25 @@ class FinalizePlan:
     output_file: Path
     input_files: list[Path]
     cleanup_files: list[Path]
-    shortest: bool = False
+    mixed_inputs: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizeMediaStream:
+    path: Path
+    input_index: int
+    stream_index: int
+    codec_type: str
+    duration: float
+    size: int
+    partial: bool
+
+
+@dataclass(frozen=True, slots=True)
+class FinalizeOutputValidation:
+    duration: float
+    audio_streams: int
+    video_streams: int
 
 
 @dataclass(slots=True)
@@ -174,6 +194,15 @@ class FinalizedSegmentFiles:
     media_file: Path | None
     chat_file: Path | None
     timing_file: Path | None
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubeVideoFormatChoice:
+    format_id: str
+    codec: str
+    selector: str
+    height: int
+    fps: float
 
 
 class CatchupTracker:
@@ -273,7 +302,13 @@ class DownloadManager:
 
         output_template = output_template_for(self.config, stream, segment_index)
         output_template.parent.mkdir(parents=True, exist_ok=True)
-        command = build_download_command(self.config, stream, segment_index)
+        youtube_video_format_selector = self._youtube_video_format_selector(stream)
+        command = build_download_command(
+            self.config,
+            stream,
+            segment_index,
+            youtube_video_format_selector=youtube_video_format_selector,
+        )
         self.logger.debug(
             "Download output template for %s segment=%03d: %s",
             stream.video_id,
@@ -391,6 +426,55 @@ class DownloadManager:
                 await self._stop_chat_recorder(orphaned)
         self._spawn_failures.pop(stream.video_id, None)
         return True
+
+    def _youtube_video_format_selector(self, stream: LiveStream) -> str:
+        if (
+            stream.platform.casefold() != "youtube"
+            or yt_dlp_args_include_format(self.config.extra_yt_dlp_args)
+        ):
+            return ""
+
+        record = self.state.get_stream(stream.video_id)
+        if record is not None and record.youtube_video_format_selector:
+            self.logger.info(
+                "Reusing locked YouTube video format video_id=%s format_id=%s "
+                "codec=%s selector=%s",
+                stream.video_id,
+                record.youtube_video_format_id,
+                record.youtube_video_codec,
+                record.youtube_video_format_selector,
+            )
+            return record.youtube_video_format_selector
+
+        choice = choose_youtube_video_format(
+            stream,
+            self.config.youtube_preferred_video_codec,
+        )
+        if choice is None:
+            self.logger.warning(
+                "Unable to lock a YouTube video format for %s; metadata contained "
+                "no usable video formats",
+                stream.video_id,
+            )
+            return ""
+
+        record = self.state.lock_youtube_video_format(
+            stream.video_id,
+            format_id=choice.format_id,
+            codec=choice.codec,
+            selector=choice.selector,
+        )
+        self.logger.info(
+            "Locked YouTube video format video_id=%s format_id=%s codec=%s "
+            "height=%s fps=%s selector=%s",
+            stream.video_id,
+            choice.format_id,
+            choice.codec,
+            choice.height or "unknown",
+            choice.fps or "unknown",
+            record.youtube_video_format_selector,
+        )
+        return record.youtube_video_format_selector
 
     async def _start_chat_recorder(
         self,
@@ -2039,13 +2123,13 @@ class DownloadManager:
             return True
         self.logger.debug(
             "Finalize plan for %s segment=%03d output=%s inputs=%s cleanup=%s "
-            "shortest=%s",
+            "mixed_inputs=%s",
             video_id,
             segment_index,
             plan.output_file,
             [str(path) for path in plan.input_files],
             [str(path) for path in plan.cleanup_files],
-            plan.shortest,
+            plan.mixed_inputs,
         )
 
         if len(plan.input_files) == 1:
@@ -2093,6 +2177,34 @@ class DownloadManager:
             )
             return False
 
+        ffprobe_path = ffprobe_path_for(self.config.ffmpeg_path)
+        try:
+            media_streams = probe_finalize_media_streams(
+                plan.input_files,
+                ffprobe_path,
+            )
+            selected_streams = select_finalize_media_streams(media_streams)
+        except VideoProbeError as exc:
+            self.logger.warning(
+                "Unable to safely select partial segment inputs; preserving all "
+                "source files: %s",
+                exc,
+            )
+            return False
+
+        self.logger.info(
+            "Selected finalization streams: %s",
+            [
+                {
+                    "type": stream.codec_type,
+                    "path": str(stream.path),
+                    "stream": stream.stream_index,
+                    "duration": round(stream.duration, 3),
+                    "partial": stream.partial,
+                }
+                for stream in selected_streams
+            ],
+        )
         temp_output = plan.output_file.with_name(
             f"{plan.output_file.stem}.muxing{plan.output_file.suffix}"
         )
@@ -2107,10 +2219,10 @@ class DownloadManager:
         ]
         for input_file in plan.input_files:
             command.extend(["-i", str(input_file)])
-        for input_index in range(len(plan.input_files)):
-            command.extend(["-map", str(input_index)])
+        for stream in selected_streams:
+            command.extend(["-map", f"{stream.input_index}:{stream.stream_index}"])
         command.extend(["-c", "copy"])
-        if plan.shortest:
+        if len({stream.codec_type for stream in selected_streams}) > 1:
             command.append("-shortest")
         command.append(str(temp_output))
         self.logger.debug("ffmpeg finalize command: %s", command_for_log(command))
@@ -2152,6 +2264,28 @@ class DownloadManager:
             )
             return False
 
+        try:
+            validation = validate_finalize_output(
+                temp_output,
+                selected_streams,
+                ffprobe_path,
+            )
+        except VideoProbeError as exc:
+            temp_output.unlink(missing_ok=True)
+            self.logger.warning(
+                "Finalized output failed validation; preserving all source files: %s",
+                exc,
+            )
+            return False
+
+        self.logger.info(
+            "Validated finalized output duration=%.3fs video_streams=%s "
+            "audio_streams=%s output=%s",
+            validation.duration,
+            validation.video_streams,
+            validation.audio_streams,
+            plan.output_file,
+        )
         temp_output.rename(plan.output_file)
         return True
 
@@ -2230,16 +2364,107 @@ def format_byte_count(value: int) -> str:
 def auto_job_id(kind: str, video_id: str, item: str) -> str:
     return f"auto-{kind}:{video_id}:{item}"
 
+
+def youtube_video_codec(value: object) -> str:
+    codec = str(value or "").strip().casefold()
+    if codec.startswith(("vp9", "vp09")):
+        return "vp9"
+    if codec.startswith(("av1", "av01")):
+        return "av1"
+    if codec.startswith(("h264", "avc1", "avc3")):
+        return "h264"
+    return codec.partition(".")[0]
+
+
+def choose_youtube_video_format(
+    stream: LiveStream,
+    preferred_codec: str = "vp9",
+) -> YouTubeVideoFormatChoice | None:
+    if stream.platform.casefold() != "youtube":
+        return None
+    formats = stream.raw.get("formats")
+    if not isinstance(formats, list):
+        return None
+
+    candidates: list[tuple[tuple[float, ...], YouTubeVideoFormatChoice]] = []
+    preferred = preferred_codec.strip().casefold()
+    for position, raw_format in enumerate(formats):
+        if not isinstance(raw_format, Mapping) or raw_format.get("has_drm"):
+            continue
+        format_id = str(raw_format.get("format_id") or "").strip()
+        if not YOUTUBE_FORMAT_ID_RE.fullmatch(format_id):
+            continue
+        raw_codec = str(raw_format.get("vcodec") or "").strip()
+        codec = youtube_video_codec(raw_codec)
+        if not codec or codec == "none":
+            continue
+
+        acodec = str(raw_format.get("acodec") or "").strip().casefold()
+        audio_ext = str(raw_format.get("audio_ext") or "").strip().casefold()
+        has_audio = (
+            acodec not in {"", "none"}
+            or audio_ext not in {"", "none"}
+        )
+        selector = format_id if has_audio else f"{format_id}+bestaudio"
+        height = format_number(raw_format.get("height"), integer=True)
+        fps = format_number(raw_format.get("fps"))
+        choice = YouTubeVideoFormatChoice(
+            format_id=format_id,
+            codec=codec,
+            selector=selector,
+            height=int(height),
+            fps=fps,
+        )
+        preferred_match = float(preferred != "auto" and codec == preferred)
+        rank = (
+            preferred_match,
+            height,
+            format_number(raw_format.get("width"), integer=True),
+            fps,
+            format_number(raw_format.get("quality")),
+            format_number(raw_format.get("tbr")),
+            format_number(raw_format.get("vbr")),
+            float(not has_audio),
+            format_number(
+                raw_format.get("filesize")
+                or raw_format.get("filesize_approx")
+            ),
+            float(position),
+        )
+        candidates.append((rank, choice))
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def format_number(value: object, *, integer: bool = False) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if number != number or number < 0:
+        return 0.0
+    return float(int(number)) if integer else number
+
+
 def build_download_command(
     config: BotConfig,
     stream: LiveStream,
     segment_index: int,
+    *,
+    youtube_video_format_selector: str = "",
 ) -> list[str]:
     output_template = output_template_for(config, stream, segment_index)
     command = [config.yt_dlp_path, *config.extra_yt_dlp_args]
     record_chat = should_record_chat_for_stream(config, stream)
-    if record_chat and not yt_dlp_args_include_format(config.extra_yt_dlp_args):
-        command.extend(["--format", DEFAULT_MEDIA_FORMAT])
+    if not yt_dlp_args_include_format(config.extra_yt_dlp_args):
+        if stream.platform.casefold() == "youtube" and youtube_video_format_selector:
+            command.extend(["--format", youtube_video_format_selector])
+        elif record_chat:
+            command.extend(["--format", DEFAULT_MEDIA_FORMAT])
     if config.live_from_start and stream.platform == "youtube":
         command.append("--live-from-start")
     if config.keep_fragments_for_resume:
@@ -2444,6 +2669,239 @@ def segment_timing_file(
     return directory / f"{segment_file_stem(segment_index)}{CHAT_TIMING_SUFFIX}"
 
 
+def probe_finalize_media_streams(
+    input_files: list[Path],
+    ffprobe_path: str = "ffprobe",
+) -> list[FinalizeMediaStream]:
+    media_streams: list[FinalizeMediaStream] = []
+    for input_index, path in enumerate(input_files):
+        command = [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-show_entries",
+            (
+                "format=duration:"
+                "stream=index,codec_type,duration,duration_ts,time_base:"
+                "stream_tags=DURATION"
+            ),
+            "-of",
+            "json",
+            str(path),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            payload = json.loads(completed.stdout)
+            raw_streams = payload.get("streams")
+            raw_format = payload.get("format")
+            if not isinstance(raw_streams, list):
+                raise ValueError("ffprobe did not return streams")
+            format_duration = media_duration_value(
+                raw_format.get("duration")
+                if isinstance(raw_format, Mapping)
+                else None
+            )
+            path_size = path.stat().st_size
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+            ValueError,
+            TypeError,
+        ) as exc:
+            raise VideoProbeError(f"Unable to inspect finalization input {path}") from exc
+
+        found_media = False
+        for raw_stream in raw_streams:
+            if not isinstance(raw_stream, Mapping):
+                continue
+            codec_type = str(raw_stream.get("codec_type") or "").casefold()
+            if codec_type not in {"audio", "video"}:
+                continue
+            found_media = True
+            try:
+                stream_index = int(raw_stream.get("index"))
+            except (TypeError, ValueError) as exc:
+                raise VideoProbeError(
+                    f"Invalid stream index while inspecting {path}"
+                ) from exc
+            duration = finalize_stream_duration(raw_stream, format_duration)
+            if duration <= 0:
+                raise VideoProbeError(
+                    f"Unable to determine {codec_type} duration for {path}"
+                )
+            media_streams.append(
+                FinalizeMediaStream(
+                    path=path,
+                    input_index=input_index,
+                    stream_index=stream_index,
+                    codec_type=codec_type,
+                    duration=duration,
+                    size=path_size,
+                    partial=path.name.endswith(".part"),
+                )
+            )
+        if not found_media:
+            raise VideoProbeError(f"No audio or video streams found in {path}")
+
+    return media_streams
+
+
+def finalize_stream_duration(
+    raw_stream: Mapping[object, object],
+    format_duration: float,
+) -> float:
+    duration = media_duration_value(raw_stream.get("duration"))
+    if duration > 0:
+        return duration
+
+    duration_ts = media_duration_value(raw_stream.get("duration_ts"))
+    time_base = rational_value(raw_stream.get("time_base"))
+    if duration_ts > 0 and time_base > 0:
+        return duration_ts * time_base
+
+    tags = raw_stream.get("tags")
+    if isinstance(tags, Mapping):
+        duration = media_duration_value(tags.get("DURATION"))
+        if duration > 0:
+            return duration
+    return format_duration
+
+
+def media_duration_value(value: object) -> float:
+    if isinstance(value, bool) or value is None:
+        return 0.0
+    text = str(value).strip()
+    if not text or text.casefold() in {"n/a", "nan", "inf", "-inf"}:
+        return 0.0
+    if ":" not in text:
+        try:
+            duration = float(text)
+        except ValueError:
+            return 0.0
+        return duration if duration > 0 else 0.0
+
+    parts = text.split(":")
+    if len(parts) != 3:
+        return 0.0
+    try:
+        hours, minutes, seconds = (
+            float(parts[0]),
+            float(parts[1]),
+            float(parts[2]),
+        )
+    except ValueError:
+        return 0.0
+    duration = hours * 3600 + minutes * 60 + seconds
+    return duration if duration > 0 else 0.0
+
+
+def rational_value(value: object) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    numerator_text, separator, denominator_text = text.partition("/")
+    try:
+        numerator = float(numerator_text)
+        denominator = float(denominator_text) if separator else 1.0
+    except ValueError:
+        return 0.0
+    if denominator == 0:
+        return 0.0
+    result = numerator / denominator
+    return result if result > 0 else 0.0
+
+
+def select_finalize_media_streams(
+    media_streams: list[FinalizeMediaStream],
+) -> list[FinalizeMediaStream]:
+    selected: list[FinalizeMediaStream] = []
+    for codec_type in ("video", "audio"):
+        candidates = [
+            stream
+            for stream in media_streams
+            if stream.codec_type == codec_type
+        ]
+        if not candidates:
+            continue
+        selected.append(
+            max(
+                candidates,
+                key=lambda stream: (
+                    stream.duration,
+                    stream.partial,
+                    stream.size,
+                    -stream.input_index,
+                    -stream.stream_index,
+                ),
+            )
+        )
+    if not selected:
+        raise VideoProbeError("No usable audio or video streams were available")
+    return selected
+
+
+def validate_finalize_output(
+    output_file: Path,
+    selected_streams: list[FinalizeMediaStream],
+    ffprobe_path: str = "ffprobe",
+) -> FinalizeOutputValidation:
+    output_streams = probe_finalize_media_streams([output_file], ffprobe_path)
+    expected_types = {stream.codec_type for stream in selected_streams}
+    audio_streams = sum(
+        stream.codec_type == "audio"
+        for stream in output_streams
+    )
+    video_streams = sum(
+        stream.codec_type == "video"
+        for stream in output_streams
+    )
+    actual_counts = {
+        "audio": audio_streams,
+        "video": video_streams,
+    }
+    if any(actual_counts[codec_type] != 1 for codec_type in expected_types):
+        raise VideoProbeError(
+            "Finalized output did not contain exactly one selected stream "
+            f"for each media type: {actual_counts}"
+        )
+    if any(
+        actual_counts[codec_type]
+        for codec_type in {"audio", "video"} - expected_types
+    ):
+        raise VideoProbeError(
+            f"Finalized output contained unexpected media streams: {actual_counts}"
+        )
+
+    expected_duration = min(stream.duration for stream in selected_streams)
+    output_durations = [
+        stream.duration
+        for stream in output_streams
+        if stream.codec_type in expected_types
+    ]
+    actual_duration = min(output_durations)
+    tolerance = min(
+        FINALIZE_DURATION_TOLERANCE_SECONDS,
+        max(0.25, expected_duration * 0.01),
+    )
+    if actual_duration + tolerance < expected_duration:
+        raise VideoProbeError(
+            "Finalized output was shorter than the selected recoverable media: "
+            f"expected={expected_duration:.3f}s actual={actual_duration:.3f}s "
+            f"tolerance={tolerance:.3f}s"
+        )
+    return FinalizeOutputValidation(
+        duration=actual_duration,
+        audio_streams=audio_streams,
+        video_streams=video_streams,
+    )
+
+
 def prepare_finalize_plan(
     config: BotConfig,
     video_id: str,
@@ -2464,7 +2922,12 @@ def prepare_finalize_plan(
         output_file=output_file,
         input_files=input_files,
         cleanup_files=cleanup,
-        shortest=segment_has_mixed_format_files(config, video_id, segment_index, channel),
+        mixed_inputs=segment_has_mixed_format_files(
+            config,
+            video_id,
+            segment_index,
+            channel,
+        ),
     )
 
 

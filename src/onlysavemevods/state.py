@@ -23,6 +23,9 @@ class StreamRecord:
     url: str
     platform: str
     source: str
+    youtube_video_format_id: str
+    youtube_video_codec: str
+    youtube_video_format_selector: str
     status: str
     segment_index: int
     first_seen_at: str
@@ -85,6 +88,9 @@ class StateStore:
                 url TEXT NOT NULL,
                 platform TEXT NOT NULL DEFAULT 'youtube',
                 source TEXT NOT NULL DEFAULT '',
+                youtube_video_format_id TEXT NOT NULL DEFAULT '',
+                youtube_video_codec TEXT NOT NULL DEFAULT '',
+                youtube_video_format_selector TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 segment_index INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TEXT NOT NULL,
@@ -96,6 +102,7 @@ class StateStore:
             """
         )
         self._ensure_stream_source_columns()
+        self._ensure_stream_video_format_columns()
         self._mark_legacy_kick_detections_ended()
         self.conn.execute(
             """
@@ -157,6 +164,19 @@ class StateStore:
                 "ALTER TABLE streams "
                 "ADD COLUMN source TEXT NOT NULL DEFAULT ''"
             )
+
+    def _ensure_stream_video_format_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(streams)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        for name in (
+            "youtube_video_format_id",
+            "youtube_video_codec",
+            "youtube_video_format_selector",
+        ):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE streams ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
 
     def _mark_legacy_kick_detections_ended(self) -> None:
         rows = self.conn.execute(
@@ -325,6 +345,45 @@ class StateStore:
             created_at=now,
         )
         self.conn.commit()
+
+    def lock_youtube_video_format(
+        self,
+        video_id: str,
+        *,
+        format_id: str,
+        codec: str,
+        selector: str,
+    ) -> StreamRecord:
+        current = self.get_stream(video_id)
+        if current is None:
+            raise ValueError(f"stream is not recorded: {video_id}")
+        if current.youtube_video_format_selector:
+            return current
+
+        now = utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE streams
+            SET youtube_video_format_id = ?,
+                youtube_video_codec = ?,
+                youtube_video_format_selector = ?,
+                updated_at = ?
+            WHERE video_id = ? AND youtube_video_format_selector = ''
+            """,
+            (format_id, codec, selector, now, video_id),
+        )
+        if cursor.rowcount:
+            self._insert_stream_event(
+                video_id,
+                "Locked YouTube video format "
+                f"id={format_id} codec={codec} selector={selector}",
+                segment_index=current.segment_index,
+                created_at=now,
+            )
+        self.conn.commit()
+        record = self.get_stream(video_id)
+        assert record is not None
+        return record
 
     def upsert_vod_stream(
         self,
@@ -633,6 +692,8 @@ class StateStore:
             """
             SELECT video_id, title, channel, url, status, segment_index,
                    platform, source,
+                   youtube_video_format_id, youtube_video_codec,
+                   youtube_video_format_selector,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE video_id = ?
@@ -647,6 +708,8 @@ class StateStore:
         query = """
             SELECT video_id, title, channel, url, status, segment_index,
                    platform, source,
+                   youtube_video_format_id, youtube_video_codec,
+                   youtube_video_format_selector,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             ORDER BY updated_at DESC, first_seen_at DESC
@@ -671,6 +734,8 @@ class StateStore:
         query = f"""
             SELECT video_id, title, channel, url, status, segment_index,
                    platform, source,
+                   youtube_video_format_id, youtube_video_codec,
+                   youtube_video_format_selector,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE status IN ({placeholders})

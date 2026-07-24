@@ -721,6 +721,13 @@ scripts/uninstall-systemd.sh
   yt-dlp progress shows all active format downloads have caught up to the live
   edge. Planned reconnects terminate yt-dlp without graceful finalization,
   leaving `.part` files in place for `--continue`.
+- YouTube recordings prefer VP9 by default. On the first download attempt, the
+  app selects an exact video format ID from the probe metadata, records its ID,
+  codec, and yt-dlp selector in SQLite, and forces that selector on every
+  reconnect or service restart. Set `youtube_preferred_video_codec` to `av1`,
+  `h264`, or `auto` to change the preference for newly detected streams.
+  Existing streams keep their recorded choice. An explicit `--format` in
+  `extra_yt_dlp_args` overrides automatic format locking.
 - Once the post-exit checks decide a stream has ended, leftover `.part` format
   files are finalized with FFmpeg and temporary `.ytdl`/fragment files are
   removed.
@@ -733,8 +740,11 @@ scripts/uninstall-systemd.sh
   `.part` files and restarts the same segment with `--live-from-start` instead
   of jumping to the live edge. If exact restore is not possible, continuation
   segments also use `--live-from-start` to prefer duplicates over missing
-  content. Once the stream is truly ended, mixed leftovers are muxed to the
-  shortest track.
+  content. During finalization, every leftover is probed and only the longest
+  recoverable video and audio streams are selected. The remuxed output must
+  contain exactly those streams and retain their common duration before source
+  files or fragments are removed. Failed probing or validation leaves all
+  recoverable inputs untouched.
 - `-k` is not used by default. Add it to `extra_yt_dlp_args` only if you want
   to debug or keep post-processing intermediates.
 - `extra_yt_dlp_args` cannot include metadata-only or download-suppression flags
