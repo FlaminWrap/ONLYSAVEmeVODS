@@ -722,12 +722,16 @@ scripts/uninstall-systemd.sh
   edge. Planned reconnects terminate yt-dlp without graceful finalization,
   leaving `.part` files in place for `--continue`.
 - YouTube recordings prefer VP9 by default. On the first download attempt, the
-  app selects an exact video format ID from the probe metadata, records its ID,
-  codec, and yt-dlp selector in SQLite, and forces that selector on every
-  reconnect or service restart. Set `youtube_preferred_video_codec` to `av1`,
-  `h264`, or `auto` to change the preference for newly detected streams.
-  Existing streams keep their recorded choice. An explicit `--format` in
-  `extra_yt_dlp_args` overrides automatic format locking.
+  app selects only from the formats in the current probe and records the exact
+  video ID, audio ID, and video codec in SQLite. Every reconnect probes again
+  and reuses that exact pair while it remains available. If either disappears,
+  the app chooses an available pair with the same video codec where possible,
+  records the replacement, and starts a new segment before downloading it. If
+  that video codec is no longer offered, the best available codec is recorded
+  in a new segment. Set
+  `youtube_preferred_video_codec` to `av1`, `h264`, or `auto` to change the
+  preference for newly detected streams. An explicit `--format` in
+  `extra_yt_dlp_args` overrides automatic format selection.
 - Once the post-exit checks decide a stream has ended, leftover `.part` format
   files are finalized with FFmpeg and temporary `.ytdl`/fragment files are
   removed.

@@ -131,6 +131,14 @@ class YoutubeProbeTests(unittest.TestCase):
         self.assertEqual(stream.video_id, "youtube:LIVEVIDEO01")
         self.assertEqual(runner.calls[0][-1], "https://www.youtube.com/@Example/live")
 
+    def test_video_probe_matches_live_from_start_download_mode(self) -> None:
+        runner = FakeRunner()
+        probe = YoutubeProbe(runner, live_from_start=True)
+
+        probe.probe_video("LIVEVIDEO01")
+
+        self.assertIn("--live-from-start", runner.calls[0])
+
     def test_ended_streams_are_not_rechecked_on_later_scans(self) -> None:
         runner = CacheRunner()
         probe = YoutubeProbe(

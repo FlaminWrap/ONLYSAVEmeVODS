@@ -385,6 +385,50 @@ class StateStore:
         assert record is not None
         return record
 
+    def update_youtube_video_format(
+        self,
+        video_id: str,
+        *,
+        format_id: str,
+        codec: str,
+        selector: str,
+    ) -> StreamRecord:
+        current = self.get_stream(video_id)
+        if current is None:
+            raise ValueError(f"stream is not recorded: {video_id}")
+        if (
+            current.youtube_video_format_id == format_id
+            and current.youtube_video_codec == codec
+            and current.youtube_video_format_selector == selector
+        ):
+            return current
+
+        now = utc_now()
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET youtube_video_format_id = ?,
+                youtube_video_codec = ?,
+                youtube_video_format_selector = ?,
+                updated_at = ?
+            WHERE video_id = ?
+            """,
+            (format_id, codec, selector, now, video_id),
+        )
+        self._insert_stream_event(
+            video_id,
+            "Changed preferred YouTube video format "
+            f"id={current.youtube_video_format_id}->{format_id} "
+            f"codec={current.youtube_video_codec}->{codec} "
+            f"selector={current.youtube_video_format_selector}->{selector}",
+            segment_index=current.segment_index,
+            created_at=now,
+        )
+        self.conn.commit()
+        record = self.get_stream(video_id)
+        assert record is not None
+        return record
+
     def upsert_vod_stream(
         self,
         stream: LiveStream,

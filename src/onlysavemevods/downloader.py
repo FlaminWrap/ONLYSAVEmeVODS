@@ -201,6 +201,7 @@ class YouTubeVideoFormatChoice:
     format_id: str
     codec: str
     selector: str
+    audio_format_id: str
     height: int
     fps: float
 
@@ -300,9 +301,77 @@ class DownloadManager:
                 segment_index = restart_segment
                 self.state.set_segment_index(stream.video_id, segment_index)
 
+        previous_format = self.state.get_stream(stream.video_id)
+        youtube_video_format_selector = self._youtube_video_format_selector(stream)
+        selected_format = self.state.get_stream(stream.video_id)
+        selected_segment_index = youtube_format_segment_index(
+            self.config,
+            stream,
+            segment_index,
+            previous_format_id=(
+                previous_format.youtube_video_format_id
+                if previous_format is not None
+                else ""
+            ),
+            previous_codec=(
+                previous_format.youtube_video_codec
+                if previous_format is not None
+                else ""
+            ),
+            previous_selector=(
+                previous_format.youtube_video_format_selector
+                if previous_format is not None
+                else ""
+            ),
+            selected_format_id=(
+                selected_format.youtube_video_format_id
+                if selected_format is not None
+                else ""
+            ),
+            selected_codec=(
+                selected_format.youtube_video_codec
+                if selected_format is not None
+                else ""
+            ),
+            selected_selector=(
+                selected_format.youtube_video_format_selector
+                if selected_format is not None
+                else ""
+            ),
+        )
+        if (
+            previous_format is not None
+            and selected_format is not None
+            and selected_segment_index != segment_index
+        ):
+            previous_segment = segment_index
+            segment_index = selected_segment_index
+            self.state.set_segment_index(stream.video_id, segment_index)
+            message = (
+                "Started a new segment after YouTube format changed "
+                f"id={previous_format.youtube_video_format_id}"
+                f"->{selected_format.youtube_video_format_id} "
+                f"codec={previous_format.youtube_video_codec}"
+                f"->{selected_format.youtube_video_codec} "
+                f"selector={previous_format.youtube_video_format_selector}"
+                f"->{selected_format.youtube_video_format_selector}"
+            )
+            self.state.add_stream_event(
+                stream.video_id,
+                message,
+                level="warning",
+                segment_index=segment_index,
+            )
+            self.logger.warning(
+                "%s video_id=%s previous_segment=%03d new_segment=%03d",
+                message,
+                stream.video_id,
+                previous_segment,
+                segment_index,
+            )
+
         output_template = output_template_for(self.config, stream, segment_index)
         output_template.parent.mkdir(parents=True, exist_ok=True)
-        youtube_video_format_selector = self._youtube_video_format_selector(stream)
         command = build_download_command(
             self.config,
             stream,
@@ -436,8 +505,50 @@ class DownloadManager:
 
         record = self.state.get_stream(stream.video_id)
         if record is not None and record.youtube_video_format_selector:
+            choice = choose_youtube_video_format(
+                stream,
+                record.youtube_video_codec,
+                preferred_format_id=record.youtube_video_format_id,
+                preferred_audio_format_id=youtube_audio_format_id(
+                    record.youtube_video_format_selector
+                ),
+            )
+            if choice is None:
+                self.logger.warning(
+                    "Unable to refresh preferred YouTube format for %s; "
+                    "reusing recorded format id=%s codec=%s",
+                    stream.video_id,
+                    record.youtube_video_format_id,
+                    record.youtube_video_codec,
+                )
+                return record.youtube_video_format_selector
+
+            if (
+                choice.format_id != record.youtube_video_format_id
+                or choice.codec != record.youtube_video_codec
+                or choice.selector != record.youtube_video_format_selector
+            ):
+                previous_format_id = record.youtube_video_format_id
+                previous_codec = record.youtube_video_codec
+                record = self.state.update_youtube_video_format(
+                    stream.video_id,
+                    format_id=choice.format_id,
+                    codec=choice.codec,
+                    selector=choice.selector,
+                )
+                self.logger.warning(
+                    "Changed YouTube format selection from current availability "
+                    "video_id=%s "
+                    "format_id=%s->%s codec=%s->%s selector=%s",
+                    stream.video_id,
+                    previous_format_id,
+                    choice.format_id,
+                    previous_codec,
+                    choice.codec,
+                    record.youtube_video_format_selector,
+                )
             self.logger.info(
-                "Reusing locked YouTube video format video_id=%s format_id=%s "
+                "Reusing preferred YouTube video format video_id=%s format_id=%s "
                 "codec=%s selector=%s",
                 stream.video_id,
                 record.youtube_video_format_id,
@@ -465,7 +576,7 @@ class DownloadManager:
             selector=choice.selector,
         )
         self.logger.info(
-            "Locked YouTube video format video_id=%s format_id=%s codec=%s "
+            "Preferred YouTube video format video_id=%s format_id=%s codec=%s "
             "height=%s fps=%s selector=%s",
             stream.video_id,
             choice.format_id,
@@ -2379,6 +2490,9 @@ def youtube_video_codec(value: object) -> str:
 def choose_youtube_video_format(
     stream: LiveStream,
     preferred_codec: str = "vp9",
+    *,
+    preferred_format_id: str = "",
+    preferred_audio_format_id: str = "",
 ) -> YouTubeVideoFormatChoice | None:
     if stream.platform.casefold() != "youtube":
         return None
@@ -2386,6 +2500,10 @@ def choose_youtube_video_format(
     if not isinstance(formats, list):
         return None
 
+    audio_format_id = choose_youtube_audio_format_id(
+        formats,
+        preferred_audio_format_id=preferred_audio_format_id,
+    )
     candidates: list[tuple[tuple[float, ...], YouTubeVideoFormatChoice]] = []
     preferred = preferred_codec.strip().casefold()
     for position, raw_format in enumerate(formats):
@@ -2405,18 +2523,29 @@ def choose_youtube_video_format(
             acodec not in {"", "none"}
             or audio_ext not in {"", "none"}
         )
-        selector = format_id if has_audio else f"{format_id}+bestaudio"
+        selector = (
+            format_id
+            if has_audio
+            else f"{format_id}+{audio_format_id or 'bestaudio'}"
+        )
         height = format_number(raw_format.get("height"), integer=True)
         fps = format_number(raw_format.get("fps"))
         choice = YouTubeVideoFormatChoice(
             format_id=format_id,
             codec=codec,
             selector=selector,
+            audio_format_id="" if has_audio else audio_format_id,
             height=int(height),
             fps=fps,
         )
+        preferred_id_match = float(
+            bool(preferred_format_id)
+            and format_id == preferred_format_id
+            and (preferred == "auto" or codec == preferred)
+        )
         preferred_match = float(preferred != "auto" and codec == preferred)
         rank = (
+            preferred_id_match,
             preferred_match,
             height,
             format_number(raw_format.get("width"), integer=True),
@@ -2436,6 +2565,52 @@ def choose_youtube_video_format(
     if not candidates:
         return None
     return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def choose_youtube_audio_format_id(
+    formats: list[object],
+    *,
+    preferred_audio_format_id: str = "",
+) -> str:
+    candidates: list[tuple[tuple[float, ...], str]] = []
+    for position, raw_format in enumerate(formats):
+        if not isinstance(raw_format, Mapping) or raw_format.get("has_drm"):
+            continue
+        format_id = str(raw_format.get("format_id") or "").strip()
+        if not YOUTUBE_FORMAT_ID_RE.fullmatch(format_id):
+            continue
+        vcodec = str(raw_format.get("vcodec") or "").strip().casefold()
+        acodec = str(raw_format.get("acodec") or "").strip().casefold()
+        if vcodec not in {"", "none"} or acodec in {"", "none"}:
+            continue
+        rank = (
+            float(
+                bool(preferred_audio_format_id)
+                and format_id == preferred_audio_format_id
+            ),
+            format_number(raw_format.get("quality")),
+            format_number(raw_format.get("abr")),
+            format_number(raw_format.get("tbr")),
+            format_number(raw_format.get("asr")),
+            format_number(raw_format.get("audio_channels")),
+            format_number(
+                raw_format.get("filesize")
+                or raw_format.get("filesize_approx")
+            ),
+            float(position),
+        )
+        candidates.append((rank, format_id))
+    if not candidates:
+        return ""
+    return max(candidates, key=lambda candidate: candidate[0])[1]
+
+
+def youtube_audio_format_id(selector: str) -> str:
+    exact_selector = selector.strip().partition("/")[0]
+    _video_format_id, separator, audio_format_id = exact_selector.partition("+")
+    if not separator or audio_format_id == "bestaudio":
+        return ""
+    return audio_format_id
 
 
 def format_number(value: object, *, integer: bool = False) -> float:
@@ -2563,6 +2738,36 @@ def choose_restart_segment(
     if segment_has_final_files(config, video_id, segment_index, channel):
         return segment_index + 1
     return segment_index
+
+
+def youtube_format_segment_index(
+    config: BotConfig,
+    stream: LiveStream,
+    segment_index: int,
+    *,
+    previous_format_id: str,
+    previous_codec: str,
+    previous_selector: str,
+    selected_format_id: str,
+    selected_codec: str,
+    selected_selector: str,
+) -> int:
+    if (
+        not previous_format_id
+        or (
+            previous_format_id == selected_format_id
+            and previous_codec == selected_codec
+            and previous_selector == selected_selector
+        )
+        or not segment_media_input_files(
+            config,
+            stream.video_id,
+            segment_index,
+            stream.channel,
+        )
+    ):
+        return segment_index
+    return segment_index + 1
 
 
 def segment_has_part_files(

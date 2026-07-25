@@ -33,6 +33,7 @@ class OnlySaveMeVodsDaemon:
             YtDlpRunner(config.yt_dlp_path),
             channel_scan_limit=config.channel_scan_limit,
             discovery_probe_concurrency=config.discovery_probe_concurrency,
+            youtube_live_from_start=config.live_from_start,
         )
         self.downloads = DownloadManager(config, self.state, self.sources)
         self.web = StatusWebServer(config) if config.web_enabled else None

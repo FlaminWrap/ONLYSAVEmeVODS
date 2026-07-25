@@ -40,6 +40,7 @@ from onlysavemevods.downloader import (
     segment_timing_file,
     segment_directory,
     validate_finalize_output,
+    youtube_format_segment_index,
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.powerchat import (
@@ -103,7 +104,85 @@ class DownloaderCommandTests(unittest.TestCase):
         self.assertEqual(choice.selector, "303+bestaudio")
         self.assertEqual(choice.height, 1080)
 
-    def test_download_command_forces_locked_youtube_format(self) -> None:
+    def test_youtube_format_choice_reuses_recorded_available_id(self) -> None:
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            raw={
+                "formats": [
+                    {
+                        "format_id": "302",
+                        "vcodec": "vp09.00.31.08",
+                        "acodec": "none",
+                        "height": 720,
+                    },
+                    {
+                        "format_id": "303",
+                        "vcodec": "vp9",
+                        "acodec": "none",
+                        "height": 1080,
+                    },
+                ]
+            },
+        )
+
+        choice = choose_youtube_video_format(
+            stream,
+            "vp9",
+            preferred_format_id="302",
+        )
+
+        self.assertIsNotNone(choice)
+        assert choice is not None
+        self.assertEqual(choice.format_id, "302")
+        self.assertEqual(choice.codec, "vp9")
+
+    def test_youtube_format_choice_records_exact_audio_id(self) -> None:
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            raw={
+                "formats": [
+                    {
+                        "format_id": "303",
+                        "vcodec": "vp9",
+                        "acodec": "none",
+                        "height": 1080,
+                    },
+                    {
+                        "format_id": "140",
+                        "vcodec": "none",
+                        "acodec": "mp4a.40.2",
+                        "abr": 129,
+                    },
+                    {
+                        "format_id": "251",
+                        "vcodec": "none",
+                        "acodec": "opus",
+                        "abr": 126,
+                    },
+                ]
+            },
+        )
+
+        initial = choose_youtube_video_format(stream, "vp9")
+        recorded = choose_youtube_video_format(
+            stream,
+            "vp9",
+            preferred_format_id="303",
+            preferred_audio_format_id="251",
+        )
+
+        self.assertIsNotNone(initial)
+        self.assertIsNotNone(recorded)
+        assert initial is not None
+        assert recorded is not None
+        self.assertEqual(initial.selector, "303+140")
+        self.assertEqual(initial.audio_format_id, "140")
+        self.assertEqual(recorded.selector, "303+251")
+        self.assertEqual(recorded.audio_format_id, "251")
+
+    def test_download_command_uses_selected_youtube_format(self) -> None:
         config = BotConfig()
         stream = LiveStream(
             video_id="youtube:LIVEVIDEO01",
@@ -119,7 +198,35 @@ class DownloaderCommandTests(unittest.TestCase):
 
         format_index = command.index("--format")
         self.assertEqual(command[format_index + 1], "303+bestaudio")
-        self.assertNotIn("bestvideo*+bestaudio/best", command)
+
+    def test_youtube_format_change_with_media_starts_new_segment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp) / "downloads")
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+            )
+            segment_dir = segment_directory(config, stream.video_id, stream.channel)
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.f303.webm.part").write_text(
+                "media",
+                encoding="utf-8",
+            )
+
+            selected_segment = youtube_format_segment_index(
+                config,
+                stream,
+                1,
+                previous_format_id="303",
+                previous_codec="vp9",
+                previous_selector="303+251",
+                selected_format_id="137",
+                selected_codec="h264",
+                selected_selector="137+251",
+            )
+
+        self.assertEqual(selected_segment, 2)
 
     def test_explicit_user_format_overrides_locked_youtube_format(self) -> None:
         config = BotConfig(
@@ -1178,7 +1285,9 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(output_exists)
         self.assertTrue(inputs_exist)
 
-    async def test_youtube_format_lock_survives_codec_change_on_reconnect(self) -> None:
+    async def test_youtube_format_preference_updates_from_available_formats(
+        self,
+    ) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
                 download_dir=Path(tmp) / "downloads",
@@ -1229,12 +1338,42 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
             state.close()
 
         self.assertEqual(first, "303+bestaudio")
-        self.assertEqual(second, "303+bestaudio")
+        self.assertEqual(second, "399+bestaudio")
         self.assertIsNotNone(record)
         assert record is not None
-        self.assertEqual(record.youtube_video_format_id, "303")
-        self.assertEqual(record.youtube_video_codec, "vp9")
-        self.assertEqual(record.youtube_video_format_selector, "303+bestaudio")
+        self.assertEqual(record.youtube_video_format_id, "399")
+        self.assertEqual(record.youtube_video_codec, "av1")
+        self.assertEqual(record.youtube_video_format_selector, second)
+
+    async def test_recorded_format_is_reused_when_probe_has_no_formats(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                raw={"formats": []},
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="303",
+                codec="vp9",
+                selector="303+bestaudio",
+            )
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            selector = manager._youtube_video_format_selector(stream)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertEqual(selector, "303+bestaudio")
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.youtube_video_format_selector, selector)
 
     async def test_live_restart_restores_finalized_formats_with_kept_fragments(self) -> None:
         with TemporaryDirectory() as tmp:

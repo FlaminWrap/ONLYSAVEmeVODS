@@ -39,12 +39,14 @@ class SourceMonitor:
         *,
         channel_scan_limit: int = 10,
         discovery_probe_concurrency: int = 4,
+        youtube_live_from_start: bool = False,
     ) -> None:
         self.runner = runner or YtDlpRunner()
         self.youtube = YoutubeProbe(
             self.runner,
             channel_scan_limit=channel_scan_limit,
             discovery_probe_concurrency=discovery_probe_concurrency,
+            live_from_start=youtube_live_from_start,
         )
 
     def discover_live_streams(

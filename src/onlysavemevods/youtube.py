@@ -115,10 +115,12 @@ class YoutubeProbe:
         *,
         channel_scan_limit: int = 10,
         discovery_probe_concurrency: int = 4,
+        live_from_start: bool = False,
     ) -> None:
         self.runner = runner or YtDlpRunner()
         self.channel_scan_limit = channel_scan_limit
         self.discovery_probe_concurrency = max(1, discovery_probe_concurrency)
+        self.live_from_start = live_from_start
         self._known_non_live_video_ids: set[str] = set()
 
     def discover_channel_live_streams(
@@ -200,15 +202,16 @@ class YoutubeProbe:
             if url_or_id.startswith(("http://", "https://"))
             else video_url(url_or_id)
         )
-        info = self.runner.run_json(
-            [
-                "--dump-json",
-                "--skip-download",
-                "--no-playlist",
-                "--no-warnings",
-                target,
-            ]
-        )
+        args = [
+            "--dump-json",
+            "--skip-download",
+            "--no-playlist",
+            "--no-warnings",
+        ]
+        if self.live_from_start:
+            args.append("--live-from-start")
+        args.append(target)
+        info = self.runner.run_json(args)
         stream = live_stream_from_info(info, fallback_url=target)
         LOGGER.debug(
             "Probed video id=%s is_live=%s live_status=%r title=%r channel=%r",
