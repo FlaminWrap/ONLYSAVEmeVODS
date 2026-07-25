@@ -99,6 +99,7 @@ from onlysavemevods.web import (
     StreamerStatStatus,
     render_stream_event_timeline,
     render_app_update_panel,
+    render_admin_recent_jobs,
     render_streamer_jobs_summary,
     STREAM_DELETE_CONFIRM_VALUE,
 )
@@ -2264,6 +2265,51 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(payload_streamer["jobs"][0]["kind"], "Chat render")
         self.assertEqual(payload_streamer["jobs"][0]["video_id"], "LIVEVIDEO01")
+
+    def test_overview_processing_uses_desktop_job_cards(self) -> None:
+        jobs = [
+            JobStatus(
+                job_id="chat-render",
+                kind="Chat render",
+                status="running",
+                phase="Preparing chat panel",
+                progress=0.19,
+                video_id="youtube:LIVEVIDEO01",
+                item="Late night stream [youtube:LIVEVIDEO01] - chat.mp4",
+                detail="",
+                message="Preparing chat panel",
+                started_at=None,
+                updated_at=None,
+                finished_at=None,
+            ),
+            JobStatus(
+                job_id="transcription",
+                kind="Transcription",
+                status="queued",
+                phase="",
+                progress=None,
+                video_id="youtube:LIVEVIDEO01",
+                item="Late night stream [youtube:LIVEVIDEO01].mkv",
+                detail="",
+                message="",
+                started_at=None,
+                updated_at=None,
+                finished_at=None,
+            ),
+        ]
+
+        html = render_admin_recent_jobs(jobs)
+
+        self.assertIn('class="overview-job-grid"', html)
+        self.assertEqual(html.count('class="overview-job-card"'), 2)
+        self.assertIn("<p>2 active jobs</p>", html)
+        self.assertIn("<h3>Preparing chat panel</h3>", html)
+        self.assertIn('value="19"', html)
+        self.assertIn("<strong>19%</strong>", html)
+        self.assertIn("<h3>Waiting to start</h3>", html)
+        self.assertIn("<strong>Waiting</strong>", html)
+        self.assertNotIn('class="mobile-records"', html)
+        self.assertNotIn('style="display:grid"', html)
 
     def test_streamer_jobs_summary_paginates_many_jobs(self) -> None:
         jobs = [

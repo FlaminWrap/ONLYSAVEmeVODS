@@ -9007,8 +9007,62 @@ def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "")
 def render_admin_recent_jobs(jobs: list[JobStatus]) -> str:
     if not jobs:
         return """<section class="card"><div class="card-header"><div><h2>Processing</h2><p>No jobs are queued or running.</p></div><a href="/activity">Activity</a></div></section>"""
-    rows = "".join(render_admin_job_mobile(job) for job in jobs[:5])
-    return f'<section class="section-stack"><div class="section-heading"><h2>Processing</h2><a href="/activity">All activity</a></div><div class="mobile-records" style="display:grid">{rows}</div></section>'
+    visible_jobs = jobs[:5]
+    rows = "".join(render_admin_overview_job(job) for job in visible_jobs)
+    count = len(jobs)
+    return f"""<section class="section-stack overview-jobs-section">
+  <div class="section-heading">
+    <div class="section-heading-copy"><h2>Processing</h2><p>{count} active job{'s' if count != 1 else ''}</p></div>
+    <a href="/activity">All activity</a>
+  </div>
+  <div class="overview-job-grid">{rows}</div>
+</section>"""
+
+
+def render_admin_overview_job(job: JobStatus) -> str:
+    search = " ".join(
+        str(value or "")
+        for value in (job.kind, job.phase, job.video_id, job.item, job.message)
+    ).lower()
+    phase = job.phase or ("Waiting to start" if job.status == "queued" else "In progress")
+    item = job.item or job.video_id or "No item details"
+    message = (job.message or "").strip()
+    supporting_text = (
+        message
+        if message and message.casefold() != phase.casefold()
+        else job.video_id
+    )
+    if job.progress is None:
+        progress_label = "Waiting"
+        progress = (
+            f'<progress max="100" aria-label="{escape(job.kind or "Job", quote=True)} '
+            'progress"></progress>'
+        )
+    else:
+        percent = max(0, min(100, round(job.progress * 100)))
+        progress_label = f"{percent}%"
+        progress = (
+            f'<progress max="100" value="{percent}" '
+            f'aria-label="{escape(job.kind or "Job", quote=True)} progress">'
+            f"{percent}%</progress>"
+        )
+    footer = (
+        f'<span class="overview-job-context">{escape(supporting_text)}</span>'
+        if supporting_text
+        else '<span></span>'
+    )
+    return f"""<article class="overview-job-card" data-activity-record data-state="{escape(job.status, quote=True)}" data-search-text="{escape(search, quote=True)}">
+  <header class="overview-job-header">
+    <div class="overview-job-heading"><span class="overview-job-kind">{escape(job.kind or "Job")}</span><h3>{escape(phase)}</h3></div>
+    <span class="status-badge {escape(job.status, quote=True)}">{escape(job.status or "-")}</span>
+  </header>
+  <div class="overview-job-item" title="{escape(item, quote=True)}">{escape(item)}</div>
+  <div class="overview-job-progress">
+    <div><span>Progress</span><strong>{escape(progress_label)}</strong></div>
+    {progress}
+  </div>
+  <footer class="overview-job-footer">{footer}<span>{escape(format_job_duration(job))}</span></footer>
+</article>"""
 
 
 def render_admin_streamers(
