@@ -280,6 +280,22 @@ class DashboardUiTests(unittest.TestCase):
                         source="kick:example",
                     )
                 )
+            state.upsert_vod_stream(
+                LiveStream(
+                    video_id="youtube:codec-example",
+                    url="https://www.youtube.com/watch?v=codec-example",
+                    title="Codec example",
+                    channel="example",
+                    platform="youtube",
+                    source="youtube:example",
+                )
+            )
+            state.lock_youtube_video_format(
+                "youtube:codec-example",
+                format_id="399",
+                codec="av1",
+                selector="399+140",
+            )
             state.close()
 
             first_page = render_admin_page(
@@ -298,18 +314,21 @@ class DashboardUiTests(unittest.TestCase):
                 {"selected": ["Example"], "page": ["2"]},
             )
 
-        self.assertIn("Showing 1–10 of 12", first_page)
+        self.assertIn("Showing 1–10 of 13", first_page)
         self.assertIn("Page 1 of 2", first_page)
         self.assertIn('rel="next"', first_page)
+        self.assertIn('class="record-list stream-history-grid"', first_page)
         self.assertNotIn("Open complete history", first_page)
         self.assertNotIn("compatibility workspace for the complete", first_page)
         self.assertIn('data-details-key="stream:kick:example:00"', first_page)
         self.assertIn('data-details-key="stream:kick:example:00:jobs"', first_page)
         self.assertIn('class="stream-subsection processing-jobs-section"', first_page)
-        self.assertIn("Showing 11–12 of 12", second_page)
+        self.assertIn("Showing 11–13 of 13", second_page)
         self.assertIn("Page 2 of 2", second_page)
         self.assertIn('rel="prev"', second_page)
-        self.assertIn("Showing 11–12 of 12", fragment)
+        self.assertIn('class="media-format-badge"', second_page)
+        self.assertIn("AV1 · format 399", second_page)
+        self.assertIn("Showing 11–13 of 13", fragment)
 
     def test_streamer_history_uses_historical_timezone_and_dst(self) -> None:
         with TemporaryDirectory() as temp_dir:

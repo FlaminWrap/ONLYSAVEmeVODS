@@ -9698,21 +9698,48 @@ def render_admin_streamer_streams(
   <span class="muted">Page {stream_page.page} of {stream_page.page_count}</span>
   <div class="button-row">{previous}{following}</div>
 </nav>"""
-    return f'{heading}{filters}{pagination}<div class="record-list">{cards}</div>{pagination}'
+    return f'{heading}{filters}{pagination}<div class="record-list stream-history-grid">{cards}</div>{pagination}'
+
+
+def video_codec_label(codec: str) -> str:
+    normalized = codec.strip().casefold().replace("_", "-")
+    if normalized.startswith(("av01", "av1")):
+        return "AV1"
+    if normalized.startswith(("vp09", "vp9")):
+        return "VP9"
+    if normalized.startswith(("avc1", "avc3", "h264", "h-264")):
+        return "H.264"
+    if normalized.startswith(("hev1", "hvc1", "hevc", "h265", "h-265")):
+        return "H.265"
+    return codec.strip().upper()
+
+
+def render_stream_video_format(stream: StreamStatus) -> tuple[str, str]:
+    codec = video_codec_label(stream.youtube_video_codec)
+    if not codec:
+        return "", "Not recorded"
+    format_id = stream.youtube_video_format_id.strip()
+    details = codec if not format_id else f"{codec} · format {format_id}"
+    badge = (
+        f'<span class="media-format-badge" title="{escape(details, quote=True)}">'
+        f"{escape(codec)}</span>"
+    )
+    return badge, details
 
 
 def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     platform, platform_label, platform_initial = stream_platform_details(stream)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
+    format_badge, video_format = render_stream_video_format(stream)
     details_key = escape(stream.video_id, quote=True)
     files = "".join(
         render_file_row(file, timezone_name) for file in stream.files[:20]
     ) or '<tr><td colspan="7">No files found</td></tr>'
     return f"""<details class="card stream-detail" data-details-key="stream:{details_key}">
-  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span></div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
+  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span>{format_badge}</div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
   <div class="section-stack">
     {render_stream_signals(stream)}
-    <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
+    <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
     <div class="button-row">{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
     <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:events"><summary><strong>Content events</strong><span class="subsection-count">{stream.content_event_count}</span></summary><div class="stream-subsection-body">{render_content_events(stream.content_events)}</div></details>
