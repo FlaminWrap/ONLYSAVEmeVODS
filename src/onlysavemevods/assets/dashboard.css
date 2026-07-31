@@ -545,7 +545,7 @@ button, a, input, select, textarea, summary { outline: none; }
   min-height: 40px;
 }
 .stream-history-grid {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
 }
 .stream-history-grid > .stream-detail { min-width: 0; }
@@ -572,6 +572,9 @@ tr:last-child td { border-bottom: 0; }
 .config-value { white-space: pre-wrap; }
 .mobile-records { display: none; }
 .detail-list { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 8px 16px; margin: 0; }
+.stream-detail-list {
+  grid-template-columns: max-content minmax(0, 1fr) max-content minmax(0, 1fr);
+}
 .detail-list dt { font-weight: 650; }
 .detail-list dd { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
 .stream-detail > summary { cursor: pointer; list-style: none; margin: -2px; padding: 2px; }
@@ -805,6 +808,7 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .powerchat-chart-grid { grid-template-columns: 1fr; }
   .event-rule-primary, .event-rule-criteria, .event-rule-card > summary { grid-template-columns: 1fr; }
   .event-rule-action { justify-self: start; }
+  .stream-detail-list { grid-template-columns: max-content minmax(0, 1fr); }
 }
 
 @media (max-width: 620px) {

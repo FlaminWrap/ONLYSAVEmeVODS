@@ -388,12 +388,30 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('data-details-key="stream:kick:example:00"', first_page)
         self.assertIn('data-details-key="stream:kick:example:00:jobs"', first_page)
         self.assertIn('class="stream-subsection processing-jobs-section"', first_page)
+        self.assertIn('class="detail-list stream-detail-list"', first_page)
         self.assertIn("Showing 11–13 of 13", second_page)
         self.assertIn("Page 2 of 2", second_page)
         self.assertIn('rel="prev"', second_page)
         self.assertIn('class="media-format-badge"', second_page)
         self.assertIn("AV1 · format 399", second_page)
         self.assertIn("Showing 11–13 of 13", fragment)
+
+        stylesheet = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.css"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            ".stream-history-grid {\n  grid-template-columns: minmax(0, 1fr);",
+            stylesheet,
+        )
+        self.assertIn(
+            "grid-template-columns: max-content minmax(0, 1fr) max-content "
+            "minmax(0, 1fr);",
+            stylesheet,
+        )
 
     def test_streamer_history_uses_historical_timezone_and_dst(self) -> None:
         with TemporaryDirectory() as temp_dir:
