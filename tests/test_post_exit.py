@@ -152,7 +152,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sleeps, [30])
         self.assertTrue(process.terminated)
 
-    async def test_mixed_segment_watchdog_reconnects_immediately(self) -> None:
+    async def test_split_track_watchdog_confirms_before_reconnecting(self) -> None:
         sleeps: list[float] = []
 
         async def fake_sleep(delay: float) -> None:
@@ -190,7 +190,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             )
             state.close()
 
-        self.assertEqual(sleeps, [10])
+        self.assertEqual(sleeps, [10, 120])
         self.assertTrue(process.terminated)
         self.assertIn("LIVEVIDEO01", manager._planned_reconnects)
 

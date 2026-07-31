@@ -55,6 +55,7 @@ from onlysavemevods.web import (
     cleanup_expired_stream_fragments,
     delete_stream,
     resolve_watermark_download_file,
+    start_segment_recovery_job,
     start_vod_redownload_job,
     vod_download_progress_from_line,
     vod_output_template_for,
@@ -586,6 +587,57 @@ class WebStatusTests(unittest.TestCase):
             "\n".join(event.message for event in events[stream.video_id]),
         )
 
+    def test_start_segment_recovery_job_tracks_preserved_fragment_recovery(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.f140.mp4").write_text(
+                "audio",
+                encoding="utf-8",
+            )
+            (segment_dir / "segment-001.f248.webm.part").write_text(
+                "video",
+                encoding="utf-8",
+            )
+
+            with patch("onlysavemevods.web.Thread") as thread_cls:
+                ok, message = start_segment_recovery_job(
+                    config,
+                    stream.video_id,
+                    "1",
+                )
+
+            state = StateStore(config.db_path)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=8)
+            state.close()
+
+        self.assertTrue(ok, message)
+        self.assertEqual(message, "Video recovery queued")
+        thread_cls.return_value.start.assert_called_once()
+        recovery_job = next(
+            job for job in list_tracked_jobs() if job.kind == "Video recovery"
+        )
+        self.assertEqual(recovery_job.item, "segment-001-recovered.mkv")
+        self.assertIn("source fragments will be preserved", recovery_job.message)
+        self.assertIn(
+            "source fragments will be preserved",
+            "\n".join(event.message for event in events[stream.video_id]),
+        )
+
     def test_streamer_ui_shows_manual_and_redownload_vod_controls(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -695,7 +747,8 @@ class WebStatusTests(unittest.TestCase):
         stream_status = snapshot.streams[0]
         self.assertEqual(stream_status.video_id, "LIVEVIDEO01")
         self.assertTrue(stream_status.has_part_files)
-        self.assertTrue(stream_status.has_mixed_formats)
+        self.assertFalse(stream_status.has_mixed_formats)
+        self.assertEqual(stream_status.recoverable_segments, [1])
         self.assertGreater(stream_status.total_bytes, 0)
         self.assertEqual(stream_status.file_kind_counts["part"], 1)
         self.assertEqual(stream_status.file_kind_counts["final"], 2)
@@ -762,6 +815,84 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(unused_channel.configured_sources, ["@Unused"])
         self.assertEqual(unused_channel.stream_count, 0)
+
+    def test_status_does_not_report_locked_audio_video_pair_as_mixed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="248",
+                codec="vp9",
+                selector="248+140",
+            )
+            state.close()
+
+            segment_dir = (
+                config.download_dir / "Example_Channel" / "youtube_LIVEVIDEO01"
+            )
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.f140.mkv").write_text(
+                "audio",
+                encoding="utf-8",
+            )
+            (segment_dir / "segment-001.f248.mkv.part").write_text(
+                "video",
+                encoding="utf-8",
+            )
+
+            snapshot = build_status_snapshot(config)
+
+        self.assertFalse(snapshot.streams[0].has_mixed_formats)
+
+    def test_status_reports_format_id_outside_locked_selector(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="303",
+                codec="vp9",
+                selector="303+140",
+            )
+            state.close()
+
+            segment_dir = (
+                config.download_dir / "Example_Channel" / "youtube_LIVEVIDEO01"
+            )
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.f248.mkv").write_text(
+                "old video",
+                encoding="utf-8",
+            )
+            (segment_dir / "segment-001.f303.mkv.part").write_text(
+                "current video",
+                encoding="utf-8",
+            )
+
+            snapshot = build_status_snapshot(config)
+
+        self.assertTrue(snapshot.streams[0].has_mixed_formats)
 
     def test_status_snapshot_and_html_include_powerchat_events(self) -> None:
         with TemporaryDirectory() as tmp:

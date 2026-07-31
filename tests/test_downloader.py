@@ -3,6 +3,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 import asyncio
 import json
+import subprocess
 import unittest
 
 from onlysavemevods.config import (
@@ -30,6 +31,8 @@ from onlysavemevods.downloader import (
     output_template_for,
     post_exit_probe_target,
     prepare_finalize_plan,
+    probe_packet_duration,
+    recover_segment_from_fragments,
     rename_finalized_segment_file,
     rename_segment_chat_file,
     rename_segment_timing_file,
@@ -1058,6 +1061,166 @@ class DownloaderCommandTests(unittest.TestCase):
         ):
             validate_finalize_output(output, selected)
 
+    def test_packet_duration_falls_back_to_last_packet_end(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="0.000000,0.033000\n1267.467000,0.033000\n",
+            stderr="",
+        )
+
+        with patch(
+            "onlysavemevods.downloader.subprocess.run",
+            return_value=completed,
+        ):
+            duration = probe_packet_duration(Path("segment-001.f248.webm.part"), 0)
+
+        self.assertAlmostEqual(duration, 1267.5)
+
+    def test_manual_segment_recovery_preserves_source_tracks(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            audio_file = segment_dir / "segment-001.f140.mp4"
+            video_part = segment_dir / "segment-001.f248.webm.part"
+            audio_file.write_text("audio", encoding="utf-8")
+            video_part.write_text("video", encoding="utf-8")
+            media_streams = [
+                FinalizeMediaStream(
+                    path=audio_file,
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="audio",
+                    duration=1267.5,
+                    size=audio_file.stat().st_size,
+                    partial=False,
+                ),
+                FinalizeMediaStream(
+                    path=video_part,
+                    input_index=1,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=1267.5,
+                    size=video_part.stat().st_size,
+                    partial=True,
+                ),
+            ]
+            progress: list[tuple[str, float]] = []
+
+            def successful_mux(
+                command: list[str],
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess:
+                Path(command[-1]).write_bytes(b"recovered")
+                return subprocess.CompletedProcess(command, 0, b"", b"")
+
+            with (
+                patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    return_value=media_streams,
+                ),
+                patch(
+                    "onlysavemevods.downloader.validate_finalize_output",
+                    return_value=FinalizeOutputValidation(
+                        duration=1267.5,
+                        audio_streams=1,
+                        video_streams=1,
+                    ),
+                ),
+                patch(
+                    "onlysavemevods.downloader.subprocess.run",
+                    side_effect=successful_mux,
+                ) as run,
+            ):
+                result = recover_segment_from_fragments(
+                    config,
+                    "LIVEVIDEO01",
+                    1,
+                    "Example Channel",
+                    progress_callback=lambda phase, value: progress.append(
+                        (phase, value)
+                    ),
+                )
+
+            command = run.call_args.args[0]
+            sources_exist = audio_file.exists() and video_part.exists()
+
+        self.assertEqual(result.output_file.name, "segment-001-recovered.mkv")
+        self.assertEqual(result.size, len(b"recovered"))
+        self.assertTrue(sources_exist)
+        self.assertEqual(
+            [
+                command[index + 1]
+                for index, argument in enumerate(command)
+                if argument == "-map"
+            ],
+            ["1:0", "0:0"],
+        )
+        self.assertEqual(progress[-1], ("Recovery complete", 1.0))
+
+    def test_failed_regeneration_keeps_previous_recovered_video(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            audio_file = segment_dir / "segment-001.f140.mp4"
+            video_part = segment_dir / "segment-001.f248.webm.part"
+            output_file = segment_dir / "segment-001-recovered.mkv"
+            audio_file.write_text("audio", encoding="utf-8")
+            video_part.write_text("video", encoding="utf-8")
+            output_file.write_text("known-good", encoding="utf-8")
+            media_streams = [
+                FinalizeMediaStream(
+                    path=audio_file,
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="audio",
+                    duration=100.0,
+                    size=5,
+                    partial=False,
+                ),
+                FinalizeMediaStream(
+                    path=video_part,
+                    input_index=1,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=100.0,
+                    size=5,
+                    partial=True,
+                ),
+            ]
+            failed = subprocess.CompletedProcess([], 1, b"", b"mux failed")
+
+            with (
+                patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    return_value=media_streams,
+                ),
+                patch(
+                    "onlysavemevods.downloader.subprocess.run",
+                    return_value=failed,
+                ),
+                self.assertRaises(VideoProbeError),
+            ):
+                recover_segment_from_fragments(
+                    config,
+                    "LIVEVIDEO01",
+                    1,
+                    "Example Channel",
+                    overwrite=True,
+                )
+
+            old_contents = output_file.read_text(encoding="utf-8")
+            staging_exists = (
+                segment_dir / "segment-001-recovered.recovering.mkv"
+            ).exists()
+            sources_exist = audio_file.exists() and video_part.exists()
+
+        self.assertEqual(old_contents, "known-good")
+        self.assertFalse(staging_exists)
+        self.assertTrue(sources_exist)
+
     def test_restore_mixed_segment_moves_final_format_back_to_resumable_part(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(download_dir=Path(tmp))
@@ -1145,6 +1308,57 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_split_track_watchdog_ignores_transient_completion_state(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            sleep = AsyncMock()
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=sleep,
+            )
+            process = AsyncMock()
+            process.returncode = None
+            checks = iter((True, False))
+
+            def split_track_state(*_args: object) -> bool:
+                result = next(checks)
+                if not result:
+                    process.returncode = 0
+                return result
+
+            with (
+                patch(
+                    "onlysavemevods.downloader.segment_has_mixed_format_files",
+                    side_effect=split_track_state,
+                ),
+                patch.object(
+                    manager,
+                    "_request_process_reconnect",
+                    new=AsyncMock(),
+                ) as reconnect,
+            ):
+                await manager._mixed_segment_watchdog(stream, process, 1)
+            state.close()
+
+        self.assertEqual(
+            [await_call.args[0] for await_call in sleep.await_args_list],
+            [10, 120],
+        )
+        reconnect.assert_not_awaited()
+
     async def test_finalize_maps_only_longest_video_and_audio_streams(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

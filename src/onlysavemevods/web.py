@@ -96,8 +96,11 @@ from .downloader import (
     is_yt_dlp_temporary_file,
     log_process_output,
     named_segment_file_stem,
+    recover_segment_from_fragments,
+    recovered_segment_output_file,
     safe_filename_stem,
     segment_directory,
+    segment_media_input_files,
 )
 from .job_tracker import (
     COMPLETED_JOB_RETENTION_SECONDS,
@@ -321,6 +324,7 @@ CHAT_RENDER_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov")
 CHAT_RENDER_OUTPUT_SUFFIX = " - chat.mp4"
 ATTENTION_STATUSES = {"checking_after_exit", "interrupted", "waiting_retry"}
 VOD_DOWNLOAD_BLOCKED_STATUSES = {"detected", "downloading", "checking_after_exit", "waiting_retry"}
+SEGMENT_RECOVERY_BLOCKED_STATUSES = set(VOD_DOWNLOAD_BLOCKED_STATUSES)
 VOD_DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%")
 STATUS_LABELS = {
     "checking_after_exit": "checking after exit",
@@ -405,6 +409,8 @@ class DirectoryScanSummary:
     latest_modified_at: float | None
     part_segments: tuple[str, ...]
     final_format_segments: tuple[str, ...]
+    part_format_ids: tuple[tuple[str, str], ...]
+    final_format_ids: tuple[tuple[str, str], ...]
     visible_entries: tuple[CachedFileEntry, ...]
 
 
@@ -424,6 +430,8 @@ class StreamFileSummary:
     latest_modified_at: float | None
     part_segments: tuple[str, ...]
     final_format_segments: tuple[str, ...]
+    part_format_ids: tuple[tuple[str, str], ...]
+    final_format_ids: tuple[tuple[str, str], ...]
     files: list[FileStatus]
 
 
@@ -603,6 +611,7 @@ class StreamStatus:
     powerchat_events: list[PowerchatEventStatus]
     jobs: list[JobStatus]
     files: list[FileStatus]
+    recoverable_segments: list[int] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1256,6 +1265,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 if path == "/transcribe":
                     self._start_transcription(parts.query)
                     return
+                if path == "/recover-segment":
+                    self._start_segment_recovery(parts.query)
+                    return
                 if path == "/cleanup-fragments":
                     self._cleanup_fragments(parts.query)
                     return
@@ -1589,6 +1601,32 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 count,
                 bytes_removed,
             )
+            self.send_response(HTTPStatus.SEE_OTHER)
+            self.send_header("Location", self._return_location("/#streamers"))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+
+        def _start_segment_recovery(self, query: str) -> None:
+            self._discard_request_body()
+            params = parse_qs(query)
+            video_id = first_query_value(params, "video_id")
+            segment_index = first_query_value(params, "segment")
+            regenerate = first_query_value(params, "regenerate").lower() in {
+                "1",
+                "true",
+                "yes",
+            }
+            ok, message = start_segment_recovery_job(
+                config,
+                video_id,
+                segment_index,
+                regenerate=regenerate,
+            )
+            if not ok:
+                self.send_error(HTTPStatus.BAD_REQUEST, message)
+                return
+
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", self._return_location("/#streamers"))
             self.send_header("Cache-Control", "no-store")
@@ -4072,6 +4110,57 @@ def powerchat_event_status(event: dict[str, Any]) -> PowerchatEventStatus:
     )
 
 
+def stream_has_conflicting_format_files(
+    summary: StreamFileSummary,
+    segment: str,
+    recorded_selector: str,
+) -> bool:
+    part_ids = {
+        format_id
+        for file_segment, format_id in summary.part_format_ids
+        if file_segment == segment
+    }
+    final_ids = {
+        format_id
+        for file_segment, format_id in summary.final_format_ids
+        if file_segment == segment
+    }
+    if not part_ids or not final_ids:
+        return False
+
+    # A normal YouTube selector is a video/audio pair such as 248+140.
+    # One track can finish briefly while the other remains partial; that is
+    # a recovery state, not a codec or format change.
+    if part_ids & final_ids:
+        return True
+
+    actual_ids = part_ids | final_ids
+    if len(actual_ids) > 2:
+        return True
+
+    selector = recorded_selector.strip().partition("/")[0]
+    selector_tokens = {
+        token.strip()
+        for token in selector.split("+")
+        if token.strip()
+    }
+    dynamic_selector = any(
+        token.casefold().startswith(("best", "worst"))
+        for token in selector_tokens
+    )
+    expected_ids = {
+        token
+        for token in selector_tokens
+        if not token.casefold().startswith(("best", "worst"))
+    }
+    unexpected_ids = actual_ids - expected_ids
+    if not expected_ids:
+        return False
+    if dynamic_selector:
+        return len(unexpected_ids) > 1
+    return bool(unexpected_ids)
+
+
 def stream_status_from_record(
     config: BotConfig,
     record: StreamRecord,
@@ -4118,7 +4207,12 @@ def stream_status_from_record(
     step_started_at = time.perf_counter()
     segment_name = f"segment-{record.segment_index:03d}"
     has_part_files = segment_name in file_summary.part_segments
-    has_mixed_formats = has_part_files and segment_name in file_summary.final_format_segments
+    has_mixed_formats = stream_has_conflicting_format_files(
+        file_summary,
+        segment_name,
+        record.youtube_video_format_selector,
+    )
+    recoverable_segments = recoverable_segment_indexes(file_summary)
     perf_step(steps, "resume_flags", step_started_at)
 
     status = StreamStatus(
@@ -4160,6 +4254,7 @@ def stream_status_from_record(
         powerchat_events=powerchat_events,
         jobs=list(job_records or []),
         files=file_summary.files,
+        recoverable_segments=recoverable_segments,
     )
     log_perf(
         "stream-status",
@@ -4172,6 +4267,25 @@ def stream_status_from_record(
         steps=format_perf_steps(steps),
     )
     return status
+
+
+def recoverable_segment_indexes(summary: StreamFileSummary) -> list[int]:
+    segments = set(summary.part_segments)
+    final_format_counts: dict[str, set[str]] = {}
+    for segment, format_id in summary.final_format_ids:
+        final_format_counts.setdefault(segment, set()).add(format_id)
+    segments.update(
+        segment
+        for segment, format_ids in final_format_counts.items()
+        if len(format_ids) >= 2
+    )
+
+    indexes: list[int] = []
+    for segment in segments:
+        match = re.fullmatch(r"segment-(\d{3})", segment)
+        if match is not None:
+            indexes.append(int(match.group(1)))
+    return sorted(set(indexes))
 
 
 def stream_event_status(event: StreamEventRecord) -> StreamEventStatus:
@@ -4198,6 +4312,8 @@ def empty_directory_scan_summary() -> DirectoryScanSummary:
         latest_modified_at=None,
         part_segments=(),
         final_format_segments=(),
+        part_format_ids=(),
+        final_format_ids=(),
         visible_entries=(),
     )
 
@@ -4214,6 +4330,8 @@ def stream_file_summary_from_scan(
         latest_modified_at=scan.latest_modified_at,
         part_segments=scan.part_segments,
         final_format_segments=scan.final_format_segments,
+        part_format_ids=scan.part_format_ids,
+        final_format_ids=scan.final_format_ids,
         files=files,
     )
 
@@ -4274,6 +4392,8 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
     latest_modified_at: float | None = None
     part_segments: set[str] = set()
     final_format_segments: set[str] = set()
+    part_format_ids: set[tuple[str, str]] = set()
+    final_format_ids: set[tuple[str, str]] = set()
     visible_entries: list[tuple[str, int, CachedFileEntry]] = []
     sequence = 0
 
@@ -4298,8 +4418,11 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
                     latest_modified_at = stat.st_mtime
                 if segment and kind == "part":
                     part_segments.add(segment)
+                    if format_id:
+                        part_format_ids.add((segment, format_id))
                 elif segment and format_id and kind == "final":
                     final_format_segments.add(segment)
+                    final_format_ids.add((segment, format_id))
 
                 if FILE_LIMIT_PER_STREAM <= 0:
                     continue
@@ -4335,6 +4458,8 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
         latest_modified_at=latest_modified_at,
         part_segments=tuple(sorted(part_segments)),
         final_format_segments=tuple(sorted(final_format_segments)),
+        part_format_ids=tuple(sorted(part_format_ids)),
+        final_format_ids=tuple(sorted(final_format_ids)),
         visible_entries=tuple(item[2] for item in visible_entries),
     )
 
@@ -4518,6 +4643,8 @@ def summarize_files(
         latest_modified_at=latest_modified_at,
         part_segments=scan_summary.part_segments,
         final_format_segments=scan_summary.final_format_segments,
+        part_format_ids=scan_summary.part_format_ids,
+        final_format_ids=scan_summary.final_format_ids,
         files=files,
     )
 
@@ -4998,6 +5125,172 @@ def start_vod_redownload_job(
         item=output_template.name.replace("%(ext)s", "media"),
     )
     return True, "VOD redownload queued"
+
+
+def start_segment_recovery_job(
+    config: BotConfig,
+    video_id: str,
+    segment_index: str | int,
+    *,
+    regenerate: bool = False,
+) -> tuple[bool, str]:
+    video_id = video_id.strip()
+    if not video_id:
+        return False, "Stream id is required"
+    try:
+        parsed_segment_index = int(segment_index)
+    except (TypeError, ValueError):
+        return False, "A valid segment number is required"
+    if parsed_segment_index < 1 or parsed_segment_index > 999:
+        return False, "Segment number must be between 1 and 999"
+
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+    finally:
+        state.close()
+    if record is None:
+        return False, "Stream was not found"
+    if record.status in SEGMENT_RECOVERY_BLOCKED_STATUSES:
+        return False, "Cannot recover a video while the stream may still be active or resume"
+
+    job_id = segment_recovery_job_id(record.video_id, parsed_segment_index)
+    if tracked_job_is_running(job_id):
+        return True, "Video recovery is already running"
+
+    input_files = segment_media_input_files(
+        config,
+        record.video_id,
+        parsed_segment_index,
+        record.channel,
+    )
+    if not input_files:
+        return False, "No recoverable media tracks were found for this segment"
+    output_file = recovered_segment_output_file(
+        config,
+        record.video_id,
+        parsed_segment_index,
+        record.channel,
+    )
+    if output_file.exists() and not regenerate:
+        return False, f"{output_file.name} already exists; use regenerate to replace it"
+
+    start_tracked_job(
+        job_id,
+        kind="Video recovery",
+        video_id=record.video_id,
+        item=output_file.name,
+        detail=", ".join(path.name for path in input_files),
+        phase="Queued",
+        message="Queued video recovery; source fragments will be preserved",
+        progress=0.0,
+    )
+    record_stream_event(
+        config,
+        record.video_id,
+        f"Queued recovery for segment={parsed_segment_index:03d}; source fragments will be preserved",
+        segment_index=parsed_segment_index,
+    )
+    thread = Thread(
+        target=run_segment_recovery_job,
+        args=(
+            config,
+            job_id,
+            record.video_id,
+            record.channel,
+            parsed_segment_index,
+            regenerate,
+        ),
+        name=f"onlysavemevods-video-recovery-{record.video_id}-{parsed_segment_index:03d}",
+        daemon=True,
+    )
+    thread.start()
+    return True, "Video recovery queued"
+
+
+def run_segment_recovery_job(
+    config: BotConfig,
+    job_id: str,
+    video_id: str,
+    channel: str,
+    segment_index: int,
+    regenerate: bool = False,
+) -> None:
+    def report_progress(phase: str, progress: float) -> None:
+        update_tracked_job(
+            job_id,
+            phase=phase,
+            message=phase,
+            progress=progress,
+        )
+
+    try:
+        result = recover_segment_from_fragments(
+            config,
+            video_id,
+            segment_index,
+            channel,
+            overwrite=regenerate,
+            progress_callback=report_progress,
+        )
+    except Exception as exc:  # noqa: BLE001 - background job must report all failures.
+        message = str(exc).strip() or exc.__class__.__name__
+        message = message[:1000]
+        finish_tracked_job(
+            job_id,
+            status="failed",
+            phase="Failed",
+            message=message,
+            progress=0.0,
+        )
+        record_stream_event(
+            config,
+            video_id,
+            f"Video recovery failed for segment={segment_index:03d}: {message}",
+            level="warning",
+            segment_index=segment_index,
+        )
+        LOGGER.exception(
+            "Video recovery failed video_id=%s segment=%03d",
+            video_id,
+            segment_index,
+        )
+        return
+
+    directory = result.output_file.parent
+    with FILE_SCAN_CACHE_LOCK:
+        FILE_SCAN_CACHE.pop(str(directory), None)
+        try:
+            FILE_SCAN_CACHE.pop(str(directory.resolve()), None)
+        except OSError:
+            pass
+    message = (
+        f"Recovered {result.output_file.name} "
+        f"({result.duration:.1f}s, {format_bytes(result.size)}); source fragments preserved"
+    )
+    finish_tracked_job(
+        job_id,
+        status="done",
+        phase="Complete",
+        message=message,
+        progress=1.0,
+    )
+    record_stream_event(
+        config,
+        video_id,
+        message,
+        segment_index=segment_index,
+    )
+    LOGGER.info(
+        "Video recovery completed video_id=%s segment=%03d output=%s",
+        video_id,
+        segment_index,
+        result.output_file,
+    )
+
+
+def segment_recovery_job_id(video_id: str, segment_index: int) -> str:
+    return f"video-recovery:{video_id}:{segment_index:03d}"
 
 
 def start_manual_vod_download_job(
@@ -5993,7 +6286,7 @@ def is_renderable_media_file(name: str) -> bool:
 def is_rendering_temporary_file(name: str) -> bool:
     path = Path(name)
     return path.suffix.lower() in CHAT_RENDER_MEDIA_SUFFIXES and path.stem.endswith(
-        ".rendering"
+        (".rendering", ".recovering")
     )
 
 
@@ -9740,7 +10033,7 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
   <div class="section-stack">
     {render_stream_signals(stream)}
     <dl class="detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
-    <div class="button-row">{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
+    <div class="button-row">{render_segment_recovery_actions(stream)}{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
     <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:events"><summary><strong>Content events</strong><span class="subsection-count">{stream.content_event_count}</span></summary><div class="stream-subsection-body">{render_content_events(stream.content_events)}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:powerchat"><summary><strong>Powerchat</strong><span class="subsection-count">{stream.powerchat_event_count}</span></summary><div class="stream-subsection-body">{render_powerchat_events(stream, timezone_name)}</div></details>
@@ -12295,7 +12588,7 @@ def dashboard_script() -> str:
 
   const renderStreamSignals = (stream) => {
     const signals = [];
-    if (stream.has_mixed_formats) signals.push("mixed finalized and partial formats");
+    if (stream.has_mixed_formats) signals.push("conflicting format files");
     if (stream.status === "checking_after_exit") signals.push("post-exit checks running");
     if (stream.status === "waiting_retry") signals.push("waiting for retry");
     if (stream.status === "interrupted") signals.push("interrupted before clean exit");
@@ -13174,7 +13467,7 @@ def dashboard_script() -> str:
       <div>Fragment size: ${escapeHtml(formatBytes(stream.fragment_bytes))}</div>
       <div>Content events: ${escapeHtml(stream.content_event_count || 0)}</div>
       <div>Powerchat: ${escapeHtml(stream.powerchat_event_count || 0)} <span class="muted">${escapeHtml(powerchatSummary)}</span></div>
-      <div>Mixed formats: ${mixed}</div>
+      <div>Conflicting formats: ${mixed}</div>
       <div>Exit code: ${escapeHtml(formatOptionalInt(stream.exit_code))}</div>
       <div>Started: ${escapeHtml(formatIso(stream.last_started_at))}</div>
       <div>Exited: ${escapeHtml(formatIso(stream.last_exit_at))}</div>
@@ -15946,6 +16239,54 @@ def render_cleanup_fragments_action(stream: StreamStatus) -> str:
     )
 
 
+def render_segment_recovery_actions(stream: StreamStatus) -> str:
+    if (
+        stream.status in SEGMENT_RECOVERY_BLOCKED_STATUSES
+        or not stream.recoverable_segments
+    ):
+        return ""
+
+    actions: list[str] = []
+    directory = Path(stream.directory)
+    for segment_index in stream.recoverable_segments:
+        output_file = directory / f"segment-{segment_index:03d}-recovered.mkv"
+        regenerate = output_file.is_file()
+        job_id = segment_recovery_job_id(stream.video_id, segment_index)
+        running = tracked_job_is_running(job_id)
+        if running:
+            label = f"Recovering segment {segment_index:03d}…"
+        elif regenerate:
+            label = f"Regenerate segment {segment_index:03d}"
+        else:
+            label = f"Recover segment {segment_index:03d}"
+        confirmation = (
+            f"Replace {output_file.name} with a newly recovered video? "
+            "The saved source fragments will be kept."
+            if regenerate
+            else
+            f"Build a playable video from the saved tracks for segment "
+            f"{segment_index:03d}? The saved source fragments will be kept."
+        )
+        params = {
+            "video_id": stream.video_id,
+            "segment": str(segment_index),
+        }
+        if regenerate:
+            params["regenerate"] = "1"
+        disabled = " disabled" if running else ""
+        actions.append(
+            '<form class="inline-form" method="post" '
+            f'action="/recover-segment?{escape(urlencode(params), quote=True)}" '
+            f'data-confirm="{escape(confirmation, quote=True)}" '
+            'data-confirm-label="Recover video">'
+            f'<button class="download action-button" type="submit"{disabled} '
+            'title="Create a validated MKV without deleting the saved tracks">'
+            f"{escape(label)}</button>"
+            "</form>"
+        )
+    return "".join(actions)
+
+
 def render_delete_stream_action(stream: StreamStatus, *, use_dialog: bool = False) -> str:
     if stream.status in STREAM_DELETE_BLOCKED_STATUSES:
         return ""
@@ -16071,7 +16412,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
       <div>Fragment size: {escape(format_bytes(stream.fragment_bytes))}</div>
       <div>Content events: {stream.content_event_count}</div>
       <div>Powerchat: {stream.powerchat_event_count} <span class="muted">{escape(powerchat_summary)}</span></div>
-      <div>Mixed formats: {mixed}</div>
+      <div>Conflicting formats: {mixed}</div>
       <div>Exit code: {escape(format_optional_int(stream.exit_code))}</div>
       <div>Started: {escape(format_optional_iso(stream.last_started_at, timezone_name))}</div>
       <div>Exited: {escape(format_optional_iso(stream.last_exit_at, timezone_name))}</div>
@@ -16425,7 +16766,7 @@ def render_status_counts(counts: dict[str, int]) -> str:
 def render_stream_signals(stream: StreamStatus) -> str:
     signals: list[str] = []
     if stream.has_mixed_formats:
-        signals.append("mixed finalized and partial formats")
+        signals.append("conflicting format files")
     if stream.status == "checking_after_exit":
         signals.append("post-exit checks running")
     if stream.status == "waiting_retry":

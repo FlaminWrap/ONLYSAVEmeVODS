@@ -8,5 +8,6 @@ dist/
 *.egg-info/
 downloads/
 state/
+/debug/
 config.toml
 /1.mkv

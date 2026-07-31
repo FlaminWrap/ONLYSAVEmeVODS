@@ -6,7 +6,14 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-from onlysavemevods.config import BotConfig, ConfigError, load_config, migrate_legacy_channels_to_streamer
+from onlysavemevods.config import (
+    BotConfig,
+    ConfigError,
+    StreamerConfig,
+    load_config,
+    migrate_legacy_channels_to_streamer,
+)
+from onlysavemevods.downloader import segment_directory
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
 from onlysavemevods.web_ui import (
@@ -245,6 +252,64 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('id="manual-vod"', html)
         self.assertIn('action="/vod-download"', html)
         self.assertNotIn('/status#streamers', html)
+
+    def test_ended_stream_offers_fragment_video_recovery(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config = BotConfig(
+                streamers={
+                    "Example": StreamerConfig(sources=["youtube:example"])
+                },
+                download_dir=Path(temp_dir) / "downloads",
+                state_dir=Path(temp_dir) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:recover-me",
+                url="https://www.youtube.com/watch?v=recover-me",
+                title="Recover me",
+                channel="example",
+                platform="youtube",
+                source="youtube:example",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = segment_directory(
+                config,
+                stream.video_id,
+                stream.channel,
+            )
+            directory.mkdir(parents=True)
+            (directory / "segment-001.f140.mp4").write_text(
+                "audio",
+                encoding="utf-8",
+            )
+            (directory / "segment-001.f248.webm.part").write_text(
+                "video",
+                encoding="utf-8",
+            )
+
+            html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+            (directory / "segment-001-recovered.mkv").write_text(
+                "recovered",
+                encoding="utf-8",
+            )
+            regenerated_html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["Example"]},
+            )
+
+        self.assertIn("/recover-segment?", html)
+        self.assertIn("Recover segment 001", html)
+        self.assertIn("saved source fragments will be kept", html)
+        self.assertIn("Create a validated MKV", html)
+        self.assertIn("Regenerate segment 001", regenerated_html)
+        self.assertIn("regenerate=1", regenerated_html)
 
     def test_powerchat_uses_packaged_dashboard_script(self) -> None:
         with TemporaryDirectory() as temp_dir:

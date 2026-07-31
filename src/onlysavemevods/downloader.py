@@ -72,6 +72,7 @@ FINALIZE_MUX_TIMEOUT_SECONDS = 60 * 60
 FINALIZE_DURATION_TOLERANCE_SECONDS = 5.0
 CATCHUP_FRAGMENT_MARGIN = 2
 MIXED_SEGMENT_WATCH_SECONDS = 10
+MIXED_SEGMENT_CONFIRM_SECONDS = 120
 DEFAULT_MEDIA_FORMAT = "bestvideo*+bestaudio/best"
 FORMAT_OPTIONS = {"-f", "--format"}
 YOUTUBE_FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -185,6 +186,13 @@ class FinalizeOutputValidation:
     duration: float
     audio_streams: int
     video_streams: int
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentRecoveryResult:
+    output_file: Path
+    duration: float
+    size: int
 
 
 @dataclass(slots=True)
@@ -747,9 +755,27 @@ class DownloadManager:
                 ):
                     continue
 
+                self.logger.info(
+                    "Detected split finalized/partial tracks for %s segment=%03d; "
+                    "waiting %ss to allow yt-dlp to finish or recover",
+                    stream.video_id,
+                    segment_index,
+                    MIXED_SEGMENT_CONFIRM_SECONDS,
+                )
+                await self.sleep(MIXED_SEGMENT_CONFIRM_SECONDS)
+                if self._stopping or process.returncode is not None:
+                    return
+                if not segment_has_mixed_format_files(
+                    self.config,
+                    stream.video_id,
+                    segment_index,
+                    stream.channel,
+                ):
+                    continue
+
                 self.logger.warning(
-                    "Detected mixed finalized/partial formats for %s segment=%03d; "
-                    "reconnecting before video continues without audio",
+                    "Split finalized/partial tracks persisted for %s segment=%03d; "
+                    "reconnecting to restore both tracks from kept fragments",
                     stream.video_id,
                     segment_index,
                 )
@@ -2124,27 +2150,29 @@ class DownloadManager:
             except OSError:
                 restored = False
                 self.logger.exception(
-                    "Unable to restore mixed segment for %s segment=%03d",
+                    "Unable to restore split-track segment for %s segment=%03d",
                     stream.video_id,
                     segment_index,
                 )
 
             if restored:
                 self.logger.info(
-                    "Prepared mixed segment for resumed live download of %s segment=%03d",
+                    "Prepared split-track segment for resumed live download of %s "
+                    "segment=%03d",
                     stream.video_id,
                     segment_index,
                 )
                 self.state.add_stream_event(
                     stream.video_id,
-                    f"Restored mixed segment={segment_index:03d} from kept fragments",
+                    f"Restored split-track segment={segment_index:03d} from kept fragments",
                     segment_index=segment_index,
                 )
                 return segment_index
 
             self.logger.warning(
-                "Unable to restore mixed segment for exact resume of %s segment=%03d; "
-                "finalizing this segment before starting a new live-from-start segment",
+                "Unable to restore split-track segment for exact resume of %s "
+                "segment=%03d; finalizing this segment before starting a new "
+                "live-from-start segment",
                 stream.video_id,
                 segment_index,
             )
@@ -2154,7 +2182,7 @@ class DownloadManager:
                 channel,
             ):
                 self.logger.warning(
-                    "Unable to finalize mixed segment for %s segment=%03d; "
+                    "Unable to finalize split-track segment for %s segment=%03d; "
                     "continuing with the next segment",
                     stream.video_id,
                     segment_index,
@@ -2937,6 +2965,8 @@ def probe_finalize_media_streams(
                 ) from exc
             duration = finalize_stream_duration(raw_stream, format_duration)
             if duration <= 0:
+                duration = probe_packet_duration(path, stream_index, ffprobe_path)
+            if duration <= 0:
                 raise VideoProbeError(
                     f"Unable to determine {codec_type} duration for {path}"
                 )
@@ -2955,6 +2985,48 @@ def probe_finalize_media_streams(
             raise VideoProbeError(f"No audio or video streams found in {path}")
 
     return media_streams
+
+
+def probe_packet_duration(
+    path: Path,
+    stream_index: int,
+    ffprobe_path: str = "ffprobe",
+) -> float:
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-select_streams",
+        str(stream_index),
+        "-show_entries",
+        "packet=pts_time,duration_time",
+        "-of",
+        "csv=p=0",
+        str(path),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0.0
+
+    last_end = 0.0
+    for line in completed.stdout.splitlines():
+        pts_text, separator, duration_text = line.strip().partition(",")
+        if not separator:
+            continue
+        try:
+            pts = float(pts_text)
+            packet_duration = float(duration_text)
+        except ValueError:
+            continue
+        if pts >= 0 and packet_duration >= 0:
+            last_end = max(last_end, pts + packet_duration)
+    return last_end
 
 
 def finalize_stream_duration(
@@ -3183,6 +3255,7 @@ def segment_final_format_files(
         for path in directory.glob(f"{segment_name}.*")
         if path.is_file()
         and not is_yt_dlp_temporary_file(path.name)
+        and not is_segment_recovery_file(path.name)
         and not is_live_chat_file(path.name)
         and not is_chat_timing_file(path.name)
         and not is_powerchat_event_file(path.name)
@@ -3202,6 +3275,126 @@ def segment_media_input_files(
             *segment_part_files(config, video_id, segment_index, channel),
         ]
     )
+
+
+def recovered_segment_output_file(
+    config: BotConfig,
+    video_id: str,
+    segment_index: int,
+    channel: str = "",
+) -> Path:
+    directory = segment_directory(config, video_id, channel)
+    return directory / f"{segment_file_stem(segment_index)}-recovered.mkv"
+
+
+def is_segment_recovery_file(name: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"segment-\d{3}-recovered(?:\.recovering)?\.mkv",
+            name,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def recover_segment_from_fragments(
+    config: BotConfig,
+    video_id: str,
+    segment_index: int,
+    channel: str = "",
+    *,
+    overwrite: bool = False,
+    progress_callback: Callable[[str, float], None] | None = None,
+    logger: logging.Logger = LOGGER,
+) -> SegmentRecoveryResult:
+    def progress(phase: str, value: float) -> None:
+        if progress_callback is not None:
+            progress_callback(phase, value)
+
+    input_files = segment_media_input_files(
+        config,
+        video_id,
+        segment_index,
+        channel,
+    )
+    if not input_files:
+        raise VideoProbeError("No recoverable media tracks were found")
+
+    output_file = recovered_segment_output_file(
+        config,
+        video_id,
+        segment_index,
+        channel,
+    )
+    if output_file.exists() and not overwrite:
+        raise FileExistsError(f"Recovered video already exists: {output_file.name}")
+
+    temporary_output = output_file.with_name(
+        f"{output_file.stem}.recovering{output_file.suffix}"
+    )
+    temporary_output.unlink(missing_ok=True)
+    ffprobe_path = ffprobe_path_for(config.ffmpeg_path)
+
+    try:
+        progress("Inspecting recoverable tracks", 0.15)
+        media_streams = probe_finalize_media_streams(input_files, ffprobe_path)
+        selected_streams = select_finalize_media_streams(media_streams)
+        selected_types = {stream.codec_type for stream in selected_streams}
+        if selected_types != {"audio", "video"}:
+            raise VideoProbeError(
+                "Recovery requires both a readable video track and audio track"
+            )
+
+        command = [
+            config.ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-y",
+        ]
+        for input_file in input_files:
+            command.extend(["-i", str(input_file)])
+        for stream in selected_streams:
+            command.extend(["-map", f"{stream.input_index}:{stream.stream_index}"])
+        command.extend(["-c", "copy", "-shortest", str(temporary_output)])
+
+        progress("Remuxing recovered video", 0.45)
+        logger.debug("ffmpeg recovery command: %s", command_for_log(command))
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=FINALIZE_MUX_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise VideoProbeError("Video recovery timed out") from exc
+        except OSError as exc:
+            raise VideoProbeError("Unable to start ffmpeg for video recovery") from exc
+        if completed.returncode != 0:
+            message = (completed.stderr or completed.stdout).decode(
+                "utf-8",
+                "replace",
+            ).strip()
+            raise VideoProbeError(
+                f"ffmpeg failed while recovering the video: {message or 'unknown error'}"
+            )
+
+        progress("Validating recovered video", 0.85)
+        validation = validate_finalize_output(
+            temporary_output,
+            selected_streams,
+            ffprobe_path,
+        )
+        temporary_output.replace(output_file)
+        progress("Recovery complete", 1.0)
+        return SegmentRecoveryResult(
+            output_file=output_file,
+            duration=validation.duration,
+            size=output_file.stat().st_size,
+        )
+    except Exception:
+        temporary_output.unlink(missing_ok=True)
+        raise
 
 
 def segment_ytdl_files(
