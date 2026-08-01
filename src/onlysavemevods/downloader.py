@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Mapping, Protocol
+from typing import Awaitable, Callable, Literal, Mapping, Protocol
 import asyncio
 import json
 import logging
@@ -43,6 +44,7 @@ from .chat_timing import (
 )
 from .config import (
     BotConfig,
+    automatic_processing_window_wait_seconds,
     download_group_name_for_channel,
     post_stream_config_for_channel,
     streamer_for_channel,
@@ -60,10 +62,10 @@ from .powerchat import (
     is_powerchat_event_file,
     run_powerchat_listener,
 )
-from .state import StateStore
+from .state import StateStore, StreamRecord
 from .transcription import transcribe_media_file, transcription_config_for_channel
 from .twitch_ad_repair import repair_twitch_ads_for_media
-from .youtube import TerminalVideoUnavailableError
+from .youtube import TerminalVideoUnavailableError, YouTubeLiveEdge
 
 
 LOGGER = logging.getLogger(__name__)
@@ -73,6 +75,9 @@ FINALIZE_DURATION_TOLERANCE_SECONDS = 5.0
 CATCHUP_FRAGMENT_MARGIN = 2
 MIXED_SEGMENT_WATCH_SECONDS = 10
 MIXED_SEGMENT_CONFIRM_SECONDS = 120
+STALE_LIVE_WATCH_INTERVAL_SECONDS = 30
+STALE_LIVE_CONFIRM_SECONDS = 30
+PROCESSING_WINDOW_RECHECK_SECONDS = 60
 DEFAULT_MEDIA_FORMAT = "bestvideo*+bestaudio/best"
 FORMAT_OPTIONS = {"-f", "--format"}
 YOUTUBE_FORMAT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
@@ -138,6 +143,17 @@ def powerchat_segment_sidecar_file(
 
 SleepFunc = Callable[[float], Awaitable[None]]
 ProbeVideoFunc = Callable[[str], Awaitable[LiveStream]]
+ProbeYouTubeLiveEdgeFunc = Callable[[str], Awaitable[YouTubeLiveEdge]]
+MonotonicFunc = Callable[[], float]
+LocalNowFunc = Callable[[], datetime]
+
+
+def server_local_now() -> datetime:
+    return datetime.now().astimezone()
+
+
+ProgressCallback = Callable[[float], None]
+YouTubeRestartDecision = Literal["restart", "defer", "stalled"]
 
 
 class StreamProbe(Protocol):
@@ -155,6 +171,7 @@ class ActiveDownload:
     reconnect_task: asyncio.Task[None] | None = None
     output_task: asyncio.Task[None] | None = None
     mixed_segment_task: asyncio.Task[None] | None = None
+    stale_live_task: asyncio.Task[None] | None = None
     chat_process: asyncio.subprocess.Process | None = None
     chat_task: asyncio.Task[None] | None = None
     chat_output_task: asyncio.Task[None] | None = None
@@ -215,10 +232,24 @@ class YouTubeVideoFormatChoice:
 
 
 class CatchupTracker:
-    def __init__(self, ready_event: asyncio.Event) -> None:
+    def __init__(
+        self,
+        ready_event: asyncio.Event,
+        *,
+        monotonic_func: MonotonicFunc = time.monotonic,
+        initial_progress_at: float | None = None,
+        progress_callback: ProgressCallback | None = None,
+    ) -> None:
         self.ready_event = ready_event
         self.fragments: dict[str, tuple[int, int]] = {}
         self.has_prefixed_context = False
+        self.monotonic = monotonic_func
+        self.progress_callback = progress_callback
+        self.last_fragment_progress_at = (
+            self.monotonic()
+            if initial_progress_at is None
+            else initial_progress_at
+        )
 
     def update(self, line: str) -> None:
         match = FRAGMENT_PROGRESS_RE.search(line)
@@ -227,12 +258,31 @@ class CatchupTracker:
 
         context = match.group("context") or "0"
         self.has_prefixed_context = self.has_prefixed_context or context != "0"
-        self.fragments[context] = (
+        progress = (
             int(match.group("fragment")),
             int(match.group("count")),
         )
+        previous = self.fragments.get(context)
+        self.fragments[context] = progress
+        if (
+            previous is None
+            or progress[0] > previous[0]
+            or progress[1] > previous[1]
+        ):
+            self._note_progress()
         if self.caught_up:
             self.ready_event.set()
+
+    def inactive_seconds(self) -> float:
+        return max(0.0, self.monotonic() - self.last_fragment_progress_at)
+
+    def note_external_progress(self) -> None:
+        self._note_progress()
+
+    def _note_progress(self) -> None:
+        self.last_fragment_progress_at = self.monotonic()
+        if self.progress_callback is not None:
+            self.progress_callback(self.last_fragment_progress_at)
 
     @property
     def caught_up(self) -> bool:
@@ -247,6 +297,91 @@ class CatchupTracker:
         )
 
 
+def youtube_live_edge_advanced(
+    previous: YouTubeLiveEdge,
+    current: YouTubeLiveEdge,
+) -> bool:
+    timestamp_advanced = (
+        current.newest_segment_at is not None
+        and previous.newest_segment_at is not None
+        and current.newest_segment_at > previous.newest_segment_at
+    )
+    sequence_advanced = (
+        current.media_sequence is not None
+        and previous.media_sequence is not None
+        and current.media_sequence > previous.media_sequence
+    )
+    return timestamp_advanced or sequence_advanced
+
+
+def youtube_live_edge_is_fresh(
+    edge: YouTubeLiveEdge,
+    *,
+    stale_after_seconds: int,
+    now: datetime,
+) -> bool:
+    if edge.newest_segment_at is None:
+        return False
+    return (now - edge.newest_segment_at).total_seconds() < stale_after_seconds
+
+
+def youtube_live_edge_is_confirmed_stale(
+    previous: YouTubeLiveEdge,
+    current: YouTubeLiveEdge,
+    *,
+    stale_after_seconds: int,
+    now: datetime,
+) -> bool:
+    if previous.has_endlist and current.has_endlist:
+        return True
+    if (
+        previous.media_sequence is None
+        or current.media_sequence is None
+        or previous.media_sequence != current.media_sequence
+        or previous.newest_segment_at is None
+        or current.newest_segment_at is None
+        or current.newest_segment_at > previous.newest_segment_at
+    ):
+        return False
+    return (now - current.newest_segment_at).total_seconds() >= stale_after_seconds
+
+
+def youtube_live_edge_advanced_from_record(
+    record: StreamRecord,
+    edge: YouTubeLiveEdge,
+) -> bool:
+    if edge.has_endlist:
+        return False
+    recorded_edge = parse_youtube_live_edge_time(record.youtube_stale_edge_at)
+    if recorded_edge is not None and edge.newest_segment_at is not None:
+        return edge.newest_segment_at > recorded_edge
+    return (
+        record.youtube_stale_media_sequence is not None
+        and edge.media_sequence is not None
+        and edge.media_sequence > record.youtube_stale_media_sequence
+    )
+
+
+def format_youtube_live_edge_time(edge: YouTubeLiveEdge) -> str:
+    if edge.newest_segment_at is None:
+        return ""
+    return edge.newest_segment_at.astimezone(timezone.utc).isoformat(
+        timespec="milliseconds"
+    )
+
+
+def parse_youtube_live_edge_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 class DownloadManager:
     def __init__(
         self,
@@ -256,6 +391,9 @@ class DownloadManager:
         *,
         sleep_func: SleepFunc = asyncio.sleep,
         probe_video_func: ProbeVideoFunc | None = None,
+        probe_youtube_live_edge_func: ProbeYouTubeLiveEdgeFunc | None = None,
+        monotonic_func: MonotonicFunc = time.monotonic,
+        local_now_func: LocalNowFunc = server_local_now,
         logger: logging.Logger = LOGGER,
     ) -> None:
         self.config = config
@@ -263,8 +401,16 @@ class DownloadManager:
         self.probe = probe
         self.sleep = sleep_func
         self.probe_video = probe_video_func or self._probe_video_in_thread
+        self.probe_youtube_live_edge = (
+            probe_youtube_live_edge_func or self._probe_youtube_live_edge_in_thread
+        )
+        self.monotonic = monotonic_func
+        self.local_now = local_now_func
         self.logger = logger
         self.active: dict[str, ActiveDownload] = {}
+        self._youtube_fragment_progress_at: dict[str, float] = {}
+        self._youtube_restart_checks: set[str] = set()
+        self._stalled_youtube_monitors: set[str] = set()
         self._post_exit_tasks: set[asyncio.Task[None]] = set()
         self._planned_reconnects: set[str] = set()
         self._spawn_failures: dict[str, int] = {}
@@ -273,8 +419,84 @@ class DownloadManager:
         )
         self._stopping = False
 
+    async def _wait_for_automatic_processing_window(
+        self,
+        stream: LiveStream,
+        action: str,
+        segment_index: int,
+    ) -> bool:
+        delayed = False
+        while not self._stopping:
+            wait_seconds = automatic_processing_window_wait_seconds(
+                self.config,
+                self.local_now(),
+            )
+            if wait_seconds <= 0:
+                if delayed:
+                    message = (
+                        "Quiet-hours processing window opened; starting automatic "
+                        f"{action}"
+                    )
+                    self.logger.info("%s video_id=%s", message, stream.video_id)
+                    self.state.add_stream_event(
+                        stream.video_id,
+                        message,
+                        segment_index=segment_index,
+                    )
+                return True
+            if not delayed:
+                message = (
+                    f"Automatic {action} waiting for quiet-hours window "
+                    f"{self.config.processing_quiet_hours_start}–"
+                    f"{self.config.processing_quiet_hours_end} server local time"
+                )
+                self.logger.info("%s video_id=%s", message, stream.video_id)
+                self.state.add_stream_event(
+                    stream.video_id,
+                    message,
+                    segment_index=segment_index,
+                )
+                delayed = True
+            await self.sleep(min(wait_seconds, PROCESSING_WINDOW_RECHECK_SECONDS))
+        return False
+
     async def _probe_video_in_thread(self, url: str) -> LiveStream:
         return await asyncio.to_thread(self.probe.probe_video, url)
+
+    async def _probe_youtube_live_edge_in_thread(self, url: str) -> YouTubeLiveEdge:
+        probe = getattr(self.probe, "probe_youtube_live_edge", None)
+        if not callable(probe):
+            raise RuntimeError("stream probe does not support YouTube live-edge checks")
+        return await asyncio.to_thread(probe, url)
+
+    def _catchup_tracker_for_stream(
+        self,
+        stream: LiveStream,
+        ready_event: asyncio.Event,
+    ) -> CatchupTracker:
+        if stream.platform.casefold() != "youtube":
+            return CatchupTracker(
+                ready_event,
+                monotonic_func=self.monotonic,
+            )
+
+        initial_progress_at = self._youtube_fragment_progress_at.get(stream.video_id)
+        if initial_progress_at is None:
+            initial_progress_at = self.monotonic()
+            self._youtube_fragment_progress_at[stream.video_id] = initial_progress_at
+
+        def remember_progress(progress_at: float) -> None:
+            self._youtube_fragment_progress_at[stream.video_id] = progress_at
+
+        return CatchupTracker(
+            ready_event,
+            monotonic_func=self.monotonic,
+            initial_progress_at=initial_progress_at,
+            progress_callback=remember_progress,
+        )
+
+    def _remember_youtube_edge_progress(self, video_id: str) -> None:
+        self._youtube_fragment_progress_at[video_id] = self.monotonic()
 
     async def start_stream(
         self,
@@ -285,6 +507,14 @@ class DownloadManager:
         if self._stopping:
             return False
         if stream.video_id in self.active:
+            return False
+        if stream.video_id in self._youtube_restart_checks:
+            self.logger.debug(
+                "Deferring %s while its YouTube live edge is checked before restart",
+                stream.video_id,
+            )
+            return False
+        if not await self._youtube_stalled_state_allows_start(stream):
             return False
         if len(self.active) >= self.config.max_concurrent_downloads:
             self.logger.info(
@@ -410,7 +640,7 @@ class DownloadManager:
         reconnect_ready = asyncio.Event()
         if not self.config.live_from_start:
             reconnect_ready.set()
-        catchup_tracker = CatchupTracker(reconnect_ready)
+        catchup_tracker = self._catchup_tracker_for_stream(stream, reconnect_ready)
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -462,6 +692,19 @@ class DownloadManager:
             self._mixed_segment_watchdog(stream, process, segment_index)
         )
         mixed_segment_task.add_done_callback(discard_task_exception)
+        stale_live_task = None
+        if (
+            stream.platform.casefold() == "youtube"
+            and self.config.youtube_stale_live_timeout_seconds > 0
+        ):
+            stale_live_task = asyncio.create_task(
+                self._stale_youtube_live_watchdog(
+                    stream,
+                    process,
+                    catchup_tracker,
+                )
+            )
+            stale_live_task.add_done_callback(discard_task_exception)
         active = ActiveDownload(
             stream=stream,
             process=process,
@@ -471,6 +714,7 @@ class DownloadManager:
             reconnect_task=reconnect_task,
             output_task=output_task,
             mixed_segment_task=mixed_segment_task,
+            stale_live_task=stale_live_task,
         )
         self.active[stream.video_id] = active
         powerchat_recorder, powerchat_task = self._start_powerchat_listener(
@@ -701,6 +945,336 @@ class DownloadManager:
         )
         return recorder, task
 
+    async def _youtube_stalled_state_allows_start(
+        self,
+        stream: LiveStream,
+    ) -> bool:
+        if stream.platform.casefold() != "youtube":
+            return True
+        record = self.state.get_stream(stream.video_id)
+        if record is None or not record.youtube_stale_detected_at:
+            return True
+
+        self.logger.debug(
+            "Deferring stalled YouTube stream while its monitor checks the edge "
+            "video_id=%s sequence=%s edge=%s",
+            stream.video_id,
+            record.youtube_stale_media_sequence,
+            record.youtube_stale_edge_at or "unknown",
+        )
+        return False
+
+    async def _check_youtube_before_restart(
+        self,
+        stream: LiveStream,
+    ) -> YouTubeRestartDecision:
+        timeout_seconds = self.config.youtube_stale_live_timeout_seconds
+        if stream.platform.casefold() != "youtube" or timeout_seconds <= 0:
+            return "restart"
+
+        check_started_at = self.monotonic()
+        self._youtube_restart_checks.add(stream.video_id)
+        try:
+            try:
+                previous = await self.probe_youtube_live_edge(stream.url)
+            except Exception as exc:
+                self.logger.warning(
+                    "Unable to inspect YouTube live edge before restarting %s: %s",
+                    stream.video_id,
+                    exc,
+                )
+                return "restart"
+
+            if (
+                previous.media_sequence is None
+                and previous.newest_segment_at is None
+                and not previous.has_endlist
+            ):
+                return "restart"
+
+            while True:
+                await self.sleep(STALE_LIVE_CONFIRM_SECONDS)
+                if self._stopping:
+                    return "defer"
+
+                record = self.state.get_stream(stream.video_id)
+                if (
+                    stream.video_id in self.active
+                    or record is None
+                    or record.status != "checking_after_exit"
+                ):
+                    return "defer"
+
+                try:
+                    current = await self.probe_youtube_live_edge(stream.url)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Unable to confirm YouTube live edge before restarting %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                    return "restart"
+
+                now = datetime.now(timezone.utc)
+                if youtube_live_edge_is_confirmed_stale(
+                    previous,
+                    current,
+                    stale_after_seconds=timeout_seconds,
+                    now=now,
+                ):
+                    edge_at = format_youtube_live_edge_time(current)
+                    self.logger.warning(
+                        "Confirmed frozen YouTube live edge before restart; "
+                        "marking stalled video_id=%s sequence=%s edge=%s",
+                        stream.video_id,
+                        current.media_sequence,
+                        edge_at or "unknown",
+                    )
+                    self.state.mark_youtube_stale_live(
+                        stream.video_id,
+                        media_sequence=current.media_sequence,
+                        edge_at=edge_at,
+                    )
+                    return "stalled"
+
+                if youtube_live_edge_advanced(previous, current):
+                    self._remember_youtube_edge_progress(stream.video_id)
+                    return "restart"
+
+                if current.newest_segment_at is None and not current.has_endlist:
+                    return "restart"
+
+                if (
+                    self.monotonic() - check_started_at
+                    >= timeout_seconds + STALE_LIVE_CONFIRM_SECONDS
+                ):
+                    self.logger.warning(
+                        "YouTube live edge remained inconclusive for %s; "
+                        "allowing restart after %ss",
+                        stream.video_id,
+                        timeout_seconds + STALE_LIVE_CONFIRM_SECONDS,
+                    )
+                    return "restart"
+
+                previous = current
+        finally:
+            self._youtube_restart_checks.discard(stream.video_id)
+
+    async def monitor_stalled_youtube(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+    ) -> None:
+        if stream.video_id in self._stalled_youtube_monitors:
+            return
+
+        self._stalled_youtube_monitors.add(stream.video_id)
+        resume_stream: LiveStream | None = None
+        resume_segment = segment_index
+        observed_stream = stream
+        consecutive_non_live_probes = 0
+        try:
+            while not self._stopping:
+                record = self.state.get_stream(stream.video_id)
+                if (
+                    record is None
+                    or record.status != "stalled"
+                    or not record.youtube_stale_detected_at
+                ):
+                    return
+                segment_index = record.segment_index
+
+                try:
+                    latest = await self.probe_video(post_exit_probe_target(observed_stream))
+                except TerminalVideoUnavailableError as exc:
+                    self.logger.info(
+                        "Stalled YouTube stream %s is terminally unavailable: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                    if self._stream_status_matches(stream.video_id, "stalled"):
+                        await self.finish_ended_stream(observed_stream, segment_index)
+                    return
+                except Exception as exc:
+                    latest = None
+                    self.logger.warning(
+                        "Unable to check stalled YouTube metadata for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+
+                if latest is not None:
+                    observed_stream = latest
+                    if not latest.is_live:
+                        consecutive_non_live_probes += 1
+                        if consecutive_non_live_probes >= 2:
+                            self.logger.info(
+                                "Stalled YouTube stream %s repeatedly reports ended; "
+                                "finalizing",
+                                stream.video_id,
+                            )
+                            if self._stream_status_matches(
+                                stream.video_id,
+                                "stalled",
+                            ):
+                                await self.finish_ended_stream(latest, segment_index)
+                            return
+                    else:
+                        consecutive_non_live_probes = 0
+
+                try:
+                    edge = await self.probe_youtube_live_edge(observed_stream.url)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Unable to inspect stalled YouTube live edge for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                else:
+                    record = self.state.get_stream(stream.video_id)
+                    if (
+                        record is None
+                        or record.status != "stalled"
+                        or not record.youtube_stale_detected_at
+                    ):
+                        return
+                    if edge.has_endlist:
+                        self.logger.info(
+                            "Stalled YouTube stream %s published an HLS end marker; "
+                            "finalizing",
+                            stream.video_id,
+                        )
+                        await self.finish_ended_stream(observed_stream, segment_index)
+                        return
+                    if youtube_live_edge_advanced_from_record(record, edge):
+                        self.logger.info(
+                            "Stalled YouTube live edge advanced; resuming %s",
+                            stream.video_id,
+                        )
+                        resume_segment = await self.choose_live_restart_segment(
+                            observed_stream,
+                            segment_index,
+                            stream.channel,
+                        )
+                        if resume_segment != segment_index:
+                            self.state.set_segment_index(
+                                stream.video_id,
+                                resume_segment,
+                            )
+                        self._remember_youtube_edge_progress(stream.video_id)
+                        self.state.clear_youtube_stale_live(stream.video_id)
+                        resume_stream = observed_stream
+                        break
+
+                await self.sleep(max(1, self.config.poll_interval_seconds))
+        finally:
+            self._stalled_youtube_monitors.discard(stream.video_id)
+
+        if resume_stream is not None and not self._stopping:
+            await self.start_stream(resume_stream, segment_index=resume_segment)
+
+    async def _stale_youtube_live_watchdog(
+        self,
+        stream: LiveStream,
+        process: asyncio.subprocess.Process,
+        tracker: CatchupTracker,
+    ) -> None:
+        timeout_seconds = self.config.youtube_stale_live_timeout_seconds
+        watch_interval = min(STALE_LIVE_WATCH_INTERVAL_SECONDS, timeout_seconds)
+        try:
+            while not self._stopping and process.returncode is None:
+                await self.sleep(watch_interval)
+                if self._stopping or process.returncode is not None:
+                    return
+                if tracker.inactive_seconds() < timeout_seconds:
+                    continue
+
+                progress_checkpoint = tracker.last_fragment_progress_at
+                try:
+                    first = await self.probe_youtube_live_edge(stream.url)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Unable to inspect inactive YouTube live edge for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                    continue
+
+                await self.sleep(STALE_LIVE_CONFIRM_SECONDS)
+                if self._stopping or process.returncode is not None:
+                    return
+                if tracker.last_fragment_progress_at > progress_checkpoint:
+                    continue
+
+                try:
+                    second = await self.probe_youtube_live_edge(stream.url)
+                except Exception as exc:
+                    self.logger.warning(
+                        "Unable to confirm inactive YouTube live edge for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                    continue
+
+                if tracker.last_fragment_progress_at > progress_checkpoint:
+                    continue
+                now = datetime.now(timezone.utc)
+                if youtube_live_edge_is_confirmed_stale(
+                    first,
+                    second,
+                    stale_after_seconds=timeout_seconds,
+                    now=now,
+                ):
+                    edge_at = format_youtube_live_edge_time(second)
+                    self.logger.warning(
+                        "Confirmed frozen YouTube live edge; pausing recording "
+                        "video_id=%s sequence=%s edge=%s inactive=%ss",
+                        stream.video_id,
+                        second.media_sequence,
+                        edge_at or "unknown",
+                        int(tracker.inactive_seconds()),
+                    )
+                    self.state.mark_youtube_stale_live(
+                        stream.video_id,
+                        media_sequence=second.media_sequence,
+                        edge_at=edge_at,
+                    )
+                    await self._stop_stale_live_process(stream.video_id, process)
+                    return
+
+                if youtube_live_edge_advanced(first, second) or youtube_live_edge_is_fresh(
+                    second,
+                    stale_after_seconds=timeout_seconds,
+                    now=now,
+                ):
+                    tracker.note_external_progress()
+        except asyncio.CancelledError:
+            raise
+        except ProcessLookupError:
+            return
+
+    async def _stop_stale_live_process(
+        self,
+        video_id: str,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(
+                process.wait(),
+                timeout=RECONNECT_STOP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            if process.returncode is None:
+                self.logger.warning(
+                    "yt-dlp did not stop after stale-live detection for %s "
+                    "within %ss; killing",
+                    video_id,
+                    RECONNECT_STOP_TIMEOUT_SECONDS,
+                )
+                process.kill()
+                await process.wait()
+
     async def _planned_reconnect_timer(
         self,
         video_id: str,
@@ -922,6 +1496,11 @@ class DownloadManager:
                 and active.mixed_segment_task is not asyncio.current_task()
             ):
                 active.mixed_segment_task.cancel()
+            if (
+                active.stale_live_task
+                and active.stale_live_task is not asyncio.current_task()
+            ):
+                active.stale_live_task.cancel()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
             await self._stop_powerchat_listener(active)
@@ -944,8 +1523,12 @@ class DownloadManager:
             segment_index,
             last_exit_at=record.last_exit_at if record else utc_now_iso(),
         )
-        if stream.video_id in self._planned_reconnects:
+        planned_reconnect = stream.video_id in self._planned_reconnects
+        if planned_reconnect:
             self._planned_reconnects.discard(stream.video_id)
+        if planned_reconnect and not (
+            record is not None and record.status == "stalled"
+        ):
             task = asyncio.create_task(self.handle_planned_reconnect(stream, segment_index))
             self._post_exit_tasks.add(task)
             task.add_done_callback(self._post_exit_tasks.discard)
@@ -1050,6 +1633,16 @@ class DownloadManager:
             return
 
         if latest.is_live:
+            restart_decision = (
+                await self._check_youtube_before_restart(latest)
+            )
+            if self._stopping:
+                return
+            if restart_decision == "stalled":
+                await self.monitor_stalled_youtube(stream, segment_index)
+                return
+            if restart_decision != "restart" or stream.video_id in self.active:
+                return
             next_segment = await self.choose_live_restart_segment(
                 latest,
                 segment_index,
@@ -1087,6 +1680,19 @@ class DownloadManager:
                 segment_index,
                 elapsed_since_exit_seconds=elapsed_since_exit_seconds,
             )
+        )
+        self._post_exit_tasks.add(task)
+        task.add_done_callback(self._post_exit_tasks.discard)
+
+    def resume_stalled_youtube_check(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+    ) -> None:
+        if self._stopping:
+            return
+        task = asyncio.create_task(
+            self.monitor_stalled_youtube(stream, segment_index)
         )
         self._post_exit_tasks.add(task)
         task.add_done_callback(self._post_exit_tasks.discard)
@@ -1133,6 +1739,17 @@ class DownloadManager:
         elapsed_since_exit_seconds: float = 0.0,
         expected_status: str | None = None,
     ) -> None:
+        record = self.state.get_stream(stream.video_id)
+        if record is not None and record.youtube_stale_detected_at:
+            if not self._stream_status_matches(stream.video_id, expected_status):
+                return
+            self.logger.info(
+                "Monitoring stalled YouTube stream %s until it resumes or ends",
+                stream.video_id,
+            )
+            await self.monitor_stalled_youtube(stream, segment_index)
+            return
+
         previous_offset = 0.0
         elapsed_since_exit_seconds = max(0.0, elapsed_since_exit_seconds)
         self.logger.debug(
@@ -1196,6 +1813,16 @@ class DownloadManager:
             if latest.is_live:
                 if not self._stream_status_matches(stream.video_id, expected_status):
                     return
+                restart_decision = (
+                    await self._check_youtube_before_restart(latest)
+                )
+                if self._stopping:
+                    return
+                if restart_decision == "stalled":
+                    await self.monitor_stalled_youtube(stream, segment_index)
+                    return
+                if restart_decision != "restart" or stream.video_id in self.active:
+                    return
                 next_segment = await self.choose_live_restart_segment(
                     latest,
                     segment_index,
@@ -1255,22 +1882,53 @@ class DownloadManager:
         if should_record_chat_for_stream(self.config, stream):
             await self.refresh_finalized_chat_files(stream, finalized_files)
         self.state.mark_ended(stream.video_id)
+        self._youtube_fragment_progress_at.pop(stream.video_id, None)
         post_stream_config = post_stream_config_for_channel(self.config, stream.channel)
-        if post_stream_config.twitch_ad_repair_enabled and stream.platform == "twitch":
+        if (
+            post_stream_config.twitch_ad_repair_enabled
+            and stream.platform == "twitch"
+            and await self._wait_for_automatic_processing_window(
+                stream,
+                "Twitch ad repair",
+                segment_index,
+            )
+        ):
             await self.repair_finalized_twitch_ads(stream, finalized_files)
-        if post_stream_config.transcribe_subtitles:
+        if (
+            post_stream_config.transcribe_subtitles
+            and await self._wait_for_automatic_processing_window(
+                stream,
+                "subtitle transcription",
+                segment_index,
+            )
+        ):
             await self.transcribe_finalized_media(
                 stream,
                 finalized_files,
                 post_stream_config=post_stream_config,
             )
-        if post_stream_config.stream_event_detection_enabled:
+        if (
+            post_stream_config.stream_event_detection_enabled
+            and await self._wait_for_automatic_processing_window(
+                stream,
+                "content event detection",
+                segment_index,
+            )
+        ):
             await self.detect_finalized_content_events(
                 stream,
                 finalized_files,
                 post_stream_config=post_stream_config,
             )
-        if post_stream_config.render_live_chat_video and stream.platform == "youtube":
+        if (
+            post_stream_config.render_live_chat_video
+            and stream.platform == "youtube"
+            and await self._wait_for_automatic_processing_window(
+                stream,
+                "chat video rendering",
+                segment_index,
+            )
+        ):
             await self.render_finalized_chat_videos(stream, finalized_files)
 
     def rename_finalized_segments(
@@ -2445,6 +3103,7 @@ class DownloadManager:
                 exc,
             )
             self.state.mark_ended(stream.video_id)
+            self._youtube_fragment_progress_at.pop(stream.video_id, None)
             return
         except Exception as exc:
             self.logger.warning("Retry probe failed for %s: %s", stream.video_id, exc)
@@ -2459,6 +3118,8 @@ class DownloadManager:
                 active.reconnect_task.cancel()
             if active.mixed_segment_task:
                 active.mixed_segment_task.cancel()
+            if active.stale_live_task:
+                active.stale_live_task.cancel()
             if active.chat_process and active.chat_process.returncode is None:
                 self.logger.info(
                     "Terminating live chat recorder for %s",

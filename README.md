@@ -166,6 +166,15 @@ default**, **Always run**, or **Never run**. Recording finalization always
 runs. Streamer choices also apply to manual VOD imports, and disabling an action
 does not delete existing output.
 
+Optional processing quiet hours can keep automatic Twitch repair,
+transcription/voice matching, content-event detection, and chat rendering inside
+an off-peak server-local window. Set `processing_quiet_hours_enabled = true`,
+then choose `processing_quiet_hours_start` and `processing_quiet_hours_end` in
+24-hour `HH:MM` form. Overnight windows such as `22:00` to `07:00` are
+supported, and matching start/end times allow processing all day. Recording and
+finalization still happen immediately, manual dashboard actions bypass the
+window, and work already started may continue after it closes.
+
 The complete stream history is available directly on the streamer page, with
 search, platform/date filters, page-size choices, and Previous/Next navigation.
 Each stream uses an expandable section:
@@ -206,6 +215,8 @@ Useful settings to start with:
 - `max_concurrent_downloads`: live downloads allowed at once.
 - `record_live_chat`: records YouTube live chat sidecars.
 - `render_live_chat_video`: creates separate `- chat.mp4` videos after capture.
+- `processing_quiet_hours_enabled`: holds new automatic processing jobs until
+  the configured server-local quiet-hours window.
 - `transcribe_subtitles`: runs WhisperX after finalized media.
 - `voice_match_enabled`: enables sample-backed voice attribution.
 - `stream_event_detection_enabled`: enables content-event detection after
@@ -312,7 +323,8 @@ Manually add or redownload a VOD:
 3. Kick VOD downloads try to fetch chat replay best-effort.
 4. Post-processing jobs that are enabled for live downloads, such as
    transcription, content events, chat render, and voice matching, are queued for
-   VOD downloads too.
+   VOD downloads too. When processing quiet hours are enabled, these automatic
+   VOD jobs wait for the same window.
 
 Create a chat video:
 
@@ -721,6 +733,20 @@ scripts/uninstall-systemd.sh
   yt-dlp progress shows all active format downloads have caught up to the live
   edge. Planned reconnects terminate yt-dlp without graceful finalization,
   leaving `.part` files in place for `--continue`.
+- YouTube's metadata can occasionally keep reporting an ended broadcast as
+  live. After 15 minutes without downloaded-fragment progress, the app checks
+  the HLS live edge twice, 30 seconds apart. It marks the recording `stalled`
+  when both checks show the same old media sequence and timestamp. Fragment
+  inactivity carries across yt-dlp process restarts. If
+  yt-dlp exits while metadata still says live, another process or segment is
+  not started until live-edge probes show that YouTube is publishing new
+  segments. A frozen but still-recent edge remains under observation until it
+  advances or reaches the configured stale age. A stalled stream retains its
+  resumable files and is monitored indefinitely. It resumes automatically if
+  the edge advances, and is finalized only after YouTube reports it non-live,
+  terminally unavailable, or publishes an HLS end marker.
+  Change `youtube_stale_live_timeout_seconds`, or set it to `0` to disable the
+  watchdog.
 - YouTube recordings prefer VP9 by default. On the first download attempt, the
   app selects only from the formats in the current probe and records the exact
   video ID, audio ID, and video codec in SQLite. Every reconnect probes again

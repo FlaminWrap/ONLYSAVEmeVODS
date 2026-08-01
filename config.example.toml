@@ -97,6 +97,15 @@ chat_render_timeout_seconds = 3600
 chat_render_use_nvenc = false
 chat_render_nvenc_devices = []
 
+# Optional off-peak window for automatic post-stream and post-VOD processing.
+# Times use the server's local clock and may cross midnight, such as 22:00-07:00.
+# Matching start and end times allow automatic processing all day.
+# Recording and finalization are never delayed, manual dashboard actions bypass
+# this window, and a job that starts inside the window may finish after it ends.
+processing_quiet_hours_enabled = false
+processing_quiet_hours_start = "01:00"
+processing_quiet_hours_end = "07:00"
+
 # Twitch sometimes records a local "Commercial break in progress" slate instead of
 # the streamer's video. When enabled, finalized Twitch videos are OCR-scanned for
 # that slate, the matching moment is pulled from the channel's recent Twitch VOD,
@@ -216,6 +225,13 @@ fragment_retention_hours = 0
 # reconnects when one format finalizes while another remains partial. Set this
 # above 0 only if you also want periodic forced reconnects after catch-up.
 reconnect_interval_seconds = 0
+
+# Pause a YouTube recording as stalled when its HLS media sequence is frozen and
+# the edge is already this old. Fragment inactivity carries across yt-dlp
+# restarts. Stalled streams keep their resumable files and are monitored until
+# the edge advances again or YouTube truly ends the stream. Zero disables this
+# watchdog.
+youtube_stale_live_timeout_seconds = 900
 
 # After yt-dlp exits, re-check the video at these offsets in seconds.
 # If any check says the stream is still live, the downloader restarts.

@@ -8,7 +8,13 @@ import re
 import logging
 
 from .models import LiveStream, qualified_stream_id
-from .youtube import YoutubeProbe, YtDlpError, YtDlpRunner, live_stream_from_info
+from .youtube import (
+    YouTubeLiveEdge,
+    YoutubeProbe,
+    YtDlpError,
+    YtDlpRunner,
+    live_stream_from_info,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -144,6 +150,9 @@ class SourceMonitor:
             fallback_url=spec.url,
             source=source or spec.raw,
         )
+
+    def probe_youtube_live_edge(self, url_or_id: str) -> YouTubeLiveEdge:
+        return self.youtube.probe_live_edge(url_or_id)
 
 
 def resolve_source(source: str, *, default_platform: str | None = None) -> SourceSpec:

@@ -1,15 +1,21 @@
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
 from onlysavemevods.config import (
     DEFAULT_POST_EXIT_CHECK_SECONDS,
+    DEFAULT_PROCESSING_QUIET_HOURS_END,
+    DEFAULT_PROCESSING_QUIET_HOURS_START,
+    DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS,
     ConfigError,
     PostStreamConfig,
     StreamEventDetectionConfig,
     StreamEventRuleConfig,
     VoiceDetectionConfig,
     VoiceProfileConfig,
+    automatic_processing_window_is_open,
+    automatic_processing_window_wait_seconds,
     append_missing_config_values,
     download_group_name_for_channel,
     load_config,
@@ -33,6 +39,86 @@ from onlysavemevods.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_processing_quiet_hours_parse_and_support_overnight_windows(self) -> None:
+        config = load_config_text(
+            "processing_quiet_hours_enabled = true\n"
+            'processing_quiet_hours_start = "22:00"\n'
+            'processing_quiet_hours_end = "07:00"\n',
+            Path("/tmp/config.toml"),
+        )
+
+        self.assertTrue(config.processing_quiet_hours_enabled)
+        self.assertEqual(config.processing_quiet_hours_start, "22:00")
+        self.assertEqual(config.processing_quiet_hours_end, "07:00")
+        self.assertTrue(
+            automatic_processing_window_is_open(
+                config,
+                datetime(2026, 8, 1, 23, 30, tzinfo=timezone.utc),
+            )
+        )
+        self.assertTrue(
+            automatic_processing_window_is_open(
+                config,
+                datetime(2026, 8, 2, 6, 59, tzinfo=timezone.utc),
+            )
+        )
+        self.assertFalse(
+            automatic_processing_window_is_open(
+                config,
+                datetime(2026, 8, 2, 7, 0, tzinfo=timezone.utc),
+            )
+        )
+        self.assertEqual(
+            automatic_processing_window_wait_seconds(
+                config,
+                datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
+            ),
+            10 * 60 * 60,
+        )
+
+    def test_processing_quiet_hours_defaults_are_disabled(self) -> None:
+        config = load_config_text("", Path("/tmp/config.toml"))
+
+        self.assertFalse(config.processing_quiet_hours_enabled)
+        self.assertEqual(
+            config.processing_quiet_hours_start,
+            DEFAULT_PROCESSING_QUIET_HOURS_START,
+        )
+        self.assertEqual(
+            config.processing_quiet_hours_end,
+            DEFAULT_PROCESSING_QUIET_HOURS_END,
+        )
+        self.assertTrue(
+            automatic_processing_window_is_open(
+                config,
+                datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            )
+        )
+
+    def test_processing_quiet_hours_reject_invalid_times(self) -> None:
+        for value in ("9:00", "24:00", "12:60", "noon"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ConfigError,
+                "HH:MM",
+            ):
+                load_config_text(
+                    f'processing_quiet_hours_start = "{value}"\n',
+                    Path("/tmp/config.toml"),
+                )
+
+        all_day = load_config_text(
+            "processing_quiet_hours_enabled = true\n"
+            'processing_quiet_hours_start = "06:00"\n'
+            'processing_quiet_hours_end = "06:00"\n',
+            Path("/tmp/config.toml"),
+        )
+        self.assertTrue(
+            automatic_processing_window_is_open(
+                all_day,
+                datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc),
+            )
+        )
+
     def test_load_config_text_resolves_paths_from_original_config_location(self) -> None:
         config = load_config_text(
             'download_dir = "downloads"\nstate_dir = "state"\n',
@@ -248,6 +334,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.post_exit_check_seconds[-1], 600)
         self.assertEqual(len(config.post_exit_check_seconds), 20)
         self.assertEqual(config.reconnect_interval_seconds, 0)
+        self.assertEqual(
+            config.youtube_stale_live_timeout_seconds,
+            DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS,
+        )
         self.assertEqual(config.channel_scan_limit, 10)
         self.assertEqual(config.discovery_probe_concurrency, 4)
         self.assertEqual(config.youtube_preferred_video_codec, "vp9")
@@ -351,6 +441,24 @@ class ConfigTests(unittest.TestCase):
             config = load_config(config_path)
 
         self.assertEqual(config.reconnect_interval_seconds, 60)
+
+    def test_youtube_stale_live_watchdog_can_be_configured_or_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "youtube_stale_live_timeout_seconds = 0\n",
+                encoding="utf-8",
+            )
+
+            disabled = load_config(config_path)
+            config_path.write_text(
+                "youtube_stale_live_timeout_seconds = 1200\n",
+                encoding="utf-8",
+            )
+            configured = load_config(config_path)
+
+        self.assertEqual(disabled.youtube_stale_live_timeout_seconds, 0)
+        self.assertEqual(configured.youtube_stale_live_timeout_seconds, 1200)
 
     def test_keep_fragments_for_resume_can_be_disabled(self) -> None:
         with TemporaryDirectory() as tmp:

@@ -33,6 +33,9 @@ class StreamRecord:
     last_started_at: str | None
     last_exit_at: str | None
     exit_code: int | None
+    youtube_stale_media_sequence: int | None = None
+    youtube_stale_edge_at: str = ""
+    youtube_stale_detected_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +94,9 @@ class StateStore:
                 youtube_video_format_id TEXT NOT NULL DEFAULT '',
                 youtube_video_codec TEXT NOT NULL DEFAULT '',
                 youtube_video_format_selector TEXT NOT NULL DEFAULT '',
+                youtube_stale_media_sequence INTEGER,
+                youtube_stale_edge_at TEXT NOT NULL DEFAULT '',
+                youtube_stale_detected_at TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 segment_index INTEGER NOT NULL DEFAULT 1,
                 first_seen_at TEXT NOT NULL,
@@ -103,6 +109,7 @@ class StateStore:
         )
         self._ensure_stream_source_columns()
         self._ensure_stream_video_format_columns()
+        self._ensure_stream_stale_live_columns()
         self._mark_legacy_kick_detections_ended()
         self.conn.execute(
             """
@@ -173,6 +180,19 @@ class StateStore:
             "youtube_video_codec",
             "youtube_video_format_selector",
         ):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE streams ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
+
+    def _ensure_stream_stale_live_columns(self) -> None:
+        rows = self.conn.execute("PRAGMA table_info(streams)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "youtube_stale_media_sequence" not in columns:
+            self.conn.execute(
+                "ALTER TABLE streams ADD COLUMN youtube_stale_media_sequence INTEGER"
+            )
+        for name in ("youtube_stale_edge_at", "youtube_stale_detected_at"):
             if name not in columns:
                 self.conn.execute(
                     f"ALTER TABLE streams ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
@@ -293,7 +313,12 @@ class StateStore:
                 created_at=now,
             )
         else:
-            status = "detected" if existing.status == "ended" and stream.is_live else existing.status
+            should_reopen = (
+                existing.status == "ended"
+                and stream.is_live
+                and not existing.youtube_stale_detected_at
+            )
+            status = "detected" if should_reopen else existing.status
             self.conn.execute(
                 """
                 UPDATE streams
@@ -311,7 +336,7 @@ class StateStore:
                     stream.video_id,
                 ),
             )
-            if existing.status == "ended" and stream.is_live:
+            if should_reopen:
                 self._insert_stream_event(
                     stream.video_id,
                     "Detected stream live again",
@@ -322,6 +347,62 @@ class StateStore:
         record = self.get_stream(stream.video_id)
         assert record is not None
         return record
+
+    def mark_youtube_stale_live(
+        self,
+        video_id: str,
+        *,
+        media_sequence: int | None,
+        edge_at: str,
+    ) -> None:
+        now = utc_now()
+        record = self.get_stream(video_id)
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET youtube_stale_media_sequence = ?,
+                youtube_stale_edge_at = ?,
+                youtube_stale_detected_at = ?,
+                status = 'stalled',
+                updated_at = ?
+            WHERE video_id = ?
+            """,
+            (media_sequence, edge_at, now, now, video_id),
+        )
+        detail = f" sequence={media_sequence}" if media_sequence is not None else ""
+        if edge_at:
+            detail += f" edge={edge_at}"
+        self._insert_stream_event(
+            video_id,
+            f"YouTube live edge stalled; recording paused{detail}",
+            level="warning",
+            segment_index=record.segment_index if record is not None else None,
+            created_at=now,
+        )
+        self.conn.commit()
+
+    def clear_youtube_stale_live(self, video_id: str) -> None:
+        now = utc_now()
+        record = self.get_stream(video_id)
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET youtube_stale_media_sequence = NULL,
+                youtube_stale_edge_at = '',
+                youtube_stale_detected_at = '',
+                status = 'detected',
+                updated_at = ?
+            WHERE video_id = ?
+            """,
+            (now, video_id),
+        )
+        self._insert_stream_event(
+            video_id,
+            "YouTube live edge advanced again; resuming recording",
+            segment_index=record.segment_index if record is not None else None,
+            created_at=now,
+        )
+        self.conn.commit()
 
     def mark_downloading(self, stream: LiveStream, segment_index: int) -> None:
         now = utc_now()
@@ -592,20 +673,29 @@ class StateStore:
     def mark_exited(self, video_id: str, exit_code: int) -> None:
         now = utc_now()
         record = self.get_stream(video_id)
+        status = (
+            "stalled"
+            if record is not None and record.youtube_stale_detected_at
+            else "checking_after_exit"
+        )
         self.conn.execute(
             """
             UPDATE streams
-            SET status = 'checking_after_exit',
+            SET status = ?,
                 last_exit_at = ?,
                 updated_at = ?,
                 exit_code = ?
             WHERE video_id = ?
             """,
-            (now, now, exit_code, video_id),
+            (status, now, now, exit_code, video_id),
         )
         self._insert_stream_event(
             video_id,
-            f"yt-dlp exited with code {exit_code}; running post-exit checks",
+            (
+                f"yt-dlp exited with code {exit_code}; monitoring stalled stream"
+                if status == "stalled"
+                else f"yt-dlp exited with code {exit_code}; running post-exit checks"
+            ),
             level="warning" if exit_code else "info",
             segment_index=record.segment_index if record is not None else None,
             created_at=now,
@@ -738,6 +828,8 @@ class StateStore:
                    platform, source,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
+                   youtube_stale_media_sequence, youtube_stale_edge_at,
+                   youtube_stale_detected_at,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE video_id = ?
@@ -754,6 +846,8 @@ class StateStore:
                    platform, source,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
+                   youtube_stale_media_sequence, youtube_stale_edge_at,
+                   youtube_stale_detected_at,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             ORDER BY updated_at DESC, first_seen_at DESC
@@ -780,6 +874,8 @@ class StateStore:
                    platform, source,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
+                   youtube_stale_media_sequence, youtube_stale_edge_at,
+                   youtube_stale_detected_at,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE status IN ({placeholders})

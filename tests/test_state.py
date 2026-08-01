@@ -42,6 +42,42 @@ class StateWatermarkTests(unittest.TestCase):
             any("Locked YouTube video format" in event.message for event in events)
         )
 
+    def test_stalled_youtube_edge_suppresses_metadata_reopen(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                platform="youtube",
+                is_live=True,
+            )
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            stalled = state.get_stream(stream.video_id)
+            state.clear_youtube_stale_live(stream.video_id)
+            cleared = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertIsNotNone(stalled)
+        assert stalled is not None
+        self.assertEqual(stalled.status, "stalled")
+        self.assertEqual(stalled.youtube_stale_media_sequence, 9655)
+        self.assertEqual(
+            stalled.youtube_stale_edge_at,
+            "2026-08-01T08:29:04.025+00:00",
+        )
+        self.assertTrue(stalled.youtube_stale_detected_at)
+        self.assertIsNotNone(cleared)
+        assert cleared is not None
+        self.assertEqual(cleared.status, "detected")
+        self.assertEqual(cleared.youtube_stale_detected_at, "")
+
     def test_existing_stream_database_migrates_video_format_columns(self) -> None:
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.sqlite3"
@@ -95,6 +131,9 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertIn("youtube_video_format_id", columns)
         self.assertIn("youtube_video_codec", columns)
         self.assertIn("youtube_video_format_selector", columns)
+        self.assertIn("youtube_stale_media_sequence", columns)
+        self.assertIn("youtube_stale_edge_at", columns)
+        self.assertIn("youtube_stale_detected_at", columns)
 
     def test_stream_records_include_platform_and_source(self) -> None:
         with TemporaryDirectory() as tmp:

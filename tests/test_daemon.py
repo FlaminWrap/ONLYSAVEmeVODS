@@ -22,6 +22,46 @@ class FakeSourceMonitor:
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_stalled_youtube_checks_queues_monitor(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                web_enabled=False,
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                title="Stalled Stream",
+                channel="Example Channel",
+                platform="youtube",
+                source="@Example",
+            )
+            daemon = OnlySaveMeVodsDaemon(config)
+            daemon.state.upsert_detected(stream)
+            daemon.state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            records = daemon.state.list_streams_by_status(["stalled"])
+            daemon.downloads.resume_stalled_youtube_check = Mock()  # type: ignore[method-assign]
+
+            try:
+                daemon.resume_stalled_youtube_checks(records)
+            finally:
+                daemon.state.close()
+
+        daemon.downloads.resume_stalled_youtube_check.assert_called_once()
+        queued_stream = (
+            daemon.downloads.resume_stalled_youtube_check.call_args.args[0]
+        )
+        queued_segment = (
+            daemon.downloads.resume_stalled_youtube_check.call_args.args[1]
+        )
+        self.assertEqual(queued_stream.video_id, stream.video_id)
+        self.assertEqual(queued_segment, 1)
+
     async def test_resume_stale_post_exit_checks_queues_recovery(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(

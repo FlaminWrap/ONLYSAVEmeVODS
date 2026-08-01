@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import unittest
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -11,6 +12,8 @@ from onlysavemevods.youtube import (
     channel_streams_url,
     is_terminal_video_unavailable_message,
     live_stream_from_info,
+    parse_youtube_hls_live_edge,
+    youtube_hls_media_manifest,
 )
 
 
@@ -81,6 +84,71 @@ class CacheRunner:
 
 
 class YoutubeProbeTests(unittest.TestCase):
+    def test_parses_hls_live_edge_timestamp_and_sequence(self) -> None:
+        edge = parse_youtube_hls_live_edge(
+            """#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:9655
+#EXT-X-PROGRAM-DATE-TIME:2026-08-01T08:28:54.025+00:00
+#EXTINF:5.0,
+segment-9655.ts
+#EXTINF:5.0,
+segment-9656.ts
+"""
+        )
+
+        self.assertEqual(edge.media_sequence, 9655)
+        self.assertEqual(
+            edge.newest_segment_at,
+            datetime(2026, 8, 1, 8, 29, 4, 25000, tzinfo=timezone.utc),
+        )
+        self.assertFalse(edge.has_endlist)
+
+    def test_parses_hls_endlist(self) -> None:
+        edge = parse_youtube_hls_live_edge(
+            """#EXTM3U
+#EXT-X-MEDIA-SEQUENCE:42
+#EXT-X-PROGRAM-DATE-TIME:2026-08-01T08:00:00Z
+#EXTINF:6.0,
+segment.ts
+#EXT-X-ENDLIST
+"""
+        )
+
+        self.assertTrue(edge.has_endlist)
+
+    def test_selects_highest_non_drm_hls_media_manifest(self) -> None:
+        manifest_url, headers = youtube_hls_media_manifest(
+            {
+                "formats": [
+                    {
+                        "protocol": "https",
+                        "url": "https://example.test/video.mp4",
+                        "height": 2160,
+                    },
+                    {
+                        "protocol": "m3u8_native",
+                        "url": "https://example.test/720.m3u8",
+                        "height": 720,
+                    },
+                    {
+                        "protocol": "m3u8_native",
+                        "url": "https://example.test/drm.m3u8",
+                        "height": 2160,
+                        "has_drm": True,
+                    },
+                    {
+                        "protocol": "m3u8_native",
+                        "url": "https://example.test/1080.m3u8",
+                        "height": 1080,
+                        "http_headers": {"User-Agent": "test-agent"},
+                    },
+                ]
+            }
+        )
+
+        self.assertEqual(manifest_url, "https://example.test/1080.m3u8")
+        self.assertEqual(headers, {"User-Agent": "test-agent"})
+
     def test_channel_url_normalization(self) -> None:
         self.assertEqual(
             channel_streams_url("@Example"),

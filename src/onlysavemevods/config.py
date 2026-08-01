@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -62,6 +63,9 @@ DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS = 300
 DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS = 2
 DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS = 180
 DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT = 5
+DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_PROCESSING_QUIET_HOURS_START = "01:00"
+DEFAULT_PROCESSING_QUIET_HOURS_END = "07:00"
 APP_UPDATE_MODES = {"disabled", "manual", "check_only", "auto_install"}
 YOUTUBE_VIDEO_CODEC_PREFERENCES = {"vp9", "av1", "h264", "auto"}
 DEFAULT_APP_UPDATE_REPOSITORY = "FlaminWrap/ONLYSAVEmeVODS"
@@ -71,6 +75,7 @@ CONFIG_UPDATE_COMMENT = (
     "Existing settings above were left unchanged."
 )
 BARE_TOML_ASSIGNMENT_RE = re.compile(r"^\s*([A-Za-z0-9_-]+)\s*=", re.MULTILINE)
+TIME_OF_DAY_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class ConfigError(ValueError):
@@ -194,6 +199,9 @@ class BotConfig:
     stream_event_min_confidence: float = DEFAULT_STREAM_EVENT_MIN_CONFIDENCE
     stream_event_max_events_per_media: int = DEFAULT_STREAM_EVENT_MAX_EVENTS_PER_MEDIA
     stream_event_rules: list[StreamEventRuleConfig] = field(default_factory=list)
+    processing_quiet_hours_enabled: bool = False
+    processing_quiet_hours_start: str = DEFAULT_PROCESSING_QUIET_HOURS_START
+    processing_quiet_hours_end: str = DEFAULT_PROCESSING_QUIET_HOURS_END
     twitch_ad_repair_enabled: bool = True
     twitch_ad_repair_tesseract_path: str = "tesseract"
     twitch_ad_repair_scan_seconds: int = DEFAULT_TWITCH_AD_REPAIR_SCAN_SECONDS
@@ -203,6 +211,7 @@ class BotConfig:
     keep_fragments_for_resume: bool = True
     fragment_retention_hours: int = 0
     reconnect_interval_seconds: int = 0
+    youtube_stale_live_timeout_seconds: int = DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS
     post_exit_check_seconds: list[int] = field(
         default_factory=lambda: list(DEFAULT_POST_EXIT_CHECK_SECONDS)
     )
@@ -290,7 +299,20 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
         "channel_speaker_labels",
     )
     streamers = _as_streamers(raw.get("streamers", {}), "streamers")
-
+    processing_quiet_hours_start = _as_time_of_day(
+        raw.get(
+            "processing_quiet_hours_start",
+            DEFAULT_PROCESSING_QUIET_HOURS_START,
+        ),
+        "processing_quiet_hours_start",
+    )
+    processing_quiet_hours_end = _as_time_of_day(
+        raw.get(
+            "processing_quiet_hours_end",
+            DEFAULT_PROCESSING_QUIET_HOURS_END,
+        ),
+        "processing_quiet_hours_end",
+    )
     return BotConfig(
         channels=_as_source_list(raw.get("channels", []), "channels"),
         streamers=streamers,
@@ -422,6 +444,12 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
             raw.get("stream_event_rules", []),
             "stream_event_rules",
         ),
+        processing_quiet_hours_enabled=_as_bool(
+            raw.get("processing_quiet_hours_enabled", False),
+            "processing_quiet_hours_enabled",
+        ),
+        processing_quiet_hours_start=processing_quiet_hours_start,
+        processing_quiet_hours_end=processing_quiet_hours_end,
         twitch_ad_repair_enabled=_as_bool(
             raw.get("twitch_ad_repair_enabled", True),
             "twitch_ad_repair_enabled",
@@ -468,6 +496,13 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
         ),
         reconnect_interval_seconds=_as_non_negative_int(
             raw.get("reconnect_interval_seconds", 0), "reconnect_interval_seconds"
+        ),
+        youtube_stale_live_timeout_seconds=_as_non_negative_int(
+            raw.get(
+                "youtube_stale_live_timeout_seconds",
+                DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS,
+            ),
+            "youtube_stale_live_timeout_seconds",
         ),
         post_exit_check_seconds=_as_offset_list(
             raw.get("post_exit_check_seconds", DEFAULT_POST_EXIT_CHECK_SECONDS),
@@ -2202,6 +2237,49 @@ def _as_optional_str(value: Any, name: str) -> str:
     if not isinstance(value, str):
         raise ConfigError(f"{name} must be a string")
     return value.strip()
+
+
+def _as_time_of_day(value: Any, name: str) -> str:
+    time_of_day = _as_optional_str(value, name)
+    if not TIME_OF_DAY_RE.fullmatch(time_of_day):
+        raise ConfigError(f"{name} must use 24-hour HH:MM format")
+    return time_of_day
+
+
+def automatic_processing_window_is_open(config: BotConfig, now: datetime) -> bool:
+    """Return whether a new automatic processing job may start at local ``now``."""
+
+    if not config.processing_quiet_hours_enabled:
+        return True
+    start = _time_of_day_seconds(config.processing_quiet_hours_start)
+    end = _time_of_day_seconds(config.processing_quiet_hours_end)
+    current = now.hour * 60 * 60 + now.minute * 60 + now.second
+    if start == end:
+        return True
+    if start < end:
+        return start <= current < end
+    return current >= start or current < end
+
+
+def automatic_processing_window_wait_seconds(config: BotConfig, now: datetime) -> float:
+    """Return local wall-clock seconds until automatic processing may start."""
+
+    if automatic_processing_window_is_open(config, now):
+        return 0.0
+    start = _time_of_day_seconds(config.processing_quiet_hours_start)
+    current = (
+        now.hour * 60 * 60
+        + now.minute * 60
+        + now.second
+        + now.microsecond / 1_000_000
+    )
+    return float((start - current) % (24 * 60 * 60))
+
+
+def _time_of_day_seconds(value: str) -> int:
+    normalized = _as_time_of_day(value, "processing quiet-hours time")
+    hours, minutes = (int(part) for part in normalized.split(":"))
+    return hours * 60 * 60 + minutes * 60
 
 
 def _as_timezone(value: Any, name: str) -> str:

@@ -68,6 +68,7 @@ from onlysavemevods.web import (
     run_render_chat_in_process_job,
     update_render_chat_job,
     run_render_chat_process_job,
+    run_deferred_vod_post_processing_jobs,
     run_vod_download_job,
     queue_vod_post_processing_jobs,
     run_transcription_job,
@@ -120,6 +121,7 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "keep_fragments_for_resume": "true",
         "fragment_retention_hours": "0",
         "reconnect_interval_seconds": "0",
+        "youtube_stale_live_timeout_seconds": "900",
         "post_exit_check_seconds": "30, 60, 90",
         "retry_backoff_seconds": "30, 60, 120",
         "extra_yt_dlp_args_mode": "keep",
@@ -130,6 +132,9 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "chat_render_timeout_seconds": "3600",
         "chat_render_use_nvenc": "false",
         "chat_render_nvenc_devices": "",
+        "processing_quiet_hours_enabled": "false",
+        "processing_quiet_hours_start": "01:00",
+        "processing_quiet_hours_end": "07:00",
         "transcribe_subtitles": "false",
         "transcription_max_concurrent": "1",
         "whisperx_path": "whisperx",
@@ -544,6 +549,90 @@ class WebStatusTests(unittest.TestCase):
         self.assertGreaterEqual(thread_cls.return_value.start.call_count, 2)
         self.assertTrue(any(job.status == "running" for job in render_jobs))
         self.assertTrue(any(job.kind == "Twitch ad repair" for job in jobs))
+
+    def test_vod_post_processing_is_deferred_outside_quiet_hours(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=True,
+                processing_quiet_hours_enabled=True,
+                processing_quiet_hours_start="01:00",
+                processing_quiet_hours_end="07:00",
+            )
+            stream = LiveStream(
+                video_id="rumble:vod-quiet-hours",
+                url="https://rumble.com/vod-quiet-hours.html",
+                title="Quiet Hours VOD",
+                channel="OUMB3rd",
+                platform="rumble",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream, message="Started VOD download")
+            state.mark_vod_download_finished(stream.video_id)
+            state.close()
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            output_template.with_name(
+                output_template.name.replace("%(ext)s", "mp4")
+            ).write_text("media", encoding="utf-8")
+
+            with (
+                patch(
+                    "onlysavemevods.web.automatic_processing_window_wait_seconds",
+                    return_value=60.0,
+                ),
+                patch("onlysavemevods.web.start_transcription_job") as start_job,
+                patch("onlysavemevods.web.Thread") as thread_cls,
+            ):
+                queue_vod_post_processing_jobs(config, stream, output_template)
+
+            state = StateStore(config.db_path)
+            events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
+                stream.video_id
+            ]
+            state.close()
+
+        start_job.assert_not_called()
+        thread_cls.return_value.start.assert_called_once()
+        self.assertIs(
+            thread_cls.call_args.kwargs["target"],
+            run_deferred_vod_post_processing_jobs,
+        )
+        self.assertTrue(
+            any("waiting for quiet-hours window" in event.message for event in events)
+        )
+
+    def test_deferred_vod_processing_starts_when_quiet_hours_open(self) -> None:
+        config = BotConfig(
+            processing_quiet_hours_enabled=True,
+            processing_quiet_hours_start="01:00",
+            processing_quiet_hours_end="07:00",
+        )
+        stream = LiveStream(
+            video_id="rumble:vod-quiet-hours",
+            url="https://rumble.com/vod-quiet-hours.html",
+            title="Quiet Hours VOD",
+            channel="OUMB3rd",
+            platform="rumble",
+            is_live=False,
+        )
+        media_file = Path("Quiet Hours VOD.mp4")
+
+        with (
+            patch(
+                "onlysavemevods.web.automatic_processing_window_wait_seconds",
+                side_effect=[30.0, 0.0],
+            ),
+            patch("onlysavemevods.web.time.sleep") as sleep,
+            patch("onlysavemevods.web.record_stream_event"),
+            patch("onlysavemevods.web.start_vod_post_processing_jobs") as start_jobs,
+        ):
+            run_deferred_vod_post_processing_jobs(config, stream, media_file)
+
+        sleep.assert_called_once_with(30.0)
+        start_jobs.assert_called_once_with(config, stream, media_file)
 
     def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3467,6 +3556,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn('name="web_port"', html)
         self.assertIn('name="twitch_ad_repair_enabled"', html)
         self.assertIn('name="chat_render_timeout_seconds"', html)
+        self.assertIn('name="processing_quiet_hours_enabled"', html)
+        self.assertIn(
+            'name="processing_quiet_hours_start" type="time" value="01:00"',
+            html,
+        )
         self.assertIn('name="watermark_strength"', html)
         self.assertIn('name="whisperx_language" type="text" value=""', html)
         self.assertIn('name="extra_yt_dlp_args_mode"', html)
@@ -3623,6 +3717,9 @@ class WebStatusTests(unittest.TestCase):
                     chat_render_timeout_seconds="7200",
                     chat_render_use_nvenc="true",
                     chat_render_nvenc_devices="0\n1",
+                    processing_quiet_hours_enabled="true",
+                    processing_quiet_hours_start="22:30",
+                    processing_quiet_hours_end="06:30",
                     transcribe_subtitles="true",
                     whisperx_language="en",
                     web_port="9090",
@@ -3650,6 +3747,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(updated.chat_render_timeout_seconds, 7200)
         self.assertTrue(updated.chat_render_use_nvenc)
         self.assertEqual(updated.chat_render_nvenc_devices, ["0", "1"])
+        self.assertTrue(updated.processing_quiet_hours_enabled)
+        self.assertEqual(updated.processing_quiet_hours_start, "22:30")
+        self.assertEqual(updated.processing_quiet_hours_end, "06:30")
         self.assertTrue(updated.transcribe_subtitles)
         self.assertEqual(updated.whisperx_language, "en")
         self.assertEqual(updated.web_port, 9090)
@@ -4616,6 +4716,24 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(
             summary["Live Chat"]["chat_render_nvenc_devices"],
             ["0: NVIDIA A2", "1: NVIDIA A2", "2: not detected"],
+        )
+
+    def test_config_summary_includes_processing_quiet_hours(self) -> None:
+        config = BotConfig(
+            processing_quiet_hours_enabled=True,
+            processing_quiet_hours_start="22:00",
+            processing_quiet_hours_end="07:00",
+        )
+
+        summary = build_config_summary(config)
+
+        self.assertEqual(
+            summary["Processing Schedule"],
+            {
+                "processing_quiet_hours_enabled": True,
+                "processing_quiet_hours_start": "22:00",
+                "processing_quiet_hours_end": "07:00",
+            },
         )
 
     def test_config_summary_redacts_watermark_secret_value(self) -> None:

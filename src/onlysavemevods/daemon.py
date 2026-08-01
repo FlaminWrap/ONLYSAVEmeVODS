@@ -42,6 +42,7 @@ class OnlySaveMeVodsDaemon:
 
     async def run(self) -> None:
         stale_post_exit_records = self.state.list_streams_by_status(["checking_after_exit"])
+        stalled_youtube_records = self.state.list_streams_by_status(["stalled"])
         self.state.mark_stale_downloads_interrupted()
         self.state.mark_stale_watermarks_interrupted()
         sources = monitored_sources(self.config)
@@ -56,9 +57,11 @@ class OnlySaveMeVodsDaemon:
             "live_from_start=%s youtube_preferred_video_codec=%s "
             "keep_fragments_for_resume=%s "
             "fragment_retention_hours=%s "
-            "reconnect_interval_seconds=%s post_exit_check_seconds=%s "
+            "reconnect_interval_seconds=%s "
+            "youtube_stale_live_timeout_seconds=%s post_exit_check_seconds=%s "
             "render_live_chat_video=%s chat_render_use_nvenc=%s "
             "chat_render_nvenc_devices=%s transcribe_subtitles=%s "
+            "processing_quiet_hours=%s processing_window=%s-%s "
             "whisperx_model=%s whisperx_diarize=%s watermark_enabled=%s "
             "watermark_strength=%s web_enabled=%s web_bind=%s:%s",
             self.config.channel_scan_limit,
@@ -68,11 +71,15 @@ class OnlySaveMeVodsDaemon:
             self.config.keep_fragments_for_resume,
             self.config.fragment_retention_hours,
             self.config.reconnect_interval_seconds,
+            self.config.youtube_stale_live_timeout_seconds,
             self.config.post_exit_check_seconds,
             self.config.render_live_chat_video,
             self.config.chat_render_use_nvenc,
             self.config.chat_render_nvenc_devices,
             self.config.transcribe_subtitles,
+            self.config.processing_quiet_hours_enabled,
+            self.config.processing_quiet_hours_start,
+            self.config.processing_quiet_hours_end,
             self.config.whisperx_model,
             self.config.whisperx_diarize,
             self.config.watermark_enabled,
@@ -108,6 +115,7 @@ class OnlySaveMeVodsDaemon:
         if not monitored_sources(self.config):
             LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
         self.resume_stale_post_exit_checks(stale_post_exit_records)
+        self.resume_stalled_youtube_checks(stalled_youtube_records)
 
         try:
             while not self._stop_event.is_set():
@@ -141,6 +149,19 @@ class OnlySaveMeVodsDaemon:
                 stream_from_record(record),
                 record.segment_index,
                 elapsed_since_exit_seconds=seconds_since_iso(record.last_exit_at),
+            )
+
+    def resume_stalled_youtube_checks(self, records: list[StreamRecord]) -> None:
+        if not records:
+            return
+        LOGGER.warning(
+            "Resuming monitoring for %s stalled YouTube stream(s) after service restart",
+            len(records),
+        )
+        for record in records:
+            self.downloads.resume_stalled_youtube_check(
+                stream_from_record(record),
+                record.segment_index,
             )
 
     async def poll_once(self) -> None:

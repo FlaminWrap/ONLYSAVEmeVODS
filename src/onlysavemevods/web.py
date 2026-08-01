@@ -66,6 +66,7 @@ from .config import (
     VoiceDetectionConfig,
     VoiceProfileConfig,
     add_voice_sample_to_profile,
+    automatic_processing_window_wait_seconds,
     load_config,
     load_config_text,
     migrate_legacy_channels_to_streamer,
@@ -316,14 +317,21 @@ STREAMER_STREAM_PAGE_SIZE = 10
 STREAMER_STREAM_PAGE_SIZE_OPTIONS = (5, 10, 25, 50)
 STREAMER_STREAM_SEARCH_MAX_LENGTH = 256
 CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
+PROCESSING_WINDOW_RECHECK_SECONDS = 60.0
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
 )
 LIVE_CHAT_SUFFIX = ".live_chat.json"
 CHAT_RENDER_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov")
 CHAT_RENDER_OUTPUT_SUFFIX = " - chat.mp4"
-ATTENTION_STATUSES = {"checking_after_exit", "interrupted", "waiting_retry"}
-VOD_DOWNLOAD_BLOCKED_STATUSES = {"detected", "downloading", "checking_after_exit", "waiting_retry"}
+ATTENTION_STATUSES = {"checking_after_exit", "interrupted", "stalled", "waiting_retry"}
+VOD_DOWNLOAD_BLOCKED_STATUSES = {
+    "detected",
+    "downloading",
+    "checking_after_exit",
+    "stalled",
+    "waiting_retry",
+}
 SEGMENT_RECOVERY_BLOCKED_STATUSES = set(VOD_DOWNLOAD_BLOCKED_STATUSES)
 VOD_DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%")
 STATUS_LABELS = {
@@ -332,6 +340,7 @@ STATUS_LABELS = {
     "downloading": "downloading",
     "ended": "ended",
     "interrupted": "interrupted",
+    "stalled": "stalled",
     "waiting_retry": "waiting retry",
 }
 CHAT_RENDER_JOBS: dict[str, RenderChatJob] = {}
@@ -806,6 +815,12 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("keep_fragments_for_resume", "Download", "bool"),
     ConfigFormField("fragment_retention_hours", "Download", "int", minimum=0),
     ConfigFormField("reconnect_interval_seconds", "Download", "int", minimum=0),
+    ConfigFormField(
+        "youtube_stale_live_timeout_seconds",
+        "Download",
+        "int",
+        minimum=0,
+    ),
     ConfigFormField("post_exit_check_seconds", "Download", "int_list", rows=3),
     ConfigFormField("retry_backoff_seconds", "Download", "int_list", rows=2),
     ConfigFormField("extra_yt_dlp_args", "Download", "extra_args", rows=4),
@@ -815,6 +830,9 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("chat_render_timeout_seconds", "Live Chat", "int", minimum=0),
     ConfigFormField("chat_render_use_nvenc", "Live Chat", "bool"),
     ConfigFormField("chat_render_nvenc_devices", "Live Chat", "str_list", rows=2),
+    ConfigFormField("processing_quiet_hours_enabled", "Processing Schedule", "bool"),
+    ConfigFormField("processing_quiet_hours_start", "Processing Schedule", "time"),
+    ConfigFormField("processing_quiet_hours_end", "Processing Schedule", "time"),
     ConfigFormField("transcribe_subtitles", "Transcription", "bool"),
     ConfigFormField("transcription_max_concurrent", "Transcription", "int", minimum=1),
     ConfigFormField("whisperx_path", "Transcription", "text"),
@@ -876,6 +894,7 @@ CONFIG_FIELD_HELP: dict[str, str] = {
     "keep_fragments_for_resume": "Keep media fragments so interrupted or mixed-format downloads can resume safely.",
     "fragment_retention_hours": "Automatically remove fragments from ended streams after this many hours. Zero keeps them until you clean them manually.",
     "reconnect_interval_seconds": "Periodically reconnect an active recording; zero disables planned reconnects.",
+    "youtube_stale_live_timeout_seconds": "Pause an inactive YouTube recording as stalled after its HLS live edge remains frozen and becomes old. Resumable files are retained while the app waits for the edge to advance or YouTube to truly end the stream. Zero disables this watchdog.",
     "post_exit_check_seconds": "Offsets used to verify that a stream really ended before finalizing it.",
     "retry_backoff_seconds": "Wait times used between retries after source or download failures.",
     "extra_yt_dlp_args": "Expert yt-dlp arguments. Existing sensitive values remain hidden unless replaced.",
@@ -885,6 +904,9 @@ CONFIG_FIELD_HELP: dict[str, str] = {
     "chat_render_timeout_seconds": "Maximum time allowed for the final chat-video FFmpeg step; zero disables the timeout.",
     "chat_render_use_nvenc": "Use NVIDIA NVENC for chat-video encoding when supported.",
     "chat_render_nvenc_devices": "Optional NVIDIA device identifiers used for concurrent chat renders.",
+    "processing_quiet_hours_enabled": "Only start automatic post-stream and post-VOD processing inside the configured server-local quiet-hours window. Recording, finalization, and manual dashboard actions remain immediate.",
+    "processing_quiet_hours_start": "Server-local time when automatic processing may begin. Overnight windows are supported; matching start and end times allow processing all day.",
+    "processing_quiet_hours_end": "Server-local time when automatic processing stops starting new jobs. Jobs already running may finish; matching start and end times allow processing all day.",
     "transcribe_subtitles": "Run WhisperX after finalization to create subtitle and transcript sidecars.",
     "transcription_max_concurrent": "Maximum WhisperX jobs that may run simultaneously.",
     "whisperx_model": "WhisperX speech-recognition model name.",
@@ -926,6 +948,7 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "keep_fragments_for_resume": "Keep fragments for recovery",
     "fragment_retention_hours": "Clear ended-stream fragments after",
     "reconnect_interval_seconds": "Planned reconnect interval",
+    "youtube_stale_live_timeout_seconds": "YouTube stalled-live timeout",
     "post_exit_check_seconds": "Post-exit verification schedule",
     "retry_backoff_seconds": "Retry schedule",
     "extra_yt_dlp_args": "Additional yt-dlp arguments",
@@ -935,6 +958,9 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "chat_render_timeout_seconds": "Chat render timeout",
     "chat_render_use_nvenc": "Use NVIDIA encoding",
     "chat_render_nvenc_devices": "NVIDIA devices",
+    "processing_quiet_hours_enabled": "Restrict automatic processing to quiet hours",
+    "processing_quiet_hours_start": "Quiet hours start",
+    "processing_quiet_hours_end": "Quiet hours end",
     "transcribe_subtitles": "Create subtitles automatically",
     "transcription_max_concurrent": "Concurrent transcriptions",
     "whisperx_path": "WhisperX executable",
@@ -981,6 +1007,7 @@ CONFIG_FIELD_ADVANCED = {
     "channels",
     "channel_scan_limit",
     "discovery_probe_concurrency",
+    "youtube_stale_live_timeout_seconds",
     "post_exit_check_seconds",
     "retry_backoff_seconds",
     "extra_yt_dlp_args",
@@ -1026,6 +1053,7 @@ CONFIG_FIELD_CATEGORIES = {
     "Discovery": "general",
     "Download": "recording",
     "Live Chat": "recording",
+    "Processing Schedule": "processing",
     "Transcription": "processing",
     "Content Events": "processing",
     "Twitch Ads": "processing",
@@ -1039,6 +1067,7 @@ CONFIG_FIELD_UNITS = {
     "poll_interval_seconds": "seconds",
     "fragment_retention_hours": "hours",
     "reconnect_interval_seconds": "seconds",
+    "youtube_stale_live_timeout_seconds": "seconds",
     "chat_render_timeout_seconds": "seconds",
     "stream_event_window_seconds": "seconds",
     "stream_event_hop_seconds": "seconds",
@@ -1056,6 +1085,8 @@ CONFIG_FIELD_DEPENDENCIES = {
     "chat_render_use_nvenc": ("ffmpeg_path",),
     "voice_match_enabled": ("transcribe_subtitles",),
     "watermark_strength": ("watermark_enabled",),
+    "processing_quiet_hours_start": ("processing_quiet_hours_enabled",),
+    "processing_quiet_hours_end": ("processing_quiet_hours_enabled",),
 }
 
 
@@ -2517,11 +2548,10 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
 
     step_started_at = time.perf_counter()
     counts: dict[str, int] = {}
-    attention_statuses = {"checking_after_exit", "interrupted", "waiting_retry"}
     attention_count = 0
     for record in records:
         counts[record.status] = counts.get(record.status, 0) + 1
-        if record.status in attention_statuses:
+        if record.status in ATTENTION_STATUSES:
             attention_count += 1
 
     jobs = build_job_statuses(watermark_records)
@@ -2764,6 +2794,9 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
             "keep_fragments_for_resume": config.keep_fragments_for_resume,
             "fragment_retention_hours": config.fragment_retention_hours,
             "reconnect_interval_seconds": config.reconnect_interval_seconds,
+            "youtube_stale_live_timeout_seconds": (
+                config.youtube_stale_live_timeout_seconds
+            ),
             "post_exit_check_seconds": list(config.post_exit_check_seconds),
             "retry_backoff_seconds": list(config.retry_backoff_seconds),
             "extra_yt_dlp_args": redacted_extra_args(config.extra_yt_dlp_args),
@@ -2779,6 +2812,13 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
                 config.chat_render_nvenc_devices
             ),
             "chat_render_nvenc_device_values": list(config.chat_render_nvenc_devices),
+        },
+        "Processing Schedule": {
+            "processing_quiet_hours_enabled": (
+                config.processing_quiet_hours_enabled
+            ),
+            "processing_quiet_hours_start": config.processing_quiet_hours_start,
+            "processing_quiet_hours_end": config.processing_quiet_hours_end,
         },
         "Transcription": {
             "transcribe_subtitles": config.transcribe_subtitles,
@@ -4888,6 +4928,7 @@ def resolve_download_file(
 FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
     "checking_after_exit",
     "downloading",
+    "stalled",
     "waiting_retry",
 }
 STREAM_DELETE_BLOCKED_STATUSES = {
@@ -5572,6 +5613,80 @@ def queue_vod_post_processing_jobs(
         )
         return
 
+    processing_config = post_stream_config_for_channel(config, stream.channel)
+    chat_file = vod_chat_sidecar_for_media_file(media_file)
+    has_automatic_job = (
+        (processing_config.twitch_ad_repair_enabled and stream.platform == "twitch")
+        or processing_config.transcribe_subtitles
+        or processing_config.stream_event_detection_enabled
+        or (
+            processing_config.render_live_chat_video
+            and stream.platform in {"youtube", "kick"}
+            and chat_file.is_file()
+        )
+    )
+    if not has_automatic_job:
+        return
+
+    wait_seconds = automatic_processing_window_wait_seconds(
+        config,
+        datetime.now().astimezone(),
+    )
+    if wait_seconds > 0:
+        message = (
+            "Automatic VOD processing waiting for quiet-hours window "
+            f"{config.processing_quiet_hours_start}–"
+            f"{config.processing_quiet_hours_end} server local time"
+        )
+        record_stream_event(
+            config,
+            stream.video_id,
+            message,
+            segment_index=1,
+        )
+        LOGGER.info("%s video_id=%s", message, stream.video_id)
+        thread = Thread(
+            target=run_deferred_vod_post_processing_jobs,
+            args=(config, stream, media_file),
+            name=f"onlysavemevods-vod-processing-schedule-{stream.video_id}",
+            daemon=True,
+        )
+        thread.start()
+        return
+
+    start_vod_post_processing_jobs(config, stream, media_file)
+
+
+def run_deferred_vod_post_processing_jobs(
+    config: BotConfig,
+    stream: LiveStream,
+    media_file: Path,
+) -> None:
+    while True:
+        wait_seconds = automatic_processing_window_wait_seconds(
+            config,
+            datetime.now().astimezone(),
+        )
+        if wait_seconds <= 0:
+            break
+        time.sleep(min(wait_seconds, PROCESSING_WINDOW_RECHECK_SECONDS))
+
+    message = "Quiet-hours processing window opened; starting automatic VOD processing"
+    record_stream_event(
+        config,
+        stream.video_id,
+        message,
+        segment_index=1,
+    )
+    LOGGER.info("%s video_id=%s", message, stream.video_id)
+    start_vod_post_processing_jobs(config, stream, media_file)
+
+
+def start_vod_post_processing_jobs(
+    config: BotConfig,
+    stream: LiveStream,
+    media_file: Path,
+) -> None:
     processing_config = post_stream_config_for_channel(config, stream.channel)
     if processing_config.twitch_ad_repair_enabled and stream.platform == "twitch":
         start_vod_twitch_ad_repair_job(processing_config, stream, media_file)
@@ -7593,9 +7708,7 @@ def config_form_value_from_params(
         return form_int_list(raw, field.key)
     if field.kind == "str_list":
         return form_string_list(raw, field.key)
-    if field.kind == "optional_text":
-        return raw.strip()
-    if field.kind == "text":
+    if field.kind in {"optional_text", "text", "time"}:
         return raw.strip()
     raise ConfigError(f"Unsupported config form field: {field.key}")
 
@@ -10157,7 +10270,11 @@ def render_admin_setting_control(field: ConfigFormField, value: Any) -> str:
         else:
             text_value = str(value)
         return f'<div class="form-field"><label class="sr-only" for="setting-{name}">{escape(field.label)}</label><textarea id="setting-{name}" name="{name}" rows="{field.rows}">{escape(text_value)}</textarea></div>'
-    input_type = "number" if field.kind in {"int", "float"} else "text"
+    input_type = (
+        "number"
+        if field.kind in {"int", "float"}
+        else ("time" if field.kind == "time" else "text")
+    )
     step = ' step="0.001"' if field.kind == "float" else ""
     minimum = f' min="{field.minimum}"' if field.minimum is not None else ""
     return f'<div class="form-field"><label class="sr-only" for="setting-{name}">{escape(field.label)}</label><input id="setting-{name}" name="{name}" type="{input_type}"{step}{minimum} value="{escape(str(value), quote=True)}"></div>'
@@ -10934,7 +11051,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel-strong);
     }}
     .badge.downloading, .badge.running, .badge.done {{ color: var(--active); border-color: color-mix(in srgb, var(--active), transparent 55%); }}
-    .badge.checking_after_exit, .badge.waiting_retry, .badge.interrupted, .badge.queued {{ color: var(--warn); }}
+    .badge.checking_after_exit, .badge.waiting_retry, .badge.interrupted, .badge.stalled, .badge.queued {{ color: var(--warn); }}
     .badge.failed {{ color: var(--bad); border-color: color-mix(in srgb, var(--bad), transparent 55%); }}
     .badge.ended {{ color: var(--muted); }}
     .signals {{
@@ -11666,9 +11783,10 @@ def dashboard_script() -> str:
     downloading: "downloading",
     ended: "ended",
     interrupted: "interrupted",
+    stalled: "stalled",
     waiting_retry: "waiting retry",
   };
-  const attentionStatuses = new Set(["checking_after_exit", "interrupted", "waiting_retry"]);
+  const attentionStatuses = new Set(["checking_after_exit", "interrupted", "stalled", "waiting_retry"]);
 
   const byId = (id) => document.getElementById(id);
   const setText = (id, value) => {
@@ -12592,6 +12710,7 @@ def dashboard_script() -> str:
     if (stream.status === "checking_after_exit") signals.push("post-exit checks running");
     if (stream.status === "waiting_retry") signals.push("waiting for retry");
     if (stream.status === "interrupted") signals.push("interrupted before clean exit");
+    if (stream.status === "stalled") signals.push("YouTube live edge is not advancing");
     if (stream.has_part_files && stream.status !== "downloading") signals.push("partial files present");
     return signals.length ? `<div class="signals">${escapeHtml(signals.join(" / "))}</div>` : "";
   };
@@ -13274,7 +13393,7 @@ def dashboard_script() -> str:
   const renderCleanupFragmentsAction = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
     const count = Number(((stream && stream.file_kind_counts) || {}).fragment || 0);
-    const blockedStatuses = new Set(["checking_after_exit", "downloading", "waiting_retry"]);
+    const blockedStatuses = new Set(["checking_after_exit", "downloading", "stalled", "waiting_retry"]);
     if (!videoId || count <= 0 || blockedStatuses.has(String(stream.status || ""))) {
       return "";
     }
@@ -13399,7 +13518,7 @@ def dashboard_script() -> str:
 
   const renderStreamVodRedownloadForm = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
-    const blockedStatuses = new Set(["detected", "downloading", "checking_after_exit", "waiting_retry"]);
+    const blockedStatuses = new Set(["detected", "downloading", "checking_after_exit", "stalled", "waiting_retry"]);
     if (!videoId || blockedStatuses.has(String((stream && stream.status) || ""))) return "";
     const rawUrl = String((stream && stream.url) || "");
     const defaultUrl = rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : "";
@@ -15484,7 +15603,7 @@ def render_app_config_control(field: ConfigFormField, value: Any) -> str:
             f'<textarea name="{name}" rows="{field.rows}" '
             f'placeholder="{escape(configured, quote=True)}"></textarea>'
         )
-    input_type = "text"
+    input_type = "time" if field.kind == "time" else "text"
     return (
         f'<input name="{name}" type="{input_type}" '
         f'value="{escape(str(value), quote=True)}">'
@@ -16773,6 +16892,8 @@ def render_stream_signals(stream: StreamStatus) -> str:
         signals.append("waiting for retry")
     if stream.status == "interrupted":
         signals.append("interrupted before clean exit")
+    if stream.status == "stalled":
+        signals.append("YouTube live edge is not advancing")
     if stream.has_part_files and stream.status != "downloading":
         signals.append("partial files present")
     if not signals:

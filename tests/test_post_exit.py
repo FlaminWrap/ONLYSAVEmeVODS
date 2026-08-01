@@ -1,6 +1,7 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 import asyncio
 import logging
 import unittest
@@ -13,7 +14,7 @@ from onlysavemevods.downloader import (
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.state import StateStore
-from onlysavemevods.youtube import TerminalVideoUnavailableError
+from onlysavemevods.youtube import TerminalVideoUnavailableError, YouTubeLiveEdge
 
 
 NULL_LOGGER = logging.getLogger("tests.null")
@@ -73,6 +74,276 @@ class FakeProcess:
 
 
 class PostExitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_old_frozen_youtube_edge_prevents_metadata_driven_restart(
+        self,
+    ) -> None:
+        sleeps: list[float] = []
+
+        async def fake_sleep(delay: float) -> None:
+            sleeps.append(delay)
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                youtube_stale_live_timeout_seconds=900,
+                post_exit_check_seconds=[0],
+            )
+            original = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            still_reported_live = LiveStream(
+                video_id=original.video_id,
+                url=original.url,
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(original)
+            state.mark_exited(original.video_id, 0)
+            probe = SequenceProbe([still_reported_live])
+            old_edge = YouTubeLiveEdge(
+                9655,
+                datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+            edge_probe = AsyncMock(side_effect=[old_edge, old_edge])
+            manager = RecordingDownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=fake_sleep,
+                probe_video_func=probe.probe_video_async,
+                probe_youtube_live_edge_func=edge_probe,
+                logger=NULL_LOGGER,
+            )
+
+            with patch.object(
+                manager,
+                "monitor_stalled_youtube",
+                new=AsyncMock(),
+            ) as monitor:
+                await manager.handle_post_exit(original, 1)
+            record = state.get_stream(original.video_id)
+            state.close()
+
+        self.assertEqual(manager.started, [])
+        self.assertEqual(edge_probe.await_count, 2)
+        self.assertEqual(sleeps, [30])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+        self.assertTrue(record.youtube_stale_detected_at)
+        monitor.assert_awaited_once_with(original, 1)
+
+    async def test_old_frozen_edge_also_prevents_planned_reconnect(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                youtube_stale_live_timeout_seconds=900,
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            probe = SequenceProbe([stream])
+            old_edge = YouTubeLiveEdge(
+                9655,
+                datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+            edge_probe = AsyncMock(side_effect=[old_edge, old_edge])
+            manager = RecordingDownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=AsyncMock(),
+                probe_video_func=probe.probe_video_async,
+                probe_youtube_live_edge_func=edge_probe,
+                logger=NULL_LOGGER,
+            )
+
+            with patch.object(
+                manager,
+                "monitor_stalled_youtube",
+                new=AsyncMock(),
+            ) as monitor:
+                await manager.handle_planned_reconnect(stream, 1)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertEqual(manager.started, [])
+        self.assertEqual(edge_probe.await_count, 2)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+        self.assertTrue(record.youtube_stale_detected_at)
+        monitor.assert_awaited_once_with(stream, 1)
+
+    async def test_fresh_youtube_edge_must_advance_before_restart(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                youtube_stale_live_timeout_seconds=900,
+                post_exit_check_seconds=[0],
+            )
+            original = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            still_live = LiveStream(
+                video_id=original.video_id,
+                url=original.url,
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(original)
+            state.mark_exited(original.video_id, 0)
+            probe = SequenceProbe([still_live])
+            fresh_edge = YouTubeLiveEdge(
+                9655,
+                datetime.now(timezone.utc) - timedelta(seconds=5),
+            )
+            advanced_edge = YouTubeLiveEdge(
+                9656,
+                datetime.now(timezone.utc),
+            )
+            edge_probe = AsyncMock(
+                side_effect=[fresh_edge, fresh_edge, advanced_edge]
+            )
+            sleep = AsyncMock()
+            manager = RecordingDownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=sleep,
+                probe_video_func=probe.probe_video_async,
+                probe_youtube_live_edge_func=edge_probe,
+                logger=NULL_LOGGER,
+            )
+
+            await manager.handle_post_exit(original, 1)
+            state.close()
+
+        self.assertEqual(len(manager.started), 1)
+        self.assertEqual(manager.started[0][0], still_live)
+        self.assertEqual(edge_probe.await_count, 3)
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [30, 30],
+        )
+
+    async def test_confirmed_frozen_youtube_edge_stays_stalled_for_monitoring(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[30, 60],
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            probe = SequenceProbe([])
+            sleep = AsyncMock()
+            manager = DownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=sleep,
+                probe_video_func=probe.probe_video_async,
+                logger=NULL_LOGGER,
+            )
+
+            with patch.object(
+                manager,
+                "monitor_stalled_youtube",
+                new=AsyncMock(),
+            ) as monitor:
+                await manager.handle_post_exit(stream, 1)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        monitor.assert_awaited_once_with(stream, 1)
+        sleep.assert_not_awaited()
+        self.assertEqual(probe.calls, 0)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+
+    async def test_frozen_edge_takes_priority_over_simultaneous_planned_reconnect(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=SequenceProbe([]),  # type: ignore[arg-type]
+                logger=NULL_LOGGER,
+            )
+            manager._planned_reconnects.add(stream.video_id)
+            process = FakeProcess()
+            process.returncode = 0
+
+            with (
+                patch.object(
+                    manager,
+                    "handle_post_exit",
+                    new=AsyncMock(),
+                ) as post_exit,
+                patch.object(
+                    manager,
+                    "handle_planned_reconnect",
+                    new=AsyncMock(),
+                ) as planned,
+            ):
+                await manager._watch_process(stream, process, 1)  # type: ignore[arg-type]
+                await asyncio.sleep(0)
+            state.close()
+
+        post_exit.assert_awaited_once_with(stream, 1)
+        planned.assert_not_awaited()
+        self.assertNotIn(stream.video_id, manager._planned_reconnects)
+
     async def test_planned_reconnect_terminates_to_leave_part_files_for_resume(self) -> None:
         sleeps: list[float] = []
 

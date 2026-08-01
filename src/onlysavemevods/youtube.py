@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
+from urllib.request import Request, urlopen
 import concurrent.futures
 import json
 import logging
@@ -21,6 +23,7 @@ YOUTUBE_ID_IN_URL_RE = re.compile(
 )
 CACHEABLE_NON_LIVE_STATUSES = {"not_live", "was_live"}
 CHANNEL_PAGE_SUFFIXES = ("/streams", "/videos", "/live", "/featured")
+HLS_MANIFEST_READ_LIMIT = 2 * 1024 * 1024
 
 
 class YtDlpError(RuntimeError):
@@ -89,6 +92,13 @@ class YtDlpRunner:
         if not isinstance(parsed, dict):
             raise YtDlpError("yt-dlp returned JSON that was not an object")
         return parsed
+
+
+@dataclass(frozen=True, slots=True)
+class YouTubeLiveEdge:
+    media_sequence: int | None
+    newest_segment_at: datetime | None
+    has_endlist: bool = False
 
 
 def is_terminal_video_unavailable_message(message: str) -> bool:
@@ -223,6 +233,36 @@ class YoutubeProbe:
         )
         return stream
 
+    def probe_live_edge(self, url_or_id: str) -> YouTubeLiveEdge:
+        """Inspect YouTube's anonymous HLS edge without changing download mode."""
+        target = (
+            url_or_id
+            if url_or_id.startswith(("http://", "https://"))
+            else video_url(url_or_id)
+        )
+        info = self.runner.run_json(
+            [
+                "--dump-json",
+                "--skip-download",
+                "--no-playlist",
+                "--no-warnings",
+                target,
+            ]
+        )
+        manifest_url, headers = youtube_hls_media_manifest(info)
+        if not manifest_url:
+            raise YtDlpError("yt-dlp metadata did not include a YouTube HLS media manifest")
+
+        request = Request(manifest_url, headers=headers)
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = response.read(HLS_MANIFEST_READ_LIMIT + 1)
+        except OSError as exc:
+            raise YtDlpError(f"unable to read YouTube HLS media manifest: {exc}") from exc
+        if len(payload) > HLS_MANIFEST_READ_LIMIT:
+            raise YtDlpError("YouTube HLS media manifest exceeded the safety limit")
+        return parse_youtube_hls_live_edge(payload.decode("utf-8", "replace"))
+
     def _probe_candidate_videos(self, video_ids: list[str]) -> list[LiveStream]:
         if not video_ids:
             LOGGER.debug("No candidate videos to probe")
@@ -295,6 +335,106 @@ def live_stream_from_info(info: dict[str, Any], *, fallback_url: str = "") -> Li
         source=fallback_url,
         raw=info,
     )
+
+
+def youtube_hls_media_manifest(
+    info: dict[str, Any],
+) -> tuple[str, dict[str, str]]:
+    formats = info.get("formats")
+    if not isinstance(formats, list):
+        return "", {}
+
+    candidates: list[tuple[tuple[float, float, float], str, dict[str, str]]] = []
+    for position, raw_format in enumerate(formats):
+        if not isinstance(raw_format, dict) or raw_format.get("has_drm"):
+            continue
+        protocol = str(raw_format.get("protocol") or "").casefold()
+        manifest_url = str(raw_format.get("url") or "").strip()
+        if not protocol.startswith("m3u8") or not manifest_url.startswith(
+            ("http://", "https://")
+        ):
+            continue
+        raw_headers = raw_format.get("http_headers")
+        headers = (
+            {
+                str(key): str(value)
+                for key, value in raw_headers.items()
+                if value is not None
+            }
+            if isinstance(raw_headers, dict)
+            else {}
+        )
+        rank = (
+            _safe_number(raw_format.get("height")),
+            _safe_number(raw_format.get("tbr")),
+            float(position),
+        )
+        candidates.append((rank, manifest_url, headers))
+
+    if not candidates:
+        return "", {}
+    _rank, manifest_url, headers = max(candidates, key=lambda candidate: candidate[0])
+    return manifest_url, headers
+
+
+def parse_youtube_hls_live_edge(manifest: str) -> YouTubeLiveEdge:
+    media_sequence: int | None = None
+    newest_segment_at: datetime | None = None
+    next_segment_at: datetime | None = None
+    pending_duration: float | None = None
+    has_endlist = False
+
+    for raw_line in manifest.splitlines():
+        line = raw_line.strip()
+        if line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
+            try:
+                media_sequence = int(line.partition(":")[2].strip())
+            except ValueError:
+                media_sequence = None
+        elif line.startswith("#EXT-X-PROGRAM-DATE-TIME:"):
+            next_segment_at = parse_hls_datetime(line.partition(":")[2].strip())
+            if next_segment_at is not None:
+                newest_segment_at = next_segment_at
+        elif line.startswith("#EXTINF:"):
+            raw_duration = line.partition(":")[2].partition(",")[0].strip()
+            try:
+                pending_duration = max(0.0, float(raw_duration))
+            except ValueError:
+                pending_duration = None
+        elif line == "#EXT-X-ENDLIST":
+            has_endlist = True
+        elif line and not line.startswith("#") and pending_duration is not None:
+            if next_segment_at is not None:
+                next_segment_at += timedelta(seconds=pending_duration)
+                newest_segment_at = next_segment_at
+            pending_duration = None
+
+    return YouTubeLiveEdge(
+        media_sequence=media_sequence,
+        newest_segment_at=newest_segment_at,
+        has_endlist=has_endlist,
+    )
+
+
+def parse_hls_datetime(value: str) -> datetime | None:
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = f"{normalized[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _safe_number(value: object) -> float:
+    try:
+        number = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number == number else 0.0
 
 
 def channel_streams_url(channel: str) -> str:

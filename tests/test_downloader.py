@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
@@ -43,6 +44,9 @@ from onlysavemevods.downloader import (
     segment_timing_file,
     segment_directory,
     validate_finalize_output,
+    youtube_live_edge_advanced,
+    youtube_live_edge_is_confirmed_stale,
+    youtube_live_edge_is_fresh,
     youtube_format_segment_index,
 )
 from onlysavemevods.models import LiveStream, video_url
@@ -53,6 +57,7 @@ from onlysavemevods.powerchat import (
 )
 from onlysavemevods.state import StateStore
 from onlysavemevods.twitch_ad_repair import TwitchAdRepairResult
+from onlysavemevods.youtube import YouTubeLiveEdge
 
 
 class NullLogger:
@@ -1306,8 +1311,365 @@ class DownloaderCommandTests(unittest.TestCase):
 
         self.assertTrue(event.is_set())
 
+    def test_catchup_tracker_only_resets_inactivity_when_fragments_advance(self) -> None:
+        now = [10.0]
+        tracker = CatchupTracker(
+            asyncio.Event(),
+            monotonic_func=lambda: now[0],
+        )
+        progress = "[download] 100.00MiB at 1.00MiB/s (frag 99/100)"
+
+        tracker.update(progress)
+        now[0] = 20.0
+        tracker.update(progress)
+        self.assertEqual(tracker.inactive_seconds(), 10.0)
+
+        tracker.update("[download] 101.00MiB at 1.00MiB/s (frag 100/101)")
+        self.assertEqual(tracker.inactive_seconds(), 0.0)
+
+    def test_youtube_fragment_inactivity_carries_across_process_trackers(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(state_dir=Path(tmp) / "state")
+            state = StateStore(config.db_path)
+            now = [5.0]
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                monotonic_func=lambda: now[0],
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+            )
+            first = manager._catchup_tracker_for_stream(stream, asyncio.Event())
+            first.update("[download] 1.00MiB at 1.00MiB/s (frag 10/11)")
+            now[0] = 100.0
+
+            restarted = manager._catchup_tracker_for_stream(
+                stream,
+                asyncio.Event(),
+            )
+            state.close()
+
+        self.assertEqual(restarted.last_fragment_progress_at, 5.0)
+        self.assertEqual(restarted.inactive_seconds(), 95.0)
+
+    def test_youtube_live_edge_requires_old_unchanged_edge(self) -> None:
+        now = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
+        old = now - timedelta(hours=1)
+        first = YouTubeLiveEdge(9655, old)
+        frozen = YouTubeLiveEdge(9655, old)
+        advanced = YouTubeLiveEdge(9656, old + timedelta(seconds=5))
+
+        self.assertTrue(
+            youtube_live_edge_is_confirmed_stale(
+                first,
+                frozen,
+                stale_after_seconds=900,
+                now=now,
+            )
+        )
+        self.assertFalse(
+            youtube_live_edge_is_confirmed_stale(
+                first,
+                advanced,
+                stale_after_seconds=900,
+                now=now,
+            )
+        )
+        self.assertTrue(youtube_live_edge_advanced(first, advanced))
+        self.assertFalse(
+            youtube_live_edge_is_fresh(
+                frozen,
+                stale_after_seconds=900,
+                now=now,
+            )
+        )
+
 
 class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_frozen_youtube_watchdog_stalls_and_stops_process(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                youtube_stale_live_timeout_seconds=10,
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            now = [0.0]
+            tracker = CatchupTracker(
+                asyncio.Event(),
+                monotonic_func=lambda: now[0],
+            )
+            now[0] = 100.0
+            edge = YouTubeLiveEdge(
+                9655,
+                datetime.now(timezone.utc) - timedelta(hours=1),
+            )
+            edge_probe = AsyncMock(side_effect=[edge, edge])
+            sleep = AsyncMock()
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=sleep,
+                probe_youtube_live_edge_func=edge_probe,
+                monotonic_func=lambda: now[0],
+            )
+            process = AsyncMock()
+            process.returncode = None
+
+            with patch.object(
+                manager,
+                "_stop_stale_live_process",
+                new=AsyncMock(),
+            ) as stop_process:
+                await manager._stale_youtube_live_watchdog(
+                    stream,
+                    process,
+                    tracker,
+                )
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertEqual(
+            [call.args[0] for call in sleep.await_args_list],
+            [10, 30],
+        )
+        self.assertEqual(edge_probe.await_count, 2)
+        stop_process.assert_awaited_once_with(stream.video_id, process)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+        self.assertEqual(record.youtube_stale_media_sequence, 9655)
+        self.assertTrue(record.youtube_stale_detected_at)
+
+    async def test_stalled_stream_cannot_start_outside_its_monitor(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            edge_probe = AsyncMock(
+                return_value=YouTubeLiveEdge(
+                    9655,
+                    datetime(2026, 8, 1, 8, 29, 4, 25000, tzinfo=timezone.utc),
+                )
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                probe_youtube_live_edge_func=edge_probe,
+            )
+
+            allowed = await manager._youtube_stalled_state_allows_start(stream)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertFalse(allowed)
+        edge_probe.assert_not_awaited()
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+        self.assertTrue(record.youtube_stale_detected_at)
+
+    async def test_stalled_monitor_resumes_when_live_edge_advances(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                probe_video_func=AsyncMock(return_value=stream),
+                probe_youtube_live_edge_func=AsyncMock(
+                    return_value=YouTubeLiveEdge(
+                        9656,
+                        datetime(
+                            2026,
+                            8,
+                            1,
+                            8,
+                            29,
+                            9,
+                            25000,
+                            tzinfo=timezone.utc,
+                        ),
+                    )
+                ),
+            )
+
+            with patch.object(
+                manager,
+                "start_stream",
+                new=AsyncMock(return_value=True),
+            ) as start:
+                await manager.monitor_stalled_youtube(stream, 1)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        start.assert_awaited_once_with(stream, segment_index=1)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "detected")
+        self.assertEqual(record.youtube_stale_detected_at, "")
+
+    async def test_stalled_monitor_finalizes_only_after_metadata_ends(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            ended = LiveStream(
+                video_id=stream.video_id,
+                url=stream.url,
+                platform="youtube",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            edge_probe = AsyncMock(
+                return_value=YouTubeLiveEdge(
+                    9655,
+                    datetime(
+                        2026,
+                        8,
+                        1,
+                        8,
+                        29,
+                        4,
+                        25000,
+                        tzinfo=timezone.utc,
+                    ),
+                )
+            )
+            metadata_probe = AsyncMock(side_effect=[ended, ended])
+            sleep = AsyncMock()
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=sleep,
+                probe_video_func=metadata_probe,
+                probe_youtube_live_edge_func=edge_probe,
+            )
+
+            await manager.monitor_stalled_youtube(stream, 1)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertEqual(metadata_probe.await_count, 2)
+        edge_probe.assert_awaited_once()
+        sleep.assert_awaited_once_with(config.poll_interval_seconds)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "ended")
+
+    async def test_stalled_monitor_keeps_frozen_live_stream_stalled(self) -> None:
+        async def stop_after_one_check(_delay: float) -> None:
+            raise asyncio.CancelledError
+
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=stop_after_one_check,
+                probe_video_func=AsyncMock(return_value=stream),
+                probe_youtube_live_edge_func=AsyncMock(
+                    return_value=YouTubeLiveEdge(
+                        9655,
+                        datetime(
+                            2026,
+                            8,
+                            1,
+                            8,
+                            29,
+                            4,
+                            25000,
+                            tzinfo=timezone.utc,
+                        ),
+                    )
+                ),
+            )
+
+            with self.assertRaises(asyncio.CancelledError):
+                await manager.monitor_stalled_youtube(stream, 1)
+            record = state.get_stream(stream.video_id)
+            state.close()
+
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "stalled")
+        self.assertTrue(record.youtube_stale_detected_at)
+
     async def test_split_track_watchdog_ignores_transient_completion_state(
         self,
     ) -> None:
@@ -1931,6 +2293,59 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.status, "done")
         self.assertEqual(job.progress, 1.0)
         self.assertIn("Late Night Stream", job.item)
+
+    async def test_automatic_transcription_waits_for_quiet_hours_to_open(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=True,
+                processing_quiet_hours_enabled=True,
+                processing_quiet_hours_start="01:00",
+                processing_quiet_hours_end="07:00",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            clock = [datetime(2026, 8, 1, 0, 59, 30, tzinfo=timezone.utc)]
+            sleep_calls: list[float] = []
+            transcribe = AsyncMock(return_value=True)
+
+            async def advance_clock(delay: float) -> None:
+                self.assertEqual(transcribe.await_count, 0)
+                sleep_calls.append(delay)
+                clock[0] += timedelta(seconds=delay)
+
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=advance_clock,
+                local_now_func=lambda: clock[0],
+            )
+
+            try:
+                with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
+                    await manager.finish_ended_stream(stream, 1)
+                events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
+                    stream.video_id
+                ]
+            finally:
+                state.close()
+
+        self.assertEqual(sleep_calls, [30.0])
+        transcribe.assert_awaited_once()
+        event_messages = "\n".join(event.message for event in events)
+        self.assertIn("waiting for quiet-hours window 01:00–07:00", event_messages)
+        self.assertIn("processing window opened", event_messages)
 
     async def test_streamer_can_enable_transcription_over_global_default(self) -> None:
         with TemporaryDirectory() as tmp:
