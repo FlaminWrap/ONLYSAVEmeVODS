@@ -79,7 +79,10 @@ def main(argv: list[str] | None = None) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="onlysavemevods",
-        description="Automatically download live YouTube streams with yt-dlp.",
+        description=(
+            "Automatically record live YouTube, Twitch, Kick, and Rumble "
+            "streams with yt-dlp."
+        ),
     )
     parser.add_argument(
         "-v",
@@ -113,7 +116,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the continuous daemon.")
     run.add_argument("--config", default="config.toml", help="Path to config TOML.")
 
-    render_chat = subparsers.add_parser("render-chat-file", help=argparse.SUPPRESS)
+    render_chat = subparsers.add_parser(
+        "render-chat-file",
+        help="Render a chat sidecar video (internal worker command).",
+    )
     render_chat.add_argument("--config", required=True, help="Path to config TOML.")
     render_chat.add_argument("--media", required=True, help="Finalized media file.")
     render_chat.add_argument("--chat", required=True, help="Live chat JSON file.")

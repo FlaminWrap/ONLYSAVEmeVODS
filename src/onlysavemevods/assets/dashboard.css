@@ -169,7 +169,10 @@ button, a, input, select, textarea, summary { outline: none; }
 .save-status.error { color: var(--danger); }
 .save-status.warning { color: var(--warning); }
 .save-status button { margin-left: 8px; }
-.page-content { width: min(1480px, 100%); padding: 28px clamp(18px, 3vw, 38px) 56px; }
+.page-content {
+  width: 100%;
+  padding: 28px clamp(18px, 3vw, 38px) 56px;
+}
 .page-heading {
   display: flex;
   align-items: flex-start;

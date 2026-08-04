@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import hashlib
 import re
 import sqlite3
 from datetime import datetime, timezone
@@ -13,6 +14,10 @@ from .models import LiveStream
 LEGACY_KICK_STREAM_ID_RE = re.compile(
     r"^kick:.+\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}$"
 )
+POST_PROCESSING_KINDS = frozenset(
+    {"twitch_ad_repair", "transcription", "content_events", "chat_render"}
+)
+POST_PROCESSING_STATUSES = frozenset({"pending", "running", "done", "failed"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +38,7 @@ class StreamRecord:
     last_started_at: str | None
     last_exit_at: str | None
     exit_code: int | None
+    recording_kind: str = "live"
     youtube_stale_media_sequence: int | None = None
     youtube_stale_edge_at: str = ""
     youtube_stale_detected_at: str = ""
@@ -64,6 +70,23 @@ class WatermarkCopyRecord:
     updated_at: str
     started_at: str | None
     finished_at: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PostProcessingJobRecord:
+    job_id: str
+    video_id: str
+    kind: str
+    segment_index: int
+    channel: str
+    media_path: str
+    chat_path: str
+    timing_path: str
+    status: str
+    attempts: int
+    error: str
+    created_at: str
+    updated_at: str
 
 
 class StateStore:
@@ -103,11 +126,13 @@ class StateStore:
                 updated_at TEXT NOT NULL,
                 last_started_at TEXT,
                 last_exit_at TEXT,
-                exit_code INTEGER
+                exit_code INTEGER,
+                recording_kind TEXT NOT NULL DEFAULT 'live'
             )
             """
         )
         self._ensure_stream_source_columns()
+        recording_kind_added = self._ensure_stream_recording_kind_column()
         self._ensure_stream_video_format_columns()
         self._ensure_stream_stale_live_columns()
         self._mark_legacy_kick_detections_ended()
@@ -123,6 +148,8 @@ class StateStore:
             )
             """
         )
+        if recording_kind_added:
+            self._backfill_legacy_vod_recording_kinds()
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS watermark_copies (
@@ -143,6 +170,26 @@ class StateStore:
             )
             """
         )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS post_processing_jobs (
+                job_id TEXT PRIMARY KEY,
+                video_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                segment_index INTEGER NOT NULL DEFAULT 1,
+                channel TEXT NOT NULL DEFAULT '',
+                media_path TEXT NOT NULL DEFAULT '',
+                chat_path TEXT NOT NULL DEFAULT '',
+                timing_path TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (video_id, kind, segment_index, media_path)
+            )
+            """
+        )
         self._ensure_watermark_progress_columns()
         self.conn.execute(
             """
@@ -154,6 +201,12 @@ class StateStore:
             """
             CREATE INDEX IF NOT EXISTS idx_watermark_copies_video_source
             ON watermark_copies (video_id, source_name, created_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_post_processing_status_created
+            ON post_processing_jobs (status, created_at, job_id)
             """
         )
         self.conn.commit()
@@ -171,6 +224,34 @@ class StateStore:
                 "ALTER TABLE streams "
                 "ADD COLUMN source TEXT NOT NULL DEFAULT ''"
             )
+
+    def _ensure_stream_recording_kind_column(self) -> bool:
+        rows = self.conn.execute("PRAGMA table_info(streams)").fetchall()
+        columns = {str(row[1]) for row in rows}
+        if "recording_kind" not in columns:
+            self.conn.execute(
+                "ALTER TABLE streams "
+                "ADD COLUMN recording_kind TEXT NOT NULL DEFAULT 'live'"
+            )
+            return True
+        return False
+
+    def _backfill_legacy_vod_recording_kinds(self) -> None:
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET recording_kind = 'vod'
+            WHERE EXISTS (
+                SELECT 1
+                FROM stream_events
+                WHERE stream_events.video_id = streams.video_id
+                  AND (
+                      stream_events.message LIKE '%VOD download%'
+                      OR stream_events.message IN ('Added VOD stream', 'Added manual VOD')
+                  )
+            )
+            """
+        )
 
     def _ensure_stream_video_format_columns(self) -> None:
         rows = self.conn.execute("PRAGMA table_info(streams)").fetchall()
@@ -240,32 +321,90 @@ class StateStore:
                 "ADD COLUMN progress REAL"
             )
 
-    def mark_stale_downloads_interrupted(self) -> None:
+    def reconcile_stale_downloads(self) -> None:
         now = utc_now()
-        rows = self.conn.execute(
+        file_operation_rows = self.conn.execute(
+            """
+            SELECT video_id, segment_index, status
+            FROM streams
+            WHERE status IN ('deleting', 'cleaning_fragments')
+            """
+        ).fetchall()
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET status = 'ended', updated_at = ?
+            WHERE status IN ('deleting', 'cleaning_fragments')
+            """,
+            (now,),
+        )
+        for row in file_operation_rows:
+            self._insert_stream_event(
+                row["video_id"],
+                f"Recovered interrupted file operation ({row['status']}) after service restart",
+                level="warning",
+                segment_index=int(row["segment_index"]),
+                created_at=now,
+            )
+        live_rows = self.conn.execute(
+            """
+            SELECT video_id, segment_index, status
+            FROM streams
+            WHERE recording_kind = 'live'
+              AND status IN ('downloading', 'waiting_retry')
+            """
+        ).fetchall()
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET status = 'checking_after_exit',
+                last_exit_at = COALESCE(last_exit_at, ?),
+                updated_at = ?
+            WHERE recording_kind = 'live'
+              AND status IN ('downloading', 'waiting_retry')
+            """,
+            (now, now),
+        )
+        for row in live_rows:
+            self._insert_stream_event(
+                row["video_id"],
+                (
+                    "Recovering active download after service restart"
+                    if str(row["status"]) == "downloading"
+                    else "Recovering pending download retry after service restart"
+                ),
+                level="warning",
+                segment_index=int(row["segment_index"]),
+                created_at=now,
+            )
+        vod_rows = self.conn.execute(
             """
             SELECT video_id, segment_index
             FROM streams
-            WHERE status = 'downloading'
+            WHERE recording_kind = 'vod' AND status = 'downloading'
             """
         ).fetchall()
         self.conn.execute(
             """
             UPDATE streams
             SET status = 'interrupted', updated_at = ?
-            WHERE status = 'downloading'
+            WHERE recording_kind = 'vod' AND status = 'downloading'
             """,
             (now,),
         )
-        for row in rows:
+        for row in vod_rows:
             self._insert_stream_event(
                 row["video_id"],
-                "Interrupted active download after service restart",
+                "Interrupted VOD download after service restart",
                 level="warning",
                 segment_index=int(row["segment_index"]),
                 created_at=now,
             )
         self.conn.commit()
+
+    def mark_stale_downloads_interrupted(self) -> None:
+        """Compatibility wrapper for callers using the old startup API."""
+        self.reconcile_stale_downloads()
 
     def mark_stale_watermarks_interrupted(self) -> None:
         now = utc_now()
@@ -292,8 +431,8 @@ class StateStore:
                 """
                 INSERT INTO streams (
                     video_id, title, channel, url, platform, source, status, segment_index,
-                    first_seen_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'detected', 1, ?, ?)
+                    first_seen_at, updated_at, recording_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, 'detected', 1, ?, ?, 'live')
                 """,
                 (
                     stream.video_id,
@@ -322,7 +461,8 @@ class StateStore:
             self.conn.execute(
                 """
                 UPDATE streams
-                SET title = ?, channel = ?, url = ?, platform = ?, source = ?, status = ?, updated_at = ?
+                SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
+                    status = ?, updated_at = ?, recording_kind = 'live'
                 WHERE video_id = ?
                 """,
                 (
@@ -404,10 +544,10 @@ class StateStore:
         )
         self.conn.commit()
 
-    def mark_downloading(self, stream: LiveStream, segment_index: int) -> None:
+    def mark_downloading(self, stream: LiveStream, segment_index: int) -> bool:
         now = utc_now()
         self.upsert_detected(stream)
-        self.conn.execute(
+        cursor = self.conn.execute(
             """
             UPDATE streams
             SET status = 'downloading',
@@ -416,9 +556,13 @@ class StateStore:
                 updated_at = ?,
                 exit_code = NULL
             WHERE video_id = ?
+              AND status NOT IN ('downloading', 'deleting', 'cleaning_fragments')
             """,
             (segment_index, now, now, stream.video_id),
         )
+        if not cursor.rowcount:
+            self.conn.commit()
+            return False
         self._insert_stream_event(
             stream.video_id,
             f"Started download segment={segment_index:03d}",
@@ -426,6 +570,28 @@ class StateStore:
             created_at=now,
         )
         self.conn.commit()
+        return True
+
+    def compare_and_set_stream_status(
+        self,
+        video_id: str,
+        *,
+        expected_status: str,
+        new_status: str,
+    ) -> bool:
+        """Atomically claim a stream lifecycle transition across DB connections."""
+
+        now = utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE streams
+            SET status = ?, updated_at = ?
+            WHERE video_id = ? AND status = ?
+            """,
+            (new_status, now, video_id, expected_status),
+        )
+        self.conn.commit()
+        return bool(cursor.rowcount)
 
     def lock_youtube_video_format(
         self,
@@ -524,8 +690,8 @@ class StateStore:
                 """
                 INSERT INTO streams (
                     video_id, title, channel, url, platform, source, status, segment_index,
-                    first_seen_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    first_seen_at, updated_at, recording_kind
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'vod')
                 """,
                 (
                     stream.video_id,
@@ -544,7 +710,7 @@ class StateStore:
                 """
                 UPDATE streams
                 SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
-                    status = ?, updated_at = ?
+                    status = ?, updated_at = ?, recording_kind = 'vod'
                 WHERE video_id = ?
                 """,
                 (
@@ -584,7 +750,7 @@ class StateStore:
             UPDATE streams
             SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
                 status = 'downloading', segment_index = 1, last_started_at = ?,
-                updated_at = ?, exit_code = NULL
+                updated_at = ?, exit_code = NULL, recording_kind = 'vod'
             WHERE video_id = ?
             """,
             (
@@ -825,7 +991,7 @@ class StateStore:
         row = self.conn.execute(
             """
             SELECT video_id, title, channel, url, status, segment_index,
-                   platform, source,
+                   platform, source, recording_kind,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
                    youtube_stale_media_sequence, youtube_stale_edge_at,
@@ -843,7 +1009,7 @@ class StateStore:
     def list_streams(self, limit: int | None = 100) -> list[StreamRecord]:
         query = """
             SELECT video_id, title, channel, url, status, segment_index,
-                   platform, source,
+                   platform, source, recording_kind,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
                    youtube_stale_media_sequence, youtube_stale_edge_at,
@@ -871,7 +1037,7 @@ class StateStore:
         placeholders = ", ".join("?" for _status in normalized)
         query = f"""
             SELECT video_id, title, channel, url, status, segment_index,
-                   platform, source,
+                   platform, source, recording_kind,
                    youtube_video_format_id, youtube_video_codec,
                    youtube_video_format_selector,
                    youtube_stale_media_sequence, youtube_stale_edge_at,
@@ -888,6 +1054,300 @@ class StateStore:
         rows = self.conn.execute(query, values).fetchall()
         return [_record_from_row(row) for row in rows]
 
+    def enqueue_post_processing_job(
+        self,
+        *,
+        video_id: str,
+        kind: str,
+        segment_index: int,
+        media_path: str | Path,
+        channel: str = "",
+        chat_path: str | Path = "",
+        timing_path: str | Path = "",
+        reset_terminal: bool = False,
+    ) -> PostProcessingJobRecord:
+        normalized_kind = kind.strip().casefold()
+        if normalized_kind not in POST_PROCESSING_KINDS:
+            raise ValueError(f"unsupported post-processing job kind: {kind}")
+        normalized_video_id = video_id.strip()
+        normalized_media_path = _path_text(media_path)
+        if not normalized_video_id or not normalized_media_path:
+            raise ValueError("video_id and media_path are required")
+        normalized_segment = max(1, int(segment_index))
+        identity = (
+            f"{normalized_video_id}\0{normalized_kind}\0"
+            f"{normalized_segment}\0{normalized_media_path}"
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        job_id = f"post-{normalized_kind}-{digest}"
+        now = utc_now()
+        self.conn.execute(
+            """
+            INSERT INTO post_processing_jobs (
+                job_id, video_id, kind, segment_index, channel,
+                media_path, chat_path, timing_path, status,
+                attempts, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, '', ?, ?)
+            ON CONFLICT (video_id, kind, segment_index, media_path) DO NOTHING
+            """,
+            (
+                job_id,
+                normalized_video_id,
+                normalized_kind,
+                normalized_segment,
+                channel.strip(),
+                normalized_media_path,
+                _path_text(chat_path),
+                _path_text(timing_path),
+                now,
+                now,
+            ),
+        )
+        if reset_terminal:
+            # A VOD redownload commonly reuses the same destination path and
+            # therefore the same durable identity. Treat terminal rows as a
+            # fresh processing request, while leaving work that is already
+            # pending or running alone.
+            self.conn.execute(
+                """
+                UPDATE post_processing_jobs
+                SET channel = ?, chat_path = ?, timing_path = ?,
+                    status = 'pending', attempts = 0, error = '', updated_at = ?
+                WHERE video_id = ? AND kind = ? AND segment_index = ?
+                  AND media_path = ? AND status IN ('done', 'failed')
+                """,
+                (
+                    channel.strip(),
+                    _path_text(chat_path),
+                    _path_text(timing_path),
+                    now,
+                    normalized_video_id,
+                    normalized_kind,
+                    normalized_segment,
+                    normalized_media_path,
+                ),
+            )
+        self.conn.commit()
+        row = self.conn.execute(
+            """
+            SELECT job_id, video_id, kind, segment_index, channel,
+                   media_path, chat_path, timing_path, status, attempts,
+                   error, created_at, updated_at
+            FROM post_processing_jobs
+            WHERE video_id = ? AND kind = ? AND segment_index = ? AND media_path = ?
+            """,
+            (
+                normalized_video_id,
+                normalized_kind,
+                normalized_segment,
+                normalized_media_path,
+            ),
+        ).fetchone()
+        assert row is not None
+        return _post_processing_record_from_row(row)
+
+    def get_post_processing_job(
+        self,
+        job_id: str,
+    ) -> PostProcessingJobRecord | None:
+        row = self.conn.execute(
+            """
+            SELECT job_id, video_id, kind, segment_index, channel,
+                   media_path, chat_path, timing_path, status, attempts,
+                   error, created_at, updated_at
+            FROM post_processing_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        return _post_processing_record_from_row(row) if row is not None else None
+
+    def list_post_processing_jobs(
+        self,
+        *,
+        video_id: str | None = None,
+        statuses: list[str] | None = None,
+        limit: int | None = 1000,
+    ) -> list[PostProcessingJobRecord]:
+        clauses: list[str] = []
+        values: list[str | int] = []
+        if video_id is not None:
+            clauses.append("video_id = ?")
+            values.append(video_id)
+        if statuses is not None:
+            normalized_statuses = [
+                status.strip().casefold()
+                for status in statuses
+                if status.strip().casefold() in POST_PROCESSING_STATUSES
+            ]
+            if not normalized_statuses:
+                return []
+            placeholders = ", ".join("?" for _status in normalized_statuses)
+            clauses.append(f"status IN ({placeholders})")
+            values.extend(normalized_statuses)
+        query = """
+            SELECT job_id, video_id, kind, segment_index, channel,
+                   media_path, chat_path, timing_path, status, attempts,
+                   error, created_at, updated_at
+            FROM post_processing_jobs
+        """
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY created_at, job_id"
+        if limit is not None:
+            query += " LIMIT ?"
+            values.append(max(0, int(limit)))
+        rows = self.conn.execute(query, values).fetchall()
+        return [_post_processing_record_from_row(row) for row in rows]
+
+    def requeue_incomplete_post_processing_jobs(self) -> int:
+        """Return crash-interrupted running jobs to the durable pending queue."""
+        now = utc_now()
+        cursor = self.conn.execute(
+            """
+            UPDATE post_processing_jobs
+            SET status = 'pending',
+                error = '',
+                updated_at = ?
+            WHERE status = 'running'
+            """,
+            (now,),
+        )
+        self.conn.commit()
+        return max(0, cursor.rowcount)
+
+    def mark_post_processing_job_running(self, job_id: str) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE post_processing_jobs
+            SET status = 'running', attempts = attempts + 1,
+                error = '', updated_at = ?
+            WHERE job_id = ? AND status = 'pending'
+            """,
+            (utc_now(), job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_post_processing_job_done(self, job_id: str) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE post_processing_jobs
+            SET status = 'done', error = '', updated_at = ?
+            WHERE job_id = ? AND status = 'running'
+            """,
+            (utc_now(), job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def mark_post_processing_job_failed(self, job_id: str, error: str) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE post_processing_jobs
+            SET status = 'failed', error = ?, updated_at = ?
+            WHERE job_id = ? AND status = 'running'
+            """,
+            (error.strip()[:2000], utc_now(), job_id),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def replace_pending_post_processing_media_path(
+        self,
+        *,
+        video_id: str,
+        segment_index: int,
+        old_path: str | Path,
+        new_path: str | Path,
+    ) -> int:
+        normalized_segment = max(1, int(segment_index))
+        normalized_old_path = _path_text(old_path)
+        normalized_new_path = _path_text(new_path)
+        if normalized_old_path == normalized_new_path:
+            return 0
+
+        changed = 0
+        now = utc_now()
+        with self.conn:
+            rows = self.conn.execute(
+                """
+                SELECT job_id, kind, channel, chat_path, timing_path
+                FROM post_processing_jobs
+                WHERE video_id = ? AND segment_index = ?
+                  AND media_path = ? AND status = 'pending'
+                """,
+                (video_id, normalized_segment, normalized_old_path),
+            ).fetchall()
+            for row in rows:
+                existing = self.conn.execute(
+                    """
+                    SELECT job_id, status
+                    FROM post_processing_jobs
+                    WHERE video_id = ? AND kind = ? AND segment_index = ?
+                      AND media_path = ?
+                    """,
+                    (
+                        video_id,
+                        str(row[1]),
+                        normalized_segment,
+                        normalized_new_path,
+                    ),
+                ).fetchone()
+                if existing is None:
+                    self.conn.execute(
+                        """
+                        UPDATE post_processing_jobs
+                        SET media_path = ?, updated_at = ?
+                        WHERE job_id = ? AND status = 'pending'
+                        """,
+                        (normalized_new_path, now, str(row[0])),
+                    )
+                else:
+                    # The repaired-path identity may already exist after a
+                    # restart or re-download. Merge the current pending work
+                    # into it instead of violating the unique constraint.
+                    existing_status = str(existing[1])
+                    if existing_status in {"done", "failed"}:
+                        self.conn.execute(
+                            """
+                            UPDATE post_processing_jobs
+                            SET channel = ?, chat_path = ?, timing_path = ?,
+                                status = 'pending', attempts = 0, error = '',
+                                updated_at = ?
+                            WHERE job_id = ?
+                            """,
+                            (
+                                str(row[2]),
+                                str(row[3]),
+                                str(row[4]),
+                                now,
+                                str(existing[0]),
+                            ),
+                        )
+                    elif existing_status == "pending":
+                        self.conn.execute(
+                            """
+                            UPDATE post_processing_jobs
+                            SET channel = ?, chat_path = ?, timing_path = ?,
+                                updated_at = ?
+                            WHERE job_id = ?
+                            """,
+                            (
+                                str(row[2]),
+                                str(row[3]),
+                                str(row[4]),
+                                now,
+                                str(existing[0]),
+                            ),
+                        )
+                    self.conn.execute(
+                        "DELETE FROM post_processing_jobs WHERE job_id = ?",
+                        (str(row[0]),),
+                    )
+                changed += 1
+        return changed
+
     def delete_stream(self, video_id: str) -> bool:
         cursor = self.conn.execute(
             "DELETE FROM streams WHERE video_id = ?",
@@ -900,6 +1360,10 @@ class StateStore:
             )
             self.conn.execute(
                 "DELETE FROM watermark_copies WHERE video_id = ?",
+                (video_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM post_processing_jobs WHERE video_id = ?",
                 (video_id,),
             )
         self.conn.commit()
@@ -1059,3 +1523,15 @@ def _event_record_from_row(row: sqlite3.Row) -> StreamEventRecord:
 def _watermark_record_from_row(row: sqlite3.Row) -> WatermarkCopyRecord:
     values: dict[str, Any] = dict(row)
     return WatermarkCopyRecord(**values)
+
+
+def _post_processing_record_from_row(
+    row: sqlite3.Row,
+) -> PostProcessingJobRecord:
+    values: dict[str, Any] = dict(row)
+    return PostProcessingJobRecord(**values)
+
+
+def _path_text(value: str | Path) -> str:
+    text = str(value).strip()
+    return text if text and text != "." else ""

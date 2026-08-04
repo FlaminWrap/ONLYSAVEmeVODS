@@ -5,7 +5,7 @@ from tempfile import TemporaryDirectory
 import json
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from onlysavemevods.chat_render import (
     ASS_CHAT_TEXT_COLOR,
@@ -350,6 +350,20 @@ class ChatRenderTests(unittest.TestCase):
         self.assertTrue(logger.infos)
         self.assertTrue(logger.warnings)
         self.assertIn("Chat ends", str(logger.warnings[0][0]))
+
+    def test_chat_media_sync_diagnostics_warn_when_chat_exceeds_media(self) -> None:
+        logger = MagicMock()
+
+        log_chat_media_sync_diagnostics(
+            [ChatEntry(offset_seconds=140.0, author="Alice", message="late")],
+            100.0,
+            media_file=Path("/tmp/live.mp4"),
+            chat_file=Path("/tmp/live.live_chat.json"),
+            logger=logger,
+        )
+
+        warnings = "\n".join(str(call.args[0]) for call in logger.warning.call_args_list)
+        self.assertIn("Chat extends", warnings)
 
     def test_render_chat_ass_places_messages_in_right_panel(self) -> None:
         layout = chat_layout_for_video(1280, 720)
@@ -723,6 +737,7 @@ class ChatRenderTests(unittest.TestCase):
             concat_file = Path(command[command.index("-i") + 1])
             captured["concat"] = concat_file.read_text(encoding="utf-8")
             captured["command"] = command
+            captured["timeout"] = kwargs.get("timeout")
             Path(command[-1]).write_bytes(b"panel video")
 
             class Result:
@@ -750,6 +765,7 @@ class ChatRenderTests(unittest.TestCase):
                     output_file,
                     duration_seconds=2.0,
                     panel_workers=2,
+                    timeout_seconds=12.0,
                 )
 
             concat = str(captured["concat"])
@@ -758,6 +774,7 @@ class ChatRenderTests(unittest.TestCase):
             command = captured["command"]
             assert isinstance(command, list)
             self.assertEqual(command[command.index("-r") + 1], str(DEFAULT_CHAT_RENDER_FPS))
+            self.assertEqual(captured["timeout"], 12.0)
             self.assertEqual(output_file.read_bytes(), b"panel video")
 
     def test_panel_emoji_uses_fixed_30px_size(self) -> None:

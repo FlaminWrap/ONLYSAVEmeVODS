@@ -13,6 +13,7 @@ DENO_INSTALL_DIR="${INSTALL_DIR}/.deno"
 CACHE_DIR="${INSTALL_DIR}/.cache"
 DOWNLOAD_DIR="${INSTALL_DIR}/downloads"
 STATE_DIR="${INSTALL_DIR}/state"
+APP_UPDATE_STATE_DIR="${INSTALL_DIR}/state"
 CONFIG_FILE="${INSTALL_DIR}/config.toml"
 SECRETS_FILE="${INSTALL_DIR}/secrets.env"
 SERVICE_NAME="onlysavemevods.service"
@@ -27,6 +28,7 @@ APP_UPDATE_TIMER_NAME="onlysavemevods-app-update.timer"
 APP_UPDATE_SERVICE_UNIT="/etc/systemd/system/${APP_UPDATE_SERVICE_NAME}"
 APP_UPDATE_PATH_UNIT="/etc/systemd/system/${APP_UPDATE_PATH_NAME}"
 APP_UPDATE_TIMER_UNIT="/etc/systemd/system/${APP_UPDATE_TIMER_NAME}"
+UPDATE_LOCK_FILE="${ONLYSAVEMEVODS_UPDATE_LOCK_FILE:-${INSTALL_DIR}/.update.lock}"
 SERVICE_USER="${ONLYSAVEMEVODS_USER:-onlysavemevods}"
 PYTHON_BIN="${PYTHON:-}"
 SKIP_OS_DEPS="${ONLYSAVEMEVODS_SKIP_OS_DEPS:-0}"
@@ -40,7 +42,18 @@ PYTHON_UPDATE_CALENDAR="${ONLYSAVEMEVODS_PYTHON_UPDATE_CALENDAR:-*-*-* 04:15:00}
 PYTHON_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY:-45m}"
 APP_UPDATE_CALENDAR="${ONLYSAVEMEVODS_APP_UPDATE_CALENDAR:-*-*-* 05:15:00}"
 APP_UPDATE_RANDOM_DELAY="${ONLYSAVEMEVODS_APP_UPDATE_RANDOM_DELAY:-45m}"
+# This root-owned systemd policy is the install ceiling. Dashboard/web config may
+# narrow behavior or create a trigger, but it cannot change the trusted source.
+TRUSTED_APP_UPDATE_REPOSITORY="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY:-FlaminWrap/ONLYSAVEmeVODS}"
+TRUSTED_APP_UPDATE_MODE="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE:-manual}"
+TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES:-false}"
+TRUSTED_APP_UPDATE_TOKEN_ENV="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_TOKEN_ENV:-GITHUB_TOKEN}"
 APT_UPDATED=0
+SERVICE_WAS_ACTIVE=0
+SERVICE_RESTARTED=0
+UPDATE_LOCK_HELD=0
+DISPLACED_APP_DIR=""
+APP_ROLLBACK_FAILED=0
 
 die() {
   echo "$*" >&2
@@ -53,6 +66,26 @@ cleanup_staged_source() {
   fi
 }
 
+installer_cleanup() {
+  local exit_code=$?
+  if [[ "${exit_code}" -ne 0 && -n "${DISPLACED_APP_DIR}" ]]; then
+    if ! rollback_application_files; then
+      APP_ROLLBACK_FAILED=1
+      echo "Automatic application rollback failed; inspect ${APP_DIR} and ${DISPLACED_APP_DIR} before restarting the service." >&2
+    fi
+  fi
+  cleanup_staged_source
+  if [[ \
+    "${SERVICE_WAS_ACTIVE}" == "1" \
+    && "${SERVICE_RESTARTED}" == "0" \
+    && "${APP_ROLLBACK_FAILED}" == "0" \
+  ]]; then
+    echo "Restarting ${SERVICE_NAME} after installer exit..." >&2
+    sudo systemctl start "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  fi
+  return "${exit_code}"
+}
+
 stage_source_if_inside_install_tree() {
   case "${ROOT_DIR}/" in
     "${INSTALL_DIR}/"*)
@@ -61,9 +94,56 @@ stage_source_if_inside_install_tree() {
       cp -a "${ROOT_DIR}/." "${STAGED_ROOT_DIR}/"
       ROOT_DIR="${STAGED_ROOT_DIR}"
       SCRIPT_DIR="${ROOT_DIR}/scripts"
-      trap cleanup_staged_source EXIT
       ;;
   esac
+}
+
+source_is_inside_install_tree() {
+  case "${ROOT_DIR}/" in
+    "${INSTALL_DIR}/"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_flock_available() {
+  if command -v flock >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Installing util-linux for safe installer serialization..."
+  if command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y util-linux
+  elif command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    APT_UPDATED=1
+    sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y util-linux
+  else
+    die "flock is required; install util-linux and rerun the installer."
+  fi
+  command -v flock >/dev/null 2>&1 || die "util-linux installed but flock is still unavailable."
+}
+
+take_update_lock() {
+  if [[ "${UPDATE_LOCK_HELD}" == "1" ]]; then
+    return 0
+  fi
+  command -v flock >/dev/null 2>&1 || die "flock is required for safe installer serialization."
+  sudo install -d -m 0755 "${INSTALL_DIR}"
+  sudo touch "${UPDATE_LOCK_FILE}"
+  sudo chown root:root "${UPDATE_LOCK_FILE}"
+  sudo chmod 0644 "${UPDATE_LOCK_FILE}"
+  exec 9<"${UPDATE_LOCK_FILE}"
+  flock -w 300 9 || die "Timed out waiting for another installer or updater to finish."
+  UPDATE_LOCK_HELD=1
+}
+
+stop_services_for_upgrade() {
+  if sudo systemctl is-active --quiet "${SERVICE_NAME}"; then
+    SERVICE_WAS_ACTIVE=1
+    echo "Stopping ${SERVICE_NAME} before replacing application or venv files..."
+    sudo systemctl stop "${SERVICE_NAME}"
+  fi
+  sudo systemctl stop "${APP_UPDATE_SERVICE_NAME}" >/dev/null 2>&1 || true
+  sudo systemctl stop "${PYTHON_UPDATE_SERVICE_NAME}" >/dev/null 2>&1 || true
 }
 
 script_has_missing_shebang_interpreter() {
@@ -162,10 +242,12 @@ ensure_service_user() {
 
 install_application_files() {
   local service_group
+  local staged_app
+  local displaced_app
   service_group="$(id -gn "${SERVICE_USER}")"
 
   echo "Installing application files to ${APP_DIR}..."
-  sudo install -d -m 0755 "${INSTALL_DIR}" "${APP_DIR}"
+  sudo install -d -m 0755 "${INSTALL_DIR}"
   sudo install -d -m 0750 -o "${SERVICE_USER}" -g "${service_group}" \
     "${CACHE_DIR}" \
     "${CACHE_DIR}/matplotlib" \
@@ -173,30 +255,103 @@ install_application_files() {
     "${DOWNLOAD_DIR}" \
     "${STATE_DIR}"
 
-  sudo rm -rf \
-    "${APP_DIR}/src" \
-    "${APP_DIR}/scripts" \
-    "${APP_DIR}/tests" \
-    "${APP_DIR}/pyproject.toml" \
-    "${APP_DIR}/README.md" \
-    "${APP_DIR}/config.example.toml"
-
-  sudo cp -a \
+  staged_app="$(sudo mktemp -d "${INSTALL_DIR}/.app-install-stage.XXXXXXXX")"
+  if ! sudo cp -a \
     "${ROOT_DIR}/pyproject.toml" \
     "${ROOT_DIR}/README.md" \
+    "${ROOT_DIR}/LICENSE" \
     "${ROOT_DIR}/config.example.toml" \
     "${ROOT_DIR}/src" \
     "${ROOT_DIR}/scripts" \
     "${ROOT_DIR}/tests" \
-    "${APP_DIR}/"
-
-  sudo chown -R root:root "${APP_DIR}"
-  sudo chmod -R go-w "${APP_DIR}"
-  if [[ -f "${APP_DIR}/scripts/update-python-deps.sh" ]]; then
-    sudo chmod 0755 "${APP_DIR}/scripts/update-python-deps.sh"
+    "${staged_app}/"; then
+    sudo rm -rf "${staged_app}"
+    die "Unable to stage application files; the live application was not changed."
   fi
-  if [[ -f "${APP_DIR}/scripts/app-update.sh" ]]; then
-    sudo chmod 0755 "${APP_DIR}/scripts/app-update.sh"
+
+  sudo chown -R root:root "${staged_app}"
+  # mktemp creates the staging root as 0700. The final service runs as an
+  # unprivileged account and must be able to traverse the app tree after the
+  # atomic rename.
+  sudo chmod -R a+rX "${staged_app}"
+  sudo chmod -R go-w "${staged_app}"
+  if command -v restorecon >/dev/null 2>&1; then
+    sudo restorecon -RF "${staged_app}" >/dev/null 2>&1 || true
+  fi
+  if [[ -f "${staged_app}/scripts/update-python-deps.sh" ]]; then
+    sudo chmod 0755 "${staged_app}/scripts/update-python-deps.sh"
+  fi
+  if [[ -f "${staged_app}/scripts/app-update.sh" ]]; then
+    sudo chmod 0755 "${staged_app}/scripts/app-update.sh"
+  fi
+
+  if [[ -e "${APP_DIR}" ]]; then
+    displaced_app="$(sudo mktemp -d "${INSTALL_DIR}/.app-install-old.XXXXXXXX")"
+    sudo rmdir "${displaced_app}"
+    sudo mv "${APP_DIR}" "${displaced_app}"
+    if ! sudo mv "${staged_app}" "${APP_DIR}"; then
+      if ! sudo mv "${displaced_app}" "${APP_DIR}"; then
+        die "Unable to activate staged application files and automatic restoration failed; previous files remain at ${displaced_app}."
+      fi
+      sudo rm -rf "${staged_app}"
+      die "Unable to activate staged application files; restored the previous application."
+    fi
+    DISPLACED_APP_DIR="${displaced_app}"
+  else
+    sudo mv "${staged_app}" "${APP_DIR}"
+  fi
+  if command -v restorecon >/dev/null 2>&1; then
+    sudo restorecon -RF "${APP_DIR}" >/dev/null 2>&1 || true
+  fi
+}
+
+rollback_application_files() {
+  local failed_app=""
+
+  if [[ -z "${DISPLACED_APP_DIR}" || ! -e "${DISPLACED_APP_DIR}" ]]; then
+    return 0
+  fi
+
+  echo "Restoring the previous application after installer failure..." >&2
+  if sudo systemctl is-active --quiet "${SERVICE_NAME}"; then
+    if ! sudo systemctl stop "${SERVICE_NAME}"; then
+      echo "Unable to stop ${SERVICE_NAME}; leaving both application trees untouched." >&2
+      return 1
+    fi
+  fi
+  SERVICE_RESTARTED=0
+
+  if [[ -e "${APP_DIR}" ]]; then
+    if ! failed_app="$(sudo mktemp -d "${INSTALL_DIR}/.app-install-failed.XXXXXXXX")"; then
+      echo "Unable to reserve a rollback path; leaving the active app untouched." >&2
+      return 1
+    fi
+    if ! sudo rmdir "${failed_app}" || ! sudo mv "${APP_DIR}" "${failed_app}"; then
+      echo "Unable to move the failed application aside; previous app remains at ${DISPLACED_APP_DIR}." >&2
+      return 1
+    fi
+  fi
+
+  if ! sudo mv "${DISPLACED_APP_DIR}" "${APP_DIR}"; then
+    echo "Unable to restore the previous app from ${DISPLACED_APP_DIR}." >&2
+    if [[ -n "${failed_app}" && ! -e "${APP_DIR}" ]]; then
+      sudo mv "${failed_app}" "${APP_DIR}" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
+  DISPLACED_APP_DIR=""
+  if [[ -n "${failed_app}" ]]; then
+    sudo rm -rf "${failed_app}" || true
+  fi
+  echo "Previous application restored at ${APP_DIR}." >&2
+}
+
+commit_application_files() {
+  local completed_backup="${DISPLACED_APP_DIR}"
+  DISPLACED_APP_DIR=""
+  if [[ -n "${completed_backup}" ]] && ! sudo rm -rf "${completed_backup}"; then
+    echo "Warning: install succeeded but old app backup cleanup failed: ${completed_backup}" >&2
   fi
 }
 
@@ -483,7 +638,7 @@ install_dnf_os_dependencies() {
   fi
 
   echo "Installing OS dependencies with dnf..."
-  sudo dnf install -y systemd curl ca-certificates unzip dejavu-sans-fonts
+  sudo dnf install -y systemd curl ca-certificates unzip util-linux dejavu-sans-fonts
 
   if ! find_python; then
     if try_dnf_install python3.13 python3.13-pip; then
@@ -561,7 +716,7 @@ install_apt_os_dependencies() {
   fi
 
   echo "Installing OS dependencies with apt..."
-  apt_install systemd curl ca-certificates unzip fonts-dejavu-core
+  apt_install systemd curl ca-certificates unzip util-linux fonts-dejavu-core
 
   if ! ensure_apt_python_with_venv; then
     echo "WARNING: Could not install or find Python 3.11+ with venv support via apt" >&2
@@ -849,6 +1004,8 @@ install_app_update_units() {
 Description=ONLYSAVEmeVODS GitHub Release app updater
 Wants=network-online.target
 After=network-online.target
+StartLimitIntervalSec=15min
+StartLimitBurst=3
 ConditionPathExists=${VENV_DIR}/bin/python
 ConditionPathExists=${APP_DIR}/scripts/app-update.sh
 
@@ -859,6 +1016,12 @@ Environment="ONLYSAVEMEVODS_APP_DIR=${APP_DIR}"
 Environment="ONLYSAVEMEVODS_VENV_DIR=${VENV_DIR}"
 Environment="ONLYSAVEMEVODS_CONFIG_FILE=${CONFIG_FILE}"
 Environment="ONLYSAVEMEVODS_SERVICE_NAME=${SERVICE_NAME}"
+Environment="ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR=${APP_UPDATE_STATE_DIR}"
+Environment="ONLYSAVEMEVODS_UPDATE_LOCK_FILE=${UPDATE_LOCK_FILE}"
+Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY=${TRUSTED_APP_UPDATE_REPOSITORY}"
+Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE=${TRUSTED_APP_UPDATE_MODE}"
+Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES=${TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES}"
+Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_TOKEN_ENV=${TRUSTED_APP_UPDATE_TOKEN_ENV}"
 EnvironmentFile=${SECRETS_FILE}
 ExecStart=/usr/bin/env bash ${APP_DIR}/scripts/app-update.sh
 
@@ -869,7 +1032,7 @@ EOF
 Description=Watch for ONLYSAVEmeVODS app update requests
 
 [Path]
-PathExists=${STATE_DIR}/app-update-request.json
+PathExists=${APP_UPDATE_STATE_DIR}/app-update-request.json
 Unit=${APP_UPDATE_SERVICE_NAME}
 
 [Install]
@@ -896,6 +1059,11 @@ EOF
   sudo chmod 0644 "${APP_UPDATE_SERVICE_UNIT}" "${APP_UPDATE_PATH_UNIT}" "${APP_UPDATE_TIMER_UNIT}"
 }
 
+main() {
+ensure_flock_available
+if source_is_inside_install_tree; then
+  take_update_lock
+fi
 stage_source_if_inside_install_tree
 install_os_dependencies
 
@@ -907,6 +1075,8 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   die "ffmpeg is required but was not found. Rerun without ONLYSAVEMEVODS_SKIP_OS_DEPS=1 so the installer can install it with dnf/apt, or install FFmpeg manually."
 fi
 
+take_update_lock
+stop_services_for_upgrade
 install_deno_runtime
 ensure_service_user
 install_application_files
@@ -965,6 +1135,7 @@ Environment=DENO_DIR=${CACHE_DIR}/deno
 Environment=MPLCONFIGDIR=${CACHE_DIR}/matplotlib
 Environment=NLTK_DATA=${CACHE_DIR}/nltk_data
 Environment=PATH=${VENV_DIR}/bin:${DENO_INSTALL_DIR}/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin
+Environment="ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR=${APP_UPDATE_STATE_DIR}"
 EnvironmentFile=${SECRETS_FILE}
 ExecStart=${VENV_DIR}/bin/onlysavemevods run --config ${CONFIG_FILE}
 Restart=always
@@ -986,6 +1157,7 @@ install_app_update_units
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}" --now
 sudo systemctl restart "${SERVICE_NAME}"
+SERVICE_RESTARTED=1
 if python_updater_enabled; then
   sudo systemctl enable "${PYTHON_UPDATE_TIMER_NAME}" --now
 fi
@@ -1001,5 +1173,13 @@ else
   echo "Python updater: disabled"
 fi
 echo "App updater: ${APP_UPDATE_TIMER_NAME} (${APP_UPDATE_CALENDAR}, randomized delay ${APP_UPDATE_RANDOM_DELAY})"
+echo "Privileged app update policy: ${TRUSTED_APP_UPDATE_MODE} from ${TRUSTED_APP_UPDATE_REPOSITORY} (root-owned ceiling)"
 echo "Status: sudo systemctl status ${SERVICE_NAME}"
 echo "Logs:   journalctl -u ${SERVICE_NAME} -f"
+commit_application_files
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  trap installer_cleanup EXIT
+  main "$@"
+fi

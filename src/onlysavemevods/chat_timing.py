@@ -8,6 +8,14 @@ import json
 
 
 CHAT_TIMING_SUFFIX = ".timing.json"
+CHAT_TIMING_FIRST_WRITE_FIELDS = frozenset(
+    {
+        "stream_started_at",
+        "media_started_at",
+        "chat_started_at",
+        "media_live_from_start",
+    }
+)
 YOUTUBE_START_TIMESTAMP_KEYS = (
     "actual_start_timestamp",
     "live_start_timestamp",
@@ -89,7 +97,17 @@ def write_chat_timing(path: Path, timing: ChatTiming) -> None:
 def update_chat_timing(path: Path, **changes: Any) -> ChatTiming:
     existing = read_chat_timing(path)
     payload = asdict(existing) if existing is not None else {}
-    payload.update(changes)
+    for key, value in changes.items():
+        existing_value = payload.get(key)
+        if (
+            existing is not None
+            and key in CHAT_TIMING_FIRST_WRITE_FIELDS
+            and existing_value is not None
+        ):
+            continue
+        if value is None and existing_value is not None:
+            continue
+        payload[key] = value
     payload["updated_at"] = utc_now_iso()
     timing = ChatTiming(
         video_id=str(payload.get("video_id") or ""),
@@ -125,7 +143,10 @@ def iso_timestamp_to_us(value: str | None) -> int | None:
         return None
     try:
         normalized = value.replace("Z", "+00:00")
-        return round(datetime.fromisoformat(normalized).timestamp() * 1_000_000)
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return round(parsed.timestamp() * 1_000_000)
     except ValueError:
         return None
 

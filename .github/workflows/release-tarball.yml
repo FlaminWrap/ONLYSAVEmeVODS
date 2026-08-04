@@ -12,20 +12,56 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
+  verify-source:
+    name: Verify release source
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag_name }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Run source checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --editable .
+          python -m unittest discover -s tests -v
+          python -m compileall -q src tests
+          node --check src/onlysavemevods/assets/dashboard.js
+          for script in scripts/*.sh; do
+            bash -n "$script"
+          done
+
   release-tarball:
     name: Build install bundle
+    needs: verify-source
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag_name }}
 
     steps:
       - name: Check out release tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag_name }}
+          persist-credentials: false
 
       - name: Build install bundle
         shell: bash
@@ -185,11 +221,25 @@ jobs:
           (cd dist && sha256sum -c "${bundle}.tar.gz.sha256")
           tmp_pyproject="$(mktemp)"
           tmp_init="$(mktemp)"
-          trap 'rm -f "${tmp_pyproject}" "${tmp_init}"' EXIT
+          extract_dir="$(mktemp -d)"
+          trap 'rm -f "${tmp_pyproject}" "${tmp_init}"; rm -rf "${extract_dir}"' EXIT
           tar -xOf "${archive}" "${bundle}/pyproject.toml" > "${tmp_pyproject}"
           tar -xOf "${archive}" "${bundle}/src/onlysavemevods/__init__.py" > "${tmp_init}"
           grep -Fxq "version = \"${PACKAGE_VERSION}\"" "${tmp_pyproject}"
           grep -Fxq "_FALLBACK_VERSION = \"${PACKAGE_VERSION}\"" "${tmp_init}"
+
+          tar -xzf "${archive}" -C "${extract_dir}"
+          python -m compileall -q "${extract_dir}/${bundle}/src"
+          PYTHONPATH="${extract_dir}/${bundle}/src" python - "${PACKAGE_VERSION}" <<'PY'
+          import sys
+
+          from onlysavemevods import _FALLBACK_VERSION
+
+          if _FALLBACK_VERSION != sys.argv[1]:
+              raise SystemExit(
+                  f"Extracted package version {_FALLBACK_VERSION!r} does not match {sys.argv[1]!r}"
+              )
+          PY
 
       - name: Upload release assets
         uses: softprops/action-gh-release@v2

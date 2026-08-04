@@ -1,6 +1,9 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
+import io
 import json
+import subprocess
 import sys
 import unittest
 
@@ -11,9 +14,11 @@ from onlysavemevods.config import (
     StreamEventRuleConfig,
 )
 from onlysavemevods.content_events import (
+    CONTENT_EVENT_SAMPLE_RATE,
     content_event_file,
     detect_content_events_for_media,
     effective_content_event_settings,
+    iter_audio_windows,
     load_content_events,
 )
 
@@ -44,6 +49,41 @@ def write_fake_ffmpeg(root: Path, *, amplitude: float = 0.5, samples: int = 32_0
 
 
 class ContentEventDetectionTests(unittest.TestCase):
+    def test_audio_window_generator_terminates_ffmpeg_when_consumer_stops(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = io.BytesIO(b"\0" * (CONTENT_EVENT_SAMPLE_RATE * 4))
+                self.returncode = None
+                self.terminated = False
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self) -> None:
+                self.returncode = -9
+
+            def wait(self, timeout=None):
+                return self.returncode or 0
+
+        process = FakeProcess()
+        captured_stderr = []
+
+        def fake_popen(*_args, **kwargs):
+            captured_stderr.append(kwargs["stderr"])
+            return process
+
+        with patch("onlysavemevods.content_events.subprocess.Popen", fake_popen):
+            windows = iter_audio_windows("ffmpeg", Path("media.mp4"), 1.0, 1.0)
+            next(windows)
+            windows.close()
+
+        self.assertTrue(process.terminated)
+        self.assertIsNot(captured_stderr[0], subprocess.PIPE)
+
     def test_fake_classifier_detects_label_event_and_writes_sidecar(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

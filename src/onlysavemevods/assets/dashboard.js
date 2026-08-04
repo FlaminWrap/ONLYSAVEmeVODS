@@ -6,9 +6,13 @@
   const navigation = document.querySelector(".app-sidebar");
   const navigationButton = document.querySelector("[data-open-navigation]");
   const closeNavigationButtons = document.querySelectorAll("[data-close-navigation]");
+  const mobileNavigation = window.matchMedia("(max-width: 820px)");
   let lastNavigationFocus = null;
   let mutationQueue = Promise.resolve();
   const autosaveTimers = new WeakMap();
+  const autosaveVersions = new WeakMap();
+  const fragmentRequests = new WeakMap();
+  let autosaveFormSequence = 0;
 
   const escapeHtml = (value) => String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -23,23 +27,35 @@
     saveStatus.innerHTML = `${escapeHtml(message)}${actions}`;
   };
 
+  const syncNavigationAccessibility = () => {
+    if (!navigation) return;
+    const closedOnMobile = mobileNavigation.matches && !body.classList.contains("navigation-open");
+    navigation.toggleAttribute("inert", closedOnMobile);
+    if (closedOnMobile) navigation.setAttribute("aria-hidden", "true");
+    else navigation.removeAttribute("aria-hidden");
+  };
+
   const openNavigation = () => {
     lastNavigationFocus = document.activeElement;
     body.classList.add("navigation-open");
     navigationButton?.setAttribute("aria-expanded", "true");
+    syncNavigationAccessibility();
     navigation?.querySelector("a")?.focus();
   };
 
   const closeNavigation = () => {
     body.classList.remove("navigation-open");
     navigationButton?.setAttribute("aria-expanded", "false");
+    syncNavigationAccessibility();
     if (lastNavigationFocus instanceof HTMLElement) lastNavigationFocus.focus();
   };
 
+  syncNavigationAccessibility();
+  mobileNavigation.addEventListener?.("change", syncNavigationAccessibility);
   navigationButton?.addEventListener("click", openNavigation);
   closeNavigationButtons.forEach((button) => button.addEventListener("click", closeNavigation));
   navigation?.querySelectorAll("a").forEach((link) => link.addEventListener("click", () => {
-    if (window.matchMedia("(max-width: 820px)").matches) closeNavigation();
+    if (mobileNavigation.matches) closeNavigation();
   }));
   document.addEventListener("keydown", (event) => {
     if (!body.classList.contains("navigation-open")) return;
@@ -118,10 +134,21 @@
     return ` <button class="button small secondary" type="button" data-reload-page>Reload</button><button class="button small secondary" type="button" data-reapply-form="${escapeHtml(formId)}">Reapply</button>`;
   };
 
+  const ensureAutosaveForm = (form) => {
+    if (!form.id) {
+      autosaveFormSequence += 1;
+      form.id = `autosave-form-${autosaveFormSequence}`;
+    }
+    if (!autosaveVersions.has(form)) autosaveVersions.set(form, 0);
+    return form;
+  };
+
   const saveAutosaveForm = async (form, { force = false } = {}) => {
     if (!(form instanceof HTMLFormElement)) return;
+    ensureAutosaveForm(form);
     if (!force && form.dataset.dirty !== "true") return;
     clearTimeout(autosaveTimers.get(form));
+    const saveVersion = autosaveVersions.get(form) || 0;
     form.dataset.saving = "true";
     setSaveStatus("Saving…", "saving");
     clearFieldErrors(form);
@@ -173,8 +200,13 @@
       return;
     }
 
-    form.dataset.dirty = "false";
     if (result.revision) body.dataset.configRevision = result.revision;
+    const hasNewerChanges = (autosaveVersions.get(form) || 0) !== saveVersion;
+    form.dataset.dirty = hasNewerChanges ? "true" : "false";
+    if (hasNewerChanges) {
+      setSaveStatus("Unsaved changes", "");
+      return;
+    }
     const restart = Array.isArray(result.restart_required) && result.restart_required.length;
     setSaveStatus(restart ? "Saved · restart required" : "Saved", restart ? "warning" : "saved");
     window.setTimeout(() => {
@@ -188,6 +220,8 @@
   };
 
   const markAutosaveDirty = (form, immediate = false) => {
+    ensureAutosaveForm(form);
+    autosaveVersions.set(form, (autosaveVersions.get(form) || 0) + 1);
     form.dataset.dirty = "true";
     setSaveStatus("Unsaved changes", "");
     clearTimeout(autosaveTimers.get(form));
@@ -214,40 +248,45 @@
     });
   };
 
-  document.querySelectorAll("form[data-autosave]").forEach((form, index) => {
-    if (!form.id) form.id = `autosave-form-${index + 1}`;
-    form.addEventListener("submit", (event) => {
-      event.preventDefault();
-      markAutosaveDirty(form, true);
-    });
-    form.addEventListener("input", (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
-      if (["checkbox", "radio"].includes(target.type)) return;
-      markAutosaveDirty(form, false);
-    });
-    form.addEventListener("change", (event) => {
-      const target = event.target;
-      if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement)) return;
-      if (target instanceof HTMLInputElement && target.type === "checkbox") {
-        const stateLabel = target.closest(".switch-field")?.querySelector(":scope > span");
-        if (stateLabel) stateLabel.textContent = target.checked ? "Enabled" : "Disabled";
-        if (target.name === "powerchat_enabled") {
-          const status = form.closest(".powerchat-listener-card")?.querySelector("[data-powerchat-listener-status]");
-          if (status) {
-            status.textContent = target.checked ? "Listening" : "Not enabled";
-            status.classList.toggle("good", target.checked);
-            status.classList.toggle("warning", !target.checked);
-          }
+  document.querySelectorAll("form[data-autosave]").forEach(ensureAutosaveForm);
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !form.matches("form[data-autosave]")) return;
+    event.preventDefault();
+    markAutosaveDirty(form, true);
+  });
+  document.addEventListener("input", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement)) return;
+    if (["checkbox", "radio"].includes(target.type)) return;
+    const form = target.closest("form[data-autosave]");
+    if (form) markAutosaveDirty(form, false);
+  });
+  document.addEventListener("change", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLInputElement || target instanceof HTMLSelectElement || target instanceof HTMLTextAreaElement)) return;
+    const form = target.closest("form[data-autosave]");
+    if (!form) return;
+    if (target instanceof HTMLInputElement && target.type === "checkbox") {
+      const stateLabel = target.closest(".switch-field")?.querySelector(":scope > span");
+      if (stateLabel) stateLabel.textContent = target.checked ? "Enabled" : "Disabled";
+      if (target.name === "powerchat_enabled") {
+        const status = form.closest(".powerchat-listener-card")?.querySelector("[data-powerchat-listener-status]");
+        if (status) {
+          status.textContent = target.checked ? "Listening" : "Not enabled";
+          status.classList.toggle("good", target.checked);
+          status.classList.toggle("warning", !target.checked);
         }
       }
-      if (target.matches("[data-post-stream-select]")) updatePostStreamStatuses(form);
-      markAutosaveDirty(form, ["checkbox", "radio"].includes(target.type) || target instanceof HTMLSelectElement);
-    });
-    form.addEventListener("focusout", (event) => {
-      const target = event.target;
-      if (target instanceof HTMLElement && target.hasAttribute("name") && form.dataset.dirty === "true") markAutosaveDirty(form, true);
-    });
+    }
+    if (target.matches("[data-post-stream-select]")) updatePostStreamStatuses(form);
+    markAutosaveDirty(form, ["checkbox", "radio"].includes(target.type) || target instanceof HTMLSelectElement);
+  });
+  document.addEventListener("focusout", (event) => {
+    const target = event.target;
+    if (!(target instanceof HTMLElement) || !target.hasAttribute("name")) return;
+    const form = target.closest("form[data-autosave]");
+    if (form?.dataset.dirty === "true") markAutosaveDirty(form, true);
   });
 
   document.addEventListener("click", (event) => {
@@ -371,34 +410,39 @@
     }).join("");
   };
 
-  document.querySelectorAll("[data-source-manager]").forEach((manager) => {
-    renderSources(manager, readSources(manager));
-    manager.addEventListener("click", (event) => {
-      const addButton = event.target.closest("[data-add-source]");
-      const removeButton = event.target.closest("[data-remove-source]");
-      if (addButton) {
-        const input = manager.querySelector("[data-source-input]");
-        const platform = manager.querySelector("[data-source-platform]");
-        const source = normalizeSource(input?.value, platform?.value);
-        if (!source) return;
-        renderSources(manager, [...readSources(manager), source]);
-        if (input) input.value = "";
-        const form = manager.closest("form[data-autosave]");
-        if (form) markAutosaveDirty(form, true);
-        input?.focus();
-      }
-      if (removeButton) {
-        renderSources(manager, readSources(manager).filter((source) => source !== removeButton.dataset.removeSource));
-        const form = manager.closest("form[data-autosave]");
-        if (form) markAutosaveDirty(form, true);
-      }
+  const initializeSourceManagers = (root = document) => {
+    root.querySelectorAll("[data-source-manager]").forEach((manager) => {
+      renderSources(manager, readSources(manager));
     });
-    manager.querySelector("[data-source-input]")?.addEventListener("keydown", (event) => {
-      if (event.key === "Enter") {
-        event.preventDefault();
-        manager.querySelector("[data-add-source]")?.click();
-      }
-    });
+  };
+  initializeSourceManagers();
+
+  document.addEventListener("click", (event) => {
+    const addButton = event.target.closest("[data-add-source]");
+    const removeButton = event.target.closest("[data-remove-source]");
+    const manager = (addButton || removeButton)?.closest("[data-source-manager]");
+    if (!manager) return;
+    if (addButton) {
+      const input = manager.querySelector("[data-source-input]");
+      const platform = manager.querySelector("[data-source-platform]");
+      const source = normalizeSource(input?.value, platform?.value);
+      if (!source) return;
+      renderSources(manager, [...readSources(manager), source]);
+      if (input) input.value = "";
+      const form = manager.closest("form[data-autosave]");
+      if (form) markAutosaveDirty(form, true);
+      input?.focus();
+      return;
+    }
+    renderSources(manager, readSources(manager).filter((source) => source !== removeButton.dataset.removeSource));
+    const form = manager.closest("form[data-autosave]");
+    if (form) markAutosaveDirty(form, true);
+  });
+  document.addEventListener("keydown", (event) => {
+    const input = event.target.closest("[data-source-input]");
+    if (!input || event.key !== "Enter") return;
+    event.preventDefault();
+    input.closest("[data-source-manager]")?.querySelector("[data-add-source]")?.click();
   });
 
   document.addEventListener("click", (event) => {
@@ -713,6 +757,26 @@
     }
   };
 
+  const loadFileDiagnostics = async (button) => {
+    const panel = button.closest("[data-file-diagnostics]");
+    const state = panel?.querySelector("[data-file-diagnostics-state]");
+    const url = button.dataset.fileDiagnosticsUrl || "";
+    if (!panel || !url) return;
+    button.disabled = true;
+    if (state) state.textContent = "Scanning fragment and internal files…";
+    try {
+      const response = await fetch(url, {
+        headers: { "X-Dashboard-Fragment": "1" },
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      panel.innerHTML = await response.text();
+    } catch (error) {
+      button.disabled = false;
+      if (state) state.textContent = `Unable to load file diagnostics: ${error.message || error}`;
+    }
+  };
+
   document.addEventListener("click", (event) => {
     const voiceButton = event.target.closest("[data-load-voice-details]");
     if (voiceButton) {
@@ -724,6 +788,12 @@
     if (speakerButton) {
       event.preventDefault();
       loadStreamSpeakers(speakerButton);
+      return;
+    }
+    const diagnosticsButton = event.target.closest("[data-load-file-diagnostics]");
+    if (diagnosticsButton) {
+      event.preventDefault();
+      loadFileDiagnostics(diagnosticsButton);
     }
   });
 
@@ -743,23 +813,31 @@
   };
 
   const refreshFragment = async (region) => {
-    if (document.hidden || region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
+    if (document.hidden || region.matches(":focus-within") || region.querySelector('[data-dirty="true"]') || region.querySelector("[data-file-diagnostics-loaded][open]")) return;
+    if (fragmentRequests.has(region)) return;
+    const request = Symbol("fragment-request");
+    fragmentRequests.set(region, request);
     try {
       const response = await fetch(region.dataset.fragmentUrl, { headers: { "X-Dashboard-Fragment": "1" }, cache: "no-store" });
       if (!response.ok) return;
       const revision = response.headers.get("X-Fragment-Revision") || "";
       if (revision && revision === region.dataset.fragmentRevision) return;
       const html = await response.text();
-      if (region.matches(":focus-within") || region.querySelector('[data-dirty="true"]')) return;
+      if (region.matches(":focus-within") || region.querySelector('[data-dirty="true"]') || region.querySelector("[data-file-diagnostics-loaded][open]")) return;
       const detailsState = captureDetailsState(region);
       region.innerHTML = html;
       restoreDetailsState(region, detailsState);
+      region.querySelectorAll("form[data-autosave]").forEach(ensureAutosaveForm);
+      initializeSourceManagers(region);
       if (region.querySelector("#powerchat-dashboard")) powerchatPage = 1;
       if (revision) region.dataset.fragmentRevision = revision;
       applyActivityFilters();
       const stamp = document.querySelector("[data-last-refreshed]");
       if (stamp) stamp.textContent = `Updated ${new Date().toLocaleTimeString()}`;
-    } catch (_) {}
+    } catch (_) {
+    } finally {
+      if (fragmentRequests.get(region) === request) fragmentRequests.delete(region);
+    }
   };
   document.querySelectorAll("[data-fragment-url]").forEach((region) => {
     window.setInterval(() => refreshFragment(region), 15000);

@@ -1,7 +1,8 @@
+import asyncio
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
-import unittest
 
 from onlysavemevods.config import BotConfig
 from onlysavemevods.daemon import OnlySaveMeVodsDaemon
@@ -22,6 +23,34 @@ class FakeSourceMonitor:
 
 
 class DaemonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_reconciles_stale_download_before_snapshotting_recovery(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                web_enabled=False,
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                title="Interrupted Download",
+                channel="Example Channel",
+                platform="youtube",
+            )
+            daemon = OnlySaveMeVodsDaemon(config)
+            daemon.state.mark_downloading(stream, 1)
+            daemon.downloads.resume_post_exit_check = Mock()  # type: ignore[method-assign]
+            daemon.downloads.resume_pending_post_processing_jobs = Mock()  # type: ignore[method-assign]
+            daemon.downloads.stop_all = AsyncMock()  # type: ignore[method-assign]
+            daemon.stop()
+
+            await daemon.run()
+
+        daemon.downloads.resume_post_exit_check.assert_called_once()
+        recovered = daemon.downloads.resume_post_exit_check.call_args.args[0]
+        self.assertEqual(recovered.video_id, stream.video_id)
+        daemon.downloads.resume_pending_post_processing_jobs.assert_called_once()
+
     async def test_resume_stalled_youtube_checks_queues_monitor(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -132,6 +161,99 @@ class DaemonTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(fake_sources.checked, ["twitch:OUMB3rd"])
         daemon.downloads.start_stream.assert_awaited_once_with(stream)
+
+    async def test_poll_once_contains_one_stream_start_failure(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["@Example"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                web_enabled=False,
+            )
+            failed_stream = LiveStream(
+                video_id="youtube:FAILED00001",
+                url="https://www.youtube.com/watch?v=FAILED00001",
+                title="Cannot Start",
+                channel="Example Channel",
+                platform="youtube",
+                source="@Example",
+            )
+            healthy_stream = LiveStream(
+                video_id="youtube:HEALTHY0001",
+                url="https://www.youtube.com/watch?v=HEALTHY0001",
+                title="Still Starts",
+                channel="Example Channel",
+                platform="youtube",
+                source="@Example",
+            )
+            daemon = OnlySaveMeVodsDaemon(config)
+            daemon.sources.discover_live_streams = Mock(  # type: ignore[method-assign]
+                return_value=[failed_stream, healthy_stream]
+            )
+            daemon.downloads.start_stream = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[PermissionError("download directory is not writable"), True]
+            )
+
+            async def inline_to_thread(func, /, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            try:
+                with patch("onlysavemevods.daemon.asyncio.to_thread", inline_to_thread):
+                    await daemon.poll_once()
+                events = daemon.state.list_stream_events(
+                    [failed_stream.video_id],
+                    limit_per_stream=8,
+                )
+            finally:
+                daemon.state.close()
+
+        self.assertEqual(daemon.downloads.start_stream.await_count, 2)
+        self.assertEqual(
+            [call.args[0] for call in daemon.downloads.start_stream.await_args_list],
+            [failed_stream, healthy_stream],
+        )
+        self.assertTrue(
+            any(
+                "Unable to start recording" in event.message
+                for event in events[failed_stream.video_id]
+            )
+        )
+
+    async def test_poll_once_propagates_stream_start_cancellation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                channels=["@Example"],
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                web_enabled=False,
+            )
+            stream = LiveStream(
+                video_id="youtube:CANCELLED01",
+                url="https://www.youtube.com/watch?v=CANCELLED01",
+                title="Cancelled Start",
+                channel="Example Channel",
+                platform="youtube",
+                source="@Example",
+            )
+            daemon = OnlySaveMeVodsDaemon(config)
+            daemon.sources.discover_live_streams = Mock(  # type: ignore[method-assign]
+                return_value=[stream]
+            )
+            daemon.downloads.start_stream = AsyncMock(  # type: ignore[method-assign]
+                side_effect=asyncio.CancelledError
+            )
+
+            async def inline_to_thread(func, /, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            try:
+                with (
+                    patch("onlysavemevods.daemon.asyncio.to_thread", inline_to_thread),
+                    self.assertRaises(asyncio.CancelledError),
+                ):
+                    await daemon.poll_once()
+            finally:
+                daemon.state.close()
 
     async def test_poll_once_runs_enabled_fragment_cleanup(self) -> None:
         with TemporaryDirectory() as tmp:

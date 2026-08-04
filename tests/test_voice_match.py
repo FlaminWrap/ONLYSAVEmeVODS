@@ -124,6 +124,74 @@ class VoiceMatchTests(unittest.TestCase):
         self.assertEqual(labels_before, {})
         self.assertEqual(labels_after, {"SPEAKER_00": "Host"})
 
+    def test_rerun_preserves_manual_approved_and_rejected_decisions(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                state_dir=root / "state",
+                streamers={
+                    "OUMB3rd": StreamerConfig(
+                        sources=["Example Channel"],
+                        voices={"Host": VoiceProfileConfig(samples=["host.wav"])},
+                    )
+                },
+                voice_match_threshold=0.2,
+            )
+            sample_dir = voice_sample_dir(config, "OUMB3rd", "Host")
+            sample_dir.mkdir(parents=True)
+            (sample_dir / "host.wav").write_bytes(b"sample")
+            media_file = root / "Live Status [LIVEVIDEO01].mp4"
+            media_file.write_bytes(b"media")
+            media_file.with_suffix(".json").write_text(
+                json.dumps(
+                    {
+                        "segments": [
+                            {"start": 0, "end": 2, "speaker": "SPEAKER_00"},
+                            {"start": 2, "end": 4, "speaker": "SPEAKER_01"},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            media_file.with_suffix(".voice-attribution.json").write_text(
+                json.dumps(
+                    {
+                        "matches": {
+                            "SPEAKER_00": {
+                                "speaker": "SPEAKER_00",
+                                "voice": "Manually Selected",
+                                "status": "approved",
+                            },
+                            "SPEAKER_01": {
+                                "speaker": "SPEAKER_01",
+                                "voice": "Host",
+                                "status": "rejected",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            matched = match_known_voices_for_media(
+                config,
+                media_file,
+                channel="Example Channel",
+                backend=FakeEmbeddingBackend(
+                    {"host.wav": [1.0, 0.0]},
+                    [1.0, 0.0],
+                ),
+            )
+            rows = {
+                row["speaker"]: row
+                for row in voice_match_rows_for_media(media_file)
+            }
+
+        self.assertTrue(matched)
+        self.assertEqual(rows["SPEAKER_00"]["status"], "approved")
+        self.assertEqual(rows["SPEAKER_00"]["voice"], "Manually Selected")
+        self.assertEqual(rows["SPEAKER_01"]["status"], "rejected")
+
     def test_transcript_sample_metadata_is_created_from_speaker_segments(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

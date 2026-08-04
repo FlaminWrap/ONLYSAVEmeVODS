@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
+import csv
+import io
 import json
 import logging
 import subprocess
@@ -14,6 +16,7 @@ from onlysavemevods.kick_chat import KickChatReplayResult
 from onlysavemevods.job_tracker import clear_tracked_jobs, list_tracked_jobs, start_tracked_job
 from onlysavemevods.log_buffer import RingBufferLogHandler, clear_log_buffer
 from onlysavemevods.models import LiveStream, video_url
+from onlysavemevods.downloader import segment_directory
 from onlysavemevods.powerchat import normalize_powerchat_payload, write_powerchat_sidecar
 from onlysavemevods.state import StateStore
 from onlysavemevods.web import (
@@ -33,9 +36,16 @@ from onlysavemevods.web import (
     chat_media_file_for_chat_file,
     file_kind,
     summarize_files,
+    scan_directory_uncached,
+    invalidate_file_scan_cache,
+    build_stream_file_diagnostics,
+    render_stream_file_diagnostics,
     FILE_LIMIT_PER_STREAM,
     FILE_SCAN_CACHE,
     FILE_SCAN_CACHE_LOCK,
+    STREAM_LIMIT,
+    WEB_FILE_SCAN_CACHE_MAX_ENTRIES,
+    WEB_FILE_SCAN_CACHE_SECONDS,
     format_bytes,
     is_watermarkable_media_file,
     render_file_action,
@@ -68,7 +78,6 @@ from onlysavemevods.web import (
     run_render_chat_in_process_job,
     update_render_chat_job,
     run_render_chat_process_job,
-    run_deferred_vod_post_processing_jobs,
     run_vod_download_job,
     queue_vod_post_processing_jobs,
     run_transcription_job,
@@ -102,6 +111,7 @@ from onlysavemevods.web import (
     render_stream_event_timeline,
     render_app_update_panel,
     render_admin_recent_jobs,
+    render_admin_fragment,
     render_streamer_jobs_summary,
     STREAM_DELETE_CONFIRM_VALUE,
 )
@@ -419,7 +429,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(any(job.job_id == job_id and job.status == "done" for job in jobs))
         self.assertTrue(any("Kick chat replay" in job.message for job in jobs))
 
-    def test_vod_download_queues_enabled_post_processing_jobs(self) -> None:
+    def test_vod_download_enqueues_enabled_durable_post_processing_jobs(self) -> None:
         class FakeProcess:
             def __init__(self, lines: list[str], return_code: int, output: Path) -> None:
                 self.stdout = iter(lines)
@@ -464,12 +474,9 @@ class WebStatusTests(unittest.TestCase):
                 progress=0.0,
             )
 
-            with (
-                patch(
-                    "onlysavemevods.web.subprocess.Popen",
-                    return_value=FakeProcess(["[download] 100.0%"], 0, media_file),
-                ),
-                patch("onlysavemevods.web.Thread") as thread_cls,
+            with patch(
+                "onlysavemevods.web.subprocess.Popen",
+                return_value=FakeProcess(["[download] 100.0%"], 0, media_file),
             ):
                 run_vod_download_job(
                     config,
@@ -481,17 +488,19 @@ class WebStatusTests(unittest.TestCase):
                 )
 
             jobs = list_tracked_jobs(limit=20)
-            with TRANSCRIPTION_JOBS_LOCK:
-                transcription_jobs = list(TRANSCRIPTION_JOBS.values())
-                TRANSCRIPTION_JOBS.clear()
-            with EVENT_DETECTION_JOBS_LOCK:
-                event_jobs = list(EVENT_DETECTION_JOBS.values())
-                EVENT_DETECTION_JOBS.clear()
+            state = StateStore(config.db_path)
+            durable_jobs = state.list_post_processing_jobs(video_id=stream.video_id)
+            record = state.get_stream(stream.video_id)
+            state.close()
 
-        self.assertTrue(thread_cls.return_value.start.called)
         self.assertTrue(any(job.kind == "VOD download" and job.status == "done" for job in jobs))
-        self.assertTrue(any(job.status == "running" for job in transcription_jobs))
-        self.assertTrue(any(job.status == "running" for job in event_jobs))
+        self.assertEqual(
+            {(job.kind, job.status) for job in durable_jobs},
+            {("transcription", "pending"), ("content_events", "pending")},
+        )
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "ended")
 
     def test_vod_post_processing_queues_chat_render_and_twitch_ad_repair(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -537,18 +546,66 @@ class WebStatusTests(unittest.TestCase):
             twitch_media = twitch_template.with_name(twitch_template.name.replace("%(ext)s", "mp4"))
             twitch_media.write_text("media", encoding="utf-8")
 
-            with patch("onlysavemevods.web.Thread") as thread_cls:
-                queue_vod_post_processing_jobs(config, kick_stream, kick_template)
-                queue_vod_post_processing_jobs(config, twitch_stream, twitch_template)
+            queue_vod_post_processing_jobs(config, kick_stream, kick_template)
+            queue_vod_post_processing_jobs(config, twitch_stream, twitch_template)
 
-            jobs = list_tracked_jobs(limit=20)
-            with CHAT_RENDER_JOBS_LOCK:
-                render_jobs = list(CHAT_RENDER_JOBS.values())
-                CHAT_RENDER_JOBS.clear()
+            state = StateStore(config.db_path)
+            kick_jobs = state.list_post_processing_jobs(video_id=kick_stream.video_id)
+            twitch_jobs = state.list_post_processing_jobs(video_id=twitch_stream.video_id)
+            state.close()
 
-        self.assertGreaterEqual(thread_cls.return_value.start.call_count, 2)
-        self.assertTrue(any(job.status == "running" for job in render_jobs))
-        self.assertTrue(any(job.kind == "Twitch ad repair" for job in jobs))
+        self.assertEqual([(job.kind, job.status) for job in kick_jobs], [("chat_render", "pending")])
+        self.assertEqual(Path(kick_jobs[0].chat_path), kick_chat)
+        self.assertEqual(
+            [(job.kind, job.status) for job in twitch_jobs],
+            [("twitch_ad_repair", "pending")],
+        )
+
+    def test_vod_redownload_requeues_terminal_post_processing_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                transcribe_subtitles=True,
+                stream_event_detection_enabled=True,
+            )
+            stream = LiveStream(
+                video_id="rumble:vod-redownload",
+                url="https://rumble.com/vod-redownload.html",
+                title="Redownloaded VOD",
+                channel="OUMB3rd",
+                platform="rumble",
+                is_live=False,
+            )
+            output_template = vod_output_template_for(config, stream, force_copy=False)
+            output_template.parent.mkdir(parents=True, exist_ok=True)
+            output_template.with_name(
+                output_template.name.replace("%(ext)s", "mp4")
+            ).write_text("first download", encoding="utf-8")
+
+            queue_vod_post_processing_jobs(config, stream, output_template)
+            state = StateStore(config.db_path)
+            first_jobs = state.list_post_processing_jobs(video_id=stream.video_id)
+            for job in first_jobs:
+                self.assertTrue(state.mark_post_processing_job_running(job.job_id))
+            self.assertTrue(state.mark_post_processing_job_done(first_jobs[0].job_id))
+            self.assertTrue(
+                state.mark_post_processing_job_failed(first_jobs[1].job_id, "failed once")
+            )
+            state.close()
+
+            queue_vod_post_processing_jobs(config, stream, output_template)
+            state = StateStore(config.db_path)
+            requeued_jobs = state.list_post_processing_jobs(video_id=stream.video_id)
+            state.close()
+
+        self.assertEqual(
+            [job.job_id for job in requeued_jobs],
+            [job.job_id for job in first_jobs],
+        )
+        self.assertEqual({job.status for job in requeued_jobs}, {"pending"})
+        self.assertEqual({job.attempts for job in requeued_jobs}, {0})
+        self.assertEqual({job.error for job in requeued_jobs}, {""})
 
     def test_vod_post_processing_is_deferred_outside_quiet_hours(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -583,7 +640,7 @@ class WebStatusTests(unittest.TestCase):
                     "onlysavemevods.web.automatic_processing_window_wait_seconds",
                     return_value=60.0,
                 ),
-                patch("onlysavemevods.web.start_transcription_job") as start_job,
+                patch("onlysavemevods.web.start_transcription_job") as legacy_start,
                 patch("onlysavemevods.web.Thread") as thread_cls,
             ):
                 queue_vod_post_processing_jobs(config, stream, output_template)
@@ -592,47 +649,25 @@ class WebStatusTests(unittest.TestCase):
             events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
                 stream.video_id
             ]
+            durable_jobs = state.list_post_processing_jobs(video_id=stream.video_id)
             state.close()
+            deleted, delete_message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
 
-        start_job.assert_not_called()
-        thread_cls.return_value.start.assert_called_once()
-        self.assertIs(
-            thread_cls.call_args.kwargs["target"],
-            run_deferred_vod_post_processing_jobs,
+        legacy_start.assert_not_called()
+        thread_cls.assert_not_called()
+        self.assertEqual(
+            [(job.kind, job.status) for job in durable_jobs],
+            [("transcription", "pending")],
         )
+        self.assertFalse(deleted)
+        self.assertIn("Transcription", delete_message)
         self.assertTrue(
             any("waiting for quiet-hours window" in event.message for event in events)
         )
-
-    def test_deferred_vod_processing_starts_when_quiet_hours_open(self) -> None:
-        config = BotConfig(
-            processing_quiet_hours_enabled=True,
-            processing_quiet_hours_start="01:00",
-            processing_quiet_hours_end="07:00",
-        )
-        stream = LiveStream(
-            video_id="rumble:vod-quiet-hours",
-            url="https://rumble.com/vod-quiet-hours.html",
-            title="Quiet Hours VOD",
-            channel="OUMB3rd",
-            platform="rumble",
-            is_live=False,
-        )
-        media_file = Path("Quiet Hours VOD.mp4")
-
-        with (
-            patch(
-                "onlysavemevods.web.automatic_processing_window_wait_seconds",
-                side_effect=[30.0, 0.0],
-            ),
-            patch("onlysavemevods.web.time.sleep") as sleep,
-            patch("onlysavemevods.web.record_stream_event"),
-            patch("onlysavemevods.web.start_vod_post_processing_jobs") as start_jobs,
-        ):
-            run_deferred_vod_post_processing_jobs(config, stream, media_file)
-
-        sleep.assert_called_once_with(30.0)
-        start_jobs.assert_called_once_with(config, stream, media_file)
 
     def test_start_vod_redownload_job_marks_stream_and_tracks_job(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1069,6 +1104,24 @@ class WebStatusTests(unittest.TestCase):
         ])
         self.assertIn("received_at,offset_seconds,hour_label,streamer", export_csv)
         self.assertIn("KDrizzy69", export_csv)
+
+    def test_powerchat_csv_neutralizes_spreadsheet_formulas(self) -> None:
+        exported = powerchat_export_csv(
+            [
+                {
+                    "donor": "=HYPERLINK(\"https://attacker.example\")",
+                    "message": "  @SUM(1+1)",
+                    "stream_title": "+cmd|' /C calc'!A0",
+                    "offset_seconds": 12.5,
+                }
+            ]
+        )
+        row = next(csv.DictReader(io.StringIO(exported)))
+
+        self.assertTrue(row["donor"].startswith("'="))
+        self.assertTrue(row["message"].startswith("'  @"))
+        self.assertTrue(row["stream_title"].startswith("'+"))
+        self.assertEqual(row["offset_seconds"], "12.5")
 
     def test_powerchat_stats_include_hourly_buckets_and_rates(self) -> None:
         stream = StreamStatus(
@@ -1610,6 +1663,237 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(status.has_part_files)
         self.assertTrue(status.has_mixed_formats)
 
+    def test_relevant_file_scan_does_not_stat_fragment_or_internal_files(self) -> None:
+        class FakeEntry:
+            def __init__(self, name: str, *, regular: bool = True) -> None:
+                self.name = name
+                self.regular = regular
+                self.stat_calls = 0
+
+            def is_file(self, *, follow_symlinks: bool = True) -> bool:
+                self.assert_no_follow(follow_symlinks)
+                return self.regular
+
+            def stat(self, *, follow_symlinks: bool = True):
+                self.assert_no_follow(follow_symlinks)
+                self.stat_calls += 1
+                if file_kind(self.name) in {"fragment", "state", "temporary"}:
+                    raise AssertionError(f"diagnostic file was statted: {self.name}")
+                return type("FakeStat", (), {"st_size": 5, "st_mtime": 123.0})()
+
+            @staticmethod
+            def assert_no_follow(follow_symlinks: bool) -> None:
+                if follow_symlinks:
+                    raise AssertionError("scan followed a directory entry")
+
+        class FakeScandir:
+            def __init__(self, entries: list[FakeEntry]) -> None:
+                self.entries = entries
+
+            def __enter__(self):
+                return iter(self.entries)
+
+            def __exit__(self, *_args) -> None:
+                return None
+
+        fragments = [
+            FakeEntry(f"segment-001.f137.mp4.part-Frag{index}")
+            for index in range(FILE_LIMIT_PER_STREAM + 5)
+        ]
+        internal = [
+            FakeEntry("segment-001.f137.mp4.ytdl"),
+            FakeEntry("segment-001.rendering.mp4"),
+        ]
+        final = FakeEntry("recording.mp4")
+        disguised_directory = FakeEntry(
+            "segment-001.f137.mp4.part-Frag-directory",
+            regular=False,
+        )
+        disguised_symlink = FakeEntry(
+            "segment-001.f137.mp4.part-Frag-symlink",
+            regular=False,
+        )
+        entries = [*fragments, *internal, final, disguised_directory, disguised_symlink]
+
+        with patch(
+            "onlysavemevods.web.os.scandir",
+            return_value=FakeScandir(entries),
+        ):
+            summary = scan_directory_uncached(
+                Path("/not-accessed"),
+                "LIVEVIDEO01",
+                include_diagnostics=False,
+            )
+
+        self.assertEqual(summary.file_count, len(fragments) + len(internal) + 1)
+        self.assertEqual(summary.diagnostic_file_count, len(fragments) + len(internal))
+        self.assertEqual(summary.counts_by_kind["fragment"], len(fragments))
+        self.assertEqual(summary.total_bytes, 5)
+        self.assertFalse(summary.file_size_totals_complete)
+        self.assertEqual([entry.name for entry in summary.visible_entries], ["recording.mp4"])
+        self.assertEqual(final.stat_calls, 1)
+        self.assertTrue(all(entry.stat_calls == 0 for entry in [*fragments, *internal]))
+
+    def test_fast_summary_keeps_recovery_names_and_exact_scan_restores_sizes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            directory.mkdir(parents=True)
+            (directory / "segment-001.f137.mp4.part").write_bytes(b"part")
+            (directory / "segment-001.f137.mp4.part-Frag1").write_bytes(b"fragment")
+            (directory / "segment-001.f137.mp4.ytdl").write_bytes(b"state")
+
+            fast = build_status_snapshot(
+                config,
+                include_file_diagnostics=False,
+            ).streams[0]
+            exact = build_stream_file_diagnostics(config, stream.video_id)
+
+        self.assertEqual(fast.file_kind_counts["fragment"], 1)
+        self.assertEqual(fast.fragment_bytes, 0)
+        self.assertEqual(fast.recoverable_segments, [1])
+        self.assertEqual(fast.diagnostic_file_count, 2)
+        self.assertFalse(fast.file_size_totals_complete)
+        self.assertNotIn("fragment", [file.kind for file in fast.files])
+        self.assertTrue(exact.file_size_totals_complete)
+        self.assertEqual(exact.bytes_by_kind["fragment"], len(b"fragment"))
+        self.assertEqual(exact.bytes_by_kind["state"], len(b"state"))
+
+    def test_file_scan_cache_modes_are_isolated_and_invalidated_together(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = Path(tmp) / "stream"
+            directory.mkdir()
+            (directory / "recording.mp4").write_bytes(b"media")
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+            summarize_files(config, directory, "LIVEVIDEO01", include_diagnostics=True)
+            summarize_files(config, directory, "LIVEVIDEO01", include_diagnostics=False)
+            with FILE_SCAN_CACHE_LOCK:
+                keys_before = set(FILE_SCAN_CACHE)
+            invalidate_file_scan_cache(directory)
+            with FILE_SCAN_CACHE_LOCK:
+                keys_after = set(FILE_SCAN_CACHE)
+
+        self.assertIn(f"full:{directory}", keys_before)
+        self.assertIn(f"relevant:{directory}", keys_before)
+        self.assertFalse(keys_after)
+
+    def test_file_scan_cache_ttl_starts_after_a_slow_scan_finishes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = Path(tmp) / "stream"
+            directory.mkdir()
+            (directory / "recording.mp4").write_bytes(b"media")
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
+            # Model a 20-second cold scan followed by a request one second
+            # later.  A ten-second TTL must begin when the summary is ready,
+            # rather than at the start of the expensive directory walk.
+            with patch(
+                "onlysavemevods.web.time.monotonic",
+                side_effect=[0.0, 20.0, 21.0],
+            ):
+                first = summarize_files(
+                    config,
+                    directory,
+                    "LIVEVIDEO01",
+                    cache_ttl_seconds=10.0,
+                )
+                with patch(
+                    "onlysavemevods.web.scan_directory_uncached",
+                    side_effect=AssertionError("completed scan was born expired"),
+                ):
+                    second = summarize_files(
+                        config,
+                        directory,
+                        "LIVEVIDEO01",
+                        cache_ttl_seconds=10.0,
+                    )
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
+        self.assertEqual(first.total_bytes, len(b"media"))
+        self.assertEqual(second.total_bytes, len(b"media"))
+
+    def test_diagnostics_html_has_exact_totals_and_a_bounded_sample(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            directory.mkdir(parents=True)
+            for index in range(FILE_LIMIT_PER_STREAM + 5):
+                (directory / f"segment-001.f137.mp4.part-Frag{index}").write_bytes(b"x")
+            (directory / "recording.mp4").write_bytes(b"media")
+
+            summary = build_stream_file_diagnostics(config, stream.video_id)
+            html = render_stream_file_diagnostics(summary)
+
+        self.assertEqual(summary.file_count, FILE_LIMIT_PER_STREAM + 6)
+        self.assertLessEqual(len(summary.files), FILE_LIMIT_PER_STREAM)
+        self.assertIn(f"<dd>{FILE_LIMIT_PER_STREAM + 6}</dd>", html)
+        self.assertIn(f"capped sample of {FILE_LIMIT_PER_STREAM}", html)
+        self.assertIn("additional files not shown", html)
+
+    def test_explicit_file_diagnostics_reports_directory_scan_failures(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = Path(tmp) / "stream"
+            directory.mkdir()
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
+            with patch(
+                "onlysavemevods.web.os.scandir",
+                side_effect=PermissionError("denied"),
+            ):
+                with self.assertRaisesRegex(ConfigError, "Unable to scan"):
+                    summarize_files(
+                        config,
+                        directory,
+                        "LIVEVIDEO01",
+                        cache_ttl_seconds=10.0,
+                        include_diagnostics=True,
+                        raise_scan_errors=True,
+                    )
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+
     def test_file_scan_cache_reuses_unchanged_directory(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
@@ -1634,6 +1918,35 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(first.file_count, 1)
         self.assertEqual(second.file_count, 1)
         self.assertEqual(second.files[0].name, "video.mp4")
+
+    def test_default_file_scan_cache_covers_a_full_stream_snapshot(self) -> None:
+        self.assertGreaterEqual(WEB_FILE_SCAN_CACHE_MAX_ENTRIES, STREAM_LIMIT)
+
+        with TemporaryDirectory() as tmp:
+            directories = [Path(tmp) / f"stream-{index:03d}" for index in range(STREAM_LIMIT)]
+            for directory in directories:
+                directory.mkdir()
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            with FILE_SCAN_CACHE_LOCK:
+                FILE_SCAN_CACHE.clear()
+            try:
+                for index, directory in enumerate(directories):
+                    summarize_files(config, directory, f"video-{index:03d}")
+                with patch(
+                    "onlysavemevods.web.scan_directory_uncached",
+                    side_effect=AssertionError("full-snapshot cache thrashed"),
+                ):
+                    for index, directory in enumerate(directories):
+                        summarize_files(config, directory, f"video-{index:03d}")
+            finally:
+                with FILE_SCAN_CACHE_LOCK:
+                    FILE_SCAN_CACHE.clear()
+
+    def test_ended_file_scan_cache_avoids_frequent_large_directory_rescans(self) -> None:
+        self.assertGreaterEqual(WEB_FILE_SCAN_CACHE_SECONDS, 300.0)
 
     def test_status_payloads_include_tracked_auto_jobs(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1664,6 +1977,52 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(lite["job_revision"], snapshot.job_revision)
         self.assertIn('data-job-revision="active:', html)
         self.assertIn("Running automatic transcription", html)
+
+    def test_activity_log_fragment_revision_advances_after_buffer_rotation(self) -> None:
+        clear_log_buffer()
+        handler = RingBufferLogHandler()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            for index in range(200):
+                handler.emit(
+                    logging.LogRecord(
+                        "test.activity",
+                        logging.INFO,
+                        __file__,
+                        1,
+                        f"message-{index}",
+                        (),
+                        None,
+                    )
+                )
+            _first_body, first_revision = render_admin_fragment(
+                config,
+                "activity",
+                {"view": ["logs"]},
+            )
+            handler.emit(
+                logging.LogRecord(
+                    "test.activity",
+                    logging.INFO,
+                    __file__,
+                    1,
+                    "message-after-rotation",
+                    (),
+                    None,
+                )
+            )
+            second_body, second_revision = render_admin_fragment(
+                config,
+                "activity",
+                {"view": ["logs"]},
+            )
+        clear_log_buffer()
+
+        self.assertNotEqual(first_revision, second_revision)
+        self.assertIn("message-after-rotation", second_body)
 
     def test_lite_status_payload_avoids_full_stream_payload(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3039,6 +3398,77 @@ class WebStatusTests(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertIsNone(record)
 
+    def test_delete_stream_aborts_if_recording_starts_before_file_claim(self) -> None:
+        clear_tracked_jobs()
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:RACEVIDEO01",
+                url="https://www.youtube.com/watch?v=RACEVIDEO01",
+                title="Race Test",
+                channel="Example Channel",
+                platform="youtube",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = segment_directory(config, stream.video_id, stream.channel)
+            directory.mkdir(parents=True)
+            media_file = directory / "segment-001.mp4"
+            media_file.write_text("recording data", encoding="utf-8")
+
+            original_compare_and_set = StateStore.compare_and_set_stream_status
+            raced = False
+
+            def start_before_claim(
+                store: StateStore,
+                video_id: str,
+                *,
+                expected_status: str,
+                new_status: str,
+            ) -> bool:
+                nonlocal raced
+                if new_status == "deleting" and not raced:
+                    raced = True
+                    competing = StateStore(config.db_path)
+                    try:
+                        competing.mark_downloading(stream, 1)
+                    finally:
+                        competing.close()
+                return original_compare_and_set(
+                    store,
+                    video_id,
+                    expected_status=expected_status,
+                    new_status=new_status,
+                )
+
+            with patch.object(
+                StateStore,
+                "compare_and_set_stream_status",
+                new=start_before_claim,
+            ):
+                deleted, message = delete_stream(
+                    config,
+                    stream.video_id,
+                    STREAM_DELETE_CONFIRM_VALUE,
+                )
+
+            state = StateStore(config.db_path)
+            record = state.get_stream(stream.video_id)
+            state.close()
+            media_exists = media_file.exists()
+
+        self.assertFalse(deleted)
+        self.assertIn("status changed", message.lower())
+        self.assertTrue(media_exists)
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "downloading")
+
     def test_delete_stream_rejects_active_download(self) -> None:
         clear_tracked_jobs()
         with TemporaryDirectory() as tmp:
@@ -3078,6 +3508,156 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("may still be active", message)
         self.assertTrue(directory_exists)
         self.assertIsNotNone(record)
+
+    def test_delete_stream_and_fragment_cleanup_reject_stalled_stream(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=100,
+                edge_at="2026-07-01T12:00:00+00:00",
+            )
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            fragment = segment_dir / "segment-001.f137.mp4.part-Frag1"
+            fragment.write_text("fragment", encoding="utf-8")
+
+            html = render_status_html(build_status_snapshot(config)).split("<script>", 1)[0]
+            deleted, delete_message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
+            with self.assertRaisesRegex(ConfigError, "may still resume"):
+                cleanup_stream_fragments(config, stream.video_id)
+            fragment_exists = fragment.exists()
+
+        self.assertNotIn('/delete-stream', html)
+        self.assertFalse(deleted)
+        self.assertIn("may still be active", delete_message)
+        self.assertTrue(fragment_exists)
+
+    def test_delete_stream_rejects_each_in_memory_manual_job_registry(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Live Status",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            state.mark_ended(stream.video_id)
+            state.close()
+            segment_dir = config.download_dir / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "Live Status.mp4").write_text("media", encoding="utf-8")
+
+            cases = [
+                (
+                    CHAT_RENDER_JOBS_LOCK,
+                    CHAT_RENDER_JOBS,
+                    "render",
+                    RenderChatJob(
+                        video_id=stream.video_id,
+                        chat_name="chat.json",
+                        media_name="Live Status.mp4",
+                        output_name="chat.mp4",
+                        status="running",
+                        message="Rendering",
+                        started_at=1.0,
+                    ),
+                    "Chat render",
+                ),
+                (
+                    CHAT_REFRESH_JOBS_LOCK,
+                    CHAT_REFRESH_JOBS,
+                    "refresh",
+                    RefreshChatJob(
+                        video_id=stream.video_id,
+                        chat_name="chat.json",
+                        media_name="Live Status.mp4",
+                        status="running",
+                        message="Refreshing",
+                        started_at=1.0,
+                    ),
+                    "Chat refresh",
+                ),
+                (
+                    TRANSCRIPTION_JOBS_LOCK,
+                    TRANSCRIPTION_JOBS,
+                    "transcription",
+                    TranscriptionJob(
+                        video_id=stream.video_id,
+                        media_name="Live Status.mp4",
+                        status="running",
+                        message="Transcribing",
+                        started_at=1.0,
+                    ),
+                    "Transcription",
+                ),
+                (
+                    EVENT_DETECTION_JOBS_LOCK,
+                    EVENT_DETECTION_JOBS,
+                    "events",
+                    EventDetectionJob(
+                        video_id=stream.video_id,
+                        media_name="Live Status.mp4",
+                        status="running",
+                        message="Detecting",
+                        started_at=1.0,
+                    ),
+                    "Content event detection",
+                ),
+            ]
+            for lock, registry, key, job, expected_kind in cases:
+                with self.subTest(job=expected_kind):
+                    with lock:
+                        registry[key] = job
+                    try:
+                        deleted, message = delete_stream(
+                            config,
+                            stream.video_id,
+                            STREAM_DELETE_CONFIRM_VALUE,
+                        )
+                    finally:
+                        with lock:
+                            registry.pop(key, None)
+                    self.assertFalse(deleted)
+                    self.assertIn(expected_kind, message)
+                    self.assertTrue(segment_dir.exists())
+
+            start_tracked_job(
+                "vod-download:LIVEVIDEO01:manual",
+                kind="VOD download",
+                video_id=stream.video_id,
+                item="Live Status.mp4",
+                message="Manual VOD download",
+            )
+            deleted, message = delete_stream(
+                config,
+                stream.video_id,
+                STREAM_DELETE_CONFIRM_VALUE,
+            )
+
+        self.assertFalse(deleted)
+        self.assertIn("VOD download", message)
 
     def test_ended_streams_are_collapsed_by_default(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -3738,6 +4318,7 @@ class WebStatusTests(unittest.TestCase):
                 ),
             )
             updated = load_config(config_path)
+            dashboard_config = build_config_summary(config)
 
         self.assertEqual(updated.channels, ["@New", "@Second"])
         self.assertEqual(updated.poll_interval_seconds, 45)
@@ -3766,7 +4347,11 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(updated.twitch_ad_repair_vod_search_limit, 3)
         self.assertEqual(updated.extra_yt_dlp_args, ["--cookies", "/secret/cookies.txt"])
         self.assertEqual(config.channels, ["@New", "@Second"])
-        self.assertEqual(config.web_port, 9090)
+        self.assertEqual(config.poll_interval_seconds, 45)
+        self.assertEqual(config.web_port, 8080)
+        self.assertEqual(config.log_level, "INFO")
+        self.assertEqual(dashboard_config["Web"]["web_port"], 9090)
+        self.assertEqual(dashboard_config["Tools"]["log_level"], "DEBUG")
         self.assertEqual(config.extra_yt_dlp_args, ["--cookies", "/secret/cookies.txt"])
 
     def test_app_config_form_can_replace_or_clear_extra_yt_dlp_args(self) -> None:
@@ -4573,6 +5158,8 @@ class WebStatusTests(unittest.TestCase):
             media_file.write_text("media", encoding="utf-8")
             chat_video_file.write_text("chat video", encoding="utf-8")
             output_file.write_text("watermarked", encoding="utf-8")
+            for index in range(FILE_LIMIT_PER_STREAM - 2):
+                (segment_dir / f"zz-extra-{index:03d}.mp4").write_bytes(b"x")
             state.create_watermark_copy(
                 copy_id="wm_copy001",
                 video_id=stream.video_id,
@@ -4603,6 +5190,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01].live_chat.json"))
         self.assertFalse(is_watermarkable_media_file("Live Status [LIVEVIDEO01] - chat.rendering.mp4"))
         stream_status = snapshot.streams[0]
+        # Root entries retain their historical cap, while separately tracked
+        # completed watermark rows remain present in the exact status payload.
+        self.assertEqual(len(stream_status.files), FILE_LIMIT_PER_STREAM + 1)
         final_file = next(file for file in stream_status.files if file.name == media_file.name)
         chat_video_status = next(file for file in stream_status.files if file.name == chat_video_file.name)
         watermark_file = next(file for file in stream_status.files if file.name == output_name)

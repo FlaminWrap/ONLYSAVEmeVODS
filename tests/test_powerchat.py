@@ -204,6 +204,63 @@ class PowerchatTests(unittest.TestCase):
         self.assertEqual(payload_on_disk["event_count"], 2)
         self.assertEqual(payload_on_disk["totals"]["units"][0]["amount"], 100.0)
 
+    def test_recorder_preserves_identical_gift_multiplicity_within_window(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "segment-001.powerchat-events.json"
+            recorder = PowerchatRecorder(
+                sidecar_path=sidecar,
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+                stream_started_at="2026-07-05T10:00:00+00:00",
+            )
+            payload = {"message": "Alice just gifted 5 Kicks on Kick"}
+
+            first_tts = recorder.record_payload(
+                payload,
+                source="tts",
+                received_at="2026-07-05T10:00:10+00:00",
+            )
+            first_feed = recorder.record_payload(
+                payload,
+                source="feed",
+                received_at="2026-07-05T10:00:11+00:00",
+            )
+
+            # Rebuild from disk to prove the one-to-one pairing state survives
+            # a service restart between two otherwise identical real gifts.
+            recorder = PowerchatRecorder(
+                sidecar_path=sidecar,
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+                stream_started_at="2026-07-05T10:00:00+00:00",
+            )
+            second_tts = recorder.record_payload(
+                payload,
+                source="tts",
+                received_at="2026-07-05T10:00:20+00:00",
+            )
+            second_feed = recorder.record_payload(
+                payload,
+                source="feed",
+                received_at="2026-07-05T10:00:21+00:00",
+            )
+            payload_on_disk = load_powerchat_sidecar(sidecar)
+
+        self.assertTrue(first_tts)
+        self.assertFalse(first_feed)
+        self.assertTrue(second_tts)
+        self.assertFalse(second_feed)
+        self.assertEqual(payload_on_disk["event_count"], 2)
+        self.assertEqual(payload_on_disk["totals"]["units"][0]["amount"], 10.0)
+        self.assertEqual(
+            [event["observed_sources"] for event in payload_on_disk["events"]],
+            [["tts", "feed"], ["tts", "feed"]],
+        )
+
     def test_socket_message_preserves_unknown_raw_payload(self) -> None:
         with TemporaryDirectory() as tmp:
             recorder = PowerchatRecorder(
@@ -260,6 +317,108 @@ class PowerchatTests(unittest.TestCase):
         self.assertEqual(target.name, "Stream Title [kick_oumb].powerchat-events.json")
         self.assertFalse(source.exists())
         self.assertEqual(payload["event_count"], 1)
+
+    def test_copy_preserves_malformed_sidecar_for_recovery(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "segment-001.powerchat-events.json"
+            media = root / "Stream Title [kick_oumb].mp4"
+            source.write_text("{not valid json", encoding="utf-8")
+            media.write_text("media", encoding="utf-8")
+
+            target = copy_powerchat_segment_sidecar(source, media)
+            source_exists = source.exists()
+
+        self.assertIsNone(target)
+        self.assertTrue(source_exists)
+
+    def test_recorder_preserves_malformed_sidecar_and_persists_new_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sidecar = root / "segment-001.powerchat-events.json"
+            malformed = b"{not valid json"
+            sidecar.write_bytes(malformed)
+            recorder = PowerchatRecorder(
+                sidecar_path=sidecar,
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+
+            recorded = recorder.record_payload(
+                "Alice just gifted 5 Kicks on Kick",
+                source="tts",
+            )
+            payload = load_powerchat_sidecar(sidecar)
+            recovery_files = list((root / ".powerchat-recovery").iterdir())
+            recovered_payload = recovery_files[0].read_bytes()
+
+        self.assertTrue(recorded)
+        self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(len(recovery_files), 1)
+        self.assertEqual(recovered_payload, malformed)
+
+    def test_copy_preserves_sidecar_without_events_list(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "segment-001.powerchat-events.json"
+            media = root / "Stream Title [kick_oumb].mp4"
+            source.write_text('{"event_count": 0}', encoding="utf-8")
+            media.write_text("media", encoding="utf-8")
+
+            target = copy_powerchat_segment_sidecar(source, media)
+            source_exists = source.exists()
+
+        self.assertIsNone(target)
+        self.assertTrue(source_exists)
+
+    def test_copy_merges_existing_target_and_deduplicates_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "segment-001.powerchat-events.json"
+            media = root / "Stream Title [kick_oumb].mp4"
+            target = root / "Stream Title [kick_oumb].powerchat-events.json"
+            media.write_text("media", encoding="utf-8")
+            first = normalize_powerchat_payload(
+                "Alice just gifted 5 Kicks on Kick",
+                source="tts",
+                received_at="2026-07-05T10:00:30+00:00",
+            )
+            second = normalize_powerchat_payload(
+                "Bob just gifted 10 Kicks on Kick",
+                source="tts",
+                received_at="2026-07-05T10:01:30+00:00",
+            )
+            assert first is not None and second is not None
+            write_powerchat_sidecar(
+                target,
+                events=[first],
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+            write_powerchat_sidecar(
+                source,
+                events=[first, second],
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+
+            copied = copy_powerchat_segment_sidecar(source, media)
+            payload = load_powerchat_sidecar(target)
+            source_exists = source.exists()
+
+        self.assertEqual(copied, target)
+        self.assertFalse(source_exists)
+        self.assertEqual(payload["event_count"], 2)
+        self.assertEqual(
+            [event["donor"] for event in payload["events"]],
+            ["Alice", "Bob"],
+        )
 
     def test_powerchat_ws_url_normalizes_username(self) -> None:
         self.assertEqual(

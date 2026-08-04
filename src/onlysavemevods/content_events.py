@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +10,7 @@ import json
 import logging
 import math
 import subprocess
+import tempfile
 
 import numpy as np
 
@@ -349,50 +351,55 @@ def audio_rule_candidates(
 ) -> list[EventCandidate]:
     candidates: list[EventCandidate] = []
     duration = probe_media_duration(config.ffmpeg_path, media_file)
-    for start, audio in iter_audio_windows(
+    windows = iter_audio_windows(
         config.ffmpeg_path,
         media_file,
         settings.window_seconds,
         settings.hop_seconds,
-    ):
-        end = start + max(len(audio) / CONTENT_EVENT_SAMPLE_RATE, MIN_AUDIO_WINDOW_SECONDS)
-        progress = None
-        if duration:
-            progress = 0.1 + min(0.7, 0.7 * (start / duration))
-        emit("Analyzing audio events", progress)
-        loudness = rms_dbfs(audio)
-        labels: list[dict[str, float]] = []
-        if backend is not None:
-            labels = [
-                row
-                for row in backend.classify(audio, CONTENT_EVENT_SAMPLE_RATE)
-                if float(row.get("score", 0.0)) >= settings.min_confidence
-            ]
-        for rule in rules:
-            if rule.voice and not transcript_window_has_voice(
-                transcript_segments,
-                start,
-                end,
-                rule.voice,
-            ):
-                continue
-            text = transcript_text_for_window(
-                transcript_segments,
-                start,
-                end,
-                voice=rule.voice,
+    )
+    with closing(windows):
+        for start, audio in windows:
+            end = start + max(
+                len(audio) / CONTENT_EVENT_SAMPLE_RATE,
+                MIN_AUDIO_WINDOW_SECONDS,
             )
-            candidate = candidate_for_rule(
-                rule,
-                start,
-                end,
-                loudness,
-                labels,
-                text,
-                settings.min_confidence,
-            )
-            if candidate is not None:
-                candidates.append(candidate)
+            progress = None
+            if duration:
+                progress = 0.1 + min(0.7, 0.7 * (start / duration))
+            emit("Analyzing audio events", progress)
+            loudness = rms_dbfs(audio)
+            labels: list[dict[str, float]] = []
+            if backend is not None:
+                labels = [
+                    row
+                    for row in backend.classify(audio, CONTENT_EVENT_SAMPLE_RATE)
+                    if float(row.get("score", 0.0)) >= settings.min_confidence
+                ]
+            for rule in rules:
+                if rule.voice and not transcript_window_has_voice(
+                    transcript_segments,
+                    start,
+                    end,
+                    rule.voice,
+                ):
+                    continue
+                text = transcript_text_for_window(
+                    transcript_segments,
+                    start,
+                    end,
+                    voice=rule.voice,
+                )
+                candidate = candidate_for_rule(
+                    rule,
+                    start,
+                    end,
+                    loudness,
+                    labels,
+                    text,
+                    settings.min_confidence,
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
     return candidates
 
 
@@ -420,43 +427,62 @@ def iter_audio_windows(
         "f32le",
         "-",
     ]
-    try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError as exc:
-        raise ContentEventDetectionError(f"ffmpeg not found: {ffmpeg_path}") from exc
-    if process.stdout is None:
-        raise ContentEventDetectionError("Unable to read ffmpeg audio output")
+    with tempfile.TemporaryFile() as stderr_file:
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=stderr_file,
+            )
+        except FileNotFoundError as exc:
+            raise ContentEventDetectionError(f"ffmpeg not found: {ffmpeg_path}") from exc
+        if process.stdout is None:
+            process.terminate()
+            process.wait()
+            raise ContentEventDetectionError("Unable to read ffmpeg audio output")
 
-    buffer = np.empty(0, dtype=np.float32)
-    start_sample = 0
-    while True:
-        chunk = process.stdout.read(262_144)
-        if not chunk:
-            break
-        usable = len(chunk) - (len(chunk) % 4)
-        if usable <= 0:
-            continue
-        samples = np.frombuffer(chunk[:usable], dtype=np.float32)
-        buffer = np.concatenate((buffer, samples))
-        while len(buffer) >= window_samples:
-            yield start_sample / CONTENT_EVENT_SAMPLE_RATE, buffer[:window_samples].copy()
-            buffer = buffer[hop_samples:]
-            start_sample += hop_samples
+        buffer = np.empty(0, dtype=np.float32)
+        start_sample = 0
+        completed = False
+        try:
+            while True:
+                chunk = process.stdout.read(262_144)
+                if not chunk:
+                    break
+                usable = len(chunk) - (len(chunk) % 4)
+                if usable <= 0:
+                    continue
+                samples = np.frombuffer(chunk[:usable], dtype=np.float32)
+                buffer = np.concatenate((buffer, samples))
+                while len(buffer) >= window_samples:
+                    yield (
+                        start_sample / CONTENT_EVENT_SAMPLE_RATE,
+                        buffer[:window_samples].copy(),
+                    )
+                    buffer = buffer[hop_samples:]
+                    start_sample += hop_samples
 
-    stderr = process.stderr.read().decode("utf-8", "replace") if process.stderr else ""
-    exit_code = process.wait()
-    if process.stdout is not None:
-        process.stdout.close()
-    if process.stderr is not None:
-        process.stderr.close()
-    if exit_code != 0:
-        raise ContentEventDetectionError(stderr.strip() or f"ffmpeg exited with {exit_code}")
-    if len(buffer) >= int(MIN_AUDIO_WINDOW_SECONDS * CONTENT_EVENT_SAMPLE_RATE):
-        yield start_sample / CONTENT_EVENT_SAMPLE_RATE, buffer.copy()
+            exit_code = process.wait()
+            completed = True
+            stderr_file.seek(0)
+            stderr = stderr_file.read().decode("utf-8", "replace")
+            if exit_code != 0:
+                raise ContentEventDetectionError(
+                    stderr.strip() or f"ffmpeg exited with {exit_code}"
+                )
+            if len(buffer) >= int(
+                MIN_AUDIO_WINDOW_SECONDS * CONTENT_EVENT_SAMPLE_RATE
+            ):
+                yield start_sample / CONTENT_EVENT_SAMPLE_RATE, buffer.copy()
+        finally:
+            process.stdout.close()
+            if not completed and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
 
 
 def probe_media_duration(ffmpeg_path: str, media_file: Path) -> float | None:

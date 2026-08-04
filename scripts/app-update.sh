@@ -6,7 +6,12 @@ APP_DIR="${ONLYSAVEMEVODS_APP_DIR:-${INSTALL_DIR}/app}"
 VENV_DIR="${ONLYSAVEMEVODS_VENV_DIR:-${INSTALL_DIR}/.venv}"
 CONFIG_FILE="${ONLYSAVEMEVODS_CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 SERVICE_NAME="${ONLYSAVEMEVODS_SERVICE_NAME:-onlysavemevods.service}"
-LOCK_DIR="${ONLYSAVEMEVODS_APP_UPDATE_LOCK_DIR:-${INSTALL_DIR}/.app-update.lock}"
+APP_UPDATE_STATE_DIR="${ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR:-${ONLYSAVEMEVODS_STATE_DIR:-${INSTALL_DIR}/state}}"
+UPDATE_LOCK_FILE="${ONLYSAVEMEVODS_UPDATE_LOCK_FILE:-${INSTALL_DIR}/.update.lock}"
+TRUSTED_REPOSITORY="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY:-FlaminWrap/ONLYSAVEmeVODS}"
+TRUSTED_MODE="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE:-manual}"
+TRUSTED_INCLUDE_PRERELEASES="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES:-false}"
+TRUSTED_TOKEN_ENV="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_TOKEN_ENV:-GITHUB_TOKEN}"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 STOPPED_SERVICE=0
 SERVICE_RESTARTED=0
@@ -22,7 +27,6 @@ cleanup() {
     echo "Restarting ${SERVICE_NAME} after app updater exit..."
     systemctl start "${SERVICE_NAME}" || true
   fi
-  rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
   exit "${exit_code}"
 }
 
@@ -38,8 +42,11 @@ require_root() {
 }
 
 take_lock() {
-  if ! mkdir "${LOCK_DIR}" >/dev/null 2>&1; then
-    skip "Another app update is already running; skipping."
+  command -v flock >/dev/null 2>&1 || die "flock is required for safe updater serialization."
+  install -d -m 0755 "${INSTALL_DIR}"
+  exec 9>"${UPDATE_LOCK_FILE}"
+  if ! flock -n 9; then
+    skip "Another installer or updater is already running; skipping."
   fi
   trap cleanup EXIT
 }
@@ -93,8 +100,22 @@ require_root
 [[ -f "${CONFIG_FILE}" ]] || die "Config file not found: ${CONFIG_FILE}"
 take_lock
 
-"${PYTHON_BIN}" -m onlysavemevods.app_update check-auto --config "${CONFIG_FILE}" >/dev/null
-if ! "${PYTHON_BIN}" -m onlysavemevods.app_update has-request --config "${CONFIG_FILE}"; then
+POLICY_ARGS=(
+  --trusted-repository "${TRUSTED_REPOSITORY}"
+  --trusted-mode "${TRUSTED_MODE}"
+  --trusted-include-prereleases "${TRUSTED_INCLUDE_PRERELEASES}"
+  --trusted-token-env "${TRUSTED_TOKEN_ENV}"
+)
+
+if ! "${PYTHON_BIN}" -m onlysavemevods.app_update check-trusted-auto \
+  --config "${CONFIG_FILE}" \
+  --state-dir "${APP_UPDATE_STATE_DIR}" \
+  "${POLICY_ARGS[@]}" >/dev/null; then
+  echo "Trusted update check failed; attempting any pending request independently." >&2
+fi
+if ! "${PYTHON_BIN}" -m onlysavemevods.app_update has-request \
+  --config "${CONFIG_FILE}" \
+  --state-dir "${APP_UPDATE_STATE_DIR}"; then
   skip "No pending app update request."
 fi
 
@@ -103,6 +124,8 @@ ensure_idle_if_service_active
   --config "${CONFIG_FILE}" \
   --install-dir "${INSTALL_DIR}" \
   --app-dir "${APP_DIR}" \
-  --venv-dir "${VENV_DIR}"
+  --venv-dir "${VENV_DIR}" \
+  --state-dir "${APP_UPDATE_STATE_DIR}" \
+  "${POLICY_ARGS[@]}"
 restart_service_if_needed
 echo "App update completed."

@@ -6,7 +6,7 @@ APP_DIR="${ONLYSAVEMEVODS_APP_DIR:-${INSTALL_DIR}/app}"
 VENV_DIR="${ONLYSAVEMEVODS_VENV_DIR:-${INSTALL_DIR}/.venv}"
 CONFIG_FILE="${ONLYSAVEMEVODS_CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 SERVICE_NAME="${ONLYSAVEMEVODS_SERVICE_NAME:-onlysavemevods.service}"
-LOCK_DIR="${ONLYSAVEMEVODS_PYTHON_UPDATE_LOCK_DIR:-${INSTALL_DIR}/.python-update.lock}"
+UPDATE_LOCK_FILE="${ONLYSAVEMEVODS_UPDATE_LOCK_FILE:-${INSTALL_DIR}/.update.lock}"
 PYTHON_BIN="${VENV_DIR}/bin/python"
 YTDLP_BIN="${VENV_DIR}/bin/yt-dlp"
 WHISPERX_BIN="${VENV_DIR}/bin/whisperx"
@@ -24,7 +24,6 @@ cleanup() {
     echo "Restarting ${SERVICE_NAME} after updater exit..."
     systemctl start "${SERVICE_NAME}" || true
   fi
-  rmdir "${LOCK_DIR}" >/dev/null 2>&1 || true
   exit "${exit_code}"
 }
 
@@ -40,8 +39,11 @@ require_root() {
 }
 
 take_lock() {
-  if ! mkdir "${LOCK_DIR}" >/dev/null 2>&1; then
-    skip "Another Python dependency update is already running; skipping."
+  command -v flock >/dev/null 2>&1 || die "flock is required for safe updater serialization."
+  install -d -m 0755 "${INSTALL_DIR}"
+  exec 9>"${UPDATE_LOCK_FILE}"
+  if ! flock -n 9; then
+    skip "Another installer or updater is already running; skipping."
   fi
   trap cleanup EXIT
 }

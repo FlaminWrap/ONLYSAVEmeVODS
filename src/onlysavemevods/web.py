@@ -3,14 +3,14 @@ from __future__ import annotations
 from bisect import insort
 from collections import OrderedDict
 from dataclasses import asdict, dataclass, field, replace
-from functools import lru_cache
+from functools import lru_cache, wraps
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 from typing import Any
-from urllib.parse import parse_qs, quote, urlencode, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
@@ -18,6 +18,7 @@ from email.policy import default as email_policy
 import asyncio
 import csv
 import hashlib
+import ipaddress
 import io
 import json
 import logging
@@ -111,7 +112,7 @@ from .job_tracker import (
     update_tracked_job,
 )
 from .kick_chat import download_kick_vod_chat_replay
-from .log_buffer import LogEntry, get_recent_log_entries
+from .log_buffer import LogEntry, get_recent_log_snapshot
 from .models import LiveStream
 from .powerchat import (
     POWERCHAT_EVENT_SUFFIX,
@@ -208,9 +209,24 @@ WEB_SLOW_REQUEST_SECONDS = env_float("ONLYSAVEMEVODS_WEB_SLOW_REQUEST_SECONDS", 
 WEB_SLOW_STEP_SECONDS = env_float("ONLYSAVEMEVODS_WEB_SLOW_STEP_SECONDS", 0.25)
 WEB_SLOW_STREAM_SECONDS = env_float("ONLYSAVEMEVODS_WEB_SLOW_STREAM_SECONDS", 0.15)
 WEB_SLOW_FILE_SECONDS = env_float("ONLYSAVEMEVODS_WEB_SLOW_FILE_SECONDS", 0.08)
-WEB_FILE_SCAN_CACHE_SECONDS = env_float("ONLYSAVEMEVODS_WEB_FILE_SCAN_CACHE_SECONDS", 30.0)
-WEB_FILE_SCAN_ACTIVE_CACHE_SECONDS = env_float("ONLYSAVEMEVODS_WEB_FILE_SCAN_ACTIVE_CACHE_SECONDS", 2.0)
-WEB_FILE_SCAN_CACHE_MAX_ENTRIES = max(0, env_int("ONLYSAVEMEVODS_WEB_FILE_SCAN_CACHE_MAX_ENTRIES", 32))
+# Ended stream directories are normally stable and can contain tens of thousands
+# of retained yt-dlp fragments.  Keep their summaries long enough that dashboard
+# polling does not repeatedly stat every fragment.  The directory fingerprint
+# still invalidates the entry immediately when a file is added or removed.
+WEB_FILE_SCAN_CACHE_SECONDS = env_float("ONLYSAVEMEVODS_WEB_FILE_SCAN_CACHE_SECONDS", 300.0)
+WEB_FILE_SCAN_ACTIVE_CACHE_SECONDS = env_float(
+    "ONLYSAVEMEVODS_WEB_FILE_SCAN_ACTIVE_CACHE_SECONDS",
+    2.0,
+)
+WEB_FILE_DIAGNOSTIC_CACHE_SECONDS = 10.0
+# A full dashboard snapshot can include STREAM_LIMIT (currently 100) streams.
+# The old 32-entry default caused complete LRU cache churn when more than 32
+# streams were shown: by the time traversal reached a previously cached stream,
+# earlier misses had already evicted it.  Leave headroom for concurrent views.
+WEB_FILE_SCAN_CACHE_MAX_ENTRIES = max(
+    0,
+    env_int("ONLYSAVEMEVODS_WEB_FILE_SCAN_CACHE_MAX_ENTRIES", 256),
+)
 
 
 def perf_elapsed(started_at: float) -> float:
@@ -309,6 +325,7 @@ WEB_ASSET_ROUTES = {
 ASSET_ROUTES = {**FAVICON_ROUTES, **PLATFORM_ICON_ROUTES, **WEB_ASSET_ROUTES}
 STREAM_LIMIT = 100
 FILE_LIMIT_PER_STREAM = 80
+DIAGNOSTIC_FILE_KINDS = frozenset({"fragment", "state", "temporary"})
 STREAM_EVENT_LIMIT = 8
 LOG_LIMIT = 200
 JOB_LIMIT = 200
@@ -317,7 +334,6 @@ STREAMER_STREAM_PAGE_SIZE = 10
 STREAMER_STREAM_PAGE_SIZE_OPTIONS = (5, 10, 25, 50)
 STREAMER_STREAM_SEARCH_MAX_LENGTH = 256
 CHAT_RENDER_PROGRESS_POLL_SECONDS = 2.0
-PROCESSING_WINDOW_RECHECK_SECONDS = 60.0
 SEGMENT_NAME_RE = re.compile(
     r"^(?P<segment>segment-\d{3})(?:\.f(?P<format_id>\d+))?"
 )
@@ -351,6 +367,7 @@ TRANSCRIPTION_JOBS: dict[str, TranscriptionJob] = {}
 TRANSCRIPTION_JOBS_LOCK = Lock()
 EVENT_DETECTION_JOBS: dict[str, EventDetectionJob] = {}
 EVENT_DETECTION_JOBS_LOCK = Lock()
+STREAM_OPERATION_LOCK = RLock()
 WATERMARK_JOB_STATUSES = {
     WATERMARK_STATUS_DONE,
     WATERMARK_STATUS_FAILED,
@@ -421,6 +438,9 @@ class DirectoryScanSummary:
     part_format_ids: tuple[tuple[str, str], ...]
     final_format_ids: tuple[tuple[str, str], ...]
     visible_entries: tuple[CachedFileEntry, ...]
+    diagnostic_file_count: int = 0
+    file_size_totals_complete: bool = True
+    scan_succeeded: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,6 +462,8 @@ class StreamFileSummary:
     part_format_ids: tuple[tuple[str, str], ...]
     final_format_ids: tuple[tuple[str, str], ...]
     files: list[FileStatus]
+    diagnostic_file_count: int = 0
+    file_size_totals_complete: bool = True
 
 
 FILE_SCAN_CACHE: OrderedDict[str, DirectoryScanCacheEntry] = OrderedDict()
@@ -621,6 +643,8 @@ class StreamStatus:
     jobs: list[JobStatus]
     files: list[FileStatus]
     recoverable_segments: list[int] = field(default_factory=list)
+    diagnostic_file_count: int = 0
+    file_size_totals_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,6 +665,7 @@ class ChannelStatus:
     fragment_bytes: int
     latest_updated_at: str | None
     latest_file_modified_at: float | None
+    file_size_totals_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -711,6 +736,7 @@ class StreamerStatStatus:
     streams: list[StreamStatus]
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
     timezone: str = "UTC"
+    file_size_totals_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -781,10 +807,12 @@ class StatusSnapshot:
     channel_stats: list[ChannelStatus]
     speaker_labels: list[SpeakerLabelStatus]
     recent_logs: list[LogEntry]
+    log_revision: int
     log_limit: int
     jobs: list[JobStatus]
     job_limit: int
     streams: list[StreamStatus]
+    file_size_totals_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -1078,7 +1106,22 @@ CONFIG_FIELD_UNITS = {
     "watermark_detect_upload_max_bytes": "bytes",
 }
 
-CONFIG_RESTART_FIELDS = {"state_dir", "web_enabled", "web_host", "web_port"}
+CONFIG_RESTART_FIELDS = {
+    # These values are captured by long-lived daemon components. Keeping the
+    # running object unchanged avoids splitting state, files, limits, or source
+    # discovery across old and new component instances.
+    "download_dir",
+    "state_dir",
+    "channel_scan_limit",
+    "discovery_probe_concurrency",
+    "live_from_start",
+    "transcription_max_concurrent",
+    "web_enabled",
+    "web_host",
+    "web_port",
+    "log_level",
+    "yt_dlp_path",
+}
 CONFIG_FIELD_DEPENDENCIES = {
     "fragment_retention_hours": ("keep_fragments_for_resume",),
     "render_live_chat_video": ("record_live_chat",),
@@ -1110,6 +1153,139 @@ CONFIG_FORM_FIELD_BY_KEY = {field.key: field for field in CONFIG_FORM_FIELDS}
 CONFIG_UPDATE_LOCK = Lock()
 
 
+def normalized_dashboard_host(value: str) -> str:
+    host = value.strip().lower().rstrip(".")
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    return host
+
+
+def parsed_http_authority(value: str) -> tuple[str, int | None] | None:
+    value = value.strip()
+    if (
+        not value
+        or any(character in value for character in "\\/?#,@")
+        or any(ord(character) < 33 or ord(character) == 127 for character in value)
+    ):
+        return None
+    try:
+        parts = urlsplit(f"//{value}")
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname or parts.username is not None or parts.password is not None:
+        return None
+    return normalized_dashboard_host(parts.hostname), port
+
+
+def dashboard_host_is_loopback(value: str) -> bool:
+    host = normalized_dashboard_host(value)
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def dashboard_host_is_wildcard(value: str) -> bool:
+    host = normalized_dashboard_host(value)
+    return host in {"", "0.0.0.0", "::"}
+
+
+def dashboard_request_host_allowed(
+    host_header: str,
+    *,
+    bind_host: str,
+    server_port: int,
+) -> bool:
+    authority = parsed_http_authority(host_header)
+    if authority is None:
+        return False
+    request_host, request_port = authority
+    if request_port is not None and server_port > 0 and request_port != server_port:
+        return False
+
+    if dashboard_host_is_loopback(bind_host):
+        if dashboard_host_is_loopback(request_host):
+            return True
+        # A loopback-bound service is commonly published through a local
+        # reverse proxy, which forwards the public DNS Host header.
+        try:
+            ipaddress.ip_address(request_host)
+        except ValueError:
+            return True
+        return False
+    if dashboard_host_is_wildcard(bind_host):
+        return True
+    return request_host == normalized_dashboard_host(bind_host)
+
+
+def dashboard_url_matches_request(
+    value: str,
+    *,
+    host_header: str,
+    server_port: int,
+) -> bool:
+    try:
+        parts = urlsplit(value.strip())
+        origin_port = parts.port
+    except ValueError:
+        return False
+    if (
+        parts.scheme not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        return False
+    request_authority = parsed_http_authority(host_header)
+    if request_authority is None:
+        return False
+    request_host, request_port = request_authority
+    default_port = 443 if parts.scheme == "https" else 80
+    expected_port = request_port if request_port is not None else default_port
+    if origin_port is None:
+        origin_port = default_port
+    if normalized_dashboard_host(parts.hostname) != request_host:
+        return False
+    return origin_port == expected_port
+
+
+def dashboard_mutation_is_same_origin(
+    headers: Any,
+    *,
+    server_port: int,
+) -> bool:
+    """Reject browser cross-origin writes while retaining non-browser API use."""
+
+    host = headers.get("Host", "")
+    fetch_site = headers.get("Sec-Fetch-Site", "").strip().lower()
+    if fetch_site in {"cross-site", "same-site"}:
+        return False
+
+    origin = headers.get("Origin", "").strip()
+    if origin:
+        return dashboard_url_matches_request(
+            origin,
+            host_header=host,
+            server_port=server_port,
+        )
+
+    referer = headers.get("Referer", "").strip()
+    if referer:
+        return dashboard_url_matches_request(
+            referer,
+            host_header=host,
+            server_port=server_port,
+        )
+
+    # Command-line clients and service integrations do not send browser fetch
+    # metadata. Cross-origin browser form/fetch requests carry Origin and/or
+    # Sec-Fetch-Site and are rejected above.
+    return fetch_site in {"", "none", "same-origin"}
+
+
 class StatusWebServer:
     def __init__(
         self,
@@ -1136,7 +1312,7 @@ class StatusWebServer:
             self.host,
             self.port,
         )
-        handler = build_handler(self.config)
+        handler = build_handler(self.config, trusted_host=self.host)
         server = ThreadingHTTPServer((self.host, self.port), handler)
         server.daemon_threads = True
         thread = Thread(target=server.serve_forever, name="onlysavemevods-web", daemon=True)
@@ -1160,7 +1336,7 @@ class StatusWebServer:
             self.host,
             self.port,
         )
-        handler = build_handler(self.config)
+        handler = build_handler(self.config, trusted_host=self.host)
         with ThreadingHTTPServer((self.host, self.port), handler) as server:
             server.daemon_threads = True
             actual_host, actual_port = server.server_address[:2]
@@ -1184,7 +1360,13 @@ class StatusWebServer:
         self._thread = None
 
 
-def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
+def build_handler(
+    config: BotConfig,
+    *,
+    trusted_host: str | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    bind_host = trusted_host if trusted_host is not None else config.web_host
+
     class StatusRequestHandler(BaseHTTPRequestHandler):
         server_version = "ONLYSAVEmeVODSDashboard/1.0"
 
@@ -1193,6 +1375,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             parts = urlsplit(self.path)
             path = parts.path
             try:
+                if not self._request_host_allowed():
+                    self.send_error(HTTPStatus.MISDIRECTED_REQUEST, "Unrecognized dashboard host")
+                    return
                 if path in ("", "/"):
                     self._send_admin_page("overview", parts.query)
                     return
@@ -1225,6 +1410,9 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                     return
                 if path == "/stream-voice-speakers":
                     self._send_stream_voice_speakers(parts.query)
+                    return
+                if path == "/stream-file-diagnostics":
+                    self._send_stream_file_diagnostics(parts.query)
                     return
                 if path == "/healthz":
                     self._send_text("ok\n", "text/plain; charset=utf-8")
@@ -1280,13 +1468,26 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             allowed = {"/", "/streamers", "/settings", "/powerchat", "/activity", "/tools", "/about"}
             if parts.path not in allowed:
                 return default
-            return parts.path + (f"?{parts.query}" if parts.query else "") + (f"#{parts.fragment}" if parts.fragment else "")
+            location = parts.path + (f"?{parts.query}" if parts.query else "")
+            location += f"#{parts.fragment}" if parts.fragment else ""
+            return safe_return_to(location, default)
 
         def do_POST(self) -> None:
             started_at = time.perf_counter()
             parts = urlsplit(self.path)
             path = parts.path
             try:
+                if not self._request_host_allowed():
+                    self._discard_request_body()
+                    self.send_error(HTTPStatus.MISDIRECTED_REQUEST, "Unrecognized dashboard host")
+                    return
+                if not dashboard_mutation_is_same_origin(
+                    self.headers,
+                    server_port=int(getattr(self.server, "server_port", 0) or 0),
+                ):
+                    self._discard_request_body()
+                    self.send_error(HTTPStatus.FORBIDDEN, "Cross-origin dashboard mutation rejected")
+                    return
                 if path == "/render-chat":
                     self._start_render_chat(parts.query)
                     return
@@ -1367,6 +1568,13 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
         def log_message(self, fmt: str, *args: Any) -> None:
             LOGGER.debug("dashboard web: " + fmt, *args)
 
+        def _request_host_allowed(self) -> bool:
+            return dashboard_request_host_allowed(
+                self.headers.get("Host", ""),
+                bind_host=bind_host,
+                server_port=int(getattr(self.server, "server_port", 0) or 0),
+            )
+
         def _send_html(self, body: str) -> None:
             self._send_text(body, "text/html; charset=utf-8")
 
@@ -1387,6 +1595,7 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             snapshot = build_status_snapshot(
                 config,
                 include_speaker_scan=include_speaker_scan,
+                include_file_diagnostics=not query_flag(params, "dashboard"),
             )
             log_perf(
                 "status-json-build",
@@ -1394,12 +1603,18 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 WEB_SLOW_STEP_SECONDS,
                 detail="full",
                 include_speaker_scan=include_speaker_scan,
+                include_file_diagnostics=not query_flag(params, "dashboard"),
             )
             self._send_json(snapshot_to_dict(snapshot))
 
         def _send_streamer_streams_json(self, query: str) -> None:
+            params = parse_qs(query)
             try:
-                payload = build_streamer_stream_page_payload(config, parse_qs(query))
+                payload = build_streamer_stream_page_payload(
+                    config,
+                    params,
+                    include_file_diagnostics=not query_flag(params, "dashboard"),
+                )
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -1524,6 +1739,27 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
             self._send_json(payload)
+
+        def _send_stream_file_diagnostics(self, query: str) -> None:
+            if self.headers.get("X-Dashboard-Fragment") != "1":
+                self.send_error(
+                    HTTPStatus.FORBIDDEN,
+                    "File diagnostics require an explicit dashboard request",
+                )
+                return
+            video_id = first_query_value(parse_qs(query), "video_id").strip()
+            if not video_id:
+                self.send_error(HTTPStatus.BAD_REQUEST, "video_id is required")
+                return
+            try:
+                summary = build_stream_file_diagnostics(config, video_id)
+            except FileNotFoundError:
+                self.send_error(HTTPStatus.NOT_FOUND, "Stream is not available")
+                return
+            except ConfigError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self._send_html(render_stream_file_diagnostics(summary))
 
         def _send_watermark_download(self, query: str) -> None:
             params = parse_qs(query)
@@ -2171,12 +2407,11 @@ def build_handler(config: BotConfig) -> type[BaseHTTPRequestHandler]:
             return self.rfile.read(length) if length > 0 else b""
 
         def _discard_request_body(self) -> None:
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError:
-                length = 0
-            if length > 0:
-                self.rfile.read(length)
+            # Rejected requests do not need their potentially attacker-sized
+            # bodies. Closing the connection prevents unread bytes from being
+            # interpreted as a subsequent request without blocking this
+            # handler while an untrusted client trickles data.
+            self.close_connection = True
 
         def _send_text(self, body: str, content_type: str) -> None:
             encoded = body.encode("utf-8")
@@ -2195,6 +2430,7 @@ def build_status_snapshot(
     config: BotConfig,
     *,
     include_speaker_scan: bool = True,
+    include_file_diagnostics: bool = True,
 ) -> StatusSnapshot:
     started_at = time.perf_counter()
     steps: list[tuple[str, float]] = []
@@ -2233,6 +2469,7 @@ def build_status_snapshot(
             watermarks_by_video.get(record.video_id, []),
             stream_events.get(record.video_id, []),
             jobs_by_video.get(record.video_id, []),
+            include_file_diagnostics=include_file_diagnostics,
         )
         for record in records
     ]
@@ -2258,6 +2495,7 @@ def build_status_snapshot(
     perf_step(steps, "speaker_labels", step_started_at)
 
     step_started_at = time.perf_counter()
+    recent_logs, log_revision = get_recent_log_snapshot(LOG_LIMIT)
     snapshot = StatusSnapshot(
         generated_at=time.time(),
         stream_revision=stream_revision_for_records(records),
@@ -2282,11 +2520,15 @@ def build_status_snapshot(
         configuration=build_config_summary(config),
         channel_stats=channel_stats,
         speaker_labels=speaker_labels,
-        recent_logs=get_recent_log_entries(LOG_LIMIT),
+        recent_logs=recent_logs,
+        log_revision=log_revision,
         log_limit=LOG_LIMIT,
         jobs=jobs,
         job_limit=JOB_LIMIT,
         streams=streams,
+        file_size_totals_complete=all(
+            stream.file_size_totals_complete for stream in streams
+        ),
     )
     perf_step(steps, "snapshot", step_started_at)
 
@@ -2299,6 +2541,7 @@ def build_status_snapshot(
         files=sum(stream.file_count for stream in streams),
         jobs=len(jobs),
         include_speaker_scan=include_speaker_scan,
+        include_file_diagnostics=include_file_diagnostics,
         steps=format_perf_steps(steps),
     )
     return snapshot
@@ -2307,8 +2550,14 @@ def build_status_snapshot(
 def build_streamer_stream_page_payload(
     config: BotConfig,
     params: dict[str, list[str]],
+    *,
+    include_file_diagnostics: bool = True,
 ) -> dict[str, Any]:
-    stream_page = build_streamer_stream_page(config, params)
+    stream_page = build_streamer_stream_page(
+        config,
+        params,
+        include_file_diagnostics=include_file_diagnostics,
+    )
     return {
         "streamer": stream_page.streamer,
         "page": stream_page.page,
@@ -2324,6 +2573,8 @@ def build_streamer_stream_page_payload(
 def build_streamer_stream_page(
     config: BotConfig,
     params: dict[str, list[str]],
+    *,
+    include_file_diagnostics: bool = True,
 ) -> StreamerStreamPage:
     streamer_name = first_query_value(params, "streamer").strip()
     if not streamer_name:
@@ -2423,6 +2674,7 @@ def build_streamer_stream_page(
             watermarks_by_video.get(record.video_id, []),
             stream_events.get(record.video_id, []),
             jobs_by_video.get(record.video_id, []),
+            include_file_diagnostics=include_file_diagnostics,
         )
         for record in page_records
     ]
@@ -2557,6 +2809,7 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
     jobs = build_job_statuses(watermark_records)
     perf_step(steps, "aggregate", step_started_at)
 
+    recent_logs, log_revision = get_recent_log_snapshot(LOG_LIMIT)
     payload = {
         "detail": "lite",
         "generated_at": time.time(),
@@ -2566,7 +2819,8 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
         "streamer_count": len(config.streamers),
         "attention_count": attention_count,
         "counts": counts,
-        "recent_logs": [asdict(entry) for entry in get_recent_log_entries(LOG_LIMIT)],
+        "recent_logs": [asdict(entry) for entry in recent_logs],
+        "log_revision": log_revision,
         "log_limit": LOG_LIMIT,
         "jobs": [asdict(job) for job in jobs],
         "job_limit": JOB_LIMIT,
@@ -2768,6 +3022,14 @@ def build_admin_static_snapshot(config: BotConfig) -> AdminStaticSnapshot:
 
 
 def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
+    # Restart-only settings remain intentionally unchanged on the live shared
+    # config object. Read the saved file for form/display values so a successful
+    # save does not appear to revert while the service awaits restart.
+    if config.config_path is not None:
+        try:
+            config = load_config(config.config_path)
+        except ConfigError:
+            LOGGER.warning("Unable to load saved config values for dashboard", exc_info=True)
     return {
         "Paths": {
             "config_path": str(config.config_path) if config.config_path else "-",
@@ -3167,6 +3429,7 @@ def streamer_stat_from_channel_status(
         latest_activity_at=latest_activity,
         jobs=jobs,
         streams=list(streams),
+        file_size_totals_complete=status.file_size_totals_complete,
     )
 
 
@@ -3426,7 +3689,11 @@ def build_powerchat_export_payload(
     params: dict[str, list[str]],
 ) -> dict[str, Any]:
     filters = powerchat_export_filters(params)
-    snapshot = build_status_snapshot(config, include_speaker_scan=False)
+    snapshot = build_status_snapshot(
+        config,
+        include_speaker_scan=False,
+        include_file_diagnostics=False,
+    )
     stats = snapshot.powerchat_stats or {}
     events = filter_powerchat_export_events(stats.get("events", []), filters)
     totals = powerchat_export_totals(events)
@@ -3534,8 +3801,24 @@ def powerchat_export_csv(events: list[dict[str, Any]]) -> str:
     writer = csv.DictWriter(buffer, fieldnames=POWERCHAT_EXPORT_COLUMNS, extrasaction="ignore")
     writer.writeheader()
     for event in events:
-        writer.writerow(event)
+        writer.writerow(
+            {
+                key: spreadsheet_safe_csv_cell(value)
+                for key, value in event.items()
+            }
+        )
     return buffer.getvalue()
+
+
+def spreadsheet_safe_csv_cell(value: Any) -> Any:
+    """Neutralize text that spreadsheet programs could execute as a formula."""
+
+    if not isinstance(value, str) or not value:
+        return value
+    significant = value.lstrip(" \t\r\n")
+    if not significant or significant[0] not in "=+-@":
+        return value
+    return "'" + value
 
 
 def powerchat_export_filename(filters: dict[str, str], export_format: str) -> str:
@@ -3895,6 +4178,9 @@ def channel_status_from_streams(
             ),
             default=None,
         ),
+        file_size_totals_complete=all(
+            stream.file_size_totals_complete for stream in streams
+        ),
     )
 
 
@@ -4207,6 +4493,8 @@ def stream_status_from_record(
     watermark_records: list[WatermarkCopyRecord] | None = None,
     event_records: list[StreamEventRecord] | None = None,
     job_records: list[JobStatus] | None = None,
+    *,
+    include_file_diagnostics: bool = True,
 ) -> StreamStatus:
     started_at = time.perf_counter()
     steps: list[tuple[str, float]] = []
@@ -4226,6 +4514,7 @@ def stream_status_from_record(
         watermark_records or [],
         platform=record.platform,
         cache_ttl_seconds=file_scan_cache_ttl,
+        include_diagnostics=include_file_diagnostics,
     )
     perf_step(steps, "files", step_started_at)
 
@@ -4295,6 +4584,8 @@ def stream_status_from_record(
         jobs=list(job_records or []),
         files=file_summary.files,
         recoverable_segments=recoverable_segments,
+        diagnostic_file_count=file_summary.diagnostic_file_count,
+        file_size_totals_complete=file_summary.file_size_totals_complete,
     )
     log_perf(
         "stream-status",
@@ -4303,6 +4594,7 @@ def stream_status_from_record(
         video_id=record.video_id,
         status=record.status,
         files=file_summary.file_count,
+        file_size_totals_complete=file_summary.file_size_totals_complete,
         directory=directory,
         steps=format_perf_steps(steps),
     )
@@ -4342,7 +4634,7 @@ def empty_stream_file_summary() -> StreamFileSummary:
     return stream_file_summary_from_scan(empty_directory_scan_summary(), [])
 
 
-def empty_directory_scan_summary() -> DirectoryScanSummary:
+def empty_directory_scan_summary(*, scan_succeeded: bool = True) -> DirectoryScanSummary:
     return DirectoryScanSummary(
         directory_entry_count=0,
         file_count=0,
@@ -4355,6 +4647,9 @@ def empty_directory_scan_summary() -> DirectoryScanSummary:
         part_format_ids=(),
         final_format_ids=(),
         visible_entries=(),
+        diagnostic_file_count=0,
+        file_size_totals_complete=True,
+        scan_succeeded=scan_succeeded,
     )
 
 
@@ -4373,7 +4668,23 @@ def stream_file_summary_from_scan(
         part_format_ids=scan.part_format_ids,
         final_format_ids=scan.final_format_ids,
         files=files,
+        diagnostic_file_count=scan.diagnostic_file_count,
+        file_size_totals_complete=scan.file_size_totals_complete,
     )
+
+
+def invalidate_file_scan_cache(directory: Path) -> None:
+    aliases = {str(directory)}
+    try:
+        aliases.add(str(directory.resolve()))
+    except OSError:
+        pass
+    with FILE_SCAN_CACHE_LOCK:
+        for alias in aliases:
+            # Remove both scan modes and any key left by an older process.
+            FILE_SCAN_CACHE.pop(alias, None)
+            FILE_SCAN_CACHE.pop(f"full:{alias}", None)
+            FILE_SCAN_CACHE.pop(f"relevant:{alias}", None)
 
 
 def directory_scan_fingerprint(directory: Path) -> tuple[int, int] | None:
@@ -4388,12 +4699,14 @@ def cached_directory_scan_summary(
     directory: Path,
     video_id: str,
     cache_ttl_seconds: float,
+    *,
+    include_diagnostics: bool = True,
 ) -> tuple[DirectoryScanSummary, str]:
     fingerprint = directory_scan_fingerprint(directory)
     if fingerprint is None:
         return empty_directory_scan_summary(), "missing"
 
-    cache_key = str(directory)
+    cache_key = f"{'full' if include_diagnostics else 'relevant'}:{directory}"
     now = time.monotonic()
     cache_status = "disabled"
     if cache_ttl_seconds >= 0 and WEB_FILE_SCAN_CACHE_MAX_ENTRIES > 0:
@@ -4409,12 +4722,20 @@ def cached_directory_scan_summary(
             else:
                 cache_status = "expired"
 
-    summary = scan_directory_uncached(directory, video_id)
+    summary = scan_directory_uncached(
+        directory,
+        video_id,
+        include_diagnostics=include_diagnostics,
+    )
     if cache_ttl_seconds >= 0 and WEB_FILE_SCAN_CACHE_MAX_ENTRIES > 0:
+        # Timestamp the completed summary, not the beginning of a potentially
+        # expensive metadata walk.  Otherwise a scan that takes longer than
+        # its TTL is already expired when it enters the cache.
+        cached_at = time.monotonic()
         with FILE_SCAN_CACHE_LOCK:
             FILE_SCAN_CACHE[cache_key] = DirectoryScanCacheEntry(
                 fingerprint=fingerprint,
-                cached_at=now,
+                cached_at=cached_at,
                 summary=summary,
             )
             FILE_SCAN_CACHE.move_to_end(cache_key)
@@ -4423,7 +4744,12 @@ def cached_directory_scan_summary(
     return summary, cache_status
 
 
-def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSummary:
+def scan_directory_uncached(
+    directory: Path,
+    video_id: str,
+    *,
+    include_diagnostics: bool = True,
+) -> DirectoryScanSummary:
     directory_entry_count = 0
     file_count = 0
     total_bytes = 0
@@ -4435,6 +4761,7 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
     part_format_ids: set[tuple[str, str]] = set()
     final_format_ids: set[tuple[str, str]] = set()
     visible_entries: list[tuple[str, int, CachedFileEntry]] = []
+    diagnostic_file_count = 0
     sequence = 0
 
     try:
@@ -4444,12 +4771,26 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
                 try:
                     if not entry.is_file(follow_symlinks=False):
                         continue
+                except OSError:
+                    continue
+                kind = file_kind(entry.name)
+                segment, format_id = file_details(entry.name)
+                if kind in DIAGNOSTIC_FILE_KINDS:
+                    diagnostic_file_count += 1
+                    if not include_diagnostics:
+                        # Fragment and internal sidecar names are sufficient for
+                        # the dashboard count.  Avoid a filesystem metadata call
+                        # for every retained yt-dlp fragment; destructive and
+                        # recovery operations perform their own authoritative
+                        # validation when invoked.
+                        file_count += 1
+                        counts_by_kind[kind] = counts_by_kind.get(kind, 0) + 1
+                        continue
+                try:
                     stat = entry.stat(follow_symlinks=False)
                 except OSError:
                     continue
 
-                kind = file_kind(entry.name)
-                segment, format_id = file_details(entry.name)
                 file_count += 1
                 total_bytes += stat.st_size
                 bytes_by_kind[kind] = bytes_by_kind.get(kind, 0) + stat.st_size
@@ -4487,7 +4828,7 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
             directory,
             exc,
         )
-        return empty_directory_scan_summary()
+        return empty_directory_scan_summary(scan_succeeded=False)
 
     return DirectoryScanSummary(
         directory_entry_count=directory_entry_count,
@@ -4501,6 +4842,8 @@ def scan_directory_uncached(directory: Path, video_id: str) -> DirectoryScanSumm
         part_format_ids=tuple(sorted(part_format_ids)),
         final_format_ids=tuple(sorted(final_format_ids)),
         visible_entries=tuple(item[2] for item in visible_entries),
+        diagnostic_file_count=diagnostic_file_count,
+        file_size_totals_complete=(include_diagnostics or diagnostic_file_count == 0),
     )
 
 
@@ -4512,6 +4855,8 @@ def summarize_files(
     watermark_records: list[WatermarkCopyRecord] | None = None,
     platform: str = "youtube",
     cache_ttl_seconds: float = WEB_FILE_SCAN_CACHE_SECONDS,
+    include_diagnostics: bool = True,
+    raise_scan_errors: bool = False,
 ) -> StreamFileSummary:
     started_at = time.perf_counter()
     if not directory.exists():
@@ -4526,7 +4871,10 @@ def summarize_files(
         directory,
         video_id,
         cache_ttl_seconds,
+        include_diagnostics=include_diagnostics,
     )
+    if raise_scan_errors and not scan_summary.scan_succeeded:
+        raise ConfigError("Unable to scan stream directory")
     scan_elapsed = perf_elapsed(scan_started_at)
 
     files: list[FileStatus] = []
@@ -4686,6 +5034,8 @@ def summarize_files(
         part_format_ids=scan_summary.part_format_ids,
         final_format_ids=scan_summary.final_format_ids,
         files=files,
+        diagnostic_file_count=scan_summary.diagnostic_file_count,
+        file_size_totals_complete=scan_summary.file_size_totals_complete,
     )
 
 
@@ -4926,17 +5276,82 @@ def resolve_download_file(
 
 
 FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
+    "cleaning_fragments",
     "checking_after_exit",
+    "deleting",
     "downloading",
     "stalled",
     "waiting_retry",
 }
 STREAM_DELETE_BLOCKED_STATUSES = {
+    "cleaning_fragments",
     "checking_after_exit",
+    "deleting",
     "downloading",
+    "stalled",
     "waiting_retry",
 }
 STREAM_DELETE_CONFIRM_VALUE = "delete_stream"
+
+
+def serialized_stream_operation(function: Any) -> Any:
+    """Serialize dashboard job registration with destructive stream removal."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        with STREAM_OPERATION_LOCK:
+            return function(*args, **kwargs)
+
+    return wrapped
+
+
+def active_dashboard_job_kinds(config: BotConfig, video_id: str) -> list[str]:
+    active_statuses = {"queued", "running"}
+    kinds = {
+        job.kind or "Dashboard job"
+        for job in list_tracked_jobs(limit=1000)
+        if job.video_id == video_id and job.status in active_statuses
+    }
+    with CHAT_RENDER_JOBS_LOCK:
+        if any(
+            job.video_id == video_id and job.status in active_statuses
+            for job in CHAT_RENDER_JOBS.values()
+        ):
+            kinds.add("Chat render")
+    with CHAT_REFRESH_JOBS_LOCK:
+        if any(
+            job.video_id == video_id and job.status in active_statuses
+            for job in CHAT_REFRESH_JOBS.values()
+        ):
+            kinds.add("Chat refresh")
+    with TRANSCRIPTION_JOBS_LOCK:
+        if any(
+            job.video_id == video_id and job.status in active_statuses
+            for job in TRANSCRIPTION_JOBS.values()
+        ):
+            kinds.add("Transcription")
+    with EVENT_DETECTION_JOBS_LOCK:
+        if any(
+            job.video_id == video_id and job.status in active_statuses
+            for job in EVENT_DETECTION_JOBS.values()
+        ):
+            kinds.add("Content event detection")
+    state = StateStore(config.db_path)
+    try:
+        durable_jobs = state.list_post_processing_jobs(
+            video_id=video_id,
+            statuses=["pending", "running"],
+        )
+    finally:
+        state.close()
+    durable_labels = {
+        "twitch_ad_repair": "Twitch ad repair",
+        "transcription": "Transcription",
+        "content_events": "Content event detection",
+        "chat_render": "Chat render",
+    }
+    kinds.update(durable_labels.get(job.kind, "Post-processing") for job in durable_jobs)
+    return sorted(kinds)
 
 
 def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int]:
@@ -4950,7 +5365,20 @@ def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int
             raise ConfigError("Stream was not found")
         if record.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
             raise ConfigError("Cannot clean fragments while the stream may still resume")
-        return cleanup_stream_fragment_files(config, state, record)
+        if not state.compare_and_set_stream_status(
+            video_id,
+            expected_status=record.status,
+            new_status="cleaning_fragments",
+        ):
+            raise ConfigError("Stream status changed; fragments were not cleaned")
+        try:
+            return cleanup_stream_fragment_files(config, state, record)
+        finally:
+            state.compare_and_set_stream_status(
+                video_id,
+                expected_status="cleaning_fragments",
+                new_status=record.status,
+            )
     finally:
         state.close()
 
@@ -4981,11 +5409,24 @@ def cleanup_expired_stream_fragments(
             ended_at = parse_cleanup_timestamp(current_record.updated_at)
             if ended_at is None or ended_at > cutoff:
                 continue
-            count, removed = cleanup_stream_fragment_files(
-                config,
-                state,
-                current_record,
-            )
+            if not state.compare_and_set_stream_status(
+                current_record.video_id,
+                expected_status="ended",
+                new_status="cleaning_fragments",
+            ):
+                continue
+            try:
+                count, removed = cleanup_stream_fragment_files(
+                    config,
+                    state,
+                    current_record,
+                )
+            finally:
+                state.compare_and_set_stream_status(
+                    current_record.video_id,
+                    expected_status="cleaning_fragments",
+                    new_status="ended",
+                )
             if count <= 0:
                 continue
             streams_cleaned += 1
@@ -5041,6 +5482,7 @@ def cleanup_stream_fragment_files(
             continue
     cleanup_files(fragments, LOGGER)
     if fragments:
+        invalidate_file_scan_cache(directory_path)
         state.add_stream_event(
             record.video_id,
             f"Cleaned {len(fragments)} fragment file(s), freed {format_bytes(bytes_removed)}",
@@ -5048,6 +5490,27 @@ def cleanup_stream_fragment_files(
     return len(fragments), bytes_removed
 
 
+def restore_stream_operation_status(
+    config: BotConfig,
+    video_id: str,
+    previous_status: str,
+    *,
+    operation_status: str,
+) -> None:
+    if not previous_status:
+        return
+    state = StateStore(config.db_path)
+    try:
+        state.compare_and_set_stream_status(
+            video_id,
+            expected_status=operation_status,
+            new_status=previous_status,
+        )
+    finally:
+        state.close()
+
+
+@serialized_stream_operation
 def delete_stream(
     config: BotConfig,
     video_id: str,
@@ -5059,14 +5522,14 @@ def delete_stream(
     if confirm_delete != STREAM_DELETE_CONFIRM_VALUE:
         return False, "Stream deletion was not confirmed"
 
-    active_jobs = [
-        job
-        for job in list_tracked_jobs(limit=1000)
-        if job.video_id == video_id and job.status in {"queued", "running"}
-    ]
-    if active_jobs:
-        return False, "Cannot delete a stream while dashboard jobs are still running"
+    active_job_kinds = active_dashboard_job_kinds(config, video_id)
+    if active_job_kinds:
+        return False, (
+            "Cannot delete a stream while dashboard jobs are still running: "
+            + ", ".join(active_job_kinds)
+        )
 
+    claimed_status = ""
     state = StateStore(config.db_path)
     try:
         record = state.get_stream(video_id)
@@ -5081,6 +5544,13 @@ def delete_stream(
         )
         if active_watermarks:
             return False, "Cannot delete a stream while watermark jobs are still running"
+        if not state.compare_and_set_stream_status(
+            video_id,
+            expected_status=record.status,
+            new_status="deleting",
+        ):
+            return False, "Stream status changed; no files were deleted"
+        claimed_status = record.status
     finally:
         state.close()
 
@@ -5095,8 +5565,20 @@ def delete_stream(
             shutil.rmtree(directory_path)
             removed_directory = True
         except OSError as exc:
+            restore_stream_operation_status(
+                config,
+                video_id,
+                claimed_status,
+                operation_status="deleting",
+            )
             return False, f"Unable to delete stream files: {exc}"
         except ConfigError as exc:
+            restore_stream_operation_status(
+                config,
+                video_id,
+                claimed_status,
+                operation_status="deleting",
+            )
             return False, str(exc)
 
     state = StateStore(config.db_path)
@@ -5107,10 +5589,7 @@ def delete_stream(
     if not deleted:
         return False, "Stream was not found"
 
-    with FILE_SCAN_CACHE_LOCK:
-        FILE_SCAN_CACHE.pop(str(directory), None)
-        if directory.exists():
-            FILE_SCAN_CACHE.pop(str(directory.resolve()), None)
+    invalidate_file_scan_cache(directory)
 
     LOGGER.info(
         "Deleted stream video_id=%s files=%s bytes=%s directory_removed=%s",
@@ -5123,6 +5602,7 @@ def delete_stream(
     return True, f"Stream deleted{detail}"
 
 
+@serialized_stream_operation
 def start_vod_redownload_job(
     config: BotConfig,
     video_id: str,
@@ -5168,6 +5648,7 @@ def start_vod_redownload_job(
     return True, "VOD redownload queued"
 
 
+@serialized_stream_operation
 def start_segment_recovery_job(
     config: BotConfig,
     video_id: str,
@@ -5299,12 +5780,7 @@ def run_segment_recovery_job(
         return
 
     directory = result.output_file.parent
-    with FILE_SCAN_CACHE_LOCK:
-        FILE_SCAN_CACHE.pop(str(directory), None)
-        try:
-            FILE_SCAN_CACHE.pop(str(directory.resolve()), None)
-        except OSError:
-            pass
+    invalidate_file_scan_cache(directory)
     message = (
         f"Recovered {result.output_file.name} "
         f"({result.duration:.1f}s, {format_bytes(result.size)}); source fragments preserved"
@@ -5334,6 +5810,7 @@ def segment_recovery_job_id(video_id: str, segment_index: int) -> str:
     return f"video-recovery:{video_id}:{segment_index:03d}"
 
 
+@serialized_stream_operation
 def start_manual_vod_download_job(
     config: BotConfig,
     streamer_name: str,
@@ -5576,24 +6053,27 @@ def run_vod_download_job(
                 segment_index=1,
             )
 
-    finish_tracked_job(
-        job_id,
-        status="done",
-        phase="Complete",
-        message=job_message,
-        progress=1.0,
-    )
-    state = StateStore(config.db_path)
-    try:
-        state.mark_vod_download_finished(
-            stream.video_id,
-            message=stream_message,
+    # Register every automatic follow-up before the VOD ceases to look active.
+    # Deletion shares this lock with job registration, closing the completion
+    # window where downloaded media could previously disappear before enqueue.
+    with STREAM_OPERATION_LOCK:
+        queue_vod_post_processing_jobs(config, stream, output_template)
+        state = StateStore(config.db_path)
+        try:
+            state.mark_vod_download_finished(
+                stream.video_id,
+                message=stream_message,
+            )
+        finally:
+            state.close()
+        finish_tracked_job(
+            job_id,
+            status="done",
+            phase="Complete",
+            message=job_message,
+            progress=1.0,
         )
-    finally:
-        state.close()
-    with FILE_SCAN_CACHE_LOCK:
-        FILE_SCAN_CACHE.pop(str(output_template.parent), None)
-    queue_vod_post_processing_jobs(config, stream, output_template)
+        invalidate_file_scan_cache(output_template.parent)
     LOGGER.info("VOD download completed video_id=%s output=%s", stream.video_id, output_template)
 
 
@@ -5615,17 +6095,39 @@ def queue_vod_post_processing_jobs(
 
     processing_config = post_stream_config_for_channel(config, stream.channel)
     chat_file = vod_chat_sidecar_for_media_file(media_file)
-    has_automatic_job = (
-        (processing_config.twitch_ad_repair_enabled and stream.platform == "twitch")
-        or processing_config.transcribe_subtitles
-        or processing_config.stream_event_detection_enabled
-        or (
-            processing_config.render_live_chat_video
-            and stream.platform in {"youtube", "kick"}
-            and chat_file.is_file()
-        )
-    )
-    if not has_automatic_job:
+    kinds: list[str] = []
+    if processing_config.twitch_ad_repair_enabled and stream.platform == "twitch":
+        kinds.append("twitch_ad_repair")
+    if processing_config.transcribe_subtitles:
+        kinds.append("transcription")
+    if processing_config.stream_event_detection_enabled:
+        kinds.append("content_events")
+    if (
+        processing_config.render_live_chat_video
+        and stream.platform in {"youtube", "kick"}
+        and chat_file.is_file()
+    ):
+        kinds.append("chat_render")
+    if not kinds:
+        return
+
+    state = StateStore(config.db_path)
+    try:
+        durable_jobs = [
+            state.enqueue_post_processing_job(
+                video_id=stream.video_id,
+                kind=kind,
+                segment_index=1,
+                channel=stream.channel,
+                media_path=media_file,
+                chat_path=chat_file if chat_file.is_file() else "",
+                reset_terminal=True,
+            )
+            for kind in kinds
+        ]
+    finally:
+        state.close()
+    if not any(job.status == "pending" for job in durable_jobs):
         return
 
     wait_seconds = automatic_processing_window_wait_seconds(
@@ -5645,95 +6147,6 @@ def queue_vod_post_processing_jobs(
             segment_index=1,
         )
         LOGGER.info("%s video_id=%s", message, stream.video_id)
-        thread = Thread(
-            target=run_deferred_vod_post_processing_jobs,
-            args=(config, stream, media_file),
-            name=f"onlysavemevods-vod-processing-schedule-{stream.video_id}",
-            daemon=True,
-        )
-        thread.start()
-        return
-
-    start_vod_post_processing_jobs(config, stream, media_file)
-
-
-def run_deferred_vod_post_processing_jobs(
-    config: BotConfig,
-    stream: LiveStream,
-    media_file: Path,
-) -> None:
-    while True:
-        wait_seconds = automatic_processing_window_wait_seconds(
-            config,
-            datetime.now().astimezone(),
-        )
-        if wait_seconds <= 0:
-            break
-        time.sleep(min(wait_seconds, PROCESSING_WINDOW_RECHECK_SECONDS))
-
-    message = "Quiet-hours processing window opened; starting automatic VOD processing"
-    record_stream_event(
-        config,
-        stream.video_id,
-        message,
-        segment_index=1,
-    )
-    LOGGER.info("%s video_id=%s", message, stream.video_id)
-    start_vod_post_processing_jobs(config, stream, media_file)
-
-
-def start_vod_post_processing_jobs(
-    config: BotConfig,
-    stream: LiveStream,
-    media_file: Path,
-) -> None:
-    processing_config = post_stream_config_for_channel(config, stream.channel)
-    if processing_config.twitch_ad_repair_enabled and stream.platform == "twitch":
-        start_vod_twitch_ad_repair_job(processing_config, stream, media_file)
-    if processing_config.transcribe_subtitles:
-        ok, message = start_transcription_job(
-            processing_config,
-            stream.video_id,
-            media_file.name,
-        )
-        if not ok:
-            record_stream_event(
-                config,
-                stream.video_id,
-                f"VOD transcription was not queued for {media_file.name}: {message}",
-                level="warning",
-                segment_index=1,
-            )
-    if processing_config.stream_event_detection_enabled:
-        ok, message = start_event_detection_job(
-            processing_config,
-            stream.video_id,
-            media_file.name,
-        )
-        if not ok:
-            record_stream_event(
-                config,
-                stream.video_id,
-                f"VOD content event detection was not queued for {media_file.name}: {message}",
-                level="warning",
-                segment_index=1,
-            )
-    if processing_config.render_live_chat_video and stream.platform in {"youtube", "kick"}:
-        chat_file = vod_chat_sidecar_for_media_file(media_file)
-        if chat_file.is_file():
-            ok, message = start_render_chat_job(
-                processing_config,
-                stream.video_id,
-                chat_file.name,
-            )
-            if not ok:
-                record_stream_event(
-                    config,
-                    stream.video_id,
-                    f"VOD chat render was not queued for {chat_file.name}: {message}",
-                    level="warning",
-                    segment_index=1,
-                )
 
 
 def vod_media_file_for_output_template(output_template: Path) -> Path | None:
@@ -6100,9 +6513,9 @@ def stream_from_record(
     )
 
 
-def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path:
+def safe_stream_directory(config: BotConfig, directory: Path) -> Path:
     if directory.is_symlink():
-        raise ConfigError("Refusing to delete a symlinked stream directory")
+        raise ConfigError("Refusing to access a symlinked stream directory")
     if not directory.is_dir():
         raise ConfigError("Stream path is not a directory")
     try:
@@ -6113,8 +6526,12 @@ def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path
     try:
         directory_path.relative_to(root_path)
     except ValueError as exc:
-        raise ConfigError("Refusing to delete a stream directory outside download_dir") from exc
+        raise ConfigError("Refusing to access a stream directory outside download_dir") from exc
     return directory_path
+
+
+def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path:
+    return safe_stream_directory(config, directory)
 
 
 def directory_file_totals(directory: Path) -> tuple[int, int]:
@@ -6625,6 +7042,7 @@ def chat_render_timeout_seconds(config: BotConfig) -> float | None:
     return float(config.chat_render_timeout_seconds)
 
 
+@serialized_stream_operation
 def start_render_chat_job(
     config: BotConfig,
     video_id: str,
@@ -6689,6 +7107,7 @@ def start_render_chat_job(
     return True, "Chat regeneration queued" if regenerate else "Chat render queued"
 
 
+@serialized_stream_operation
 def start_refresh_chat_job(
     config: BotConfig,
     video_id: str,
@@ -7452,10 +7871,23 @@ def mutation_response(
 
 def safe_return_to(value: str, default: str) -> str:
     candidate = value.strip()
-    if not candidate.startswith("/") or candidate.startswith("//"):
-        return default
-    parts = urlsplit(candidate)
-    if parts.scheme or parts.netloc:
+    probe = candidate
+    for _attempt in range(3):
+        if (
+            not probe.startswith("/")
+            or probe.startswith("//")
+            or "\\" in probe
+            or any(ord(character) < 32 or ord(character) >= 127 for character in probe)
+        ):
+            return default
+        parts = urlsplit(probe)
+        if parts.scheme or parts.netloc:
+            return default
+        decoded = unquote(probe)
+        if decoded == probe:
+            break
+        probe = decoded
+    else:
         return default
     return candidate
 
@@ -7819,7 +8251,7 @@ def reload_running_config(config: BotConfig) -> None:
         raise ConfigError("Config path is not available")
     loaded = load_config(config.config_path)
     for name in config.__dataclass_fields__:
-        if name == "config_path":
+        if name == "config_path" or name in CONFIG_RESTART_FIELDS:
             continue
         setattr(config, name, getattr(loaded, name))
 
@@ -8549,6 +8981,7 @@ def validate_env_var_name(value: str, name: str) -> None:
         raise ConfigError(f"{name} must be a valid environment variable name")
 
 
+@serialized_stream_operation
 def start_transcription_job(
     config: BotConfig,
     video_id: str,
@@ -8719,6 +9152,7 @@ def update_transcription_job(key: str, **changes: Any) -> None:
         )
 
 
+@serialized_stream_operation
 def start_event_detection_job(
     config: BotConfig,
     video_id: str,
@@ -8896,6 +9330,7 @@ def update_event_detection_job(key: str, **changes: Any) -> None:
         )
 
 
+@serialized_stream_operation
 def start_watermark_job(
     config: BotConfig,
     video_id: str,
@@ -8986,8 +9421,7 @@ def delete_watermark_copy(config: BotConfig, copy_id: str) -> tuple[bool, str]:
         state.close()
 
     if directory is not None:
-        with FILE_SCAN_CACHE_LOCK:
-            FILE_SCAN_CACHE.pop(str(directory), None)
+        invalidate_file_scan_cache(directory)
     LOGGER.info("Deleted watermark copy copy_id=%s", copy_id)
     return True, "Watermark copy deleted"
 
@@ -9222,7 +9656,11 @@ def render_admin_page(
         snapshot: StatusSnapshot | AdminStaticSnapshot = build_admin_static_snapshot(config)
         extra_attributes = ""
     else:
-        snapshot = build_status_snapshot(config, include_speaker_scan=False)
+        snapshot = build_status_snapshot(
+            config,
+            include_speaker_scan=False,
+            include_file_diagnostics=False,
+        )
         extra_attributes = (
             f'data-stream-revision="{escape(snapshot.stream_revision, quote=True)}" '
             f'data-job-revision="{escape(snapshot.job_revision, quote=True)}"'
@@ -9241,6 +9679,7 @@ def render_admin_page(
             build_streamer_stream_page(
                 config,
                 admin_streamer_stream_params(params, selected),
+                include_file_diagnostics=False,
             )
             if selected and streamer_tab == "overview"
             else None
@@ -9282,10 +9721,14 @@ def render_admin_fragment(
     page: str,
     params: dict[str, list[str]],
 ) -> tuple[str, str]:
-    snapshot = build_status_snapshot(config, include_speaker_scan=False)
+    snapshot = build_status_snapshot(
+        config,
+        include_speaker_scan=False,
+        include_file_diagnostics=False,
+    )
     if page == "overview":
         body = render_admin_overview_dynamic(snapshot)
-        revision = f"{snapshot.stream_revision}:{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+        revision = f"{snapshot.stream_revision}:{snapshot.job_revision}:{snapshot.log_revision}"
     elif page == "streamers":
         selected = first_query_value(params, "selected").strip()
         if selected:
@@ -9299,6 +9742,7 @@ def render_admin_fragment(
                 stream_page = build_streamer_stream_page(
                     config,
                     admin_streamer_stream_params(params, selected),
+                    include_file_diagnostics=False,
                 )
                 body = render_admin_streamer_streams(streamer, stream_page)
         else:
@@ -9315,7 +9759,7 @@ def render_admin_fragment(
     elif page == "activity":
         view = first_query_value(params, "view").strip().lower() or "jobs"
         body = render_admin_activity_records(snapshot, view)
-        revision = f"{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+        revision = f"{snapshot.job_revision}:{snapshot.log_revision}"
     elif page == "powerchat":
         body = render_powerchat_dashboard(snapshot.powerchat_stats) + (
             '<script type="application/json" id="powerchat-stats-json">'
@@ -9333,7 +9777,7 @@ def render_admin_overview(snapshot: StatusSnapshot) -> str:
     setup = render_admin_setup_checklist(snapshot)
     return f"""<div class="section-stack">
   {setup}
-  <section data-fragment-url="/?fragment=status" data-fragment-revision="{escape(snapshot.stream_revision, quote=True)}">
+  <section data-fragment-url="/?fragment=status" data-fragment-revision="{escape(f'{snapshot.stream_revision}:{snapshot.job_revision}:{snapshot.log_revision}', quote=True)}">
     {render_admin_overview_dynamic(snapshot)}
   </section>
 </div>"""
@@ -9345,6 +9789,11 @@ def render_admin_overview_dynamic(snapshot: StatusSnapshot) -> str:
     active_jobs = [job for job in snapshot.jobs if job.status in {"queued", "running"}]
     health_class = "warning" if attention else "good"
     health_text = "Needs attention" if attention else "Healthy"
+    storage_label = (
+        "Storage used"
+        if all(stream.file_size_totals_complete for stream in snapshot.streams)
+        else "Relevant storage"
+    )
     streamer_names = {
         stream.video_id: streamer.name
         for streamer in snapshot.streamer_stats
@@ -9370,7 +9819,7 @@ def render_admin_overview_dynamic(snapshot: StatusSnapshot) -> str:
     <article class="metric-card"><span class="metric-label">Service health</span><strong><span class="status-badge {health_class}">{health_text}</span></strong><span class="metric-detail">{len(attention)} attention item{'s' if len(attention) != 1 else ''}</span></article>
     <article class="metric-card"><span class="metric-label">Recording now</span><strong>{len(active)}</strong><span class="metric-detail">of {len(snapshot.streams)} known streams</span></article>
     <article class="metric-card"><span class="metric-label">Active processing</span><strong>{len(active_jobs)}</strong><span class="metric-detail">queued or running jobs</span></article>
-    <article class="metric-card"><span class="metric-label">Storage used</span><strong>{escape(format_bytes(snapshot.total_bytes))}</strong><span class="metric-detail">{escape(format_bytes(snapshot.part_bytes))} partial</span></article>
+    <article class="metric-card"><span class="metric-label">{storage_label}</span><strong>{escape(format_bytes(snapshot.total_bytes))}</strong><span class="metric-detail">{escape(format_bytes(snapshot.part_bytes))} partial · diagnostics on demand</span></article>
   </div>
   <section class="section-stack">
     <div class="section-heading"><h2>Live and attention</h2><a href="/streamers">View all streamers</a></div>
@@ -9400,12 +9849,13 @@ def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "")
     platform, platform_label, platform_initial = stream_platform_details(stream)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
     status_class = "warning" if stream_needs_attention(stream) else "good"
+    stored_label = "Stored" if stream.file_size_totals_complete else "Relevant storage"
     return f"""<article class="streamer-summary">
   <div>
     <h3>{escape(stream.title or stream.video_id)}</h3>
     <div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(stream.channel or 'Unknown streamer')}</span><span class="muted">{escape(stream.video_id)}</span></div>
   </div>
-  <div class="summary-stats"><div class="summary-stat"><strong>{escape(format_bytes(stream.total_bytes))}</strong><span>Stored</span></div><div class="summary-stat"><strong>{stream.file_count}</strong><span>Files</span></div></div>
+  <div class="summary-stats"><div class="summary-stat"><strong>{escape(format_bytes(stream.total_bytes))}</strong><span>{stored_label}</span></div><div class="summary-stat"><strong>{stream.file_count}</strong><span>Files</span></div></div>
   <div class="streamer-summary-actions"><span class="status-badge {status_class}">{escape(status_label)}</span><a class="button small secondary" href="/streamers?selected={quote(streamer_name or stream.channel or '', safe='')}">Details</a></div>
 </article>"""
 
@@ -9503,12 +9953,17 @@ def render_admin_streamer_summary(streamer: StreamerStatStatus) -> str:
     status = "Needs grouping" if streamer.needs_grouping else ("Needs attention" if streamer.attention_count else "Configured")
     search_text = " ".join([streamer.name, *streamer.sources]).lower()
     selected = quote(streamer.name, safe="")
+    storage_label = (
+        "Storage"
+        if all(stream.file_size_totals_complete for stream in streamer.streams)
+        else "Relevant storage"
+    )
     return f"""<article class="streamer-summary" data-streamer-summary data-search-text="{escape(search_text, quote=True)}">
   <div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div>
   <div class="summary-stats">
     <div class="summary-stat"><strong>{streamer.active_count}</strong><span>Active</span></div>
     <div class="summary-stat"><strong>{streamer.stream_count}</strong><span>Streams</span></div>
-    <div class="summary-stat"><strong>{escape(format_bytes(streamer.total_bytes))}</strong><span>Storage</span></div>
+    <div class="summary-stat"><strong>{escape(format_bytes(streamer.total_bytes))}</strong><span>{storage_label}</span></div>
   </div>
   <div class="streamer-summary-actions"><span class="status-badge {status_class}">{status}</span><a class="button small secondary" href="/streamers?selected={selected}">{'Migrate' if streamer.needs_grouping else 'Manage'}</a></div>
 </article>"""
@@ -10140,14 +10595,16 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     details_key = escape(stream.video_id, quote=True)
     files = "".join(
         render_file_row(file, timezone_name) for file in stream.files[:20]
-    ) or '<tr><td colspan="7">No files found</td></tr>'
+    ) or '<tr><td colspan="7">No relevant files found</td></tr>'
+    file_diagnostics = render_file_diagnostics_control(stream)
+    storage_label = "Storage" if stream.file_size_totals_complete else "Relevant storage"
     return f"""<details class="card stream-detail" data-details-key="stream:{details_key}">
   <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span>{format_badge}</div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
   <div class="section-stack">
     {render_stream_signals(stream)}
-    <dl class="detail-list stream-detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>Storage</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
+    <dl class="detail-list stream-detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>{storage_label}</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
     <div class="button-row">{render_segment_recovery_actions(stream)}{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
-    <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div></div></details>
+    <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div>{file_diagnostics}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:events"><summary><strong>Content events</strong><span class="subsection-count">{stream.content_event_count}</span></summary><div class="stream-subsection-body">{render_content_events(stream.content_events)}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:powerchat"><summary><strong>Powerchat</strong><span class="subsection-count">{stream.powerchat_event_count}</span></summary><div class="stream-subsection-body">{render_powerchat_events(stream, timezone_name)}</div></details>
     <details class="stream-subsection processing-jobs-section" data-details-key="stream:{details_key}:jobs"><summary><strong>Processing jobs</strong><span class="subsection-count">{len(stream.jobs)}</span></summary><div class="stream-subsection-body">{render_stream_jobs(stream.jobs, timezone_name)}</div></details>
@@ -10290,7 +10747,7 @@ def render_admin_powerchat(snapshot: StatusSnapshot) -> str:
 def render_admin_activity(snapshot: StatusSnapshot, view: str) -> str:
     if view not in {"jobs", "logs"}:
         view = "jobs"
-    revision = f"{snapshot.job_revision}:{len(snapshot.recent_logs)}"
+    revision = f"{snapshot.job_revision}:{snapshot.log_revision}"
     tabs = f"""<nav class="tabs" aria-label="Activity type"><a href="/activity?view=jobs" class="{'active' if view == 'jobs' else ''}">Jobs</a><a href="/activity?view=logs" class="{'active' if view == 'logs' else ''}">Logs</a></nav>"""
     states = (
         '<option value="">All statuses</option><option value="queued">Queued</option><option value="running">Running</option><option value="done">Done</option><option value="failed">Failed</option>'
@@ -10397,6 +10854,12 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
     powerchat_dashboard = render_powerchat_dashboard(snapshot.powerchat_stats)
     powerchat_stats_json = json_script_payload(snapshot.powerchat_stats)
     script = dashboard_script()
+    storage_label = "Storage" if snapshot.file_size_totals_complete else "Relevant storage"
+    diagnostic_storage = (
+        lambda value: format_bytes(value)
+        if snapshot.file_size_totals_complete
+        else "Per-stream diagnostics"
+    )
 
     body = f"""<!doctype html>
 <html lang="en">
@@ -11648,7 +12111,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       <div class="metric"><strong id="metric-streamers">{len(snapshot.streamer_stats)}</strong><span>Streamers</span></div>
       <div class="metric"><strong id="metric-jobs">{active_job_count(snapshot.jobs)}</strong><span>Active Jobs</span></div>
       <div class="metric"><strong id="metric-logs">{len(snapshot.recent_logs)}</strong><span>Logs</span></div>
-      <div class="metric"><strong id="metric-storage">{escape(format_bytes(snapshot.total_bytes))}</strong><span>Storage</span></div>
+      <div class="metric"><strong id="metric-storage">{escape(format_bytes(snapshot.total_bytes))}</strong><span id="metric-storage-label">{storage_label}</span></div>
       <div class="metric"><strong id="metric-partial">{escape(format_bytes(snapshot.part_bytes))}</strong><span>Partial</span></div>
     </div>
     <div class="toolbar">
@@ -11681,9 +12144,9 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
             <dt>Final</dt><dd id="storage-final">{escape(format_bytes(snapshot.final_bytes))}</dd>
             <dt>Partial</dt><dd id="storage-part">{escape(format_bytes(snapshot.part_bytes))}</dd>
             <dt>Chat</dt><dd id="storage-chat">{escape(format_bytes(snapshot.chat_bytes))}</dd>
-            <dt>Fragments</dt><dd id="storage-fragment">{escape(format_bytes(snapshot.fragment_bytes))}</dd>
-            <dt>State files</dt><dd id="storage-state">{escape(format_bytes(snapshot.state_bytes))}</dd>
-            <dt>Temporary</dt><dd id="storage-temporary">{escape(format_bytes(snapshot.temporary_bytes))}</dd>
+            <dt>Fragments</dt><dd id="storage-fragment">{escape(diagnostic_storage(snapshot.fragment_bytes))}</dd>
+            <dt>State files</dt><dd id="storage-state">{escape(diagnostic_storage(snapshot.state_bytes))}</dd>
+            <dt>Temporary</dt><dd id="storage-temporary">{escape(diagnostic_storage(snapshot.temporary_bytes))}</dd>
           </dl>
         </section>
         <section class="panel">
@@ -12002,6 +12465,7 @@ def dashboard_script() -> str:
       (activeElement && streamerList.contains(activeElement))
       || streamerList.querySelector("form.streamer-form[data-dirty='true']")
       || streamerList.querySelector("[data-source-popover]:not([hidden])")
+      || streamerList.querySelector("[data-file-diagnostics-loaded][open]")
     );
   };
   const streamNeedsAttention = (stream) => attentionStatuses.has(stream.status) || Boolean(stream.has_mixed_formats);
@@ -12209,6 +12673,7 @@ def dashboard_script() -> str:
       page_size: String(state.page_size),
     });
     try {
+      query.set("dashboard", "1");
       const response = await fetch(`/streamer-streams.json?${query.toString()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const payload = await response.json();
@@ -13402,6 +13867,35 @@ def dashboard_script() -> str:
     return `<form class="inline-form" method="post" action="${escapeAttr(url)}"><button class="download action-button" type="submit" title="Remove saved .part-Frag files for this stream">${escapeHtml(label)}</button></form>`;
   };
 
+  const renderFileDiagnosticsControl = (stream) => {
+    const count = Number((stream && stream.diagnostic_file_count) || 0);
+    if (!stream || stream.file_size_totals_complete !== false || count <= 0) return "";
+    const fragments = Number(((stream.file_kind_counts || {}).fragment) || 0);
+    const suffix = fragments > 0 ? ` (${fragments} fragment${fragments === 1 ? "" : "s"})` : "";
+    const query = new URLSearchParams({ video_id: String(stream.video_id || "") });
+    return `<div class="file-diagnostics-control" data-file-diagnostics><span class="file-meta" data-file-diagnostics-state>${escapeHtml(`${count} fragment or internal file${count === 1 ? " was" : "s were"} omitted from the routine view${suffix}. Their size is loaded only when requested.`)}</span><button class="download action-button" type="button" data-load-file-diagnostics data-file-diagnostics-url="/stream-file-diagnostics?${escapeAttr(query.toString())}">Load file diagnostics</button></div>`;
+  };
+
+  document.addEventListener("click", async (event) => {
+    const button = event.target.closest("[data-load-file-diagnostics]");
+    if (!button) return;
+    event.preventDefault();
+    const panel = button.closest("[data-file-diagnostics]");
+    const state = panel && panel.querySelector("[data-file-diagnostics-state]");
+    const url = button.getAttribute("data-file-diagnostics-url") || "";
+    if (!panel || !url) return;
+    button.disabled = true;
+    if (state) state.textContent = "Scanning fragment and internal files...";
+    try {
+      const response = await fetch(url, { headers: { "X-Dashboard-Fragment": "1" }, cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      panel.innerHTML = await response.text();
+    } catch (error) {
+      button.disabled = false;
+      if (state) state.textContent = `Unable to load file diagnostics: ${error.message || error}`;
+    }
+  });
+
   const renderDeleteStreamAction = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
     const blockedStatuses = new Set(["checking_after_exit", "detected", "downloading", "waiting_retry"]);
@@ -13547,7 +14041,12 @@ def dashboard_script() -> str:
     const toggleLabel = collapsed ? "Expand" : "Collapse";
     const expanded = collapsed ? "false" : "true";
     const files = (stream.files || []).slice(0, 20).map(renderFileRow).join("")
-      || '<tr><td colspan="7" class="file-meta">No files found</td></tr>';
+      || '<tr><td colspan="7" class="file-meta">No relevant files found</td></tr>';
+    const fileDiagnostics = renderFileDiagnosticsControl(stream);
+    const sizeTotalsComplete = stream.file_size_totals_complete !== false;
+    const totalSizeLabel = sizeTotalsComplete ? "Total size" : "Relevant size";
+    const fragmentSize = sizeTotalsComplete ? formatBytes(stream.fragment_bytes) : "Load diagnostics";
+    const latestFileLabel = sizeTotalsComplete ? "Latest file" : "Latest relevant file";
     const filesTabId = `stream-tab-${videoId}-files`;
     const eventsTabId = `stream-tab-${videoId}-events`;
     const powerchatTabId = `stream-tab-${videoId}-powerchat`;
@@ -13579,11 +14078,11 @@ def dashboard_script() -> str:
     <div class="meta">
       <div>Segment: ${String(stream.segment_index).padStart(3, "0")}</div>
       <div>Files: ${escapeHtml(stream.file_count)}</div>
-      <div>Total size: ${escapeHtml(formatBytes(stream.total_bytes))}</div>
+      <div>${totalSizeLabel}: ${escapeHtml(formatBytes(stream.total_bytes))}</div>
       <div>Partial size: ${escapeHtml(formatBytes(stream.part_bytes))}</div>
       <div>Final size: ${escapeHtml(formatBytes(stream.final_bytes))}</div>
       <div>Chat size: ${escapeHtml(formatBytes(stream.chat_bytes))}</div>
-      <div>Fragment size: ${escapeHtml(formatBytes(stream.fragment_bytes))}</div>
+      <div>Fragment size: ${escapeHtml(fragmentSize)}</div>
       <div>Content events: ${escapeHtml(stream.content_event_count || 0)}</div>
       <div>Powerchat: ${escapeHtml(stream.powerchat_event_count || 0)} <span class="muted">${escapeHtml(powerchatSummary)}</span></div>
       <div>Conflicting formats: ${mixed}</div>
@@ -13591,7 +14090,7 @@ def dashboard_script() -> str:
       <div>Started: ${escapeHtml(formatIso(stream.last_started_at))}</div>
       <div>Exited: ${escapeHtml(formatIso(stream.last_exit_at))}</div>
       <div>Updated: ${escapeHtml(formatIso(stream.updated_at))}</div>
-      <div>Latest file: ${escapeHtml(formatEpoch(stream.latest_file_modified_at))} <span class="muted">${escapeHtml(formatEpochAge(stream.latest_file_modified_at))}</span></div>
+      <div>${latestFileLabel}: ${escapeHtml(formatEpoch(stream.latest_file_modified_at))} <span class="muted">${escapeHtml(formatEpochAge(stream.latest_file_modified_at))}</span></div>
       <div class="wide">Kinds: ${escapeHtml(formatKindCounts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: ${escapeHtml(stream.directory)}</div>
     </div>
@@ -13619,6 +14118,7 @@ def dashboard_script() -> str:
               <tbody>${files}</tbody>
             </table>
           </div>
+          ${fileDiagnostics}
         </section>
         <section class="stream-tab-panel stream-tab-events">${renderContentEvents(stream.content_events || [])}</section>
         <section class="stream-tab-panel stream-tab-powerchat">${renderPowerchatEvents(stream)}</section>
@@ -14041,6 +14541,7 @@ def dashboard_script() -> str:
     const warning = streamer.needs_grouping ? '<div class="signals">Needs streamer group</div>' : "";
     const groupAction = renderStreamerGroupingAction(streamer, snapshot);
     const latestAge = formatEpochAge(streamer.latest_activity_at);
+    const storageLabel = streamer.file_size_totals_complete === false ? "Relevant storage" : "Storage";
     return `<section class="streamer-section${needsClass}${collapsedClass}" data-streamer-key="${escapeAttr(streamer.name || "")}" data-streamer-name="${escapeAttr(streamer.name || "")}" data-streamer-active="${escapeAttr(streamer.active_count || 0)}" data-streamer-attention="${escapeAttr(streamer.attention_count || 0)}" data-streamer-active-jobs="${escapeAttr(activeJobs)}" data-streamer-needs-grouping="${streamer.needs_grouping ? "true" : "false"}">
   <div class="streamer-head">
     <div class="streamer-title">
@@ -14051,7 +14552,7 @@ def dashboard_script() -> str:
       <span class="badge ${stateClass}">${stateLabel}</span>
       <span class="badge downloading">Active ${escapeHtml(streamer.active_count || 0)}</span>
       <span class="badge checking_after_exit">Attention ${escapeHtml(streamer.attention_count || 0)}</span>
-      <span class="badge">Storage ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
+      <span class="badge">${storageLabel} ${escapeHtml(formatBytes(streamer.total_bytes))}</span>
       <span class="badge">Latest ${escapeHtml(latestAge || "-")}</span>
       ${groupAction}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="${escapeAttr(streamer.name || "")}" aria-expanded="false">Settings</button>
@@ -14063,7 +14564,7 @@ def dashboard_script() -> str:
     <div class="streamer-stat-grid">
       <div data-streamer-stream-total><strong>${escapeHtml(streamer.stream_count || 0)}</strong><br><span class="muted">Streams</span></div>
       <div><strong>${escapeHtml(streamer.file_count || 0)}</strong><br><span class="muted">Files</span></div>
-      <div><strong>${escapeHtml(formatBytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+      <div><strong>${escapeHtml(formatBytes(streamer.total_bytes))}</strong><br><span class="muted">${storageLabel}</span></div>
       <div><strong>${escapeHtml(formatBytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
       <div><strong>${escapeHtml(formatBytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
       <div><strong>${escapeHtml(formatBytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
@@ -14192,13 +14693,17 @@ def dashboard_script() -> str:
       lastStreamRevision = String(snapshot.stream_revision || "");
       lastJobRevision = String(snapshot.job_revision || "");
       setText("metric-storage", formatBytes(snapshot.total_bytes));
+      setText("metric-storage-label", snapshot.file_size_totals_complete === false ? "Relevant storage" : "Storage");
       setText("metric-partial", formatBytes(snapshot.part_bytes));
       setText("storage-final", formatBytes(snapshot.final_bytes));
       setText("storage-part", formatBytes(snapshot.part_bytes));
       setText("storage-chat", formatBytes(snapshot.chat_bytes));
-      setText("storage-fragment", formatBytes(snapshot.fragment_bytes));
-      setText("storage-state", formatBytes(snapshot.state_bytes));
-      setText("storage-temporary", formatBytes(snapshot.temporary_bytes));
+      const diagnosticStorage = snapshot.file_size_totals_complete === false
+        ? "Per-stream diagnostics"
+        : null;
+      setText("storage-fragment", diagnosticStorage || formatBytes(snapshot.fragment_bytes));
+      setText("storage-state", diagnosticStorage || formatBytes(snapshot.state_bytes));
+      setText("storage-temporary", diagnosticStorage || formatBytes(snapshot.temporary_bytes));
       setText("runtime-download-dir", snapshot.download_dir || "-");
       setText("runtime-state-db", snapshot.state_db || "-");
       setText("runtime-stream-limit", snapshot.stream_limit);
@@ -14577,6 +15082,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
         streamer.timezone if streamer.configured else None,
     )
     latest_activity_age = format_epoch_age(streamer.latest_activity_at)
+    storage_label = "Storage" if streamer.file_size_totals_complete else "Relevant storage"
     streamer_key = escape(streamer.name, quote=True)
     return f"""<section class="streamer-section{needs_class}{collapsed_class}" data-streamer-key="{streamer_key}" data-streamer-name="{streamer_key}" data-streamer-active="{streamer.active_count}" data-streamer-attention="{streamer.attention_count}" data-streamer-active-jobs="{active_jobs}" data-streamer-needs-grouping="{'true' if streamer.needs_grouping else 'false'}">
   <div class="streamer-head">
@@ -14588,7 +15094,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
       <span class="badge {state_class}">{escape(state_label)}</span>
       <span class="badge downloading">Active {streamer.active_count}</span>
       <span class="badge checking_after_exit">Attention {streamer.attention_count}</span>
-      <span class="badge">Storage {escape(format_bytes(streamer.total_bytes))}</span>
+      <span class="badge">{storage_label} {escape(format_bytes(streamer.total_bytes))}</span>
       <span class="badge">Latest {escape(latest_activity_age or '-')}</span>
       {group_action}
       <button class="download streamer-settings-toggle" type="button" data-streamer-settings-toggle="{streamer_key}" aria-expanded="false">Settings</button>
@@ -14600,7 +15106,7 @@ def render_streamer_card(streamer: StreamerStatStatus, snapshot: StatusSnapshot)
     <div class="streamer-stat-grid">
       <div data-streamer-stream-total><strong>{streamer.stream_count}</strong><br><span class="muted">Streams</span></div>
       <div><strong>{streamer.file_count}</strong><br><span class="muted">Files</span></div>
-      <div><strong>{escape(format_bytes(streamer.total_bytes))}</strong><br><span class="muted">Storage</span></div>
+      <div><strong>{escape(format_bytes(streamer.total_bytes))}</strong><br><span class="muted">{storage_label}</span></div>
       <div><strong>{escape(format_bytes(streamer.final_bytes))}</strong><br><span class="muted">Final</span></div>
       <div><strong>{escape(format_bytes(streamer.part_bytes))}</strong><br><span class="muted">Partial</span></div>
       <div><strong>{escape(format_bytes(streamer.chat_bytes))}</strong><br><span class="muted">Chat</span></div>
@@ -14636,7 +15142,7 @@ def build_streamer_voice_details_payload(
 ) -> dict[str, Any]:
     if not streamer_name:
         raise ConfigError("streamer is required")
-    snapshot = build_status_snapshot(config)
+    snapshot = build_status_snapshot(config, include_file_diagnostics=False)
     streamer = next(
         (item for item in snapshot.streamer_stats if item.name == streamer_name),
         None,
@@ -14658,7 +15164,7 @@ def build_stream_voice_speakers_payload(
         raise ConfigError("streamer is required")
     if not video_id:
         raise ConfigError("video_id is required")
-    snapshot = build_status_snapshot(config)
+    snapshot = build_status_snapshot(config, include_file_diagnostics=False)
     streamer = next(
         (item for item in snapshot.streamer_stats if item.name == streamer_name),
         None,
@@ -14669,6 +15175,43 @@ def build_stream_voice_speakers_payload(
     if stream is None:
         raise ConfigError(f"stream is not available for streamer: {video_id}")
     return {"speakers": render_stream_voice_transcript_sample_forms(streamer, stream)}
+
+
+def build_stream_file_diagnostics(
+    config: BotConfig,
+    video_id: str,
+) -> StreamFileSummary:
+    """Build an exact per-stream file summary only after an explicit request."""
+    state = StateStore(config.db_path)
+    try:
+        record = state.get_stream(video_id)
+        if record is None:
+            raise FileNotFoundError(video_id)
+        watermark_records = state.list_watermark_copies(
+            video_id=record.video_id,
+            limit=1000,
+        )
+    finally:
+        state.close()
+
+    directory = segment_directory(config, record.video_id, record.channel)
+    if directory.is_symlink():
+        raise ConfigError("Refusing to scan a symlinked stream directory")
+    if directory.exists():
+        directory = safe_stream_directory(config, directory)
+    return summarize_files(
+        config,
+        directory,
+        record.video_id,
+        config.watermark_enabled and bool(watermark_secret(config)),
+        watermark_records,
+        platform=record.platform,
+        # A short, mode-separated cache prevents repeated clicks or clients
+        # from immediately repeating a large metadata walk.
+        cache_ttl_seconds=WEB_FILE_DIAGNOSTIC_CACHE_SECONDS,
+        include_diagnostics=True,
+        raise_scan_errors=True,
+    )
 
 
 def render_streamer_voice_settings(
@@ -16342,6 +16885,58 @@ def format_powerchat_number(value: float, *, decimals: int = 0) -> str:
     return f"{value:.{decimals}f}" if decimals > 0 else f"{value:g}"
 
 
+def stream_file_diagnostics_url(video_id: str) -> str:
+    return "/stream-file-diagnostics?" + urlencode({"video_id": video_id})
+
+
+def render_file_diagnostics_control(stream: StreamStatus) -> str:
+    if stream.file_size_totals_complete or stream.diagnostic_file_count <= 0:
+        return ""
+    fragment_count = stream.file_kind_counts.get("fragment", 0)
+    description = (
+        f"{stream.diagnostic_file_count} fragment or internal file"
+        f"{'s were' if stream.diagnostic_file_count != 1 else ' was'} omitted from the routine view"
+    )
+    if fragment_count:
+        description += f" ({fragment_count} fragment{'s' if fragment_count != 1 else ''})"
+    return (
+        '<div class="file-diagnostics-control" data-file-diagnostics>'
+        f'<span class="file-meta" data-file-diagnostics-state>{escape(description)}. '
+        "Their size is loaded only when requested.</span>"
+        '<button class="download action-button" type="button" '
+        'data-load-file-diagnostics '
+        f'data-file-diagnostics-url="{escape(stream_file_diagnostics_url(stream.video_id), quote=True)}">'
+        "Load file diagnostics</button>"
+        "</div>"
+    )
+
+
+def render_stream_file_diagnostics(summary: StreamFileSummary) -> str:
+    sample = summary.files[:FILE_LIMIT_PER_STREAM]
+    rows = "".join(render_file_row(file) for file in sample)
+    if not rows:
+        rows = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
+    fragment_count = summary.counts_by_kind.get("fragment", 0)
+    internal_count = sum(
+        summary.counts_by_kind.get(kind, 0)
+        for kind in ("state", "temporary")
+    )
+    omitted = max(0, summary.file_count - len(sample))
+    sample_text = (
+        f"Showing a capped sample of {len(sample)} of {summary.file_count} files"
+        f"; {omitted} additional file{'s' if omitted != 1 else ''} not shown."
+        if omitted
+        else f"Showing all {len(sample)} files (sample cap {FILE_LIMIT_PER_STREAM})."
+    )
+    return f'''<details class="file-diagnostics-loaded" data-file-diagnostics-loaded open>
+  <summary><strong>Exact file diagnostics</strong> <span class="file-meta">Close to resume automatic dashboard refreshes.</span></summary>
+  <div class="notice info">This explicit scan includes fragment and internal file metadata.</div>
+  <dl class="detail-list"><dt>All files</dt><dd>{summary.file_count}</dd><dt>All storage</dt><dd>{escape(format_bytes(summary.total_bytes))}</dd><dt>Fragments</dt><dd>{fragment_count} / {escape(format_bytes(summary.bytes_by_kind.get("fragment", 0)))}</dd><dt>State and temporary</dt><dd>{internal_count} / {escape(format_bytes(summary.bytes_by_kind.get("state", 0) + summary.bytes_by_kind.get("temporary", 0)))}</dd><dt>Kinds</dt><dd>{escape(format_kind_counts(summary.counts_by_kind))}</dd></dl>
+  <p class="file-meta">{escape(sample_text)}</p>
+  <div class="table-wrap"><table class="files"><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{rows}</tbody></table></div>
+</details>'''
+
+
 def render_cleanup_fragments_action(stream: StreamStatus) -> str:
     count = stream.file_kind_counts.get("fragment", 0)
     if count <= 0 or stream.status in FRAGMENT_CLEANUP_BLOCKED_STATUSES:
@@ -16482,7 +17077,19 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
         render_file_row(file, timezone_name) for file in stream.files[:20]
     )
     if not files:
-        files = '<tr><td colspan="7" class="file-meta">No files found</td></tr>'
+        files = '<tr><td colspan="7" class="file-meta">No relevant files found</td></tr>'
+    file_diagnostics = render_file_diagnostics_control(stream)
+    total_size_label = "Total size" if stream.file_size_totals_complete else "Relevant size"
+    fragment_size = (
+        format_bytes(stream.fragment_bytes)
+        if stream.file_size_totals_complete
+        else "Load diagnostics"
+    )
+    latest_file_label = (
+        "Latest file"
+        if stream.file_size_totals_complete
+        else "Latest relevant file"
+    )
     events = render_stream_event_timeline(stream.events, timezone_name)
     content_events = render_content_events(stream.content_events)
     powerchat = render_powerchat_events(stream, timezone_name)
@@ -16524,11 +17131,11 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
     <div class="meta">
       <div>Segment: {stream.segment_index:03d}</div>
       <div>Files: {stream.file_count}</div>
-      <div>Total size: {escape(format_bytes(stream.total_bytes))}</div>
+      <div>{total_size_label}: {escape(format_bytes(stream.total_bytes))}</div>
       <div>Partial size: {escape(format_bytes(stream.part_bytes))}</div>
       <div>Final size: {escape(format_bytes(stream.final_bytes))}</div>
       <div>Chat size: {escape(format_bytes(stream.chat_bytes))}</div>
-      <div>Fragment size: {escape(format_bytes(stream.fragment_bytes))}</div>
+      <div>Fragment size: {escape(fragment_size)}</div>
       <div>Content events: {stream.content_event_count}</div>
       <div>Powerchat: {stream.powerchat_event_count} <span class="muted">{escape(powerchat_summary)}</span></div>
       <div>Conflicting formats: {mixed}</div>
@@ -16536,7 +17143,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
       <div>Started: {escape(format_optional_iso(stream.last_started_at, timezone_name))}</div>
       <div>Exited: {escape(format_optional_iso(stream.last_exit_at, timezone_name))}</div>
       <div>Updated: {escape(format_optional_iso(stream.updated_at, timezone_name))}</div>
-      <div>Latest file: {escape(latest_file)} <span class="muted">{escape(latest_age)}</span></div>
+      <div>{latest_file_label}: {escape(latest_file)} <span class="muted">{escape(latest_age)}</span></div>
       <div class="wide">Kinds: {escape(format_kind_counts(stream.file_kind_counts))}</div>
       <div class="wide">Directory: {escape(stream.directory)}</div>
     </div>
@@ -16564,6 +17171,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
               <tbody>{files}</tbody>
             </table>
           </div>
+          {file_diagnostics}
         </section>
         <section class="stream-tab-panel stream-tab-events">{content_events}</section>
         <section class="stream-tab-panel stream-tab-powerchat">{powerchat}</section>

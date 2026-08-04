@@ -340,7 +340,11 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
             state.close()
 
-        post_exit.assert_awaited_once_with(stream, 1)
+        post_exit.assert_awaited_once_with(
+            stream,
+            1,
+            expected_status="checking_after_exit",
+        )
         planned.assert_not_awaited()
         self.assertNotIn(stream.video_id, manager._planned_reconnects)
 

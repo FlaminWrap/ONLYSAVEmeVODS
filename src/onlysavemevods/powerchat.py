@@ -10,6 +10,7 @@ import json
 import logging
 import re
 import tempfile
+import uuid
 
 
 LOGGER = logging.getLogger(__name__)
@@ -55,18 +56,49 @@ class PowerchatRecorder:
     stream_started_at: str = ""
     events: list[dict[str, Any]] = field(default_factory=list)
     _dedupe_keys: set[str] = field(default_factory=set, init=False)
+    _preserve_invalid_sidecar: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         self.sidecar_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = load_powerchat_sidecar(self.sidecar_path)
-        for event in payload.get("events", []):
-            if not isinstance(event, dict):
+        payload = _read_powerchat_sidecar(self.sidecar_path)
+        if payload is None or not isinstance(payload.get("events"), list):
+            if self.sidecar_path.is_file():
+                try:
+                    recovery_path = preserve_malformed_powerchat_sidecar(
+                        self.sidecar_path
+                    )
+                except OSError as exc:
+                    self._preserve_invalid_sidecar = True
+                    LOGGER.error(
+                        "Unable to preserve malformed Powerchat sidecar %s: %s",
+                        self.sidecar_path,
+                        exc,
+                    )
+                else:
+                    LOGGER.warning(
+                        "Moved malformed Powerchat sidecar %s to %s before recording new events",
+                        self.sidecar_path,
+                        recovery_path,
+                    )
+            payload = {}
+        for raw_event in payload.get("events", []):
+            if not isinstance(raw_event, dict):
                 continue
+            event = dict(raw_event)
             key = str(event.get("dedupe_key") or "").strip()
-            if not key or key in self._dedupe_keys:
+            if not key:
+                key = powerchat_dedupe_key(event)
+                event["dedupe_key"] = key
+            event_keys = powerchat_observed_event_keys(event)
+            if key.startswith("id:"):
+                event_keys.append(key)
+            if any(event_key in self._dedupe_keys for event_key in event_keys):
                 continue
+            self._dedupe_keys.update(event_keys)
+            sources = powerchat_observed_sources(event)
+            if sources:
+                event["observed_sources"] = sources
             self.events.append(dict(event))
-            self._dedupe_keys.add(key)
 
     def record_payload(
         self,
@@ -84,15 +116,49 @@ class PowerchatRecorder:
         if event is None:
             return False
         key = str(event.get("dedupe_key") or "").strip()
-        if not key or key in self._dedupe_keys:
+        if key.startswith("id:") and key in self._dedupe_keys:
             return False
+        if self._pair_cross_source_duplicate(event):
+            if key.startswith("id:"):
+                self._dedupe_keys.add(key)
+            self.write()
+            return False
+        if not key.startswith("id:"):
+            event["dedupe_key"] = f"occurrence:{uuid.uuid4().hex}"
+        sources = powerchat_observed_sources(event)
+        if sources:
+            event["observed_sources"] = sources
         self.events.append(event)
-        self._dedupe_keys.add(key)
+        if key.startswith("id:"):
+            self._dedupe_keys.add(key)
         self.write()
         return True
 
+    def _pair_cross_source_duplicate(self, event: dict[str, Any]) -> bool:
+        source = str(event.get("source") or "").strip().casefold()
+        if not source:
+            return False
+        pairing_key = powerchat_pairing_key(event)
+        for existing in self.events:
+            sources = powerchat_observed_sources(existing)
+            if (
+                source in sources
+                or powerchat_pairing_key(existing) != pairing_key
+                or not powerchat_events_within_dedupe_window(existing, event)
+            ):
+                continue
+            existing["observed_sources"] = [*sources, source]
+            key = str(event.get("dedupe_key") or "").strip()
+            if key.startswith("id:"):
+                observed_keys = powerchat_observed_event_keys(existing)
+                if key not in observed_keys:
+                    observed_keys.append(key)
+                existing["observed_event_keys"] = observed_keys
+            return True
+        return False
+
     def write(self) -> None:
-        if not self.events:
+        if not self.events or self._preserve_invalid_sidecar:
             return
         write_powerchat_sidecar(
             self.sidecar_path,
@@ -202,8 +268,19 @@ def powerchat_dedupe_key(event: dict[str, Any]) -> str:
     explicit_id = str(event.get("id") or "").strip()
     if explicit_id:
         return f"id:{explicit_id}"
+    return powerchat_payload_key(event, include_time_bucket=True)
+
+
+def powerchat_pairing_key(event: dict[str, Any]) -> str:
+    return powerchat_payload_key(event, include_time_bucket=False)
+
+
+def powerchat_payload_key(
+    event: dict[str, Any],
+    *,
+    include_time_bucket: bool,
+) -> str:
     bits = {
-        "time_bucket": powerchat_dedupe_time_bucket(event.get("received_at")),
         "kind": event.get("kind") or "unknown",
         "donor": event.get("donor") or "",
         "platform": event.get("platform") or "",
@@ -213,8 +290,50 @@ def powerchat_dedupe_key(event: dict[str, Any]) -> str:
         "unit_amount": event.get("unit_amount"),
         "unit": event.get("unit") or "",
     }
+    if include_time_bucket:
+        bits["time_bucket"] = powerchat_dedupe_time_bucket(
+            event.get("received_at")
+        )
     digest = hashlib.sha1(json.dumps(bits, sort_keys=True).encode("utf-8")).hexdigest()
     return f"payload:{digest[:20]}"
+
+
+def powerchat_observed_sources(event: dict[str, Any]) -> list[str]:
+    raw_sources = event.get("observed_sources")
+    candidates = raw_sources if isinstance(raw_sources, list) else []
+    candidates = [*candidates, event.get("source")]
+    sources: list[str] = []
+    for value in candidates:
+        source = str(value or "").strip().casefold()
+        if source and source not in sources:
+            sources.append(source)
+    return sources
+
+
+def powerchat_observed_event_keys(event: dict[str, Any]) -> list[str]:
+    raw_keys = event.get("observed_event_keys")
+    if not isinstance(raw_keys, list):
+        return []
+    keys: list[str] = []
+    for value in raw_keys:
+        key = str(value or "").strip()
+        if key.startswith("id:") and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def powerchat_events_within_dedupe_window(
+    first: dict[str, Any],
+    second: dict[str, Any],
+) -> bool:
+    first_timestamp = parse_iso_datetime(str(first.get("received_at") or ""))
+    second_timestamp = parse_iso_datetime(str(second.get("received_at") or ""))
+    if first_timestamp is None or second_timestamp is None:
+        return False
+    return (
+        abs((second_timestamp - first_timestamp).total_seconds())
+        <= POWERCHAT_DEDUPE_WINDOW_SECONDS
+    )
 
 
 def powerchat_dedupe_time_bucket(value: Any) -> str:
@@ -264,15 +383,33 @@ def write_powerchat_sidecar(
 
 
 def load_powerchat_sidecar(path: Path) -> dict[str, Any]:
+    payload = _read_powerchat_sidecar(path)
+    return payload if payload is not None else {}
+
+
+def _read_powerchat_sidecar(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
-        return {}
+        return None
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
+        return None
     if not isinstance(payload, dict):
-        return {}
+        return None
     return repair_powerchat_sidecar_payload(payload)
+
+
+def preserve_malformed_powerchat_sidecar(path: Path) -> Path:
+    """Move an unreadable sidecar aside without exposing it as segment media."""
+
+    recovery_dir = path.parent / ".powerchat-recovery"
+    recovery_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    recovery_path = recovery_dir / (
+        f"{path.name}.{stamp}.{uuid.uuid4().hex}.malformed"
+    )
+    path.rename(recovery_path)
+    return recovery_path
 
 
 def repair_powerchat_sidecar_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -370,6 +507,25 @@ def powerchat_totals(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[st
     }
 
 
+def merge_powerchat_events(
+    *event_groups: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for events in event_groups:
+        for raw_event in events:
+            event = dict(raw_event)
+            key = str(event.get("dedupe_key") or "").strip()
+            if not key:
+                key = powerchat_dedupe_key(event)
+                event["dedupe_key"] = key
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(event)
+    return merged
+
+
 def copy_powerchat_segment_sidecar(
     source: Path,
     media_file: Path,
@@ -382,8 +538,14 @@ def copy_powerchat_segment_sidecar(
 ) -> Path | None:
     if not source.is_file():
         return None
-    payload = load_powerchat_sidecar(source)
-    events = [event for event in payload.get("events", []) if isinstance(event, dict)]
+    payload = _read_powerchat_sidecar(source)
+    if payload is None or not isinstance(payload.get("events"), list):
+        logger.warning(
+            "Unable to read Powerchat sidecar %s; preserving it for recovery",
+            source,
+        )
+        return None
+    events = [event for event in payload["events"] if isinstance(event, dict)]
     if not events:
         try:
             source.unlink(missing_ok=True)
@@ -391,15 +553,57 @@ def copy_powerchat_segment_sidecar(
             logger.debug("Unable to remove empty Powerchat sidecar %s", source)
         return None
     target = powerchat_event_file(media_file)
+    existing_payload: dict[str, Any] = {}
+    if target.is_file():
+        candidate = _read_powerchat_sidecar(target)
+        if candidate is None or not isinstance(candidate.get("events"), list):
+            try:
+                recovery_path = preserve_malformed_powerchat_sidecar(target)
+            except OSError as exc:
+                logger.warning(
+                    "Unable to preserve malformed Powerchat target %s: %s",
+                    target,
+                    exc,
+                )
+                return None
+            logger.warning(
+                "Moved malformed Powerchat target %s to %s before finalizing",
+                target,
+                recovery_path,
+            )
+        else:
+            existing_payload = candidate
+    existing_events = [
+        event
+        for event in existing_payload.get("events", [])
+        if isinstance(event, dict)
+    ]
+    events = merge_powerchat_events(existing_events, events)
     try:
         write_powerchat_sidecar(
             target,
             events=events,
-            streamer_name=streamer_name or str(payload.get("streamer") or ""),
-            username=username or str(payload.get("username") or ""),
-            video_id=video_id or str(payload.get("video_id") or ""),
+            streamer_name=(
+                streamer_name
+                or str(payload.get("streamer") or "")
+                or str(existing_payload.get("streamer") or "")
+            ),
+            username=(
+                username
+                or str(payload.get("username") or "")
+                or str(existing_payload.get("username") or "")
+            ),
+            video_id=(
+                video_id
+                or str(payload.get("video_id") or "")
+                or str(existing_payload.get("video_id") or "")
+            ),
             segment_index=segment_index,
-            stream_started_at=str(payload.get("stream_start") or ""),
+            stream_started_at=str(
+                payload.get("stream_start")
+                or existing_payload.get("stream_start")
+                or ""
+            ),
         )
     except OSError as exc:
         logger.warning("Unable to write Powerchat sidecar %s: %s", target, exc)

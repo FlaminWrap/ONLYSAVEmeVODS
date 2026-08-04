@@ -16,12 +16,41 @@ from onlysavemevods.twitch_ad_repair import (
     merge_commercial_samples,
     repaired_media_path,
     repair_twitch_ads_for_media,
+    render_repaired_media,
+    TwitchAdRepairError,
     twitch_ad_repair_sidecar_path,
     twitch_channel_from_stream,
 )
 
 
 class TwitchAdRepairTests(unittest.TestCase):
+    def test_failed_repair_render_cleans_temp_and_preserves_existing_output(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "stream.mp4"
+            vod_slice = root / "vod.mp4"
+            output = root / "stream.repaired.mp4"
+            media.write_bytes(b"media")
+            vod_slice.write_bytes(b"vod")
+            output.write_bytes(b"existing")
+            ad = TwitchAdSegment(0.0, 10.0, 0.9)
+
+            with patch(
+                "onlysavemevods.twitch_ad_repair.run_command",
+                side_effect=TwitchAdRepairError("ffmpeg failed"),
+            ):
+                with self.assertRaises(TwitchAdRepairError):
+                    render_repaired_media(
+                        media,
+                        [(ad, vod_slice, 5.0, 15.0)],
+                        output,
+                    )
+            output_bytes = output.read_bytes()
+            temp_exists = (root / "stream.repaired.rendering.mp4").exists()
+
+        self.assertEqual(output_bytes, b"existing")
+        self.assertFalse(temp_exists)
+
     def test_commercial_break_ocr_text_is_detected(self) -> None:
         self.assertTrue(
             is_twitch_commercial_break_text("Twitch\nCommercial break in progress")
@@ -155,8 +184,57 @@ class TwitchAdRepairTests(unittest.TestCase):
         self.assertEqual(Path(result.output_file), repaired_media_path(media))
         self.assertEqual(rendered, [(media, repaired_media_path(media))])
         self.assertTrue(payload["repaired"])
-        self.assertEqual(payload["segment_results"][0]["vod_replacement_start"], 22.0)
-        self.assertEqual(payload["segment_results"][0]["vod_replacement_end"], 52.0)
+        self.assertEqual(payload["segment_results"][0]["vod_replacement_start"], 21.5)
+        self.assertEqual(payload["segment_results"][0]["vod_replacement_end"], 51.5)
+
+    def test_repair_checks_older_vods_when_newest_does_not_cover_recording(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            media = root / "segment-001.mp4"
+            media.write_bytes(b"media")
+            vod_slice = root / "vod.mp4"
+            vod_slice.write_bytes(b"vod")
+            config = BotConfig(download_dir=root, state_dir=root / "state")
+            stream = LiveStream(
+                video_id="twitch:Example",
+                url="https://www.twitch.tv/Example",
+                channel="Example",
+                platform="twitch",
+                source="twitch:Example",
+            )
+            ad = TwitchAdSegment(0.0, 30.0, 0.9, "Commercial break in progress")
+            latest_url = "https://www.twitch.tv/videos/2"
+            older_url = "https://www.twitch.tv/videos/1"
+
+            def fake_render(_media, _replacements, output_file, **_kwargs):
+                output_file.write_bytes(b"repaired")
+
+            with (
+                patch("onlysavemevods.twitch_ad_repair.executable_available", return_value=True),
+                patch("onlysavemevods.twitch_ad_repair.detect_twitch_commercial_breaks", return_value=[ad]),
+                patch("onlysavemevods.twitch_ad_repair.find_recent_twitch_vod_url", return_value=latest_url),
+                patch("onlysavemevods.twitch_ad_repair.find_recent_twitch_vod_urls", return_value=[latest_url, older_url]),
+                patch(
+                    "onlysavemevods.twitch_ad_repair.probe_twitch_vod",
+                    side_effect=[
+                        TwitchVodMetadata(latest_url, timestamp=2000.0, duration=300.0),
+                        TwitchVodMetadata(older_url, timestamp=1000.0, duration=3600.0),
+                    ],
+                ),
+                patch("onlysavemevods.twitch_ad_repair.probe_media_duration", side_effect=[120.0, 90.0]),
+                patch("onlysavemevods.twitch_ad_repair.download_twitch_vod_slice", return_value=vod_slice),
+                patch("onlysavemevods.twitch_ad_repair.find_best_alignment_time", return_value=(52.0, 3.0)),
+                patch("onlysavemevods.twitch_ad_repair.render_repaired_media", fake_render),
+            ):
+                result = repair_twitch_ads_for_media(
+                    config,
+                    stream,
+                    media,
+                    started_at="1970-01-01T00:20:00+00:00",
+                )
+
+        self.assertTrue(result.repaired)
+        self.assertEqual(result.vod_url, older_url)
 
     def test_config_parses_twitch_ad_repair_settings(self) -> None:
         with TemporaryDirectory() as tmp:

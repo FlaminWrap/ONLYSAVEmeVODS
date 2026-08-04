@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from threading import Lock
+from typing import cast
 import time
 
 
@@ -23,6 +24,7 @@ class TrackedJob:
 
 _TRACKED_JOBS: dict[str, TrackedJob] = {}
 _TRACKED_JOBS_LOCK = Lock()
+_UNSET = object()
 MAX_TRACKED_JOBS = 200
 FINAL_JOB_STATUSES = {"done", "failed", "interrupted"}
 COMPLETED_JOB_RETENTION_SECONDS = 5 * 60
@@ -64,7 +66,7 @@ def update_tracked_job(
     *,
     status: str | None = None,
     phase: str | None = None,
-    progress: float | None = None,
+    progress: float | None | object = _UNSET,
     message: str | None = None,
     finished: bool = False,
 ) -> None:
@@ -74,11 +76,16 @@ def update_tracked_job(
         if current is None:
             return
         next_status = status if status is not None else current.status
+        next_progress = (
+            current.progress
+            if progress is _UNSET
+            else cast(float | None, progress)
+        )
         _TRACKED_JOBS[job_id] = replace(
             current,
             status=next_status,
             phase=phase if phase is not None else current.phase,
-            progress=progress if progress is not None else current.progress,
+            progress=next_progress,
             message=message if message is not None else current.message,
             updated_at=now,
             finished_at=now if finished else current.finished_at,

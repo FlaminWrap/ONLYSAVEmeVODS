@@ -167,8 +167,10 @@ def render_python_update_service_unit(
     config_file: str,
     main_service_name: str,
     update_script: str | None = None,
+    update_lock_file: str | None = None,
 ) -> str:
     script = update_script or f"{app_dir}/scripts/update-python-deps.sh"
+    lock_file = update_lock_file or f"{install_dir}/.update.lock"
     return "\n".join(
         [
             "[Unit]",
@@ -185,6 +187,7 @@ def render_python_update_service_unit(
             systemd_environment_line("ONLYSAVEMEVODS_VENV_DIR", venv_dir),
             systemd_environment_line("ONLYSAVEMEVODS_CONFIG_FILE", config_file),
             systemd_environment_line("ONLYSAVEMEVODS_SERVICE_NAME", main_service_name),
+            systemd_environment_line("ONLYSAVEMEVODS_UPDATE_LOCK_FILE", lock_file),
             f"ExecStart=/usr/bin/env bash {script}",
             "",
         ]

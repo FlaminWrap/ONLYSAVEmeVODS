@@ -50,12 +50,39 @@ web_port = 8080
 """
 
 
+class NonClosingBuffer(BytesIO):
+    def close(self) -> None:
+        pass
+
+
+def run_dashboard_request(
+    config: BotConfig,
+    raw_request: bytes,
+    *,
+    trusted_host: str | None = None,
+) -> str:
+    class Request:
+        def __init__(self) -> None:
+            self.input = NonClosingBuffer(raw_request)
+            self.output = NonClosingBuffer()
+
+        def makefile(self, mode: str, buffering: int | None = None) -> NonClosingBuffer:
+            return self.input
+
+        def sendall(self, data: bytes) -> None:
+            self.output.write(data)
+
+    class Server:
+        server_name = "localhost"
+        server_port = 8080
+
+    request = Request()
+    build_handler(config, trusted_host=trusted_host)(request, ("127.0.0.1", 1), Server())
+    return request.output.getvalue().decode("latin-1")
+
+
 class DashboardUiTests(unittest.TestCase):
     def test_old_status_route_redirects_to_current_dashboard(self) -> None:
-        class NonClosingBuffer(BytesIO):
-            def close(self) -> None:
-                pass
-
         class Request:
             def __init__(self) -> None:
                 self.input = NonClosingBuffer(
@@ -99,6 +126,263 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('form.getAttribute("action")', script)
         self.assertNotIn("fetch(form.action", script)
 
+    def test_file_diagnostics_loader_is_delegated_and_on_demand(self) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('event.target.closest("[data-load-file-diagnostics]")', script)
+        self.assertIn('headers: { "X-Dashboard-Fragment": "1" }', script)
+        self.assertIn("Scanning fragment and internal files", script)
+        self.assertGreaterEqual(
+            script.count('region.querySelector("[data-file-diagnostics-loaded][open]")'),
+            2,
+        )
+
+    def test_admin_stream_page_omits_diagnostic_rows_until_requested(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                streamers={"OUMB3rd": StreamerConfig(sources=["@OUMB3rd"])},
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                title="Live Status",
+                channel="OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = segment_directory(config, stream.video_id, stream.channel)
+            directory.mkdir(parents=True)
+            fragment_name = "segment-001.f137.mp4.part-Frag1"
+            (directory / fragment_name).write_bytes(b"fragment")
+            (directory / "recording.mp4").write_bytes(b"media")
+
+            html = render_admin_page(
+                config,
+                "streamers",
+                {"selected": ["OUMB3rd"]},
+            )
+
+        self.assertIn("Relevant storage", html)
+        self.assertIn("Load file diagnostics", html)
+        self.assertIn("1 fragment or internal file", html)
+        self.assertNotIn(fragment_name, html)
+
+    def test_file_diagnostics_endpoint_is_bounded_no_store_and_safe(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                title="Live Status",
+                channel="OUMB3rd",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_ended(stream.video_id)
+            state.close()
+            directory = segment_directory(config, stream.video_id, stream.channel)
+            directory.mkdir(parents=True)
+            for index in range(85):
+                (directory / f"segment-001.f137.mp4.part-Frag{index}").write_bytes(b"x")
+            (directory / "recording.mp4").write_bytes(b"media")
+
+            response = run_dashboard_request(
+                config,
+                b"GET /stream-file-diagnostics?video_id=LIVEVIDEO01 HTTP/1.1\r\nHost: localhost\r\nX-Dashboard-Fragment: 1\r\n\r\n",
+            )
+            unknown = run_dashboard_request(
+                config,
+                b"GET /stream-file-diagnostics?video_id=UNKNOWN HTTP/1.1\r\nHost: localhost\r\nX-Dashboard-Fragment: 1\r\n\r\n",
+            )
+            implicit = run_dashboard_request(
+                config,
+                b"GET /stream-file-diagnostics?video_id=LIVEVIDEO01 HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            )
+
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            unsafe_stream = LiveStream(
+                video_id="UNSAFEVIDEO1",
+                url="https://www.youtube.com/watch?v=UNSAFEVIDEO1",
+                title="Unsafe",
+                channel="Unsafe Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(unsafe_stream)
+            state.mark_ended(unsafe_stream.video_id)
+            state.close()
+            unsafe_directory = segment_directory(
+                config,
+                unsafe_stream.video_id,
+                unsafe_stream.channel,
+            )
+            unsafe_directory.parent.mkdir(parents=True, exist_ok=True)
+            unsafe_directory.symlink_to(outside, target_is_directory=True)
+            unsafe = run_dashboard_request(
+                config,
+                b"GET /stream-file-diagnostics?video_id=UNSAFEVIDEO1 HTTP/1.1\r\nHost: localhost\r\nX-Dashboard-Fragment: 1\r\n\r\n",
+            )
+
+        self.assertIn(" 200 OK\r\n", response)
+        self.assertIn("Cache-Control: no-store\r\n", response)
+        self.assertIn("X-Content-Type-Options: nosniff\r\n", response)
+        self.assertIn("Exact file diagnostics", response)
+        self.assertIn("capped sample of 80 of 86 files", response)
+        self.assertIn("HTTP/1.0 403 ", implicit)
+        self.assertIn("HTTP/1.0 404 ", unknown)
+        self.assertIn("HTTP/1.0 400 ", unsafe)
+
+    def test_browser_mutations_require_same_origin_and_trusted_host(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+
+            def request(origin: str, host: str, value: int) -> str:
+                payload = (
+                    '{"values":{"poll_interval_seconds":%d},"revision":"%s"}'
+                    % (value, config_file_revision(config))
+                ).encode()
+                return run_dashboard_request(
+                    config,
+                    b"POST /config HTTP/1.1\r\n"
+                    + f"Host: {host}\r\n".encode()
+                    + f"Origin: {origin}\r\n".encode()
+                    + b"Sec-Fetch-Site: same-origin\r\n"
+                    + b"Content-Type: application/json\r\n"
+                    + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                    + payload,
+                )
+
+            same_origin = request("http://localhost:8080", "localhost:8080", 75)
+            cross_origin = request("https://attacker.example", "localhost:8080", 90)
+            bad_host = request("http://localhost:9999", "localhost:9999", 95)
+            saved = load_config(config_path)
+
+        self.assertIn(" 200 OK\r\n", same_origin)
+        self.assertIn("HTTP/1.0 403 ", cross_origin)
+        self.assertIn("HTTP/1.0 421 ", bad_host)
+        self.assertEqual(saved.poll_interval_seconds, 75)
+
+    def test_same_origin_proxy_and_wildcard_hosts_are_supported(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+            payload = (
+                '{"values":{"poll_interval_seconds":75},"revision":"%s"}'
+                % config_file_revision(config)
+            ).encode()
+            raw_request = (
+                b"POST /config HTTP/1.1\r\n"
+                b"Host: vods.home.example\r\n"
+                b"Origin: https://vods.home.example\r\n"
+                b"Sec-Fetch-Site: same-origin\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+                + payload
+            )
+            proxy_response = run_dashboard_request(config, raw_request)
+            mismatched_port_response = run_dashboard_request(
+                config,
+                raw_request.replace(
+                    b"Origin: https://vods.home.example\r\n",
+                    b"Origin: https://vods.home.example:444\r\n",
+                ),
+            )
+
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+            wildcard_payload = (
+                '{"values":{"poll_interval_seconds":80},"revision":"%s"}'
+                % config_file_revision(config)
+            ).encode()
+            wildcard_response = run_dashboard_request(
+                config,
+                raw_request.replace(payload, wildcard_payload),
+                trusted_host="0.0.0.0",
+            )
+
+        self.assertIn(" 200 OK\r\n", proxy_response)
+        self.assertIn("HTTP/1.0 403 ", mismatched_port_response)
+        self.assertIn(" 200 OK\r\n", wildcard_response)
+
+    def test_cross_origin_gate_covers_every_mutating_post_route(self) -> None:
+        config = BotConfig()
+        mutation_paths = (
+            "/render-chat",
+            "/refresh-chat",
+            "/transcribe",
+            "/recover-segment",
+            "/cleanup-fragments",
+            "/delete-stream",
+            "/vod-download",
+            "/detect-events",
+            "/voice-detection",
+            "/stream-event-rules",
+            "/speaker-labels",
+            "/streamer-voices",
+            "/streamer-voice-samples",
+            "/streamer-voice-samples/from-transcript",
+            "/streamer-voice-attributions",
+            "/streamers",
+            "/config",
+            "/app-update/check",
+            "/app-update/request",
+            "/watermark",
+            "/delete-watermark",
+            "/detect-watermark",
+        )
+        for path in mutation_paths:
+            with self.subTest(path=path):
+                response = run_dashboard_request(
+                    config,
+                    f"POST {path} HTTP/1.1\r\n".encode()
+                    + b"Host: localhost:8080\r\n"
+                    + b"Origin: https://attacker.example\r\n"
+                    + b"Sec-Fetch-Site: cross-site\r\n"
+                    + b"Content-Length: 0\r\n\r\n",
+                )
+                self.assertIn("HTTP/1.0 403 ", response)
+
+    def test_return_to_cannot_inject_redirect_response_headers(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+            body = (
+                b"form_kind=streamer_form&action=save&streamer_name=Example"
+                b"&sources=%40Example&download_dir_name="
+                b"&return_to=%2Fstreamers%0D%0AX-Injected%3A+yes"
+            )
+            response = run_dashboard_request(
+                config,
+                b"POST /streamers HTTP/1.1\r\n"
+                b"Host: localhost:8080\r\n"
+                b"Origin: http://localhost:8080\r\n"
+                b"Sec-Fetch-Site: same-origin\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body,
+            )
+
+        self.assertIn(" 303 See Other\r\n", response)
+        self.assertIn("Location: /streamers?selected=Example\r\n", response)
+        self.assertNotIn("\r\nX-Injected:", response)
+
     def test_fragment_refresh_preserves_expanded_details(self) -> None:
         script = (
             Path(__file__).parents[1]
@@ -114,6 +398,36 @@ class DashboardUiTests(unittest.TestCase):
         self.assertLess(capture, replace)
         self.assertLess(replace, restore)
         self.assertIn('details[data-details-key]', script)
+
+    def test_autosave_and_fragment_refresh_are_generation_safe_and_delegated(self) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("const autosaveVersions = new WeakMap();", script)
+        self.assertIn("const saveVersion = autosaveVersions.get(form) || 0;", script)
+        self.assertIn("const hasNewerChanges", script)
+        self.assertIn('document.addEventListener("input"', script)
+        self.assertIn('document.addEventListener("change"', script)
+        self.assertIn("const fragmentRequests = new WeakMap();", script)
+        self.assertIn("if (fragmentRequests.has(region)) return;", script)
+        self.assertIn("initializeSourceManagers(region);", script)
+
+    def test_mobile_navigation_is_inert_while_closed(self) -> None:
+        script = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('navigation.toggleAttribute("inert", closedOnMobile);', script)
+        self.assertIn('navigation.setAttribute("aria-hidden", "true")', script)
 
     def test_static_pages_use_sidebar_shell_and_packaged_assets(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -137,6 +451,21 @@ class DashboardUiTests(unittest.TestCase):
                 html,
             )
             self.assertIn('aria-current="page"', html)
+
+    def test_desktop_page_content_uses_the_available_workspace_width(self) -> None:
+        stylesheet = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.css"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            ".page-content {\n  width: 100%;\n  padding: 28px clamp(18px, 3vw, 38px) 56px;",
+            stylesheet,
+        )
+        self.assertNotIn("width: min(1480px, 100%)", stylesheet)
 
     def test_settings_are_guided_searchable_and_autosaved(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -594,6 +923,8 @@ class DashboardUiTests(unittest.TestCase):
             reloaded = load_config(config_path)
             self.assertEqual(reloaded.poll_interval_seconds, 75)
             self.assertEqual(reloaded.web_port, 8081)
+            self.assertEqual(config.poll_interval_seconds, 75)
+            self.assertEqual(config.web_port, 8080)
             self.assertEqual(result["saved"], ["poll_interval_seconds", "web_port"])
             self.assertEqual(result["restart_required"], ["web_port"])
             self.assertNotEqual(result["revision"], revision)
@@ -816,6 +1147,10 @@ state_dir = "state"
         self.assertEqual(safe_return_to("/streamers?selected=Example", "/"), "/streamers?selected=Example")
         self.assertEqual(safe_return_to("https://example.com", "/settings"), "/settings")
         self.assertEqual(safe_return_to("//example.com/path", "/settings"), "/settings")
+        self.assertEqual(safe_return_to("/settings\\\\evil.example", "/"), "/")
+        self.assertEqual(safe_return_to("/%2f%2fevil.example", "/settings"), "/settings")
+        self.assertEqual(safe_return_to("/settings\r\nX-Injected: yes", "/"), "/")
+        self.assertEqual(safe_return_to("/settings%0d%0aX-Injected:yes", "/"), "/")
 
 
 if __name__ == "__main__":

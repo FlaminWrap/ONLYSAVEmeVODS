@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onlysavemevods"
-version = "0.1.1.dev0"
+version = "1.1.2.dev0"
 description = "Watch streamer sources and automatically record live streams with yt-dlp."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -17,6 +17,7 @@ dependencies = [
   "Pillow>=10.0.0",
   "numpy>=1.26",
   "opencv-python-headless>=4.9.0",
+  "packaging>=24.0",
   "websockets>=12.0",
 ]
 

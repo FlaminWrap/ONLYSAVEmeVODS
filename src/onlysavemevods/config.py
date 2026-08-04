@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
+import math
 import re
 import tomllib
 
@@ -248,13 +249,12 @@ class BotConfig:
 
 def load_config(path: str | Path) -> BotConfig:
     config_path = Path(path).expanduser()
-    if config_path.exists():
-        try:
-            config_text = config_path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ConfigError(f"Unable to read config file {config_path}: {exc}") from exc
-    else:
-        config_text = ""
+    if not config_path.is_file():
+        raise ConfigError(f"Config file does not exist: {config_path}")
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {config_path}: {exc}") from exc
 
     return load_config_text(config_text, config_path)
 
@@ -2147,6 +2147,8 @@ def _as_non_negative_float(value: Any, name: str) -> float:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ConfigError(f"{name} must be a number") from exc
+    if not math.isfinite(parsed):
+        raise ConfigError(f"{name} must be a finite number")
     if parsed < 0:
         raise ConfigError(f"{name} must not be negative")
     return parsed
@@ -2321,19 +2323,23 @@ def _as_positive_int(value: Any, name: str) -> int:
 
 
 def _as_positive_float(value: Any, name: str) -> float:
-    if (
-        not isinstance(value, (int, float))
-        or isinstance(value, bool)
-        or float(value) <= 0
-    ):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{name} must be a positive number")
-    return float(value)
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ConfigError(f"{name} must be a finite positive number")
+    if parsed <= 0:
+        raise ConfigError(f"{name} must be a positive number")
+    return parsed
 
 
 def _as_float(value: Any, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ConfigError(f"{name} must be a number")
-    return float(value)
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ConfigError(f"{name} must be a finite number")
+    return parsed
 
 
 def _as_probability(value: Any, name: str) -> float:

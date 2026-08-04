@@ -396,8 +396,21 @@ def match_known_voices_for_media(
         logger.warning("Unable to build voice profile embeddings for %s: %s", streamer_name, exc)
         return False
 
-    matches: dict[str, dict[str, Any]] = {}
+    previous_payload = load_voice_attribution_payload(media_file)
+    previous_matches = previous_payload.get("matches")
+    matches: dict[str, dict[str, Any]] = {
+        str(speaker): dict(item)
+        for speaker, item in (
+            previous_matches.items()
+            if isinstance(previous_matches, dict)
+            else []
+        )
+        if isinstance(item, dict)
+        and str(item.get("status") or "") in {"approved", "rejected"}
+    }
     for speaker in speakers:
+        if speaker in matches:
+            continue
         ranges = ranges_for_speaker(segments, speaker)
         if not ranges:
             continue

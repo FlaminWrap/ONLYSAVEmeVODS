@@ -7,7 +7,10 @@ from typing import Awaitable, Callable, Literal, Mapping, Protocol
 import asyncio
 import json
 import logging
+import os
 import re
+import shutil
+import signal
 import shlex
 import subprocess
 import sys
@@ -33,7 +36,7 @@ from .chat_render import (
     run_ffmpeg_command_with_output_progress,
     write_chat_ass_file,
 )
-from .chat_refresh import refresh_chat_sidecar
+from .chat_refresh import live_chat_file_has_live_markers, refresh_chat_sidecar
 from .chat_timing import (
     CHAT_TIMING_SUFFIX,
     chat_timing_file_for_chat_file,
@@ -62,7 +65,7 @@ from .powerchat import (
     is_powerchat_event_file,
     run_powerchat_listener,
 )
-from .state import StateStore, StreamRecord
+from .state import PostProcessingJobRecord, StateStore, StreamRecord
 from .transcription import transcribe_media_file, transcription_config_for_channel
 from .twitch_ad_repair import repair_twitch_ads_for_media
 from .youtube import TerminalVideoUnavailableError, YouTubeLiveEdge
@@ -70,6 +73,9 @@ from .youtube import TerminalVideoUnavailableError, YouTubeLiveEdge
 
 LOGGER = logging.getLogger(__name__)
 RECONNECT_STOP_TIMEOUT_SECONDS = 20
+CHAT_RECORDER_DRAIN_SECONDS = 5
+CHAT_RECORDER_RETRY_BACKOFF_SECONDS = (5, 15, 30, 60, 120)
+EXIT_STATE_RETRY_SECONDS = (0.25, 1.0, 5.0)
 FINALIZE_MUX_TIMEOUT_SECONDS = 60 * 60
 FINALIZE_DURATION_TOLERANCE_SECONDS = 5.0
 CATCHUP_FRAGMENT_MARGIN = 2
@@ -100,6 +106,31 @@ FRAGMENT_PROGRESS_RE = re.compile(
 )
 KEPT_FRAGMENT_RE = re.compile(r"-Frag(?P<fragment>\d+)$")
 CHANNEL_SOURCE_POST_EXIT_PLATFORMS = {"kick", "twitch"}
+POST_PROCESSING_KIND_ORDER = {
+    "twitch_ad_repair": 0,
+    "transcription": 1,
+    "content_events": 2,
+    "chat_render": 3,
+}
+POST_PROCESSING_ACTION_LABELS = {
+    "twitch_ad_repair": "Twitch ad repair",
+    "transcription": "subtitle transcription",
+    "content_events": "content event detection",
+    "chat_render": "chat video rendering",
+}
+FINALIZED_MEDIA_SUFFIXES = {
+    ".avi",
+    ".flv",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp4",
+    ".mpeg",
+    ".mpg",
+    ".ts",
+    ".webm",
+}
+STREAM_FILE_OPERATION_STATUSES = {"deleting", "cleaning_fragments"}
 
 
 def post_exit_probe_target(stream: LiveStream) -> str:
@@ -219,6 +250,7 @@ class FinalizedSegmentFiles:
     media_file: Path | None
     chat_file: Path | None
     timing_file: Path | None
+    chat_timeline_valid: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -411,9 +443,15 @@ class DownloadManager:
         self._youtube_fragment_progress_at: dict[str, float] = {}
         self._youtube_restart_checks: set[str] = set()
         self._stalled_youtube_monitors: set[str] = set()
+        self._deferred_post_exit_retries: set[str] = set()
+        self._deferred_stalled_retries: set[str] = set()
         self._post_exit_tasks: set[asyncio.Task[None]] = set()
+        self._post_processing_video_ids: set[str] = set()
+        self._finalizing_video_ids: set[str] = set()
+        self._starting_video_ids: set[str] = set()
         self._planned_reconnects: set[str] = set()
         self._spawn_failures: dict[str, int] = {}
+        self._spawn_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._transcription_semaphore = asyncio.Semaphore(
             config.transcription_max_concurrent
         )
@@ -504,7 +542,58 @@ class DownloadManager:
         *,
         segment_index: int | None = None,
     ) -> bool:
+        if stream.video_id in self._starting_video_ids:
+            self.logger.debug(
+                "Deferring %s while its downloader process is starting",
+                stream.video_id,
+            )
+            return False
+        occupied_video_ids = set(self.active) | self._starting_video_ids
+        if (
+            stream.video_id not in occupied_video_ids
+            and len(occupied_video_ids) >= self.config.max_concurrent_downloads
+        ):
+            self.logger.info(
+                "Concurrency limit reached; deferring %s (%s)",
+                stream.video_id,
+                stream.title,
+            )
+            self.state.upsert_detected(stream)
+            return False
+
+        self._starting_video_ids.add(stream.video_id)
+        try:
+            return await self._start_stream_reserved(
+                stream,
+                segment_index=segment_index,
+            )
+        finally:
+            self._starting_video_ids.discard(stream.video_id)
+
+    async def _start_stream_reserved(
+        self,
+        stream: LiveStream,
+        *,
+        segment_index: int | None = None,
+    ) -> bool:
         if self._stopping:
+            return False
+        if stream.video_id in self._finalizing_video_ids:
+            self.logger.info(
+                "Deferring %s while its previous segment is finalized",
+                stream.video_id,
+            )
+            return False
+        spawn_retry = self._spawn_retry_tasks.get(stream.video_id)
+        if (
+            spawn_retry is not None
+            and not spawn_retry.done()
+            and spawn_retry is not asyncio.current_task()
+        ):
+            self.logger.debug(
+                "Deferring %s while its start retry is pending",
+                stream.video_id,
+            )
             return False
         if stream.video_id in self.active:
             return False
@@ -525,7 +614,20 @@ class DownloadManager:
             self.state.upsert_detected(stream)
             return False
 
-        self.state.upsert_detected(stream)
+        detected_record = self.state.upsert_detected(stream)
+        if detected_record.status == "downloading":
+            self.logger.info(
+                "Deferring %s because its recording lifecycle is already claimed",
+                stream.video_id,
+            )
+            return False
+        if detected_record.status in STREAM_FILE_OPERATION_STATUSES:
+            self.logger.info(
+                "Deferring %s while dashboard file operation %s is active",
+                stream.video_id,
+                detected_record.status,
+            )
+            return False
         if segment_index is None:
             record = self.state.get_stream(stream.video_id)
             segment_index = record.segment_index if record else 1
@@ -635,7 +737,29 @@ class DownloadManager:
             segment_index,
             stream.title,
         )
-        self.state.mark_downloading(stream, segment_index)
+        if stream.video_id in self._finalizing_video_ids:
+            self.logger.info(
+                "Deferring %s because finalization began during startup",
+                stream.video_id,
+            )
+            return False
+        current_record = self.state.get_stream(stream.video_id)
+        if (
+            current_record is not None
+            and current_record.status in STREAM_FILE_OPERATION_STATUSES
+        ):
+            self.logger.info(
+                "Deferring %s because dashboard file operation %s began during startup",
+                stream.video_id,
+                current_record.status,
+            )
+            return False
+        if not self.state.mark_downloading(stream, segment_index):
+            self.logger.info(
+                "Deferring %s because a dashboard file operation won the startup race",
+                stream.video_id,
+            )
+            return False
 
         reconnect_ready = asyncio.Event()
         if not self.config.live_from_start:
@@ -652,12 +776,36 @@ class DownloadManager:
         except FileNotFoundError:
             self.logger.exception("Unable to start yt-dlp; binary not found")
             self.state.mark_waiting_retry(stream.video_id)
-            await self._schedule_spawn_retry(stream)
+            self._ensure_spawn_retry(stream)
             return False
         except OSError:
             self.logger.exception("Unable to start yt-dlp for %s", stream.video_id)
             self.state.mark_waiting_retry(stream.video_id)
-            await self._schedule_spawn_retry(stream)
+            self._ensure_spawn_retry(stream)
+            return False
+
+        if self._stopping:
+            self.logger.info(
+                "Stopping newly spawned downloader for %s because shutdown began",
+                stream.video_id,
+            )
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=RECONNECT_STOP_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
             return False
 
         record_chat = should_record_chat_for_stream(self.config, stream)
@@ -716,23 +864,34 @@ class DownloadManager:
             mixed_segment_task=mixed_segment_task,
             stale_live_task=stale_live_task,
         )
+        if process.returncode is not None:
+            for side_task in (reconnect_task, mixed_segment_task, stale_live_task):
+                if side_task is not None:
+                    side_task.cancel()
+            if output_task is not None:
+                await self._finish_output_task(output_task)
+            self.logger.warning(
+                "yt-dlp exited before startup completed video_id=%s segment=%03d",
+                stream.video_id,
+                segment_index,
+            )
+            return False
         self.active[stream.video_id] = active
-        powerchat_recorder, powerchat_task = self._start_powerchat_listener(
-            stream,
-            segment_index,
-            media_started_at=stream_start_iso(stream.raw) or media_started_at,
-        )
-        active.powerchat_recorder = powerchat_recorder
-        active.powerchat_task = powerchat_task
+        # The active registry now owns the concurrency slot; release the
+        # shorter-lived startup reservation before sidecars are attached.
+        self._starting_video_ids.discard(stream.video_id)
         if record_chat:
-            chat_process, chat_task, chat_output_task = await self._start_chat_recorder(
+            chat_process, _, chat_output_task = await self._start_chat_recorder(
                 stream,
                 segment_index,
             )
             if self.active.get(stream.video_id) is active and process.returncode is None:
                 active.chat_process = chat_process
-                active.chat_task = chat_task
                 active.chat_output_task = chat_output_task
+                active.chat_task = asyncio.create_task(
+                    self._watch_chat_process(stream, segment_index, chat_process)
+                )
+                active.chat_task.add_done_callback(discard_task_exception)
             elif chat_process is not None:
                 orphaned = ActiveDownload(
                     stream=stream,
@@ -741,10 +900,17 @@ class DownloadManager:
                     output_template=output_template,
                     task=task,
                     chat_process=chat_process,
-                    chat_task=chat_task,
                     chat_output_task=chat_output_task,
                 )
                 await self._stop_chat_recorder(orphaned)
+        if self.active.get(stream.video_id) is active and process.returncode is None:
+            powerchat_recorder, powerchat_task = self._start_powerchat_listener(
+                stream,
+                segment_index,
+                media_started_at=stream_start_iso(stream.raw) or media_started_at,
+            )
+            active.powerchat_recorder = powerchat_recorder
+            active.powerchat_task = powerchat_task
         self._spawn_failures.pop(stream.video_id, None)
         return True
 
@@ -843,11 +1009,30 @@ class DownloadManager:
         self,
         stream: LiveStream,
         segment_index: int,
+        *,
+        record_timing: bool = True,
     ) -> tuple[
         asyncio.subprocess.Process | None,
         asyncio.Task[None] | None,
         asyncio.Task[None] | None,
     ]:
+        try:
+            prepare_chat_output_for_resume(
+                self.config,
+                stream.video_id,
+                segment_index,
+                stream.channel,
+                self.logger,
+            )
+        except OSError:
+            self.logger.exception(
+                "Unable to prepare live chat output for resume video_id=%s "
+                "segment=%03d",
+                stream.video_id,
+                segment_index,
+            )
+            return None, None, None
+
         command = build_chat_download_command(self.config, stream, segment_index)
         self.logger.debug(
             "yt-dlp live chat command for %s segment=%03d: %s",
@@ -877,13 +1062,12 @@ class DownloadManager:
             stream.video_id,
             segment_index,
         )
-        self.update_segment_timing(
-            stream,
-            segment_index,
-            chat_started_at=chat_started_at,
-        )
-        task = asyncio.create_task(self._watch_chat_process(stream.video_id, process))
-        task.add_done_callback(discard_task_exception)
+        if record_timing:
+            self.update_segment_timing(
+                stream,
+                segment_index,
+                chat_started_at=chat_started_at,
+            )
         output_task = None
         if process.stdout is not None:
             output_task = asyncio.create_task(
@@ -894,7 +1078,7 @@ class DownloadManager:
                 )
             )
             output_task.add_done_callback(discard_task_exception)
-        return process, task, output_task
+        return process, None, output_task
 
     def _start_powerchat_listener(
         self,
@@ -1093,7 +1277,12 @@ class DownloadManager:
                         exc,
                     )
                     if self._stream_status_matches(stream.video_id, "stalled"):
-                        await self.finish_ended_stream(observed_stream, segment_index)
+                        await self.finish_ended_stream(
+                            observed_stream,
+                            segment_index,
+                            expected_status="stalled",
+                            allow_chat_replay=False,
+                        )
                     return
                 except Exception as exc:
                     latest = None
@@ -1117,7 +1306,11 @@ class DownloadManager:
                                 stream.video_id,
                                 "stalled",
                             ):
-                                await self.finish_ended_stream(latest, segment_index)
+                                await self.finish_ended_stream(
+                                    latest,
+                                    segment_index,
+                                    expected_status="stalled",
+                                )
                             return
                     else:
                         consecutive_non_live_probes = 0
@@ -1144,7 +1337,11 @@ class DownloadManager:
                             "finalizing",
                             stream.video_id,
                         )
-                        await self.finish_ended_stream(observed_stream, segment_index)
+                        await self.finish_ended_stream(
+                            observed_stream,
+                            segment_index,
+                            expected_status="stalled",
+                        )
                         return
                     if youtube_live_edge_advanced_from_record(record, edge):
                         self.logger.info(
@@ -1171,7 +1368,15 @@ class DownloadManager:
             self._stalled_youtube_monitors.discard(stream.video_id)
 
         if resume_stream is not None and not self._stopping:
-            await self.start_stream(resume_stream, segment_index=resume_segment)
+            started = await self.start_stream(
+                resume_stream,
+                segment_index=resume_segment,
+            )
+            if not started and resume_stream.video_id not in self.active:
+                record = self.state.get_stream(resume_stream.video_id)
+                if record is not None and record.status == "detected":
+                    self.state.mark_exited(resume_stream.video_id, -1)
+                    self._defer_post_exit_retry(resume_stream, resume_segment)
 
     async def _stale_youtube_live_watchdog(
         self,
@@ -1453,21 +1658,119 @@ class DownloadManager:
 
     async def _watch_chat_process(
         self,
-        video_id: str,
-        process: asyncio.subprocess.Process,
+        stream: LiveStream,
+        segment_index: int,
+        process: asyncio.subprocess.Process | None,
     ) -> None:
-        exit_code = await process.wait()
-        if self._stopping:
-            self.logger.info("Live chat recorder stopped for %s during shutdown", video_id)
-            return
-        if exit_code == 0:
-            self.logger.info("Live chat recorder exited video_id=%s", video_id)
-            return
-        self.logger.warning(
-            "Live chat recorder exited video_id=%s exit_code=%s",
-            video_id,
-            exit_code,
-        )
+        current_process = process
+        has_started = process is not None
+        failures = 0
+        while True:
+            exit_code = await current_process.wait() if current_process is not None else None
+            active = self.active.get(stream.video_id)
+            if self._stopping:
+                self.logger.info(
+                    "Live chat recorder stopped for %s during shutdown",
+                    stream.video_id,
+                )
+                return
+            if (
+                active is None
+                or active.chat_task is not asyncio.current_task()
+                or active.chat_process is not current_process
+                or active.process.returncode is not None
+            ):
+                return
+
+            if active.chat_output_task is not None:
+                await self._finish_output_task(active.chat_output_task)
+            active.chat_process = None
+            active.chat_output_task = None
+
+            delay = CHAT_RECORDER_RETRY_BACKOFF_SECONDS[
+                min(failures, len(CHAT_RECORDER_RETRY_BACKOFF_SECONDS) - 1)
+            ]
+            if exit_code is None:
+                message = f"Live chat recorder failed to start; retrying in {delay}s"
+            else:
+                message = (
+                    f"Live chat recorder exited unexpectedly (code {exit_code}); "
+                    f"retrying in {delay}s"
+                )
+            self.logger.warning(
+                "%s video_id=%s segment=%03d",
+                message,
+                stream.video_id,
+                segment_index,
+            )
+            try:
+                self.state.add_stream_event(
+                    stream.video_id,
+                    message,
+                    level="warning",
+                    segment_index=segment_index,
+                )
+            except Exception as exc:  # noqa: BLE001 - recorder recovery must continue.
+                self.logger.debug(
+                    "Unable to record live chat recovery event for %s: %s",
+                    stream.video_id,
+                    exc,
+                )
+
+            failures += 1
+            await self.sleep(delay)
+            active = self.active.get(stream.video_id)
+            if (
+                self._stopping
+                or active is None
+                or active.chat_task is not asyncio.current_task()
+                or active.chat_process is not None
+                or active.process.returncode is not None
+            ):
+                return
+
+            try:
+                replacement, _, output_task = await self._start_chat_recorder(
+                    stream,
+                    segment_index,
+                    record_timing=not has_started,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep supervising after extractor errors.
+                self.logger.exception(
+                    "Unable to restart live chat recorder video_id=%s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+                replacement = None
+                output_task = None
+
+            latest = self.active.get(stream.video_id)
+            if (
+                self._stopping
+                or latest is not active
+                or latest.chat_task is not asyncio.current_task()
+                or latest.process.returncode is not None
+            ):
+                if replacement is not None:
+                    orphaned = ActiveDownload(
+                        stream=stream,
+                        process=active.process,
+                        segment_index=segment_index,
+                        output_template=active.output_template,
+                        task=active.task,
+                        chat_process=replacement,
+                        chat_output_task=output_task,
+                    )
+                    await self._stop_chat_recorder(orphaned)
+                return
+
+            latest.chat_process = replacement
+            latest.chat_output_task = output_task
+            if replacement is not None:
+                has_started = True
+            current_process = replacement
 
     async def _finish_output_task(self, output_task: asyncio.Task[None]) -> None:
         try:
@@ -1486,9 +1789,22 @@ class DownloadManager:
         segment_index: int,
     ) -> None:
         exit_code = await process.wait()
+        media_exited_at = utc_now_iso()
+        self.update_segment_timing_if_exists(
+            stream,
+            segment_index,
+            last_exit_at=media_exited_at,
+        )
+        planned_reconnect = stream.video_id in self._planned_reconnects
         active = self.active.get(stream.video_id)
+        if active is not None and active.process is not process:
+            self.logger.info(
+                "Ignoring exit from superseded downloader video_id=%s segment=%03d",
+                stream.video_id,
+                segment_index,
+            )
+            return
         if active and active.process is process:
-            self.active.pop(stream.video_id, None)
             if active.reconnect_task and active.reconnect_task is not asyncio.current_task():
                 active.reconnect_task.cancel()
             if (
@@ -1503,10 +1819,41 @@ class DownloadManager:
                 active.stale_live_task.cancel()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
-            await self._stop_powerchat_listener(active)
-            await self._stop_chat_recorder(active)
+            try:
+                await self._stop_powerchat_listener(active)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - media exit must still be recorded.
+                self.logger.exception(
+                    "Powerchat cleanup failed after media exit video_id=%s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+            try:
+                await self._stop_chat_recorder(
+                    active,
+                    allow_drain=not planned_reconnect,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - media exit must still be recorded.
+                self.logger.exception(
+                    "Live chat cleanup failed after media exit video_id=%s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+            current_active = self.active.get(stream.video_id)
+            if current_active is not active and current_active is not None:
+                self.logger.info(
+                    "Ignoring exit from superseded downloader video_id=%s segment=%03d",
+                    stream.video_id,
+                    segment_index,
+                )
+                return
 
         if self._stopping:
+            if self.active.get(stream.video_id) is active:
+                self.active.pop(stream.video_id, None)
             self.logger.info("Downloader stopped for %s during shutdown", stream.video_id)
             return
 
@@ -1516,34 +1863,104 @@ class DownloadManager:
             segment_index,
             exit_code,
         )
-        self.state.mark_exited(stream.video_id, int(exit_code))
-        record = self.state.get_stream(stream.video_id)
-        self.update_segment_timing_if_exists(
+        if not await self._mark_stream_exited_with_retry(
             stream,
             segment_index,
-            last_exit_at=record.last_exit_at if record else utc_now_iso(),
-        )
-        planned_reconnect = stream.video_id in self._planned_reconnects
+            int(exit_code),
+        ):
+            return
+        if self.active.get(stream.video_id) is active:
+            self.active.pop(stream.video_id, None)
+        try:
+            record = self.state.get_stream(stream.video_id)
+        except Exception:  # noqa: BLE001 - post-exit checking can proceed without it.
+            self.logger.exception(
+                "Unable to reload stream state after exit video_id=%s",
+                stream.video_id,
+            )
+            record = None
         if planned_reconnect:
             self._planned_reconnects.discard(stream.video_id)
         if planned_reconnect and not (
             record is not None and record.status == "stalled"
         ):
             task = asyncio.create_task(self.handle_planned_reconnect(stream, segment_index))
-            self._post_exit_tasks.add(task)
-            task.add_done_callback(self._post_exit_tasks.discard)
+            self._track_lifecycle_task(
+                task,
+                stream,
+                segment_index,
+                "planned reconnect",
+            )
             return
 
-        task = asyncio.create_task(self.handle_post_exit(stream, segment_index))
-        self._post_exit_tasks.add(task)
-        task.add_done_callback(self._post_exit_tasks.discard)
+        task = asyncio.create_task(
+            self.handle_post_exit(
+                stream,
+                segment_index,
+                expected_status="checking_after_exit",
+            )
+        )
+        self._track_lifecycle_task(task, stream, segment_index, "post-exit checks")
 
-    async def _stop_chat_recorder(self, active: ActiveDownload) -> None:
+    async def _mark_stream_exited_with_retry(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        exit_code: int,
+    ) -> bool:
+        attempts = len(EXIT_STATE_RETRY_SECONDS) + 1
+        for attempt in range(attempts):
+            try:
+                self.state.mark_exited(stream.video_id, exit_code)
+                return True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retry transient state failures.
+                if attempt >= len(EXIT_STATE_RETRY_SECONDS):
+                    self.logger.exception(
+                        "Unable to persist downloader exit after %d attempts "
+                        "video_id=%s segment=%03d; keeping lifecycle claimed",
+                        attempts,
+                        stream.video_id,
+                        segment_index,
+                    )
+                    return False
+                delay = EXIT_STATE_RETRY_SECONDS[attempt]
+                self.logger.warning(
+                    "Unable to persist downloader exit video_id=%s segment=%03d: %s; "
+                    "retrying in %.2fs",
+                    stream.video_id,
+                    segment_index,
+                    exc,
+                    delay,
+                )
+                await self.sleep(delay)
+                if self._stopping:
+                    return False
+        return False
+
+    async def _stop_chat_recorder(
+        self,
+        active: ActiveDownload,
+        *,
+        allow_drain: bool = False,
+    ) -> None:
         process = active.chat_process
-        if process is None:
-            return
+        if (
+            process is not None
+            and process.returncode is None
+            and allow_drain
+            and not self._stopping
+        ):
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=CHAT_RECORDER_DRAIN_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
 
-        if process.returncode is None:
+        if process is not None and process.returncode is None:
             self.logger.info(
                 "Terminating live chat recorder for %s",
                 active.stream.video_id,
@@ -1553,23 +1970,24 @@ class DownloadManager:
             except ProcessLookupError:
                 pass
 
-        try:
-            await asyncio.wait_for(
-                process.wait(),
-                timeout=RECONNECT_STOP_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            if process.returncode is None:
-                self.logger.warning(
-                    "Live chat recorder did not stop for %s within %ss; killing",
-                    active.stream.video_id,
-                    RECONNECT_STOP_TIMEOUT_SECONDS,
+        if process is not None:
+            try:
+                await asyncio.wait_for(
+                    process.wait(),
+                    timeout=RECONNECT_STOP_TIMEOUT_SECONDS,
                 )
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                await process.wait()
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    self.logger.warning(
+                        "Live chat recorder did not stop for %s within %ss; killing",
+                        active.stream.video_id,
+                        RECONNECT_STOP_TIMEOUT_SECONDS,
+                    )
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
 
         if active.chat_output_task:
             await self._finish_output_task(active.chat_output_task)
@@ -1578,6 +1996,8 @@ class DownloadManager:
             and active.chat_task is not asyncio.current_task()
             and not active.chat_task.done()
         ):
+            if process is None:
+                active.chat_task.cancel()
             try:
                 await asyncio.wait_for(active.chat_task, timeout=5)
             except asyncio.TimeoutError:
@@ -1621,7 +2041,12 @@ class DownloadManager:
         try:
             latest = await self.probe_video(post_exit_probe_target(stream))
         except TerminalVideoUnavailableError as exc:
-            await self._mark_terminal_unavailable(stream, segment_index, exc)
+            await self._mark_terminal_unavailable(
+                stream,
+                segment_index,
+                exc,
+                expected_status="checking_after_exit",
+            )
             return
         except Exception as exc:
             self.logger.warning(
@@ -1629,7 +2054,28 @@ class DownloadManager:
                 stream.video_id,
                 exc,
             )
-            await self.handle_post_exit(stream, segment_index)
+            await self.handle_post_exit(
+                stream,
+                segment_index,
+                expected_status="checking_after_exit",
+            )
+            return
+
+        if latest.is_live and latest.video_id != stream.video_id:
+            self.logger.info(
+                "Planned reconnect for %s found a new live session %s; "
+                "starting it independently and finalizing the previous session",
+                stream.video_id,
+                latest.video_id,
+            )
+            if not self._stopping:
+                await self.start_stream(latest)
+            if self._stream_status_matches(stream.video_id, "checking_after_exit"):
+                await self.finish_ended_stream(
+                    stream,
+                    segment_index,
+                    expected_status="checking_after_exit",
+                )
             return
 
         if latest.is_live:
@@ -1656,14 +2102,27 @@ class DownloadManager:
                 stream.video_id,
                 next_segment,
             )
-            await self.start_stream(latest, segment_index=next_segment)
+            started = await self.start_stream(latest, segment_index=next_segment)
+            if (
+                not started
+                and stream.video_id not in self.active
+                and self._stream_status_matches(
+                    stream.video_id,
+                    "checking_after_exit",
+                )
+            ):
+                self._defer_post_exit_retry(stream, segment_index)
             return
 
         self.logger.info(
             "Stream %s not live during planned reconnect; using post-exit schedule",
             stream.video_id,
         )
-        await self.handle_post_exit(stream, segment_index)
+        await self.handle_post_exit(
+            stream,
+            segment_index,
+            expected_status="checking_after_exit",
+        )
 
     def resume_post_exit_check(
         self,
@@ -1681,8 +2140,131 @@ class DownloadManager:
                 elapsed_since_exit_seconds=elapsed_since_exit_seconds,
             )
         )
+        self._track_lifecycle_task(
+            task,
+            stream,
+            segment_index,
+            "recovered post-exit checks",
+        )
+
+    def _track_lifecycle_task(
+        self,
+        task: asyncio.Task[None],
+        stream: LiveStream,
+        segment_index: int,
+        label: str,
+    ) -> None:
         self._post_exit_tasks.add(task)
-        task.add_done_callback(self._post_exit_tasks.discard)
+
+        def completed(finished: asyncio.Task[None]) -> None:
+            self._post_exit_tasks.discard(finished)
+            if finished.cancelled():
+                return
+            try:
+                error = finished.exception()
+            except asyncio.CancelledError:
+                return
+            if error is None:
+                return
+            self.logger.error(
+                "Background %s failed video_id=%s segment=%03d",
+                label,
+                stream.video_id,
+                segment_index,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+            try:
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Background {label} failed and will be retried: {error}",
+                    level="warning",
+                    segment_index=segment_index,
+                )
+            except Exception:  # noqa: BLE001 - failure is already logged.
+                pass
+            if self._stopping:
+                return
+            try:
+                record = self.state.get_stream(stream.video_id)
+            except Exception:  # noqa: BLE001 - the task failure is already recorded.
+                return
+            if record is None:
+                return
+            if record.status == "checking_after_exit":
+                self._defer_post_exit_retry(stream, segment_index)
+            elif record.status == "stalled":
+                self._defer_stalled_retry(stream, segment_index)
+
+        task.add_done_callback(completed)
+
+    def _defer_post_exit_retry(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+    ) -> None:
+        if self._stopping or stream.video_id in self._deferred_post_exit_retries:
+            return
+        self._deferred_post_exit_retries.add(stream.video_id)
+
+        async def retry() -> None:
+            try:
+                delay = max(1, min(self.config.poll_interval_seconds, 30))
+                self.logger.info(
+                    "Deferring restart supervision for %s by %ss",
+                    stream.video_id,
+                    delay,
+                )
+                await self.sleep(delay)
+                if self._stopping or not self._stream_status_matches(
+                    stream.video_id,
+                    "checking_after_exit",
+                ):
+                    return
+                await self.handle_post_exit(
+                    stream,
+                    segment_index,
+                    expected_status="checking_after_exit",
+                )
+            finally:
+                self._deferred_post_exit_retries.discard(stream.video_id)
+
+        task = asyncio.create_task(retry())
+        self._track_lifecycle_task(
+            task,
+            stream,
+            segment_index,
+            "deferred post-exit retry",
+        )
+
+    def _defer_stalled_retry(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+    ) -> None:
+        if self._stopping or stream.video_id in self._deferred_stalled_retries:
+            return
+        self._deferred_stalled_retries.add(stream.video_id)
+
+        async def retry() -> None:
+            try:
+                delay = max(1, min(self.config.poll_interval_seconds, 30))
+                await self.sleep(delay)
+                if self._stopping or not self._stream_status_matches(
+                    stream.video_id,
+                    "stalled",
+                ):
+                    return
+                await self.monitor_stalled_youtube(stream, segment_index)
+            finally:
+                self._deferred_stalled_retries.discard(stream.video_id)
+
+        task = asyncio.create_task(retry())
+        self._track_lifecycle_task(
+            task,
+            stream,
+            segment_index,
+            "deferred stalled-stream retry",
+        )
 
     def resume_stalled_youtube_check(
         self,
@@ -1694,8 +2276,12 @@ class DownloadManager:
         task = asyncio.create_task(
             self.monitor_stalled_youtube(stream, segment_index)
         )
-        self._post_exit_tasks.add(task)
-        task.add_done_callback(self._post_exit_tasks.discard)
+        self._track_lifecycle_task(
+            task,
+            stream,
+            segment_index,
+            "stalled YouTube monitoring",
+        )
 
     async def recover_post_exit_check(
         self,
@@ -1799,7 +2385,12 @@ class DownloadManager:
                 latest = await self.probe_video(post_exit_probe_target(stream))
             except TerminalVideoUnavailableError as exc:
                 if self._stream_status_matches(stream.video_id, expected_status):
-                    await self._mark_terminal_unavailable(stream, segment_index, exc)
+                    await self._mark_terminal_unavailable(
+                        stream,
+                        segment_index,
+                        exc,
+                        expected_status=expected_status,
+                    )
                 return
             except Exception as exc:
                 self.logger.warning(
@@ -1809,6 +2400,23 @@ class DownloadManager:
                     exc,
                 )
                 continue
+
+            if latest.is_live and latest.video_id != stream.video_id:
+                self.logger.info(
+                    "Post-exit source for %s found a new live session %s; "
+                    "starting it independently and finalizing the previous session",
+                    stream.video_id,
+                    latest.video_id,
+                )
+                if not self._stopping:
+                    await self.start_stream(latest)
+                if self._stream_status_matches(stream.video_id, expected_status):
+                    await self.finish_ended_stream(
+                        stream,
+                        segment_index,
+                        expected_status=expected_status,
+                    )
+                return
 
             if latest.is_live:
                 if not self._stream_status_matches(stream.video_id, expected_status):
@@ -1837,7 +2445,17 @@ class DownloadManager:
                     offset,
                     next_segment,
                 )
-                await self.start_stream(latest, segment_index=next_segment)
+                started = await self.start_stream(
+                    latest,
+                    segment_index=next_segment,
+                )
+                if (
+                    not started
+                    and expected_status == "checking_after_exit"
+                    and stream.video_id not in self.active
+                    and self._stream_status_matches(stream.video_id, expected_status)
+                ):
+                    self._defer_post_exit_retry(stream, segment_index)
                 return
 
             self.logger.info(
@@ -1852,84 +2470,269 @@ class DownloadManager:
             "Stream %s did not return live during post-exit window; marking ended",
             stream.video_id,
         )
-        await self.finish_ended_stream(stream, segment_index)
+        await self.finish_ended_stream(
+            stream,
+            segment_index,
+            expected_status=expected_status,
+        )
 
     async def _mark_terminal_unavailable(
         self,
         stream: LiveStream,
         segment_index: int,
         exc: Exception,
+        *,
+        expected_status: str | None = None,
     ) -> None:
         self.logger.info(
             "Stream %s is terminally unavailable; ending checks: %s",
             stream.video_id,
             exc,
         )
-        await self.finish_ended_stream(stream, segment_index)
+        await self.finish_ended_stream(
+            stream,
+            segment_index,
+            expected_status=expected_status,
+            allow_chat_replay=False,
+        )
 
     async def finish_ended_stream(
         self,
         stream: LiveStream,
         segment_index: int,
+        *,
+        expected_status: str | None = None,
+        allow_chat_replay: bool = True,
     ) -> None:
-        await self.finalize_ended_segment(
-            stream.video_id,
-            segment_index,
-            stream.channel,
-        )
-        finalized_files = self.rename_finalized_segments(stream, segment_index)
-        self.finalize_powerchat_sidecars(stream, finalized_files)
-        if should_record_chat_for_stream(self.config, stream):
-            await self.refresh_finalized_chat_files(stream, finalized_files)
-        self.state.mark_ended(stream.video_id)
-        self._youtube_fragment_progress_at.pop(stream.video_id, None)
-        post_stream_config = post_stream_config_for_channel(self.config, stream.channel)
-        if (
-            post_stream_config.twitch_ad_repair_enabled
-            and stream.platform == "twitch"
-            and await self._wait_for_automatic_processing_window(
-                stream,
-                "Twitch ad repair",
+        if stream.video_id in self.active:
+            self.logger.info(
+                "Skipping finalization for %s because a replacement recording is active",
+                stream.video_id,
+            )
+            return
+        if not self._stream_status_matches(stream.video_id, expected_status):
+            return
+        if stream.video_id in self._finalizing_video_ids:
+            return
+
+        self._finalizing_video_ids.add(stream.video_id)
+        try:
+            await self.finalize_ended_segment(
+                stream.video_id,
                 segment_index,
+                stream.channel,
             )
-        ):
-            await self.repair_finalized_twitch_ads(stream, finalized_files)
-        if (
-            post_stream_config.transcribe_subtitles
-            and await self._wait_for_automatic_processing_window(
+            finalized_files = self.rename_finalized_segments(stream, segment_index)
+            self.finalize_powerchat_sidecars(stream, finalized_files)
+            if should_record_chat_for_stream(self.config, stream):
+                if allow_chat_replay:
+                    await self.refresh_finalized_chat_files(stream, finalized_files)
+                else:
+                    await self.refresh_finalized_chat_files(
+                        stream,
+                        finalized_files,
+                        allow_replay=False,
+                    )
+            self.enqueue_finalized_post_processing(stream, finalized_files)
+            self.state.mark_ended(stream.video_id)
+            self._youtube_fragment_progress_at.pop(stream.video_id, None)
+        finally:
+            self._finalizing_video_ids.discard(stream.video_id)
+        await self.process_pending_post_processing(stream)
+
+    def enqueue_finalized_post_processing(
+        self,
+        stream: LiveStream,
+        finalized_files: list[FinalizedSegmentFiles],
+    ) -> list[PostProcessingJobRecord]:
+        settings = post_stream_config_for_channel(self.config, stream.channel)
+        queued: list[PostProcessingJobRecord] = []
+        for files in finalized_files:
+            if files.media_file is None:
+                continue
+            common = {
+                "video_id": stream.video_id,
+                "segment_index": files.segment_index,
+                "channel": files.channel,
+                "media_path": files.media_file,
+                "chat_path": files.chat_file or "",
+                "timing_path": files.timing_file or "",
+            }
+            if settings.twitch_ad_repair_enabled and stream.platform == "twitch":
+                queued.append(
+                    self.state.enqueue_post_processing_job(
+                        kind="twitch_ad_repair",
+                        **common,
+                    )
+                )
+            if settings.transcribe_subtitles:
+                queued.append(
+                    self.state.enqueue_post_processing_job(
+                        kind="transcription",
+                        **common,
+                    )
+                )
+            if settings.stream_event_detection_enabled:
+                queued.append(
+                    self.state.enqueue_post_processing_job(
+                        kind="content_events",
+                        **common,
+                    )
+                )
+            if (
+                settings.render_live_chat_video
+                and stream.platform == "youtube"
+                and files.chat_file is not None
+                and files.chat_timeline_valid
+            ):
+                queued.append(
+                    self.state.enqueue_post_processing_job(
+                        kind="chat_render",
+                        **common,
+                    )
+                )
+        return queued
+
+    def resume_pending_post_processing_jobs(self) -> None:
+        if self._stopping:
+            return
+        jobs = self.state.list_post_processing_jobs(statuses=["pending"])
+        for video_id in dict.fromkeys(job.video_id for job in jobs):
+            if video_id in self._post_processing_video_ids:
+                continue
+            record = self.state.get_stream(video_id)
+            if record is None:
+                continue
+            self._post_processing_video_ids.add(video_id)
+            stream = stream_from_state_record(record)
+            task = asyncio.create_task(
+                self._run_claimed_post_processing(stream)
+            )
+            self._track_lifecycle_task(
+                task,
                 stream,
-                "subtitle transcription",
-                segment_index,
+                record.segment_index,
+                "post-processing recovery",
             )
-        ):
-            await self.transcribe_finalized_media(
+
+    async def process_pending_post_processing(self, stream: LiveStream) -> None:
+        if stream.video_id in self._post_processing_video_ids:
+            return
+        self._post_processing_video_ids.add(stream.video_id)
+        await self._run_claimed_post_processing(stream)
+
+    async def _run_claimed_post_processing(self, stream: LiveStream) -> None:
+        try:
+            await self._process_pending_post_processing(stream)
+        finally:
+            self._post_processing_video_ids.discard(stream.video_id)
+
+    async def _process_pending_post_processing(self, stream: LiveStream) -> None:
+        settings = post_stream_config_for_channel(self.config, stream.channel)
+        for kind in POST_PROCESSING_KIND_ORDER:
+            kind_jobs = [
+                job
+                for job in self.state.list_post_processing_jobs(
+                    video_id=stream.video_id,
+                    statuses=["pending"],
+                )
+                if job.kind == kind
+            ]
+            kind_jobs.sort(key=lambda job: (job.segment_index, job.job_id))
+            if not kind_jobs:
+                continue
+            if not await self._wait_for_automatic_processing_window(
                 stream,
-                finalized_files,
-                post_stream_config=post_stream_config,
-            )
-        if (
-            post_stream_config.stream_event_detection_enabled
-            and await self._wait_for_automatic_processing_window(
-                stream,
-                "content event detection",
-                segment_index,
-            )
-        ):
-            await self.detect_finalized_content_events(
-                stream,
-                finalized_files,
-                post_stream_config=post_stream_config,
-            )
-        if (
-            post_stream_config.render_live_chat_video
-            and stream.platform == "youtube"
-            and await self._wait_for_automatic_processing_window(
-                stream,
-                "chat video rendering",
-                segment_index,
-            )
-        ):
-            await self.render_finalized_chat_videos(stream, finalized_files)
+                POST_PROCESSING_ACTION_LABELS[kind],
+                kind_jobs[0].segment_index,
+            ):
+                return
+            for job in kind_jobs:
+                if self._stopping:
+                    return
+                if not self.state.mark_post_processing_job_running(job.job_id):
+                    continue
+                files = finalized_files_from_post_processing_job(job)
+                original_media = files.media_file
+                try:
+                    if files.media_file is None or not files.media_file.is_file():
+                        raise FileNotFoundError(
+                            f"post-processing media is missing: {job.media_path}"
+                        )
+                    if kind == "twitch_ad_repair":
+                        succeeded = await self.repair_finalized_twitch_ads(
+                            stream,
+                            [files],
+                            post_stream_config=settings,
+                        )
+                    elif kind == "transcription":
+                        succeeded = await self.transcribe_finalized_media(
+                            stream,
+                            [files],
+                            post_stream_config=settings,
+                        )
+                    elif kind == "content_events":
+                        succeeded = await self.detect_finalized_content_events(
+                            stream,
+                            [files],
+                            post_stream_config=settings,
+                        )
+                    else:
+                        succeeded = bool(
+                            files.chat_file
+                            and files.chat_file.is_file()
+                            and await self.render_live_chat_video(
+                                stream,
+                                files.media_file,
+                                files.chat_file,
+                                files.segment_index,
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - durable job boundary.
+                    self.logger.exception(
+                        "Automatic post-processing failed kind=%s media=%s",
+                        kind,
+                        job.media_path,
+                    )
+                    self.state.mark_post_processing_job_failed(
+                        job.job_id,
+                        str(exc) or exc.__class__.__name__,
+                    )
+                    continue
+
+                if not succeeded:
+                    self.state.mark_post_processing_job_failed(
+                        job.job_id,
+                        f"automatic {POST_PROCESSING_ACTION_LABELS[kind]} failed",
+                    )
+                    continue
+                if (
+                    kind == "twitch_ad_repair"
+                    and original_media is not None
+                    and files.media_file is not None
+                    and files.media_file != original_media
+                ):
+                    try:
+                        self.state.replace_pending_post_processing_media_path(
+                            video_id=job.video_id,
+                            segment_index=job.segment_index,
+                            old_path=original_media,
+                            new_path=files.media_file,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - durable job boundary.
+                        self.logger.exception(
+                            "Unable to update downstream post-processing paths %s -> %s",
+                            original_media,
+                            files.media_file,
+                        )
+                        self.state.mark_post_processing_job_failed(
+                            job.job_id,
+                            str(exc) or exc.__class__.__name__,
+                        )
+                        continue
+                self.state.mark_post_processing_job_done(job.job_id)
 
     def rename_finalized_segments(
         self,
@@ -2004,39 +2807,59 @@ class DownloadManager:
         self,
         stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
-    ) -> None:
+    ) -> bool:
+        succeeded = True
         for files in finalized_files:
             if files.media_file is None or files.chat_file is None:
                 continue
-            await self.render_live_chat_video(
-                stream,
-                files.media_file,
-                files.chat_file,
-                files.segment_index,
+            succeeded = (
+                await self.render_live_chat_video(
+                    stream,
+                    files.media_file,
+                    files.chat_file,
+                    files.segment_index,
+                )
+                and succeeded
             )
+        return succeeded
 
     async def refresh_finalized_chat_files(
         self,
         stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
+        *,
+        allow_replay: bool = True,
     ) -> None:
         record = self.state.get_stream(stream.video_id)
         last_exit_at = record.last_exit_at if record else None
         for files in finalized_files:
             if files.media_file is None or files.chat_file is None:
                 continue
-            result = await asyncio.to_thread(
-                refresh_chat_sidecar,
-                self.config,
-                video_url=stream.url,
-                media_file=files.media_file,
-                chat_file=files.chat_file,
-                last_exit_at=last_exit_at,
-                stream_metadata=stream.raw,
-                timing_file=files.timing_file,
-                logger=self.logger,
-            )
-            if result.ok:
+            try:
+                result = await asyncio.to_thread(
+                    refresh_chat_sidecar,
+                    self.config,
+                    video_url=stream.url,
+                    media_file=files.media_file,
+                    chat_file=files.chat_file,
+                    last_exit_at=last_exit_at,
+                    stream_metadata=stream.raw,
+                    timing_file=files.timing_file,
+                    allow_replay=allow_replay,
+                    logger=self.logger,
+                )
+            except Exception as exc:  # noqa: BLE001 - retain raw chat and finish media.
+                result = None
+                failure_message = str(exc) or exc.__class__.__name__
+                self.logger.exception(
+                    "Chat refresh failed unexpectedly segment=%03d",
+                    files.segment_index,
+                )
+            else:
+                failure_message = result.message
+
+            if result is not None and result.ok:
+                files.chat_timeline_valid = True
                 self.logger.info(
                     "Chat refresh completed segment=%03d source=%s message=%s",
                     files.segment_index,
@@ -2044,11 +2867,26 @@ class DownloadManager:
                     result.message,
                 )
             else:
+                files.chat_timeline_valid = False
                 self.logger.warning(
                     "Chat refresh unavailable segment=%03d message=%s",
                     files.segment_index,
-                    result.message,
+                    failure_message,
                 )
+                try:
+                    self.state.add_stream_event(
+                        stream.video_id,
+                        "Skipped automatic chat rendering because the captured chat "
+                        f"timeline could not be validated: {failure_message}",
+                        level="warning",
+                        segment_index=files.segment_index,
+                    )
+                except Exception as exc:  # noqa: BLE001 - finalization must continue.
+                    self.logger.debug(
+                        "Unable to record invalid chat timeline event for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
 
     def write_segment_timing_started(
         self,
@@ -2112,8 +2950,9 @@ class DownloadManager:
         finalized_files: list[FinalizedSegmentFiles],
         *,
         post_stream_config: BotConfig | None = None,
-    ) -> None:
+    ) -> bool:
         processing_config = post_stream_config or self.config
+        succeeded = True
         for files in finalized_files:
             if files.media_file is None:
                 continue
@@ -2143,6 +2982,7 @@ class DownloadManager:
                         channel=files.channel,
                     )
             except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                succeeded = False
                 self.logger.exception("Automatic transcription failed for %s", files.media_file)
                 finish_tracked_job(
                     job_id,
@@ -2162,14 +3002,19 @@ class DownloadManager:
                 job_id,
                 message="Automatic transcription completed",
             )
+        return succeeded
 
     async def repair_finalized_twitch_ads(
         self,
         stream: LiveStream,
         finalized_files: list[FinalizedSegmentFiles],
-    ) -> None:
+        *,
+        post_stream_config: BotConfig | None = None,
+    ) -> bool:
+        processing_config = post_stream_config or self.config
         record = self.state.get_stream(stream.video_id)
         started_at = record.last_started_at if record else None
+        succeeded = True
         for files in finalized_files:
             if files.media_file is None:
                 continue
@@ -2196,7 +3041,7 @@ class DownloadManager:
             try:
                 result = await asyncio.to_thread(
                     repair_twitch_ads_for_media,
-                    self.config,
+                    processing_config,
                     stream,
                     files.media_file,
                     started_at=started_at,
@@ -2204,6 +3049,7 @@ class DownloadManager:
                     logger=self.logger,
                 )
             except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                succeeded = False
                 self.logger.exception("Twitch ad repair failed for %s", files.media_file)
                 finish_tracked_job(
                     job_id,
@@ -2245,6 +3091,7 @@ class DownloadManager:
                 level="info",
                 segment_index=files.segment_index,
             )
+        return succeeded
 
     async def detect_finalized_content_events(
         self,
@@ -2252,8 +3099,9 @@ class DownloadManager:
         finalized_files: list[FinalizedSegmentFiles],
         *,
         post_stream_config: BotConfig | None = None,
-    ) -> None:
+    ) -> bool:
         processing_config = post_stream_config or self.config
+        succeeded = True
         for files in finalized_files:
             if files.media_file is None:
                 continue
@@ -2283,6 +3131,7 @@ class DownloadManager:
                     channel=files.channel,
                 )
             except ContentEventDetectorUnavailable as exc:
+                succeeded = False
                 self.logger.warning(
                     "Content event detection unavailable for %s: %s",
                     files.media_file,
@@ -2303,6 +3152,7 @@ class DownloadManager:
                 )
                 continue
             except Exception as exc:  # noqa: BLE001 - post-processing must not break finalization.
+                succeeded = False
                 self.logger.exception(
                     "Content event detection failed for %s",
                     files.media_file,
@@ -2339,6 +3189,7 @@ class DownloadManager:
                     phase="Complete",
                     message="No content events detected",
                 )
+        return succeeded
 
     async def render_live_chat_video(
         self,
@@ -2360,6 +3211,31 @@ class DownloadManager:
                 output_file,
             )
             return True
+        if live_chat_file_has_live_markers(chat_file):
+            message = (
+                "Refusing to render raw live chat because its offsets are relative "
+                "to the chat recorder rather than the media timeline"
+            )
+            self.logger.warning(
+                "%s segment=%03d chat=%s",
+                message,
+                segment_index,
+                chat_file,
+            )
+            try:
+                self.state.add_stream_event(
+                    stream.video_id,
+                    message,
+                    level="warning",
+                    segment_index=segment_index,
+                )
+            except Exception as exc:  # noqa: BLE001 - rendering refusal is authoritative.
+                self.logger.debug(
+                    "Unable to record raw chat render refusal for %s: %s",
+                    stream.video_id,
+                    exc,
+                )
+            return False
 
         job_id = auto_job_id("chat-render", stream.video_id, chat_file.name)
         start_tracked_job(
@@ -2520,6 +3396,7 @@ class DownloadManager:
                     nvenc_device,
                     frame_rate,
                     timezone_name=timezone_name,
+                    timeout_seconds=chat_render_timeout_seconds(self.config),
                 )
                 command = build_chat_panel_merge_command(
                     self.config.ffmpeg_path,
@@ -2746,12 +3623,51 @@ class DownloadManager:
                 *command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
         except OSError:
             self.logger.exception("Unable to start isolated chat render process")
             return False
 
-        stdout, stderr = await process.communicate()
+        timeout_seconds = chat_render_timeout_seconds(self.config)
+        try:
+            if timeout_seconds is None:
+                stdout, stderr = await process.communicate()
+            else:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=timeout_seconds,
+                )
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                self.logger.warning(
+                    "Isolated chat render timed out after %ss segment=%03d",
+                    timeout_seconds,
+                    segment_index,
+                )
+            else:
+                self.logger.info(
+                    "Stopping isolated chat render after cancellation segment=%03d",
+                    segment_index,
+                )
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (AttributeError, ProcessLookupError, PermissionError):
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.wait_for(process.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            return False
 
         log_process_output(
             self.logger,
@@ -2932,7 +3848,13 @@ class DownloadManager:
         if len(plan.input_files) == 1:
             if not await self._finalize_single_input(plan):
                 return False
-            cleanup_files(plan.cleanup_files, self.logger)
+            cleanup_files(
+                [
+                    *(path for path in plan.input_files if path != plan.output_file),
+                    *plan.cleanup_files,
+                ],
+                self.logger,
+            )
             self.logger.info(
                 "Finalized partial segment for %s segment=%03d as %s",
                 video_id,
@@ -2957,14 +3879,12 @@ class DownloadManager:
         input_file = plan.input_files[0]
         if input_file == plan.output_file:
             return True
-        if plan.output_file.exists():
-            self.logger.warning(
-                "Final output already exists; leaving partial input in place: %s",
-                plan.output_file,
-            )
-            return False
-        input_file.rename(plan.output_file)
-        return True
+        # A successful ffprobe only proves that the container header is readable.
+        # In particular, a truncated .part can still advertise a positive duration.
+        # Run the input through the same complete remux-and-validate path used for
+        # split tracks, then leave the source and recovery sidecars untouched unless
+        # the validated temporary output was atomically promoted.
+        return await self._mux_finalize_inputs(plan)
 
     async def _mux_finalize_inputs(self, plan: FinalizePlan) -> bool:
         if plan.output_file.exists():
@@ -3045,8 +3965,19 @@ class DownloadManager:
                 process.communicate(),
                 timeout=FINALIZE_MUX_TIMEOUT_SECONDS,
             )
+        except asyncio.CancelledError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            temp_output.unlink(missing_ok=True)
+            raise
         except asyncio.TimeoutError:
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
             await process.wait()
             temp_output.unlink(missing_ok=True)
             self.logger.warning("ffmpeg timed out while finalizing partial segment")
@@ -3086,33 +4017,133 @@ class DownloadManager:
         temp_output.rename(plan.output_file)
         return True
 
-    async def _schedule_spawn_retry(self, stream: LiveStream) -> None:
-        failures = self._spawn_failures.get(stream.video_id, 0)
-        delay = self.config.retry_backoff_seconds[
-            min(failures, len(self.config.retry_backoff_seconds) - 1)
-        ]
-        self._spawn_failures[stream.video_id] = failures + 1
-        self.logger.info("Retrying start for %s in %ss", stream.video_id, delay)
-        await self.sleep(delay)
-        try:
-            latest = await self.probe_video(post_exit_probe_target(stream))
-        except TerminalVideoUnavailableError as exc:
-            self.logger.info(
-                "Retry probe found %s terminally unavailable: %s",
+    def _ensure_spawn_retry(self, stream: LiveStream) -> None:
+        existing = self._spawn_retry_tasks.get(stream.video_id)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(self._schedule_spawn_retry(stream))
+        self._spawn_retry_tasks[stream.video_id] = task
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            if self._spawn_retry_tasks.get(stream.video_id) is completed:
+                self._spawn_retry_tasks.pop(stream.video_id, None)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except asyncio.CancelledError:
+                return
+            if error is None:
+                return
+            self.logger.error(
+                "Downloader start-retry supervisor failed video_id=%s",
                 stream.video_id,
-                exc,
+                exc_info=(type(error), error, error.__traceback__),
             )
-            self.state.mark_ended(stream.video_id)
-            self._youtube_fragment_progress_at.pop(stream.video_id, None)
-            return
-        except Exception as exc:
-            self.logger.warning("Retry probe failed for %s: %s", stream.video_id, exc)
-            return
-        if latest.is_live:
-            await self.start_stream(latest)
+            try:
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Downloader start-retry supervisor failed and will retry: {error}",
+                    level="warning",
+                )
+                record = self.state.get_stream(stream.video_id)
+            except Exception:  # noqa: BLE001 - original failure is already logged.
+                record = None
+            if (
+                not self._stopping
+                and record is not None
+                and record.status == "waiting_retry"
+            ):
+                self._ensure_spawn_retry(stream)
+
+        task.add_done_callback(finished)
+
+    async def _schedule_spawn_retry(self, stream: LiveStream) -> None:
+        while not self._stopping:
+            failures = self._spawn_failures.get(stream.video_id, 0)
+            delay = self.config.retry_backoff_seconds[
+                min(failures, len(self.config.retry_backoff_seconds) - 1)
+            ]
+            self._spawn_failures[stream.video_id] = failures + 1
+            self.logger.info("Retrying start for %s in %ss", stream.video_id, delay)
+            await self.sleep(delay)
+            if self._stopping:
+                return
+
+            record = self.state.get_stream(stream.video_id)
+            if record is None or record.status != "waiting_retry":
+                return
+            segment_index = record.segment_index
+            try:
+                latest = await self.probe_video(post_exit_probe_target(stream))
+            except TerminalVideoUnavailableError as exc:
+                self.logger.info(
+                    "Retry probe found %s terminally unavailable: %s",
+                    stream.video_id,
+                    exc,
+                )
+                await self.finish_ended_stream(
+                    stream,
+                    segment_index,
+                    expected_status="waiting_retry",
+                    allow_chat_replay=False,
+                )
+                return
+            except Exception as exc:
+                self.logger.warning(
+                    "Retry probe failed for %s: %s",
+                    stream.video_id,
+                    exc,
+                )
+                self.state.mark_exited(stream.video_id, -1)
+                await self.handle_post_exit(
+                    stream,
+                    segment_index,
+                    expected_status="checking_after_exit",
+                )
+                return
+
+            if not latest.is_live:
+                await self.finish_ended_stream(
+                    stream,
+                    segment_index,
+                    expected_status="waiting_retry",
+                )
+                return
+
+            if latest.video_id != stream.video_id:
+                self.logger.info(
+                    "Start retry for %s found a new live session %s; "
+                    "starting it independently and finalizing the previous session",
+                    stream.video_id,
+                    latest.video_id,
+                )
+                await self.start_stream(latest)
+                if self._stream_status_matches(stream.video_id, "waiting_retry"):
+                    await self.finish_ended_stream(
+                        stream,
+                        segment_index,
+                        expected_status="waiting_retry",
+                    )
+                return
+
+            if await self.start_stream(latest, segment_index=segment_index):
+                return
+            if stream.video_id in self.active:
+                return
+            record = self.state.get_stream(stream.video_id)
+            if record is None or record.status != "waiting_retry":
+                return
 
     async def stop_all(self) -> None:
         self._stopping = True
+        spawn_retry_tasks = list(self._spawn_retry_tasks.values())
+        for task in spawn_retry_tasks:
+            task.cancel()
+        if spawn_retry_tasks:
+            await asyncio.gather(*spawn_retry_tasks, return_exceptions=True)
+        self._spawn_retry_tasks.clear()
+
         for active in list(self.active.values()):
             if active.reconnect_task:
                 active.reconnect_task.cancel()
@@ -3163,6 +4194,30 @@ def format_byte_count(value: int) -> str:
 
 def auto_job_id(kind: str, video_id: str, item: str) -> str:
     return f"auto-{kind}:{video_id}:{item}"
+
+
+def stream_from_state_record(record: StreamRecord) -> LiveStream:
+    return LiveStream(
+        video_id=record.video_id,
+        url=record.url,
+        title=record.title,
+        channel=record.channel,
+        is_live=False,
+        platform=record.platform,
+        source=record.source,
+    )
+
+
+def finalized_files_from_post_processing_job(
+    job: PostProcessingJobRecord,
+) -> FinalizedSegmentFiles:
+    return FinalizedSegmentFiles(
+        segment_index=job.segment_index,
+        channel=job.channel,
+        media_file=Path(job.media_path) if job.media_path else None,
+        chat_file=Path(job.chat_path) if job.chat_path else None,
+        timing_file=Path(job.timing_path) if job.timing_path else None,
+    )
 
 
 def youtube_video_codec(value: object) -> str:
@@ -3493,6 +4548,7 @@ def segment_has_final_files(
             and not is_yt_dlp_temporary_file(path.name)
             and not is_live_chat_file(path.name)
             and not is_chat_timing_file(path.name)
+            and not is_powerchat_event_file(path.name)
         ):
             return True
     return False
@@ -4120,7 +5176,18 @@ def rename_finalized_segment_file(
 ) -> Path | None:
     source = finalized_segment_file(config, stream.video_id, segment_index, stream.channel)
     if source is None:
-        return None
+        directory = segment_directory(config, stream.video_id, stream.channel)
+        named_stem = named_segment_file_stem(
+            stream.title,
+            stream.video_id,
+            segment_index,
+        )
+        existing = sorted(
+            path
+            for path in directory.glob(f"{named_stem}.*")
+            if path.is_file() and path.suffix.casefold() in FINALIZED_MEDIA_SUFFIXES
+        )
+        return existing[0] if existing else None
 
     target = named_finalized_output_file(config, stream, segment_index, source.suffix)
     if source == target:
@@ -4146,6 +5213,7 @@ def rename_segment_chat_file(
     segment_index: int,
     logger: logging.Logger,
 ) -> Path | None:
+    target = named_segment_chat_file(config, stream, segment_index)
     source = finalized_segment_chat_file(
         config,
         stream.video_id,
@@ -4154,9 +5222,8 @@ def rename_segment_chat_file(
         logger,
     )
     if source is None:
-        return None
+        return target if target.is_file() else None
 
-    target = named_segment_chat_file(config, stream, segment_index)
     if source == target:
         return target
     if target.exists():
@@ -4180,11 +5247,11 @@ def rename_segment_timing_file(
     segment_index: int,
     logger: logging.Logger,
 ) -> Path | None:
+    target = named_segment_timing_file(config, stream, segment_index)
     source = segment_timing_file(config, stream.video_id, segment_index, stream.channel)
     if not source.is_file():
-        return None
+        return target if target.is_file() else None
 
-    target = named_segment_timing_file(config, stream, segment_index)
     if source == target:
         return target
     if target.exists():
@@ -4202,6 +5269,71 @@ def rename_segment_timing_file(
     return target
 
 
+def segment_chat_output_file(
+    config: BotConfig,
+    video_id: str,
+    segment_index: int,
+    channel: str = "",
+) -> Path:
+    return segment_directory(config, video_id, channel) / (
+        f"{segment_file_stem(segment_index)}.live_chat.json"
+    )
+
+
+def concatenate_chat_jsonl_files(sources: list[Path], target: Path) -> None:
+    replacement = target.with_name(f"{target.name}.writing")
+    try:
+        with replacement.open("wb") as destination:
+            for source in sources:
+                with source.open("rb") as input_file:
+                    shutil.copyfileobj(input_file, destination)
+                destination.write(b"\n")
+            destination.flush()
+            os.fsync(destination.fileno())
+        replacement.replace(target)
+    except OSError:
+        replacement.unlink(missing_ok=True)
+        raise
+
+
+def prepare_chat_output_for_resume(
+    config: BotConfig,
+    video_id: str,
+    segment_index: int,
+    channel: str,
+    logger: logging.Logger,
+) -> None:
+    final_file = segment_chat_output_file(
+        config,
+        video_id,
+        segment_index,
+        channel,
+    )
+    if not final_file.is_file():
+        return
+
+    part_file = final_file.with_name(f"{final_file.name}.part")
+    if not part_file.exists():
+        final_file.replace(part_file)
+        logger.info(
+            "Prepared finalized live chat for resumed capture video_id=%s "
+            "segment=%03d",
+            video_id,
+            segment_index,
+        )
+        return
+
+    merged_file = part_file.with_name(f"{part_file.name}.merged")
+    concatenate_chat_jsonl_files([final_file, part_file], merged_file)
+    merged_file.replace(part_file)
+    final_file.unlink()
+    logger.warning(
+        "Merged finalized and partial live chat before resume video_id=%s segment=%03d",
+        video_id,
+        segment_index,
+    )
+
+
 def finalized_segment_chat_file(
     config: BotConfig,
     video_id: str,
@@ -4210,6 +5342,43 @@ def finalized_segment_chat_file(
     logger: logging.Logger,
 ) -> Path | None:
     final_chat = segment_chat_file(config, video_id, segment_index, channel)
+    part_file = segment_chat_part_file(config, video_id, segment_index, channel)
+    if final_chat is not None and part_file is not None:
+        merged_file = final_chat.with_name(f"{final_chat.name}.merged")
+        try:
+            concatenate_chat_jsonl_files([final_chat, part_file], merged_file)
+            merged_entries = parse_live_chat_file(merged_file)
+        except OSError:
+            merged_file.unlink(missing_ok=True)
+            logger.warning(
+                "Unable to merge finalized and partial live chat; preserving both %s %s",
+                final_chat,
+                part_file,
+            )
+            return final_chat
+        if not merged_entries:
+            merged_file.unlink(missing_ok=True)
+            logger.warning(
+                "Merged live chat had no usable messages; preserving both %s %s",
+                final_chat,
+                part_file,
+            )
+            return final_chat
+
+        merged_file.replace(final_chat)
+        part_file.unlink()
+        cleanup_files(
+            segment_chat_fragment_files(config, video_id, segment_index, channel),
+            logger,
+        )
+        logger.info(
+            "Merged finalized and partial live chat video_id=%s segment=%03d messages=%d",
+            video_id,
+            segment_index,
+            len(merged_entries),
+        )
+        return final_chat
+
     if final_chat is not None:
         cleanup_files(
             segment_chat_fragment_files(config, video_id, segment_index, channel),
@@ -4217,7 +5386,6 @@ def finalized_segment_chat_file(
         )
         return final_chat
 
-    part_file = segment_chat_part_file(config, video_id, segment_index, channel)
     if part_file is None:
         return None
 

@@ -41,9 +41,14 @@ class OnlySaveMeVodsDaemon:
         self._last_fragment_cleanup_monotonic: float | None = None
 
     async def run(self) -> None:
-        stale_post_exit_records = self.state.list_streams_by_status(["checking_after_exit"])
+        self.state.reconcile_stale_downloads()
+        requeued_post_processing = (
+            self.state.requeue_incomplete_post_processing_jobs()
+        )
+        stale_post_exit_records = self.state.list_streams_by_status(
+            ["checking_after_exit"]
+        )
         stalled_youtube_records = self.state.list_streams_by_status(["stalled"])
-        self.state.mark_stale_downloads_interrupted()
         self.state.mark_stale_watermarks_interrupted()
         sources = monitored_sources(self.config)
         LOGGER.info(
@@ -116,6 +121,12 @@ class OnlySaveMeVodsDaemon:
             LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
         self.resume_stale_post_exit_checks(stale_post_exit_records)
         self.resume_stalled_youtube_checks(stalled_youtube_records)
+        if requeued_post_processing:
+            LOGGER.warning(
+                "Requeued %s interrupted post-processing job(s) after service restart",
+                requeued_post_processing,
+            )
+        self.downloads.resume_pending_post_processing_jobs()
 
         try:
             while not self._stop_event.is_set():
@@ -165,6 +176,7 @@ class OnlySaveMeVodsDaemon:
             )
 
     async def poll_once(self) -> None:
+        self.downloads.resume_pending_post_processing_jobs()
         await self.cleanup_expired_fragments()
         for source in monitored_sources(self.config):
             LOGGER.info("Checking source %s", source)
@@ -189,7 +201,30 @@ class OnlySaveMeVodsDaemon:
                     stream.video_id,
                     stream.title,
                 )
-                await self._start_stream(stream)
+                try:
+                    await self._start_stream(stream)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - isolate one stream startup.
+                    LOGGER.exception(
+                        "Unable to start stream video_id=%s source=%s; "
+                        "continuing source checks",
+                        stream.video_id,
+                        source,
+                    )
+                    try:
+                        self.state.add_stream_event(
+                            stream.video_id,
+                            "Unable to start recording: "
+                            f"{str(exc) or exc.__class__.__name__}",
+                            level="error",
+                        )
+                    except Exception:  # noqa: BLE001 - failure reporting is best effort.
+                        LOGGER.debug(
+                            "Unable to record stream startup failure for %s",
+                            stream.video_id,
+                            exc_info=True,
+                        )
 
     async def cleanup_expired_fragments(self) -> None:
         if self.config.fragment_retention_hours <= 0:

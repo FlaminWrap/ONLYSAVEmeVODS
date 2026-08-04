@@ -173,7 +173,9 @@ then choose `processing_quiet_hours_start` and `processing_quiet_hours_end` in
 24-hour `HH:MM` form. Overnight windows such as `22:00` to `07:00` are
 supported, and matching start/end times allow processing all day. Recording and
 finalization still happen immediately, manual dashboard actions bypass the
-window, and work already started may continue after it closes.
+window, and work already started may continue after it closes. Automatic jobs
+are stored in SQLite before they wait, so pending work and a job interrupted by
+a service restart are resumed instead of being lost.
 
 The complete stream history is available directly on the streamer page, with
 search, platform/date filters, page-size choices, and Previous/Next navigation.
@@ -398,7 +400,10 @@ scripts/install-ubuntu.sh
 The installer enables and restarts `onlysavemevods.service`, so rerunning it after an
 update makes systemd pick up the newly installed code. It also appends any
 missing top-level settings from the current `config.example.toml` to an existing
-`config.toml` without overwriting your configured values.
+`config.toml` without overwriting your configured values. During an upgrade it
+keeps the previous application directory until dependency, config, unit, and
+service setup all succeed; a later installer failure restores that directory
+before restarting a service that was previously active.
 
 By default the systemd installer deploys to `/opt/onlysavemevods`, creates a dedicated
 `onlysavemevods` system user, and runs the service as that user instead of as root or
@@ -461,8 +466,8 @@ and applies updates only when the service is idle. Configure behavior in
 `config.toml` with `app_update_mode`:
 
 Source checkouts identify themselves as development builds for the next release,
-such as `0.1.1.dev0` after a `0.1.0` release. Release tarballs rewrite the
-package and About-page version to the published tag, such as `0.1.0`, during
+such as `1.1.2.dev0` after a `1.1.1` release. Release tarballs rewrite the
+package and About-page version to the published tag, such as `1.1.2`, during
 the GitHub release workflow.
 
 - `disabled`: no checks or install controls.
@@ -471,12 +476,33 @@ the GitHub release workflow.
 - `auto_install`: scheduled checks request newer releases and install them when
   idle.
 
-Manual install requests are written under `state/app-update-request.json`; the
-web process does not replace root-owned app files itself. The systemd app
-updater applies the request, backs up the current app directory, restores it if
-the update fails, and preserves config, secrets, downloads, state, venv, Deno,
-and cache directories. Its default timer runs at `05:15` with up to `45m`
-randomized delay. Reschedule it at install time with:
+Manual install requests use a small updater mailbox. On systemd installs that
+mailbox stays under `${INSTALL_DIR}/state` and its path is supplied to both the
+web service and privileged updater by root-owned units. It is intentionally
+independent of configurable `state_dir`, so changing the application state
+folder cannot strand an update request or hide its status. Source/non-systemd
+runs use `state_dir` instead.
+
+The web process does not replace root-owned app files itself and its request
+cannot supply download URLs. The systemd updater resolves the requested tag
+again from a repository pinned in its root-owned unit, validates the release
+asset URLs, checksum, archive layout, and bundled version, then swaps a staged
+app directory into place. It keeps a backup and restores it if installation
+fails.
+
+The privileged updater policy is an install ceiling separate from the
+web-editable `app_update_mode`. It defaults to `manual` and the official
+repository. To permit unattended installs or pin another trusted fork, rerun
+the installer with root-owned policy values such as:
+
+```bash
+ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE=auto_install scripts/install-systemd.sh
+ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY='owner/repository' scripts/install-systemd.sh
+```
+
+The updater preserves config, secrets, downloads, state, venv, Deno, and cache
+directories. Its default timer runs at `05:15` with up to `45m` randomized
+delay. Reschedule it at install time with:
 
 ```bash
 ONLYSAVEMEVODS_APP_UPDATE_CALENDAR='*-*-* 05:30:00' scripts/install-systemd.sh
@@ -746,7 +772,9 @@ scripts/uninstall-systemd.sh
   the edge advances, and is finalized only after YouTube reports it non-live,
   terminally unavailable, or publishes an HLS end marker.
   Change `youtube_stale_live_timeout_seconds`, or set it to `0` to disable the
-  watchdog.
+  watchdog. If the service restarts while a live download or retry is active,
+  that record re-enters the post-exit recovery checks instead of being abandoned;
+  an interrupted manual VOD download is marked separately as interrupted.
 - YouTube recordings prefer VP9 by default. On the first download attempt, the
   app selects only from the formats in the current probe and records the exact
   video ID, audio ID, and video codec in SQLite. Every reconnect probes again

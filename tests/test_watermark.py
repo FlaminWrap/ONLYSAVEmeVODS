@@ -1,4 +1,5 @@
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import unittest
 
@@ -6,10 +7,13 @@ from onlysavemevods.config import BotConfig
 from onlysavemevods.state import WatermarkCopyRecord
 from onlysavemevods.watermark import (
     build_audio_mux_command,
+    create_watermarked_copy,
     derive_pattern,
     score_watermark_frame_groups,
     score_watermark_records,
+    validate_watermark_output,
     validate_recipient_label,
+    WatermarkError,
     watermark_secret,
     watermarked_output_name,
 )
@@ -35,6 +39,147 @@ def copy_record(copy_id: str, label: str) -> WatermarkCopyRecord:
 
 
 class WatermarkTests(unittest.TestCase):
+    def test_failed_validation_preserves_existing_output_atomically(self) -> None:
+        import numpy as np
+
+        class FakeCapture:
+            def __init__(self) -> None:
+                self.frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(3)]
+
+            def isOpened(self) -> bool:
+                return True
+
+            def get(self, property_id: int) -> float:
+                return {
+                    1: 30.0,
+                    2: 3.0,
+                    3: 2.0,
+                    4: 2.0,
+                }.get(property_id, 0.0)
+
+            def read(self):
+                return (True, self.frames.pop(0)) if self.frames else (False, None)
+
+            def release(self) -> None:
+                return None
+
+        class FakeWriter:
+            def isOpened(self) -> bool:
+                return True
+
+            def write(self, _frame) -> None:
+                return None
+
+            def release(self) -> None:
+                return None
+
+        class FakeCv2:
+            CAP_PROP_FPS = 1
+            CAP_PROP_FRAME_COUNT = 2
+            CAP_PROP_FRAME_WIDTH = 3
+            CAP_PROP_FRAME_HEIGHT = 4
+            INTER_CUBIC = 5
+
+            @staticmethod
+            def VideoCapture(_path: str) -> FakeCapture:
+                return FakeCapture()
+
+            @staticmethod
+            def VideoWriter_fourcc(*_args: str) -> int:
+                return 1
+
+            @staticmethod
+            def VideoWriter(*_args) -> FakeWriter:
+                return FakeWriter()
+
+            @staticmethod
+            def resize(pattern, _size, interpolation=None):
+                return pattern
+
+        class Result:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.mp4"
+            output = root / "output.mp4"
+            source.write_bytes(b"source")
+            output.write_bytes(b"existing")
+
+            def fake_run(command, **_kwargs):
+                Path(command[-1]).write_bytes(b"truncated")
+                return Result()
+
+            with (
+                patch(
+                    "onlysavemevods.watermark.optional_cv_dependencies",
+                    return_value=(np, FakeCv2),
+                ),
+                patch(
+                    "onlysavemevods.watermark.apply_watermark_to_frame",
+                    side_effect=lambda frame, *_args: frame,
+                ),
+                patch("onlysavemevods.watermark.subprocess.run", fake_run),
+                patch(
+                    "onlysavemevods.watermark.validate_watermark_output",
+                    side_effect=WatermarkError("truncated"),
+                ),
+            ):
+                with self.assertRaises(WatermarkError):
+                    create_watermarked_copy(
+                        source_file=source,
+                        output_file=output,
+                        secret="secret",
+                        copy_id="wm_copy",
+                        video_id="video",
+                        source_name=source.name,
+                        strength="balanced",
+                        ffmpeg_path="ffmpeg",
+                        overwrite=True,
+                    )
+            existing = output.read_bytes()
+            temp_exists = (root / "output.muxing.mp4").exists()
+
+        self.assertEqual(existing, b"existing")
+        self.assertFalse(temp_exists)
+
+    def test_truncated_watermark_output_is_rejected(self) -> None:
+        class FakeCapture:
+            def __init__(self) -> None:
+                self.remaining = 20
+
+            def isOpened(self) -> bool:
+                return True
+
+            def get(self, _property: object) -> float:
+                return 30.0
+
+            def read(self):
+                if self.remaining <= 0:
+                    return False, None
+                self.remaining -= 1
+                return True, object()
+
+            def release(self) -> None:
+                return None
+
+        class FakeCv2:
+            CAP_PROP_FPS = 5
+
+            @staticmethod
+            def VideoCapture(_path: str) -> FakeCapture:
+                return FakeCapture()
+
+        with self.assertRaisesRegex(WatermarkError, "truncated"):
+            validate_watermark_output(
+                Path("rendering.mp4"),
+                expected_frames=300,
+                expected_duration=10.0,
+                cv2=FakeCv2,
+            )
+
     def test_pattern_is_secret_keyed_and_deterministic(self) -> None:
         first = derive_pattern(
             "secret-a",

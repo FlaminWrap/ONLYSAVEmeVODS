@@ -8,6 +8,172 @@ from onlysavemevods.state import StateStore
 
 
 class StateWatermarkTests(unittest.TestCase):
+    def test_post_processing_queue_is_idempotent_and_requeues_running_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite3"
+            media = Path(tmp) / "stream.mp4"
+            state = StateStore(db_path)
+            first = state.enqueue_post_processing_job(
+                video_id="LIVEVIDEO01",
+                kind="transcription",
+                segment_index=1,
+                channel="Example",
+                media_path=media,
+            )
+            duplicate = state.enqueue_post_processing_job(
+                video_id="LIVEVIDEO01",
+                kind="transcription",
+                segment_index=1,
+                channel="Example",
+                media_path=media,
+            )
+            self.assertTrue(state.mark_post_processing_job_running(first.job_id))
+            running = state.get_post_processing_job(first.job_id)
+            state.close()
+
+            reopened = StateStore(db_path)
+            requeued = reopened.requeue_incomplete_post_processing_jobs()
+            pending = reopened.get_post_processing_job(first.job_id)
+            self.assertTrue(reopened.mark_post_processing_job_running(first.job_id))
+            self.assertTrue(reopened.mark_post_processing_job_done(first.job_id))
+            done = reopened.get_post_processing_job(first.job_id)
+            reopened.close()
+
+        self.assertEqual(first.job_id, duplicate.job_id)
+        self.assertIsNotNone(running)
+        assert running is not None
+        self.assertEqual(running.status, "running")
+        self.assertEqual(running.attempts, 1)
+        self.assertEqual(requeued, 1)
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending.status, "pending")
+        self.assertIsNotNone(done)
+        assert done is not None
+        self.assertEqual(done.status, "done")
+        self.assertEqual(done.attempts, 2)
+
+    def test_post_processing_enqueue_can_reset_only_terminal_jobs(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            arguments = {
+                "video_id": "VODVIDEO01",
+                "kind": "transcription",
+                "segment_index": 1,
+                "channel": "Example",
+                "media_path": Path(tmp) / "vod.mp4",
+            }
+            job = state.enqueue_post_processing_job(**arguments)
+            self.assertTrue(state.mark_post_processing_job_running(job.job_id))
+
+            state.enqueue_post_processing_job(**arguments, reset_terminal=True)
+            still_running = state.get_post_processing_job(job.job_id)
+            self.assertTrue(state.mark_post_processing_job_failed(job.job_id, "first failure"))
+            state.enqueue_post_processing_job(**arguments, reset_terminal=True)
+            reset = state.get_post_processing_job(job.job_id)
+
+            self.assertTrue(state.mark_post_processing_job_running(job.job_id))
+            self.assertTrue(state.mark_post_processing_job_done(job.job_id))
+            state.enqueue_post_processing_job(**arguments)
+            still_done = state.get_post_processing_job(job.job_id)
+            state.close()
+
+        self.assertIsNotNone(still_running)
+        assert still_running is not None
+        self.assertEqual(still_running.status, "running")
+        self.assertIsNotNone(reset)
+        assert reset is not None
+        self.assertEqual(reset.status, "pending")
+        self.assertEqual(reset.attempts, 0)
+        self.assertEqual(reset.error, "")
+        self.assertIsNotNone(still_done)
+        assert still_done is not None
+        self.assertEqual(still_done.status, "done")
+
+    def test_replacing_pending_media_path_merges_existing_identity(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            state = StateStore(root / "state.sqlite3")
+            old_path = root / "stream.mp4"
+            repaired_path = root / "stream.repaired.mp4"
+            old_job = state.enqueue_post_processing_job(
+                video_id="twitch:Example",
+                kind="transcription",
+                segment_index=1,
+                channel="Example",
+                media_path=old_path,
+                chat_path=root / "current-chat.json",
+            )
+            existing = state.enqueue_post_processing_job(
+                video_id="twitch:Example",
+                kind="transcription",
+                segment_index=1,
+                channel="Old Example",
+                media_path=repaired_path,
+                chat_path=root / "old-chat.json",
+            )
+            self.assertTrue(state.mark_post_processing_job_running(existing.job_id))
+            self.assertTrue(
+                state.mark_post_processing_job_failed(existing.job_id, "stale failure")
+            )
+
+            changed = state.replace_pending_post_processing_media_path(
+                video_id="twitch:Example",
+                segment_index=1,
+                old_path=old_path,
+                new_path=repaired_path,
+            )
+            jobs = state.list_post_processing_jobs(video_id="twitch:Example")
+            old_remaining = state.get_post_processing_job(old_job.job_id)
+            state.close()
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0].job_id, existing.job_id)
+        self.assertEqual(jobs[0].media_path, str(repaired_path))
+        self.assertEqual(jobs[0].status, "pending")
+        self.assertEqual(jobs[0].attempts, 0)
+        self.assertEqual(jobs[0].error, "")
+        self.assertEqual(jobs[0].channel, "Example")
+        self.assertEqual(jobs[0].chat_path, str(root / "current-chat.json"))
+        self.assertIsNone(old_remaining)
+
+    def test_restart_reconciles_live_downloads_but_interrupts_vod_downloads(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            downloading = LiveStream(
+                video_id="LIVEVIDEO01",
+                url="https://example.test/live-one",
+            )
+            retrying = LiveStream(
+                video_id="LIVEVIDEO02",
+                url="https://example.test/live-two",
+            )
+            vod = LiveStream(
+                video_id="VODVIDEO01",
+                url="https://example.test/vod",
+                is_live=False,
+            )
+            state.mark_downloading(downloading, 1)
+            state.mark_downloading(retrying, 2)
+            state.mark_waiting_retry(retrying.video_id)
+            state.mark_vod_downloading(vod)
+
+            state.reconcile_stale_downloads()
+            live_record = state.get_stream(downloading.video_id)
+            retry_record = state.get_stream(retrying.video_id)
+            vod_record = state.get_stream(vod.video_id)
+            state.close()
+
+        assert live_record is not None
+        assert retry_record is not None
+        assert vod_record is not None
+        self.assertEqual(live_record.status, "checking_after_exit")
+        self.assertEqual(retry_record.status, "checking_after_exit")
+        self.assertTrue(live_record.last_exit_at)
+        self.assertEqual(vod_record.status, "interrupted")
+        self.assertEqual(vod_record.recording_kind, "vod")
+
     def test_youtube_video_format_lock_persists_across_reopen(self) -> None:
         with TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "state.sqlite3"
@@ -134,6 +300,69 @@ class StateWatermarkTests(unittest.TestCase):
         self.assertIn("youtube_stale_media_sequence", columns)
         self.assertIn("youtube_stale_edge_at", columns)
         self.assertIn("youtube_stale_detected_at", columns)
+
+    def test_migration_backfills_legacy_vod_kind_from_events(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "state.sqlite3"
+            connection = sqlite3.connect(db_path)
+            connection.execute(
+                """
+                CREATE TABLE streams (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL DEFAULT '',
+                    channel TEXT NOT NULL DEFAULT '',
+                    url TEXT NOT NULL,
+                    platform TEXT NOT NULL DEFAULT 'youtube',
+                    source TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL,
+                    segment_index INTEGER NOT NULL DEFAULT 1,
+                    first_seen_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_started_at TEXT,
+                    last_exit_at TEXT,
+                    exit_code INTEGER
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE stream_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    video_id TEXT NOT NULL,
+                    level TEXT NOT NULL DEFAULT 'info',
+                    message TEXT NOT NULL,
+                    segment_index INTEGER,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO streams (
+                    video_id, url, status, first_seen_at, updated_at
+                ) VALUES ('youtube:VOD1', 'https://example.test/vod', 'downloading', ?, ?)
+                """,
+                ("2026-07-24T00:00:00+00:00", "2026-07-24T00:00:00+00:00"),
+            )
+            connection.execute(
+                """
+                INSERT INTO stream_events (
+                    video_id, message, created_at
+                ) VALUES ('youtube:VOD1', 'Started VOD download', ?)
+                """,
+                ("2026-07-24T00:00:00+00:00",),
+            )
+            connection.commit()
+            connection.close()
+
+            state = StateStore(db_path)
+            state.reconcile_stale_downloads()
+            record = state.get_stream("youtube:VOD1")
+            state.close()
+
+        assert record is not None
+        self.assertEqual(record.recording_kind, "vod")
+        self.assertEqual(record.status, "interrupted")
 
     def test_stream_records_include_platform_and_source(self) -> None:
         with TemporaryDirectory() as tmp:

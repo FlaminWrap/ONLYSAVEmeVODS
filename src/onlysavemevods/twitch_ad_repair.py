@@ -132,6 +132,26 @@ def repair_twitch_ads_for_media(
         write_twitch_ad_repair_sidecar(media_file, result)
         return result
 
+    media_duration = probe_media_duration(
+        media_file,
+        ffprobe_path_for(config.ffmpeg_path),
+    )
+    recording_started_ts = recording_started_timestamp(
+        started_at,
+        media_file,
+        media_duration,
+    )
+    if recording_started_ts is None:
+        result = TwitchAdRepairResult(
+            False,
+            "",
+            "Unable to estimate recording start time for VOD alignment",
+            scan,
+            [],
+        )
+        write_twitch_ad_repair_sidecar(media_file, result)
+        return result
+
     progress("Finding recent Twitch VOD", 0.18)
     vod_url = find_recent_twitch_vod_url(
         channel,
@@ -144,14 +164,69 @@ def repair_twitch_ads_for_media(
         return result
 
     progress("Probing Twitch VOD", 0.22)
-    vod = probe_twitch_vod(vod_url, yt_dlp_path=config.yt_dlp_path)
-    media_duration = probe_media_duration(media_file, ffprobe_path_for(config.ffmpeg_path))
-    recording_started_ts = recording_started_timestamp(started_at, media_file, media_duration)
-    if recording_started_ts is None:
+    vod: TwitchVodMetadata | None = None
+    fallback_vod: TwitchVodMetadata | None = None
+    try:
+        latest_vod = probe_twitch_vod(vod_url, yt_dlp_path=config.yt_dlp_path)
+    except (OSError, subprocess.SubprocessError, TwitchAdRepairError) as exc:
+        log.warning("Unable to probe newest Twitch VOD %s: %s", vod_url, exc)
+    else:
+        if twitch_vod_covers_recording(
+            latest_vod,
+            recording_started_ts,
+            tolerance_seconds=0.0,
+        ):
+            vod = latest_vod
+        elif twitch_vod_covers_recording(latest_vod, recording_started_ts):
+            fallback_vod = latest_vod
+
+    if vod is None:
+        try:
+            candidate_urls = find_recent_twitch_vod_urls(
+                channel,
+                yt_dlp_path=config.yt_dlp_path,
+                search_limit=config.twitch_ad_repair_vod_search_limit,
+            )
+        except (OSError, subprocess.SubprocessError, TwitchAdRepairError) as exc:
+            log.warning("Unable to list older Twitch VOD candidates: %s", exc)
+            candidate_urls = []
+        for candidate_url in candidate_urls:
+            if candidate_url == vod_url:
+                continue
+            try:
+                candidate_vod = probe_twitch_vod(
+                    candidate_url,
+                    yt_dlp_path=config.yt_dlp_path,
+                )
+            except (OSError, subprocess.SubprocessError, TwitchAdRepairError) as exc:
+                log.warning("Unable to probe Twitch VOD candidate %s: %s", candidate_url, exc)
+                continue
+            if twitch_vod_covers_recording(
+                candidate_vod,
+                recording_started_ts,
+                tolerance_seconds=0.0,
+            ):
+                vod = candidate_vod
+                vod_url = candidate_vod.url
+                break
+            if (
+                fallback_vod is None
+                and twitch_vod_covers_recording(
+                    candidate_vod,
+                    recording_started_ts,
+                )
+            ):
+                fallback_vod = candidate_vod
+
+    if vod is None and fallback_vod is not None:
+        vod = fallback_vod
+        vod_url = fallback_vod.url
+
+    if vod is None:
         result = TwitchAdRepairResult(
             False,
             "",
-            "Unable to estimate recording start time for VOD alignment",
+            "No recent Twitch VOD covered the recording start time",
             scan,
             [],
             vod_url=vod_url,
@@ -160,17 +235,6 @@ def repair_twitch_ads_for_media(
         return result
 
     vod_recording_offset = recording_started_ts - vod.timestamp
-    if vod_recording_offset < -300:
-        result = TwitchAdRepairResult(
-            False,
-            "",
-            "Recording appears to start before the available Twitch VOD",
-            scan,
-            [],
-            vod_url=vod_url,
-        )
-        write_twitch_ad_repair_sidecar(media_file, result)
-        return result
 
     repairable_ads = [
         ad for ad in scan if ad.duration > 0 and ad.duration <= config.twitch_ad_repair_max_seconds
@@ -223,10 +287,11 @@ def repair_twitch_ads_for_media(
                     f"Aligning Twitch VOD slice for ad {index}/{len(repairable_ads)}",
                     0.45 + (index - 1) * 0.2 / max(1, len(repairable_ads)),
                 )
+                local_alignment_time = min(media_duration - 0.1, ad.end + 0.5)
                 match_time, diff = find_best_alignment_time(
                     local_media=media_file,
                     vod_slice=slice_file,
-                    local_time=min(media_duration - 0.1, ad.end + 0.5),
+                    local_time=local_alignment_time,
                     ffmpeg_path=config.ffmpeg_path,
                     logger=log,
                 )
@@ -245,7 +310,14 @@ def repair_twitch_ads_for_media(
                         )
                     )
                     continue
-                replacement_start = max(0.0, match_time - ad.duration)
+                sample_offset_from_ad_start = max(
+                    0.0,
+                    local_alignment_time - ad.start,
+                )
+                replacement_start = max(
+                    0.0,
+                    match_time - sample_offset_from_ad_start,
+                )
                 replacement_end = replacement_start + ad.duration
                 slice_duration = probe_media_duration(slice_file, ffprobe_path_for(config.ffmpeg_path))
                 if replacement_end > slice_duration:
@@ -414,15 +486,43 @@ def _sample_group_to_segment(
     return [TwitchAdSegment(start=start, end=end, confidence=confidence, text=display_text)]
 
 
+def twitch_vod_covers_recording(
+    vod: TwitchVodMetadata,
+    recording_started_timestamp: float,
+    *,
+    tolerance_seconds: float = 300.0,
+) -> bool:
+    offset = recording_started_timestamp - vod.timestamp
+    if offset < -tolerance_seconds:
+        return False
+    if vod.duration > 0 and offset > vod.duration + tolerance_seconds:
+        return False
+    return True
+
+
 def find_recent_twitch_vod_url(
     channel: str,
     *,
     yt_dlp_path: str = "yt-dlp",
     search_limit: int = 5,
 ) -> str:
+    candidates = find_recent_twitch_vod_urls(
+        channel,
+        yt_dlp_path=yt_dlp_path,
+        search_limit=search_limit,
+    )
+    return candidates[0] if candidates else ""
+
+
+def find_recent_twitch_vod_urls(
+    channel: str,
+    *,
+    yt_dlp_path: str = "yt-dlp",
+    search_limit: int = 5,
+) -> list[str]:
     channel = channel.strip().strip("/")
     if not channel:
-        return ""
+        return []
     url = f"https://www.twitch.tv/{channel}/videos?filter=archives&sort=time"
     command = [
         yt_dlp_path,
@@ -440,7 +540,8 @@ def find_recent_twitch_vod_url(
         raise TwitchAdRepairError("yt-dlp returned invalid Twitch VOD playlist JSON") from exc
     entries = payload.get("entries")
     if not isinstance(entries, list):
-        return ""
+        return []
+    candidates: list[str] = []
     for entry in entries:
         if not isinstance(entry, dict):
             continue
@@ -449,10 +550,14 @@ def find_recent_twitch_vod_url(
             continue
         candidate = candidate.strip()
         if candidate.startswith(("http://", "https://")):
-            return candidate
-        if candidate.isdigit():
-            return f"https://www.twitch.tv/videos/{candidate}"
-    return ""
+            normalized = candidate
+        elif candidate.isdigit():
+            normalized = f"https://www.twitch.tv/videos/{candidate}"
+        else:
+            continue
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
 
 
 def probe_twitch_vod(vod_url: str, *, yt_dlp_path: str = "yt-dlp") -> TwitchVodMetadata:

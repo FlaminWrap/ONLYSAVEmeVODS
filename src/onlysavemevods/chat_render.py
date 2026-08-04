@@ -948,6 +948,7 @@ def render_chat_panel_video(
     frame_rate: int = DEFAULT_CHAT_RENDER_FPS,
     progress_callback: ProgressCallback | None = None,
     timezone_name: str = DEFAULT_CHAT_TIME_ZONE,
+    timeout_seconds: float | None = None,
 ) -> bool:
     def emit(phase: str, progress: float | None = None) -> None:
         if progress_callback is None:
@@ -1086,7 +1087,17 @@ def render_chat_panel_video(
         emit("Encoding chat panel video", 0.82)
         LOGGER.debug("ffmpeg chat panel command: %s", shlex.join(command))
         ffmpeg_started_at = time.monotonic()
-        result = subprocess.run(command, capture_output=True)
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            output_file.unlink(missing_ok=True)
+            raise ChatPanelRenderError(
+                "ffmpeg timed out while encoding the chat panel"
+            ) from exc
         ffmpeg_elapsed = time.monotonic() - ffmpeg_started_at
         if result.returncode != 0:
             output_file.unlink(missing_ok=True)
@@ -1139,6 +1150,13 @@ def log_chat_media_sync_diagnostics(
         logger.warning(
             "Chat ends %.2fs before media end for %s; live chat may need refresh or sync",
             tail_gap,
+            chat_file,
+        )
+    elif tail_gap < -CHAT_SYNC_WARNING_THRESHOLD_SECONDS:
+        logger.warning(
+            "Chat extends %.2fs beyond media end for %s; timeline origin or segment "
+            "selection may be inconsistent",
+            -tail_gap,
             chat_file,
         )
 
@@ -2786,6 +2804,7 @@ def render_chat_video_file(
                         0.18 + 0.52 * (progress if progress is not None else 0.0),
                     ),
                     timezone_name=timezone_name,
+                    timeout_seconds=timeout_seconds,
                 )
                 command = build_chat_panel_merge_command(
                     ffmpeg_path,

@@ -4,10 +4,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 import json
+import tomllib
 import unittest
 
-from onlysavemevods import __version__
-from onlysavemevods.cli import main
+from onlysavemevods import _FALLBACK_VERSION, __version__
+from onlysavemevods.cli import build_parser, main
 from onlysavemevods.config import load_config
 from onlysavemevods.state import StateStore
 from onlysavemevods.watermark import DetectionCandidate, DetectionResult
@@ -21,6 +22,20 @@ class CliVersionTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.code, 0)
         self.assertIn(__version__, output.getvalue())
+
+    def test_package_and_source_fallback_versions_match(self) -> None:
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        project = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(_FALLBACK_VERSION, project["project"]["version"])
+
+    def test_help_describes_all_supported_platforms_without_suppression_marker(self) -> None:
+        help_text = build_parser().format_help()
+
+        for platform in ("YouTube", "Twitch", "Kick", "Rumble"):
+            self.assertIn(platform, help_text)
+        self.assertNotIn("==SUPPRESS==", help_text)
+        self.assertIn("render-chat-file", help_text)
 
 
 class CliRenderChatTests(unittest.TestCase):

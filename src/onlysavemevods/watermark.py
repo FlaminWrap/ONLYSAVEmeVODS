@@ -32,6 +32,8 @@ STRENGTH_DELTAS = {
 }
 DETECT_MIN_SCORE = 0.012
 DETECT_MIN_MARGIN = 0.004
+WATERMARK_FRAME_COUNT_TOLERANCE_RATIO = 0.01
+WATERMARK_DURATION_TOLERANCE_SECONDS = 0.5
 ProgressCallback = Callable[[str, float | None], None]
 
 
@@ -265,6 +267,16 @@ def create_watermarked_copy(
     if frame_count <= 0:
         temp_video.unlink(missing_ok=True)
         raise WatermarkError(f"No frames found in media file: {source_file}")
+    source_frame_tolerance = max(
+        2,
+        int(total_frames * WATERMARK_FRAME_COUNT_TOLERANCE_RATIO),
+    )
+    if total_frames > 0 and frame_count + source_frame_tolerance < total_frames:
+        temp_video.unlink(missing_ok=True)
+        raise WatermarkError(
+            "Source video decoding stopped before the advertised frame count: "
+            f"expected={total_frames} decoded={frame_count}"
+        )
 
     emit("Muxing audio", 0.9)
     command = build_audio_mux_command(ffmpeg_path, temp_video, source_file, temp_output)
@@ -272,9 +284,11 @@ def create_watermarked_copy(
         result = subprocess.run(command, capture_output=True, check=False)
     except FileNotFoundError as exc:
         temp_video.unlink(missing_ok=True)
+        temp_output.unlink(missing_ok=True)
         raise WatermarkError(f"ffmpeg not found: {ffmpeg_path}") from exc
     except OSError as exc:
         temp_video.unlink(missing_ok=True)
+        temp_output.unlink(missing_ok=True)
         raise WatermarkError(f"Unable to start ffmpeg: {exc}") from exc
 
     if result.returncode != 0:
@@ -284,11 +298,61 @@ def create_watermarked_copy(
         command_text = command_for_log(command)
         raise WatermarkError(message or f"ffmpeg failed while muxing: {command_text}")
 
-    if output_file.exists():
-        output_file.unlink()
-    temp_output.rename(output_file)
+    try:
+        validate_watermark_output(
+            temp_output,
+            expected_frames=frame_count,
+            expected_duration=frame_count / fps,
+            cv2=cv2,
+        )
+    except WatermarkError:
+        temp_video.unlink(missing_ok=True)
+        temp_output.unlink(missing_ok=True)
+        raise
+
+    temp_output.replace(output_file)
     temp_video.unlink(missing_ok=True)
     emit("Watermark complete", 1.0)
+
+
+def validate_watermark_output(
+    output_file: Path,
+    *,
+    expected_frames: int,
+    expected_duration: float,
+    cv2: Any,
+) -> tuple[int, float]:
+    capture = cv2.VideoCapture(str(output_file))
+    if not capture.isOpened():
+        raise WatermarkError(f"Unable to open watermarked output: {output_file}")
+    output_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+    decoded_frames = 0
+    try:
+        while True:
+            ok, _frame = capture.read()
+            if not ok:
+                break
+            decoded_frames += 1
+    finally:
+        capture.release()
+    if output_fps <= 0 or output_fps != output_fps:
+        raise WatermarkError(f"Watermarked output has invalid frame rate: {output_file}")
+    frame_tolerance = max(
+        2,
+        int(expected_frames * WATERMARK_FRAME_COUNT_TOLERANCE_RATIO),
+    )
+    if decoded_frames + frame_tolerance < expected_frames:
+        raise WatermarkError(
+            "Watermarked output is truncated: "
+            f"expected_frames={expected_frames} decoded_frames={decoded_frames}"
+        )
+    duration = decoded_frames / output_fps
+    if duration + WATERMARK_DURATION_TOLERANCE_SECONDS < expected_duration:
+        raise WatermarkError(
+            "Watermarked output duration is too short: "
+            f"expected={expected_duration:.3f}s actual={duration:.3f}s"
+        )
+    return decoded_frames, duration
 
 
 def clamp_progress(value: float | None) -> float | None:

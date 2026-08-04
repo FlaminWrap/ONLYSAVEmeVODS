@@ -39,6 +39,34 @@ from onlysavemevods.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_explicit_missing_config_is_rejected(self) -> None:
+        with TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.toml"
+
+            with self.assertRaisesRegex(ConfigError, "does not exist"):
+                load_config(missing)
+
+    def test_example_config_includes_both_media_tool_paths(self) -> None:
+        example_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+
+        config = load_config(example_path)
+
+        self.assertEqual(config.yt_dlp_path, "yt-dlp")
+        self.assertEqual(config.ffmpeg_path, "ffmpeg")
+
+    def test_non_finite_numeric_values_are_rejected(self) -> None:
+        assignments = (
+            "voice_match_threshold = nan\n",
+            "stream_event_window_seconds = inf\n",
+            "stream_event_min_confidence = nan\n",
+        )
+        for assignment in assignments:
+            with self.subTest(assignment=assignment), self.assertRaisesRegex(
+                ConfigError,
+                "finite",
+            ):
+                load_config_text(assignment, Path("/tmp/config.toml"))
+
     def test_processing_quiet_hours_parse_and_support_overnight_windows(self) -> None:
         config = load_config_text(
             "processing_quiet_hours_enabled = true\n"
@@ -327,7 +355,7 @@ class ConfigTests(unittest.TestCase):
     def test_defaults_include_requested_post_exit_schedule(self) -> None:
         with TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.toml"
-            config = load_config(config_path)
+            config = load_config_text("", config_path)
 
         self.assertEqual(config.post_exit_check_seconds, DEFAULT_POST_EXIT_CHECK_SECONDS)
         self.assertEqual(config.post_exit_check_seconds[0], 30)

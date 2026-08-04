@@ -1,9 +1,10 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
 import json
+import signal
 import subprocess
 import unittest
 
@@ -866,6 +867,32 @@ class DownloaderCommandTests(unittest.TestCase):
             )
 
         self.assertEqual(parts, [])
+        self.assertEqual(next_segment, 1)
+
+    def test_powerchat_only_sidecar_does_not_count_as_finalized_segment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            (segment_dir / "segment-001.powerchat-events.json").write_text(
+                '{"events": []}',
+                encoding="utf-8",
+            )
+
+            has_final = segment_has_final_files(
+                config,
+                "LIVEVIDEO01",
+                1,
+                "Example Channel",
+            )
+            next_segment = choose_restart_segment(
+                config,
+                "LIVEVIDEO01",
+                1,
+                "Example Channel",
+            )
+
+        self.assertFalse(has_final)
         self.assertEqual(next_segment, 1)
 
     def test_live_chat_part_does_not_block_next_segment_after_media_final(self) -> None:
@@ -2016,12 +2043,379 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+    async def test_single_corrupt_part_preserves_part_and_recovery_sidecars(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = segment_directory(
+                config,
+                "LIVEVIDEO01",
+                "Example Channel",
+            )
+            directory.mkdir(parents=True)
+            part = directory / "segment-001.mp4.part"
+            ytdl = directory / "segment-001.mp4.ytdl"
+            fragment = directory / "segment-001.mp4.part-Frag1"
+            part.write_bytes(b"truncated")
+            ytdl.write_text("{}", encoding="utf-8")
+            fragment.write_bytes(b"fragment")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            try:
+                with patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    side_effect=VideoProbeError("invalid media"),
+                ):
+                    finalized = await manager.finalize_ended_segment(
+                        "LIVEVIDEO01",
+                        1,
+                        "Example Channel",
+                    )
+            finally:
+                state.close()
+
+            output_exists = (directory / "segment-001.mp4").exists()
+            recovery_inputs_exist = part.exists() and ytdl.exists() and fragment.exists()
+
+        self.assertFalse(finalized)
+        self.assertFalse(output_exists)
+        self.assertTrue(recovery_inputs_exist)
+
+    async def test_single_probeable_truncated_part_requires_validated_remux(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            directory = segment_directory(
+                config,
+                "LIVEVIDEO01",
+                "Example Channel",
+            )
+            directory.mkdir(parents=True)
+            part = directory / "segment-001.mp4.part"
+            ytdl = directory / "segment-001.mp4.ytdl"
+            fragment = directory / "segment-001.mp4.part-Frag1"
+            part.write_bytes(b"probeable but truncated")
+            ytdl.write_text("{}", encoding="utf-8")
+            fragment.write_bytes(b"recoverable fragment")
+            output = directory / "segment-001.mp4"
+            temporary_output = directory / "segment-001.muxing.mp4"
+            advertised_input = [
+                FinalizeMediaStream(
+                    path=part,
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=300.0,
+                    size=part.stat().st_size,
+                    partial=True,
+                )
+            ]
+            shortened_remux = [
+                FinalizeMediaStream(
+                    path=temporary_output,
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=12.0,
+                    size=1,
+                    partial=False,
+                )
+            ]
+            process = AsyncMock()
+            process.returncode = 0
+            process.communicate.return_value = (b"", b"")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        side_effect=[advertised_input, shortened_remux],
+                    ) as probe_streams,
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(return_value=process),
+                    ) as spawn,
+                ):
+                    finalized = await manager.finalize_ended_segment(
+                        "LIVEVIDEO01",
+                        1,
+                        "Example Channel",
+                    )
+            finally:
+                state.close()
+
+            source_contents = part.read_bytes()
+            recovery_inputs_exist = part.exists() and ytdl.exists() and fragment.exists()
+            output_exists = output.exists()
+            temporary_output_exists = temporary_output.exists()
+
+        self.assertFalse(finalized)
+        self.assertEqual(probe_streams.call_count, 2)
+        self.assertEqual(Path(spawn.await_args.args[-1]), temporary_output)
+        self.assertFalse(output_exists)
+        self.assertFalse(temporary_output_exists)
+        self.assertTrue(recovery_inputs_exist)
+        self.assertEqual(source_contents, b"probeable but truncated")
+
+    async def test_partial_finalize_cancellation_kills_ffmpeg_and_cleans_staging(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "segment-001.mp4.part"
+            output_file = root / "segment-001.mp4"
+            temporary_output = root / "segment-001.muxing.mp4"
+            input_file.write_bytes(b"recoverable")
+            plan = FinalizePlan(
+                output_file=output_file,
+                input_files=[input_file],
+                cleanup_files=[],
+                mixed_inputs=False,
+            )
+            media_streams = [
+                FinalizeMediaStream(
+                    path=input_file,
+                    input_index=0,
+                    stream_index=0,
+                    codec_type="video",
+                    duration=60.0,
+                    size=input_file.stat().st_size,
+                    partial=True,
+                )
+            ]
+            communicate_started = asyncio.Event()
+
+            class HungProcess:
+                returncode = None
+
+                def __init__(self) -> None:
+                    self.killed = False
+
+                async def communicate(self):
+                    temporary_output.write_bytes(b"partial staging output")
+                    communicate_started.set()
+                    await asyncio.Future()
+
+                def kill(self) -> None:
+                    self.killed = True
+                    self.returncode = -9
+
+                async def wait(self) -> int:
+                    return -9
+
+            process = HungProcess()
+            config = BotConfig(download_dir=root, state_dir=root / "state")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=media_streams,
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(return_value=process),
+                    ),
+                ):
+                    task = asyncio.create_task(manager._mux_finalize_inputs(plan))
+                    await communicate_started.wait()
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            finally:
+                state.close()
+
+            input_exists = input_file.exists()
+            output_exists = output_file.exists()
+            staging_exists = temporary_output.exists()
+
+        self.assertTrue(process.killed)
+        self.assertTrue(input_exists)
+        self.assertFalse(output_exists)
+        self.assertFalse(staging_exists)
+
+
 class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         clear_tracked_jobs()
 
     def tearDown(self) -> None:
         clear_tracked_jobs()
+
+    async def test_isolated_chat_render_timeout_kills_process_group(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+                config_path=root / "config.toml",
+                chat_render_timeout_seconds=0.01,
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+
+            class HungProcess:
+                pid = 4242
+                returncode = None
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def communicate(self):
+                    self.calls += 1
+                    if self.calls == 1:
+                        await asyncio.Future()
+                    self.returncode = -9
+                    return b"", b""
+
+                def kill(self) -> None:
+                    self.returncode = -9
+
+                async def wait(self) -> int:
+                    return -9
+
+            process = HungProcess()
+            killed: list[tuple[int, int]] = []
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(return_value=process),
+                    ) as spawn,
+                    patch(
+                        "onlysavemevods.downloader.os.killpg",
+                        side_effect=lambda pid, sig: killed.append((pid, sig)),
+                    ),
+                ):
+                    rendered = await manager.render_live_chat_video_process(
+                        root / "media.mp4",
+                        root / "chat.json",
+                        root / "output.mp4",
+                        1,
+                    )
+            finally:
+                state.close()
+
+        self.assertFalse(rendered)
+        self.assertEqual(killed, [(4242, signal.SIGKILL)])
+        self.assertTrue(spawn.await_args.kwargs["start_new_session"])
+
+    async def test_isolated_chat_render_cancellation_kills_process_group(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+                config_path=root / "config.toml",
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            communicate_started = asyncio.Event()
+
+            class HungProcess:
+                pid = 4343
+                returncode = None
+
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def communicate(self):
+                    self.calls += 1
+                    if self.calls == 1:
+                        communicate_started.set()
+                        await asyncio.Future()
+                    self.returncode = -9
+                    return b"", b""
+
+                def kill(self) -> None:
+                    self.returncode = -9
+
+                async def wait(self) -> int:
+                    return -9
+
+            process = HungProcess()
+            killed: list[tuple[int, int]] = []
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(return_value=process),
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.os.killpg",
+                        side_effect=lambda pid, sig: killed.append((pid, sig)),
+                    ),
+                ):
+                    task = asyncio.create_task(
+                        manager.render_live_chat_video_process(
+                            root / "media.mp4",
+                            root / "chat.json",
+                            root / "output.mp4",
+                            1,
+                        )
+                    )
+                    await communicate_started.wait()
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+            finally:
+                state.close()
+
+        self.assertEqual(killed, [(4343, signal.SIGKILL)])
+        self.assertEqual(process.calls, 2)
+
+    async def test_finish_finalizes_sidecars_before_enqueuing_post_processing(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+                record_live_chat=True,
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            order: list[str] = []
+            manager.finalize_ended_segment = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            manager.rename_finalized_segments = MagicMock(return_value=[])  # type: ignore[method-assign]
+            manager.finalize_powerchat_sidecars = MagicMock(  # type: ignore[method-assign]
+                side_effect=lambda *_args: order.append("powerchat")
+            )
+            manager.refresh_finalized_chat_files = AsyncMock(  # type: ignore[method-assign]
+                side_effect=lambda *_args: order.append("chat")
+            )
+            manager.enqueue_finalized_post_processing = MagicMock(  # type: ignore[method-assign]
+                side_effect=lambda *_args: order.append("enqueue")
+            )
+            manager.process_pending_post_processing = AsyncMock(  # type: ignore[method-assign]
+                side_effect=lambda *_args: order.append("process")
+            )
+
+            try:
+                with patch.object(
+                    state,
+                    "mark_ended",
+                    side_effect=lambda *_args: order.append("ended"),
+                ):
+                    await manager.finish_ended_stream(stream, 1)
+            finally:
+                state.close()
+
+        self.assertEqual(
+            order,
+            ["powerchat", "chat", "enqueue", "ended", "process"],
+        )
 
     async def test_segment_timing_sidecar_records_capture_anchors(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2346,6 +2740,219 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         event_messages = "\n".join(event.message for event in events)
         self.assertIn("waiting for quiet-hours window 01:00–07:00", event_messages)
         self.assertIn("processing window opened", event_messages)
+
+    async def test_pending_quiet_hours_transcription_resumes_after_restart(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+                transcribe_subtitles=True,
+                processing_quiet_hours_enabled=True,
+                processing_quiet_hours_start="01:00",
+                processing_quiet_hours_end="07:00",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            directory = segment_directory(config, stream.video_id, stream.channel)
+            directory.mkdir(parents=True)
+            (directory / "segment-001.mp4").write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            sleep_started = asyncio.Event()
+
+            async def wait_until_cancelled(_delay: float) -> None:
+                sleep_started.set()
+                await asyncio.Future()
+
+            first_manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=wait_until_cancelled,
+                local_now_func=lambda: datetime(
+                    2026,
+                    8,
+                    1,
+                    0,
+                    59,
+                    tzinfo=timezone.utc,
+                ),
+            )
+            finish_task = asyncio.create_task(
+                first_manager.finish_ended_stream(stream, 1)
+            )
+            await sleep_started.wait()
+            finish_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await finish_task
+            pending_before = state.list_post_processing_jobs(
+                video_id=stream.video_id,
+                statuses=["pending"],
+            )
+            state.close()
+
+            reopened = StateStore(config.db_path)
+            manager = DownloadManager(
+                config,
+                reopened,
+                probe=None,  # type: ignore[arg-type]
+                local_now_func=lambda: datetime(
+                    2026,
+                    8,
+                    1,
+                    2,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+            )
+            transcribe = AsyncMock(return_value=True)
+            try:
+                with patch(
+                    "onlysavemevods.downloader.transcribe_media_file",
+                    transcribe,
+                ):
+                    manager.resume_pending_post_processing_jobs()
+                    await asyncio.gather(*list(manager._post_exit_tasks))
+                jobs_after = reopened.list_post_processing_jobs(
+                    video_id=stream.video_id,
+                )
+            finally:
+                reopened.close()
+
+        self.assertEqual(len(pending_before), 1)
+        transcribe.assert_awaited_once()
+        self.assertEqual([job.status for job in jobs_after], ["done"])
+
+    async def test_durable_post_processing_jobs_run_in_dependency_order(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+            )
+            stream = LiveStream(
+                video_id="twitch:Example",
+                url="https://www.twitch.tv/Example",
+                title="Stream",
+                channel="Example",
+                platform="twitch",
+            )
+            media = root / "stream.mp4"
+            chat = root / "stream.live_chat.json"
+            media.write_text("media", encoding="utf-8")
+            chat.write_text("chat", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            for kind in (
+                "chat_render",
+                "content_events",
+                "transcription",
+                "twitch_ad_repair",
+            ):
+                state.enqueue_post_processing_job(
+                    video_id=stream.video_id,
+                    kind=kind,
+                    segment_index=1,
+                    channel=stream.channel,
+                    media_path=media,
+                    chat_path=chat,
+                )
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            calls: list[str] = []
+
+            async def repaired(*_args, **_kwargs):
+                calls.append("twitch_ad_repair")
+                return True
+
+            async def transcribed(*_args, **_kwargs):
+                calls.append("transcription")
+                return True
+
+            async def detected(*_args, **_kwargs):
+                calls.append("content_events")
+                return True
+
+            async def rendered(*_args, **_kwargs):
+                calls.append("chat_render")
+                return True
+
+            manager.repair_finalized_twitch_ads = repaired  # type: ignore[method-assign]
+            manager.transcribe_finalized_media = transcribed  # type: ignore[method-assign]
+            manager.detect_finalized_content_events = detected  # type: ignore[method-assign]
+            manager.render_live_chat_video = rendered  # type: ignore[method-assign]
+            try:
+                await manager.process_pending_post_processing(stream)
+                jobs = state.list_post_processing_jobs(video_id=stream.video_id)
+            finally:
+                state.close()
+
+        self.assertEqual(
+            calls,
+            [
+                "twitch_ad_repair",
+                "transcription",
+                "content_events",
+                "chat_render",
+            ],
+        )
+        self.assertEqual({job.status for job in jobs}, {"done"})
+
+    async def test_periodic_post_processing_scan_dedupes_running_video(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Stream",
+                channel="Example",
+            )
+            media = root / "stream.mp4"
+            media.write_text("media", encoding="utf-8")
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.enqueue_post_processing_job(
+                video_id=stream.video_id,
+                kind="transcription",
+                segment_index=1,
+                channel=stream.channel,
+                media_path=media,
+            )
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            started = asyncio.Event()
+            release = asyncio.Event()
+            call_count = 0
+
+            async def transcribed(*_args, **_kwargs):
+                nonlocal call_count
+                call_count += 1
+                started.set()
+                await release.wait()
+                return True
+
+            manager.transcribe_finalized_media = transcribed  # type: ignore[method-assign]
+            try:
+                manager.resume_pending_post_processing_jobs()
+                await started.wait()
+                first_task_count = len(manager._post_exit_tasks)
+                manager.resume_pending_post_processing_jobs()
+                second_task_count = len(manager._post_exit_tasks)
+                release.set()
+                await asyncio.gather(*list(manager._post_exit_tasks))
+            finally:
+                state.close()
+
+        self.assertEqual(first_task_count, 1)
+        self.assertEqual(second_task_count, 1)
+        self.assertEqual(call_count, 1)
 
     async def test_streamer_can_enable_transcription_over_global_default(self) -> None:
         with TemporaryDirectory() as tmp:

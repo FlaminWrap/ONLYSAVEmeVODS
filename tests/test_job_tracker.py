@@ -73,6 +73,20 @@ class JobTrackerTests(unittest.TestCase):
 
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].status, "failed")
+        self.assertIsNone(jobs[0].progress)
+
+    def test_omitted_progress_preserves_existing_value(self) -> None:
+        start_tracked_job(
+            "job",
+            kind="Transcription",
+            video_id="VIDEO1",
+            item="video.mp4",
+            progress=0.25,
+        )
+
+        update_tracked_job("job", message="Still running")
+
+        self.assertEqual(list_tracked_jobs()[0].progress, 0.25)
 
 
 if __name__ == "__main__":

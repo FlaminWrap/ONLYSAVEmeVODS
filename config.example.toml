@@ -251,7 +251,8 @@ retry_backoff_seconds = [30, 60, 120, 300]
 # extra_yt_dlp_args = ["--format", "bestvideo+bestaudio/best"]
 extra_yt_dlp_args = []
 
-# FFmpeg is used to finalize leftover .part format files after a stream ends.
+# Executable names or absolute paths for the two media tools used by the app.
+yt_dlp_path = "yt-dlp"
 ffmpeg_path = "ffmpeg"
 
 # Generate private, per-recipient invisible watermark copies from finalized
