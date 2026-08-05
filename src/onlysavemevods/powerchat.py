@@ -93,6 +93,12 @@ class PowerchatRecorder:
             if key.startswith("id:"):
                 event_keys.append(key)
             if any(event_key in self._dedupe_keys for event_key in event_keys):
+                for existing in self.events:
+                    existing_keys = powerchat_observed_event_keys(existing)
+                    existing_keys.append(str(existing.get("dedupe_key") or ""))
+                    if set(event_keys) & set(existing_keys):
+                        propagate_powerchat_test_marker(existing, event)
+                        break
                 continue
             self._dedupe_keys.update(event_keys)
             sources = powerchat_observed_sources(event)
@@ -117,6 +123,14 @@ class PowerchatRecorder:
             return False
         key = str(event.get("dedupe_key") or "").strip()
         if key.startswith("id:") and key in self._dedupe_keys:
+            for existing in self.events:
+                existing_keys = powerchat_observed_event_keys(existing)
+                existing_keys.append(str(existing.get("dedupe_key") or ""))
+                if key in existing_keys and propagate_powerchat_test_marker(
+                    existing, event
+                ):
+                    self.write()
+                    break
             return False
         if self._pair_cross_source_duplicate(event):
             if key.startswith("id:"):
@@ -147,6 +161,7 @@ class PowerchatRecorder:
                 or not powerchat_events_within_dedupe_window(existing, event)
             ):
                 continue
+            propagate_powerchat_test_marker(existing, event)
             existing["observed_sources"] = [*sources, source]
             key = str(event.get("dedupe_key") or "").strip()
             if key.startswith("id:"):
@@ -258,6 +273,7 @@ def normalize_powerchat_payload(
         "unit": unit,
         "raw": raw,
     }
+    event["is_test"] = is_powerchat_test_event(event)
     event["dedupe_key"] = powerchat_dedupe_key(event)
     if not message and kind == "unknown" and not explicit_id:
         return None
@@ -269,6 +285,47 @@ def powerchat_dedupe_key(event: dict[str, Any]) -> str:
     if explicit_id:
         return f"id:{explicit_id}"
     return powerchat_payload_key(event, include_time_bucket=True)
+
+
+def is_powerchat_test_event(event: dict[str, Any]) -> bool:
+    """Return whether Powerchat identifies the payment provider as Test."""
+
+    marker = event.get("is_test")
+    if marker is True or (
+        isinstance(marker, str)
+        and marker.strip().casefold() in {"1", "true", "yes"}
+    ):
+        return True
+
+    providers = [
+        event.get("paymentPlatform"),
+        event.get("paymentProvider"),
+        event.get("payment_provider"),
+        event.get("platform"),
+    ]
+    raw = event.get("raw")
+    if isinstance(raw, dict):
+        providers.extend(
+            [
+                raw.get("paymentPlatform"),
+                raw.get("paymentProvider"),
+                raw.get("payment_provider"),
+            ]
+        )
+    return any(
+        str(provider or "").strip().casefold() in {"test", "powerchat-test"}
+        for provider in providers
+    )
+
+
+def propagate_powerchat_test_marker(
+    target: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    if not is_powerchat_test_event(candidate) or is_powerchat_test_event(target):
+        return False
+    target["is_test"] = True
+    return True
 
 
 def powerchat_pairing_key(event: dict[str, Any]) -> str:
@@ -354,7 +411,12 @@ def write_powerchat_sidecar(
     segment_index: int | None = None,
     stream_started_at: str = "",
 ) -> None:
-    event_list = [dict(event) for event in events]
+    event_list: list[dict[str, Any]] = []
+    for event in events:
+        normalized_event = dict(event)
+        normalized_event["is_test"] = is_powerchat_test_event(normalized_event)
+        event_list.append(normalized_event)
+    test_event_count = sum(is_powerchat_test_event(event) for event in event_list)
     payload = {
         "version": POWERCHAT_SIDECAR_VERSION,
         "generated_at": utc_now_iso(),
@@ -364,6 +426,8 @@ def write_powerchat_sidecar(
         "segment_index": segment_index,
         "stream_start": stream_started_at,
         "event_count": len(event_list),
+        "counted_event_count": len(event_list) - test_event_count,
+        "test_event_count": test_event_count,
         "totals": powerchat_totals(event_list),
         "events": event_list,
     }
@@ -426,6 +490,12 @@ def repair_powerchat_sidecar_payload(payload: dict[str, Any]) -> dict[str, Any]:
     repaired = dict(payload)
     repaired["events"] = events
     repaired["event_count"] = len(events)
+    repaired["test_event_count"] = sum(
+        is_powerchat_test_event(event) for event in events
+    )
+    repaired["counted_event_count"] = (
+        len(events) - repaired["test_event_count"]
+    )
     repaired["totals"] = powerchat_totals(events)
     return repaired
 
@@ -435,9 +505,11 @@ def repair_powerchat_event(
     *,
     stream_started_at: str = "",
 ) -> dict[str, Any]:
+    original = dict(event)
+    original["is_test"] = is_powerchat_test_event(original)
     raw = event.get("raw")
     if not isinstance(raw, dict):
-        return dict(event)
+        return original
 
     source = str(event.get("source") or "feed")
     raw_timestamp = first_string(raw, "createdAt", "created_at", "timestamp")
@@ -449,10 +521,10 @@ def repair_powerchat_event(
         stream_started_at=stream_started_at,
     )
     if repaired is None or repaired.get("kind") == "unknown":
-        return dict(event)
+        return original
 
     if event.get("kind") not in {None, "", "unknown"}:
-        return dict(event)
+        return original
 
     merged = dict(event)
     for key in (
@@ -468,6 +540,7 @@ def repair_powerchat_event(
         "money_currency",
         "unit_amount",
         "unit",
+        "is_test",
         "raw",
     ):
         merged[key] = repaired.get(key)
@@ -483,6 +556,8 @@ def powerchat_totals(events: Iterable[dict[str, Any]]) -> dict[str, list[dict[st
     money: dict[str, float] = {}
     units: dict[tuple[str, str], float] = {}
     for event in events:
+        if is_powerchat_test_event(event):
+            continue
         if event.get("kind") == "money":
             amount = parse_number(event.get("money_amount"))
             currency = str(event.get("money_currency") or "").upper()
@@ -511,7 +586,7 @@ def merge_powerchat_events(
     *event_groups: Iterable[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     for events in event_groups:
         for raw_event in events:
             event = dict(raw_event)
@@ -519,9 +594,11 @@ def merge_powerchat_events(
             if not key:
                 key = powerchat_dedupe_key(event)
                 event["dedupe_key"] = key
-            if key in seen:
+            existing = seen.get(key)
+            if existing is not None:
+                propagate_powerchat_test_marker(existing, event)
                 continue
-            seen.add(key)
+            seen[key] = event
             merged.append(event)
     return merged
 
@@ -798,6 +875,8 @@ def normalize_platform_label(value: str) -> str:
         "twitch": "Twitch",
         "rumble": "Rumble",
         "powerchat": "Powerchat",
+        "test": "Test",
+        "powerchat-test": "Test",
         "paypal": "PayPal",
     }
     return known.get(text.casefold(), text[:1].upper() + text[1:])

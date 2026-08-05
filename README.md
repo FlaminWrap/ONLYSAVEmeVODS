@@ -249,6 +249,11 @@ The dashboard shows:
 - an optional **Overall Breakdown** for all streamers combined;
 - a searchable/filterable event ledger.
 
+Powerchat test alerts are kept in sidecars, the event ledger, and exports for
+audit purposes. Events whose payment provider is `test` or `powerchat-test` are
+marked **Test (not counted)** and excluded from event counts, totals, rates,
+hourly charts, stream counts, and donor rankings.
+
 Use the filters for streamer, platform/payment source, event kind, date range,
 and donor/message/title search. The **Download JSON** and **Download CSV** links
 respect the current filters. Streamer summaries and individual stream Powerchat
@@ -634,7 +639,9 @@ scripts/uninstall-systemd.sh
   Powerchat section, and tallied as separate money totals and platform-unit totals
   such as Kick gifts. This is a
   best-effort unofficial integration, so unknown payloads are preserved in the
-  sidecar for later parser fixes but are not counted. The top-level Powerchat
+  sidecar for later parser fixes but are not counted. Test alerts from the
+  `test` or `powerchat-test` payment provider are likewise retained and visibly
+  marked, but excluded from all support analytics. The top-level Powerchat
   dashboard has per-streamer cards, an overall breakdown, donations per hour,
   top donors, a searchable ledger, and filtered JSON/CSV export links. Streamer
   summaries and individual stream Powerchat sections also provide scoped JSON/CSV

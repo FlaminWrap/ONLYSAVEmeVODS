@@ -508,6 +508,11 @@
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
   };
+  const isPowerchatTestEvent = (event = {}) => {
+    if (event.is_test === true || ["1", "true", "yes"].includes(String(event.is_test || "").trim().toLowerCase())) return true;
+    return [event.payment_provider, event.paymentProvider, event.paymentPlatform, event.platform]
+      .some((provider) => ["test", "powerchat-test"].includes(String(provider || "").trim().toLowerCase()));
+  };
   const newPowerchatBucket = () => ({ event_count: 0, money: {}, money_counts: {}, units: {} });
   const addPowerchatEvent = (bucket, event) => {
     bucket.event_count += 1;
@@ -559,6 +564,8 @@
     return true;
   };
   const aggregatePowerchat = (events, sourceStats) => {
+    const countedEvents = events.filter((event) => !isPowerchatTestEvent(event));
+    const testEventCount = events.length - countedEvents.length;
     const durations = new Map((sourceStats.stream_totals || []).map((row) => [row.video_id, Number(row.duration_seconds || 0)]));
     const total = newPowerchatBucket();
     const donors = new Map();
@@ -567,6 +574,13 @@
     const streamers = new Map();
     let withoutOffset = 0;
     events.forEach((event) => {
+      const streamerName = event.streamer || "Unknown streamer";
+      if (!streamers.has(streamerName)) streamers.set(streamerName, { streamer: streamerName, bucket: newPowerchatBucket(), donors: new Map(), hours: new Map(), streams: new Map(), without_offset: 0, recorded_event_count: 0, test_event_count: 0 });
+      const streamer = streamers.get(streamerName);
+      streamer.recorded_event_count += 1;
+      if (isPowerchatTestEvent(event)) streamer.test_event_count += 1;
+    });
+    countedEvents.forEach((event) => {
       addPowerchatEvent(total, event);
       addPowerchatDonor(donors, event);
       if (!addPowerchatHour(hours, event)) withoutOffset += 1;
@@ -574,7 +588,6 @@
       if (!streams.has(streamKey)) streams.set(streamKey, { streamer: event.streamer || "", video_id: event.video_id || "", title: event.stream_title || "-", duration_seconds: durations.get(event.video_id) || 0, bucket: newPowerchatBucket() });
       addPowerchatEvent(streams.get(streamKey).bucket, event);
       const streamerName = event.streamer || "Unknown streamer";
-      if (!streamers.has(streamerName)) streamers.set(streamerName, { streamer: streamerName, bucket: newPowerchatBucket(), donors: new Map(), hours: new Map(), streams: new Map(), without_offset: 0 });
       const streamer = streamers.get(streamerName);
       addPowerchatEvent(streamer.bucket, event);
       addPowerchatDonor(streamer.donors, event);
@@ -600,6 +613,8 @@
       return {
         streamer: row.streamer,
         event_count: row.bucket.event_count,
+        recorded_event_count: row.recorded_event_count,
+        test_event_count: row.test_event_count,
         stream_count: childStreams.length,
         duration_seconds: childDuration,
         events_without_offset: row.without_offset,
@@ -613,7 +628,9 @@
       };
     }).sort((a, b) => b.sort_amount - a.sort_amount || b.event_count - a.event_count || a.streamer.localeCompare(b.streamer));
     return {
-      event_count: events.length,
+      event_count: countedEvents.length,
+      recorded_event_count: events.length,
+      test_event_count: testEventCount,
       streams_with_powerchat: streamRows.length,
       events_without_offset: withoutOffset,
       money_totals: powerchatMoney(total),
@@ -662,6 +679,7 @@
       ["Total", powerchatSummary(stats.money_totals, stats.unit_totals) || "-"],
       ["Per hour", powerchatRates(stats.money_rates) || "-"],
       ["Events", String(stats.event_count || 0)],
+      ["Tests excluded", String(stats.test_event_count || 0)],
       [streamer ? "Streams" : "Top donor", streamer ? String(stats.stream_count || 0) : donor],
       [streamer ? "Top donor" : "Streams", streamer ? donor : String(stats.streams_with_powerchat || 0)],
       ["No offset", String(stats.events_without_offset || 0)],
@@ -672,7 +690,7 @@
   const renderPowerchatStreams = (rows = []) => rows.length ? rows.slice(0, 50).map((row) => `<tr><td>${escapeHtml(row.streamer || "-")}</td><td class="file-name">${escapeHtml(row.title || row.video_id || "-")}</td><td>${row.event_count || 0}</td><td>${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</td><td>${escapeHtml(powerchatDuration(row.duration_seconds))}</td><td>${escapeHtml(powerchatRates(row.money_rates) || "-")}</td></tr>`).join("") : '<tr><td colspan="6" class="file-meta">No streams with Powerchat events yet</td></tr>';
   const renderPowerchatDonors = (rows = []) => rows.length ? rows.slice(0, 25).map((row) => `<tr><td>${escapeHtml(row.donor || "Unknown donor")}</td><td>${row.event_count || 0}</td><td>${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</td><td>${escapeHtml(powerchatDateTime(row.latest_received_at))}</td></tr>`).join("") : '<tr><td colspan="4" class="file-meta">No Powerchat donors yet</td></tr>';
   const powerchatAmount = (event) => event.kind === "money" && event.money_currency ? `${String(event.money_currency).toUpperCase()} ${powerchatNumber(event.money_amount, 2)}` : event.kind === "unit" && event.unit ? `${event.platform ? `${event.platform}: ` : ""}${powerchatNumber(event.unit_amount)} ${event.unit}` : "-";
-  const renderPowerchatLedger = (events = []) => events.length ? events.map((event) => `<tr><td>${escapeHtml(event.offset_seconds == null ? powerchatDateTime(event.received_at) : powerchatDuration(event.offset_seconds))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatAmount(event))}</td><td>${escapeHtml(event.platform || "Powerchat")}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("") : '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>';
+  const renderPowerchatLedger = (events = []) => events.length ? events.map((event) => `<tr><td>${escapeHtml(event.offset_seconds == null ? powerchatDateTime(event.received_at) : powerchatDuration(event.offset_seconds))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatAmount(event))}</td><td>${escapeHtml(isPowerchatTestEvent(event) ? "Test (not counted)" : event.platform || "Powerchat")}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("") : '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>';
   const renderPowerchatStreamers = (rows = []) => rows.length ? rows.map((row, index) => `<details class="powerchat-streamer-card"${index === 0 ? " open" : ""}><summary><strong>${escapeHtml(row.streamer)}</strong><span>Total: ${escapeHtml(powerchatSummary(row.money_totals, row.unit_totals) || "-")}</span><span>Rate: ${escapeHtml(powerchatRates(row.money_rates) || "-")}</span><span>${row.stream_count || 0} streams</span><span>${row.event_count || 0} events</span></summary><div class="powerchat-streamer-card-body"><div class="powerchat-export-actions"><a class="download action-button" href="${escapeHtml(powerchatExportUrl("json", { streamer: row.streamer }))}">Download JSON</a><a class="download action-button" href="${escapeHtml(powerchatExportUrl("csv", { streamer: row.streamer }))}">Download CSV</a></div><div class="powerchat-summary-grid">${renderPowerchatSummaryCards(row, true)}</div><div class="powerchat-dashboard-section"><h4>Donations Per Hour</h4><div class="table-wrap"><table><thead><tr><th>Stream Hour</th><th>Events</th><th>Total</th><th>Average</th></tr></thead><tbody>${renderPowerchatHours(row.hourly_totals)}</tbody></table></div></div><div class="powerchat-dashboard-section"><h4>Streams</h4><div class="table-wrap"><table><thead><tr><th>Streamer</th><th>Stream</th><th>Events</th><th>Total</th><th>Duration</th><th>Per hour</th></tr></thead><tbody>${renderPowerchatStreams(row.stream_totals)}</tbody></table></div></div><div class="powerchat-dashboard-section"><h4>Top Donors</h4><div class="table-wrap"><table><thead><tr><th>Donor</th><th>Events</th><th>Total</th><th>Latest</th></tr></thead><tbody>${renderPowerchatDonors(row.top_donors)}</tbody></table></div></div></div></details>`).join("") : '<div class="file-meta">No streamers with Powerchat events yet.</div>';
   const renderPowerchatDashboard = () => {
     if (!document.getElementById("powerchat-dashboard")) return;

@@ -117,6 +117,7 @@ from .models import LiveStream
 from .powerchat import (
     POWERCHAT_EVENT_SUFFIX,
     is_powerchat_event_file,
+    is_powerchat_test_event,
     load_powerchat_sidecar,
     powerchat_totals,
 )
@@ -600,6 +601,7 @@ class PowerchatEventStatus:
     money_currency: str
     unit_amount: float | None
     unit: str
+    is_test: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -645,6 +647,8 @@ class StreamStatus:
     recoverable_segments: list[int] = field(default_factory=list)
     diagnostic_file_count: int = 0
     file_size_totals_complete: bool = True
+    powerchat_recorded_event_count: int = 0
+    powerchat_test_event_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -3494,6 +3498,8 @@ def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str,
             {
                 "streamer": streamer.name,
                 "event_count": 0,
+                "recorded_event_count": 0,
+                "test_event_count": 0,
                 "stream_count": 0,
                 "duration_seconds": 0.0,
                 "accumulator": new_powerchat_accumulator(),
@@ -3511,16 +3517,28 @@ def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str,
             if not events:
                 continue
 
+            counted_events = [event for event in events if not event.is_test]
+            test_event_count = len(events) - len(counted_events)
+            streamer_acc["recorded_event_count"] += len(events)
+            streamer_acc["test_event_count"] += test_event_count
+
+            for event in events:
+                event_rows.append(
+                    powerchat_dashboard_event_row(streamer.name, stream, event)
+                )
+
+            if not counted_events:
+                continue
+
             streams_with_powerchat += 1
-            stream_duration = powerchat_stream_duration_seconds(stream, events)
+            stream_duration = powerchat_stream_duration_seconds(stream, counted_events)
             duration_seconds += stream_duration
             streamer_acc["stream_count"] += 1
             streamer_acc["duration_seconds"] += stream_duration
 
             stream_acc = new_powerchat_accumulator()
-            for event in events:
+            for event in counted_events:
                 row = powerchat_dashboard_event_row(streamer.name, stream, event)
-                event_rows.append(row)
                 add_powerchat_event_to_accumulator(totals, event)
                 add_powerchat_event_to_accumulator(streamer_acc["accumulator"], event)
                 add_powerchat_event_to_accumulator(stream_acc, event)
@@ -3584,13 +3602,15 @@ def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str,
                 streamer_hour["event_count"] += 1
                 add_powerchat_event_to_accumulator(streamer_hour["accumulator"], event)
 
-            streamer_acc["event_count"] += len(events)
+            streamer_acc["event_count"] += len(counted_events)
             stream_row = finalize_powerchat_stream_row(
                 streamer.name,
                 stream,
                 stream_acc,
-                len(events),
+                len(counted_events),
                 stream_duration,
+                recorded_event_count=len(events),
+                test_event_count=test_event_count,
             )
             stream_rows.append(stream_row)
             streamer_acc["stream_rows"].append(stream_row)
@@ -3600,13 +3620,15 @@ def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str,
     streamer_dashboards = [
         finalize_powerchat_streamer_dashboard(item)
         for item in streamers.values()
-        if item["event_count"]
+        if item["recorded_event_count"]
     ]
     hour_rows = [finalize_powerchat_hour_row(item) for item in hours.values()]
     event_rows.sort(key=powerchat_event_row_sort_key, reverse=True)
 
     return {
         "event_count": totals["event_count"],
+        "recorded_event_count": len(event_rows),
+        "test_event_count": sum(row["is_test"] for row in event_rows),
         "streams_with_powerchat": streams_with_powerchat,
         "duration_seconds": round(duration_seconds, 3),
         "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
@@ -3625,16 +3647,19 @@ def build_powerchat_stats(streamer_stats: list[StreamerStatStatus]) -> dict[str,
 
 def build_stream_powerchat_stats(stream: StreamStatus, streamer_name: str = "") -> dict[str, Any]:
     events = list(stream.powerchat_events)
+    counted_events = [event for event in events if not event.is_test]
     totals = new_powerchat_accumulator()
     donors: dict[str, dict[str, Any]] = {}
     hours: dict[int, dict[str, Any]] = {}
     event_rows: list[dict[str, Any]] = []
     events_without_offset = 0
-    duration_seconds = powerchat_stream_duration_seconds(stream, events)
+    duration_seconds = powerchat_stream_duration_seconds(stream, counted_events)
 
     for event in events:
         row = powerchat_dashboard_event_row(streamer_name or stream.channel, stream, event)
         event_rows.append(row)
+        if event.is_test:
+            continue
         add_powerchat_event_to_accumulator(totals, event)
 
         donor_name = event.donor or "Unknown donor"
@@ -3672,6 +3697,8 @@ def build_stream_powerchat_stats(stream: StreamStatus, streamer_name: str = "") 
     event_rows.sort(key=powerchat_event_row_sort_key, reverse=True)
     return {
         "event_count": totals["event_count"],
+        "recorded_event_count": len(events),
+        "test_event_count": len(events) - len(counted_events),
         "duration_seconds": round(duration_seconds, 3),
         "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
         "events_without_offset": events_without_offset,
@@ -3697,10 +3724,13 @@ def build_powerchat_export_payload(
     stats = snapshot.powerchat_stats or {}
     events = filter_powerchat_export_events(stats.get("events", []), filters)
     totals = powerchat_export_totals(events)
+    test_event_count = sum(powerchat_export_event_is_test(event) for event in events)
     return {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         "filters": filters,
-        "event_count": len(events),
+        "event_count": len(events) - test_event_count,
+        "recorded_event_count": len(events),
+        "test_event_count": test_event_count,
         "money_totals": totals["money"],
         "unit_totals": totals["units"],
         "events": events,
@@ -3759,6 +3789,8 @@ def powerchat_export_totals(events: list[dict[str, Any]]) -> dict[str, list[dict
     money: dict[str, float] = {}
     units: dict[tuple[str, str], float] = {}
     for event in events:
+        if powerchat_export_event_is_test(event):
+            continue
         if event.get("kind") == "money" and event.get("money_amount") is not None and event.get("money_currency"):
             currency = str(event.get("money_currency") or "").upper()
             money[currency] = money.get(currency, 0.0) + float(event.get("money_amount") or 0.0)
@@ -3777,6 +3809,10 @@ def powerchat_export_totals(events: list[dict[str, Any]]) -> dict[str, list[dict
     }
 
 
+def powerchat_export_event_is_test(event: dict[str, Any]) -> bool:
+    return is_powerchat_test_event(event)
+
+
 POWERCHAT_EXPORT_COLUMNS = [
     "received_at",
     "offset_seconds",
@@ -3791,6 +3827,7 @@ POWERCHAT_EXPORT_COLUMNS = [
     "unit_amount",
     "unit",
     "platform",
+    "is_test",
     "source",
     "message",
 ]
@@ -3847,6 +3884,8 @@ def add_powerchat_event_to_accumulator(
     accumulator: dict[str, Any],
     event: PowerchatEventStatus,
 ) -> None:
+    if event.is_test:
+        return
     accumulator["event_count"] = int(accumulator.get("event_count") or 0) + 1
     if event.kind == "money" and event.money_amount is not None and event.money_currency:
         currency = event.money_currency.upper()
@@ -3950,6 +3989,7 @@ def powerchat_dashboard_event_row(
         "money_currency": event.money_currency,
         "unit_amount": event.unit_amount,
         "unit": event.unit,
+        "is_test": event.is_test,
     }
 
 
@@ -3971,6 +4011,9 @@ def finalize_powerchat_stream_row(
     accumulator: dict[str, Any],
     event_count: int,
     duration_seconds: float,
+    *,
+    recorded_event_count: int | None = None,
+    test_event_count: int = 0,
 ) -> dict[str, Any]:
     return {
         "streamer": streamer_name,
@@ -3981,6 +4024,10 @@ def finalize_powerchat_stream_row(
         "url": stream.url,
         "status": stream.status,
         "event_count": event_count,
+        "recorded_event_count": (
+            event_count if recorded_event_count is None else recorded_event_count
+        ),
+        "test_event_count": test_event_count,
         "duration_seconds": round(duration_seconds, 3),
         "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
         "money_totals": powerchat_accumulator_money_totals(accumulator),
@@ -3996,6 +4043,8 @@ def finalize_powerchat_streamer_row(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "streamer": item["streamer"],
         "event_count": item["event_count"],
+        "recorded_event_count": item.get("recorded_event_count", item["event_count"]),
+        "test_event_count": item.get("test_event_count", 0),
         "stream_count": item["stream_count"],
         "duration_seconds": round(duration_seconds, 3),
         "duration_hours": round(duration_seconds / 3600, 3) if duration_seconds > 0 else 0.0,
@@ -4378,7 +4427,7 @@ def powerchat_status_for_directory(
     if not directory.is_dir():
         return [], [], []
     rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
+    seen: dict[str, dict[str, Any]] = {}
     for sidecar in sorted(directory.glob(f"*{POWERCHAT_EVENT_SUFFIX}")):
         payload = load_powerchat_sidecar(sidecar)
         for event in payload.get("events", []):
@@ -4389,9 +4438,12 @@ def powerchat_status_for_directory(
                 key = hashlib.sha1(
                     json.dumps(event, sort_keys=True, default=str).encode("utf-8")
                 ).hexdigest()
-            if key in seen:
+            existing = seen.get(key)
+            if existing is not None:
+                if is_powerchat_test_event(event):
+                    existing["is_test"] = True
                 continue
-            seen.add(key)
+            seen[key] = event
             rows.append(event)
     rows.sort(
         key=lambda event: (
@@ -4433,6 +4485,7 @@ def powerchat_event_status(event: dict[str, Any]) -> PowerchatEventStatus:
             else None
         ),
         unit=str(event.get("unit") or ""),
+        is_test=is_powerchat_test_event(event),
     )
 
 
@@ -4577,7 +4630,7 @@ def stream_status_from_record(
         events=[stream_event_status(event) for event in event_records or []],
         content_event_count=len(content_events),
         content_events=content_events,
-        powerchat_event_count=len(powerchat_events),
+        powerchat_event_count=sum(not event.is_test for event in powerchat_events),
         powerchat_money_totals=powerchat_money_totals,
         powerchat_unit_totals=powerchat_unit_totals,
         powerchat_events=powerchat_events,
@@ -4586,6 +4639,8 @@ def stream_status_from_record(
         recoverable_segments=recoverable_segments,
         diagnostic_file_count=file_summary.diagnostic_file_count,
         file_size_totals_complete=file_summary.file_size_totals_complete,
+        powerchat_recorded_event_count=len(powerchat_events),
+        powerchat_test_event_count=sum(event.is_test for event in powerchat_events),
     )
     log_perf(
         "stream-status",
@@ -10231,7 +10286,7 @@ def render_streamer_powerchat_events(
         f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
         f'<td>{escape(str(row.get("donor") or "Unknown supporter"))}</td>'
         f'<td>{escape(powerchat_dashboard_event_amount_text(row) or "-")}</td>'
-        f'<td>{escape(str(row.get("platform") or "Powerchat"))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_platform_text(row))}</td>'
         f'<td class="log-message">{escape(str(row.get("message") or "-"))}</td>'
         "</tr>"
         for row in rows
@@ -13258,6 +13313,15 @@ def dashboard_script() -> str:
     }
     return "";
   };
+  const powerchatEventIsTest = (event) => {
+    const marker = event && event.is_test;
+    if (marker === true || ["1", "true", "yes"].includes(String(marker || "").trim().toLowerCase())) return true;
+    return ["test", "powerchat-test"].includes(String((event && event.platform) || "").trim().toLowerCase());
+  };
+  const powerchatEventPlatformText = (event) => {
+    const platform = String((event && event.platform) || "Powerchat");
+    return powerchatEventIsTest(event) ? "Test (not counted)" : platform;
+  };
 
   const renderPowerchatEvents = (stream) => {
     const events = (stream && stream.powerchat_events) || [];
@@ -13293,6 +13357,7 @@ def dashboard_script() -> str:
 
   const newPowerchatAccumulator = () => ({ event_count: 0, money: {}, money_event_counts: {}, units: {} });
   const addPowerchatEventToAccumulator = (accumulator, event) => {
+    if (powerchatEventIsTest(event)) return;
     accumulator.event_count += 1;
     if (event.kind === "money" && event.money_amount !== null && event.money_amount !== undefined && event.money_currency) {
       const currency = String(event.money_currency || "").toUpperCase();
@@ -13371,11 +13436,13 @@ def dashboard_script() -> str:
       ["Duration", formatDuration(stats.duration_seconds || 0)],
       ["Top donor", topDonor || "-"],
       ["No offset", String(stats.events_without_offset || 0)],
+      ["Tests excluded", String(stats.test_event_count || 0)],
     ];
     return cards.map(([label, value]) => `<div class="powerchat-summary-card"><strong>${escapeHtml(value)}</strong><span class="muted">${escapeHtml(label)}</span></div>`).join("");
   };
   const buildStreamPowerchatStats = (stream) => {
     const events = (stream && stream.powerchat_events) || [];
+    const countedEvents = events.filter((event) => !powerchatEventIsTest(event));
     const totals = newPowerchatAccumulator();
     const donors = new Map();
     const hours = new Map();
@@ -13403,7 +13470,9 @@ def dashboard_script() -> str:
         money_currency: event.money_currency || "",
         unit_amount: event.unit_amount,
         unit: event.unit || "",
+        is_test: powerchatEventIsTest(event),
       });
+      if (powerchatEventIsTest(event)) return;
       addPowerchatEventToAccumulator(totals, event);
       const donorName = event.donor || "Unknown donor";
       if (!donors.has(donorName)) donors.set(donorName, { donor: donorName, event_count: 0, latest_received_at: "", accumulator: newPowerchatAccumulator() });
@@ -13420,7 +13489,7 @@ def dashboard_script() -> str:
       hour.event_count += 1;
       addPowerchatEventToAccumulator(hour.accumulator, event);
     });
-    const durationSeconds = streamPowerchatDurationSeconds(stream, events);
+    const durationSeconds = streamPowerchatDurationSeconds(stream, countedEvents);
     const donorRows = [...donors.values()].map((donor) => ({
       donor: donor.donor,
       event_count: donor.event_count,
@@ -13440,6 +13509,8 @@ def dashboard_script() -> str:
     }));
     return {
       event_count: totals.event_count,
+      recorded_event_count: events.length,
+      test_event_count: events.length - countedEvents.length,
       duration_seconds: durationSeconds,
       duration_hours: durationSeconds > 0 ? Math.round((durationSeconds / 3600) * 1000) / 1000 : 0,
       events_without_offset: eventsWithoutOffset,
@@ -13501,6 +13572,8 @@ def dashboard_script() -> str:
         streamers.set(streamerName, {
           streamer: streamerName,
           event_count: 0,
+          recorded_event_count: 0,
+          test_event_count: 0,
           events_without_offset: 0,
           accumulator: newPowerchatAccumulator(),
           donors: new Map(),
@@ -13509,6 +13582,11 @@ def dashboard_script() -> str:
         });
       }
       const streamer = streamers.get(streamerName);
+      streamer.recorded_event_count += 1;
+      if (powerchatEventIsTest(event)) {
+        streamer.test_event_count += 1;
+        return;
+      }
       streamer.event_count += 1;
       addPowerchatEventToAccumulator(streamer.accumulator, event);
 
@@ -13577,6 +13655,8 @@ def dashboard_script() -> str:
       return {
         streamer: streamer.streamer,
         event_count: streamer.event_count,
+        recorded_event_count: streamer.recorded_event_count,
+        test_event_count: streamer.test_event_count,
         stream_count: streamRows.length,
         duration_seconds: durationSeconds,
         duration_hours: durationSeconds > 0 ? Math.round((durationSeconds / 3600) * 1000) / 1000 : 0,
@@ -13592,13 +13672,14 @@ def dashboard_script() -> str:
     }).sort((a, b) => (Number(b.sort_amount || 0) - Number(a.sort_amount || 0)) || (Number(b.event_count || 0) - Number(a.event_count || 0)) || String(a.streamer || "").localeCompare(String(b.streamer || "")));
   };
   const aggregatePowerchatEvents = (events, stats) => {
+    const countedEvents = events.filter((event) => !powerchatEventIsTest(event));
     const totals = newPowerchatAccumulator();
     const donors = new Map();
     const streams = new Map();
     const hours = new Map();
     const streamDurations = new Map((stats.stream_totals || []).map((stream) => [stream.video_id, Number(stream.duration_seconds || 0)]));
     let eventsWithoutOffset = 0;
-    events.forEach((event) => {
+    countedEvents.forEach((event) => {
       addPowerchatEventToAccumulator(totals, event);
       const donorName = event.donor || "Unknown donor";
       if (!donors.has(donorName)) donors.set(donorName, { donor: donorName, event_count: 0, latest_received_at: "", accumulator: newPowerchatAccumulator() });
@@ -13624,7 +13705,9 @@ def dashboard_script() -> str:
     const durationSeconds = [...streams.values()].reduce((total, stream) => total + Number(stream.duration_seconds || 0), 0);
     const streamerDashboards = buildPowerchatStreamerDashboards(events, streamDurations);
     return {
-      event_count: events.length,
+      event_count: countedEvents.length,
+      recorded_event_count: events.length,
+      test_event_count: events.length - countedEvents.length,
       streams_with_powerchat: streams.size,
       duration_seconds: durationSeconds,
       events_without_offset: eventsWithoutOffset,
@@ -13632,7 +13715,7 @@ def dashboard_script() -> str:
       unit_totals: powerchatUnitTotalsFromAccumulator(totals),
       money_rates: powerchatRatesFromAccumulator(totals, durationSeconds),
       top_donors: [...donors.values()].map((donor) => ({ donor: donor.donor, event_count: donor.event_count, latest_received_at: donor.latest_received_at, money_totals: powerchatMoneyTotalsFromAccumulator(donor.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(donor.accumulator), sort_amount: powerchatSortAmount(donor.accumulator) })).sort((a, b) => (b.sort_amount - a.sort_amount) || (b.event_count - a.event_count)).slice(0, 25),
-      streamer_totals: streamerDashboards.map((streamer) => ({ streamer: streamer.streamer, event_count: streamer.event_count, stream_count: streamer.stream_count, duration_seconds: streamer.duration_seconds, duration_hours: streamer.duration_hours, money_totals: streamer.money_totals, unit_totals: streamer.unit_totals, money_rates: streamer.money_rates, sort_amount: streamer.sort_amount })),
+      streamer_totals: streamerDashboards.map((streamer) => ({ streamer: streamer.streamer, event_count: streamer.event_count, recorded_event_count: streamer.recorded_event_count, test_event_count: streamer.test_event_count, stream_count: streamer.stream_count, duration_seconds: streamer.duration_seconds, duration_hours: streamer.duration_hours, money_totals: streamer.money_totals, unit_totals: streamer.unit_totals, money_rates: streamer.money_rates, sort_amount: streamer.sort_amount })),
       streamer_dashboards: streamerDashboards,
       stream_totals: [...streams.values()].map((stream) => ({ streamer: stream.streamer, video_id: stream.video_id, title: stream.title, event_count: stream.event_count, duration_seconds: stream.duration_seconds, money_totals: powerchatMoneyTotalsFromAccumulator(stream.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(stream.accumulator), money_rates: powerchatRatesFromAccumulator(stream.accumulator, stream.duration_seconds), sort_amount: powerchatSortAmount(stream.accumulator) })).sort((a, b) => (b.sort_amount - a.sort_amount) || (b.event_count - a.event_count)),
       hourly_totals: [...hours.values()].map((hour) => ({ hour_index: hour.hour_index, hour_label: hour.hour_label, event_count: hour.event_count, money_totals: powerchatMoneyTotalsFromAccumulator(hour.accumulator), unit_totals: powerchatUnitTotalsFromAccumulator(hour.accumulator), average_money: powerchatAveragesFromAccumulator(hour.accumulator) })).sort((a, b) => a.hour_index - b.hour_index),
@@ -13647,6 +13730,7 @@ def dashboard_script() -> str:
       ["Top donor", topDonor ? topDonor.donor : "-"],
       ["Streams", String(stats.streams_with_powerchat || 0)],
       ["No offset", String(stats.events_without_offset || 0)],
+      ["Tests excluded", String(stats.test_event_count || 0)],
     ];
     return cards.map(([label, value]) => `<div class="powerchat-summary-card"><strong>${escapeHtml(value)}</strong><span class="muted">${escapeHtml(label)}</span></div>`).join("");
   };
@@ -13659,6 +13743,7 @@ def dashboard_script() -> str:
       ["Streams", String(stats.stream_count || 0)],
       ["Top donor", topDonor ? topDonor.donor : "-"],
       ["No offset", String(stats.events_without_offset || 0)],
+      ["Tests excluded", String(stats.test_event_count || 0)],
     ];
     return cards.map(([label, value]) => `<div class="powerchat-summary-card"><strong>${escapeHtml(value)}</strong><span class="muted">${escapeHtml(label)}</span></div>`).join("");
   };
@@ -13713,7 +13798,7 @@ def dashboard_script() -> str:
   };
   const renderPowerchatLedgerRows = (events) => {
     if (!events || !events.length) return '<tr><td colspan="7" class="file-meta">No Powerchat events captured yet</td></tr>';
-    return events.map((event) => `<tr><td>${escapeHtml(powerchatEventTime(event))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatEventAmountText(event) || "-")}</td><td>${escapeHtml(event.platform || "Powerchat")}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("");
+    return events.map((event) => `<tr><td>${escapeHtml(powerchatEventTime(event))}</td><td>${escapeHtml(event.streamer || "-")}</td><td class="file-name">${escapeHtml(event.stream_title || event.video_id || "-")}</td><td>${escapeHtml(event.donor || "Unknown donor")}</td><td>${escapeHtml(powerchatEventAmountText(event) || "-")}</td><td>${escapeHtml(powerchatEventPlatformText(event))}</td><td class="log-message">${escapeHtml(event.message || "-")}</td></tr>`).join("");
   };
   const renderPowerchatDashboard = (stats) => {
     stats = stats || { events: [] };
@@ -16582,6 +16667,7 @@ def render_powerchat_summary_cards(stats: dict[str, Any]) -> str:
         ("Top donor", str(top_donor or "-")),
         ("Streams", str(stats.get("streams_with_powerchat") or 0)),
         ("No offset", str(stats.get("events_without_offset") or 0)),
+        ("Tests excluded", str(stats.get("test_event_count") or 0)),
     ]
     return "".join(
         f'<div class="powerchat-summary-card"><strong>{escape(value)}</strong><span class="muted">{escape(label)}</span></div>'
@@ -16641,6 +16727,7 @@ def render_powerchat_streamer_summary_cards(stats: dict[str, Any]) -> str:
         ("Streams", str(stats.get("stream_count") or 0)),
         ("Top donor", str(top_donor or "-")),
         ("No offset", str(stats.get("events_without_offset") or 0)),
+        ("Tests excluded", str(stats.get("test_event_count") or 0)),
     ]
     return "".join(
         f'<div class="powerchat-summary-card"><strong>{escape(value)}</strong><span class="muted">{escape(label)}</span></div>'
@@ -16728,7 +16815,7 @@ def render_powerchat_ledger_rows(
         f'<td class="file-name">{escape(str(row.get("stream_title") or row.get("video_id") or "-"))}</td>'
         f'<td>{escape(str(row.get("donor") or "Unknown donor"))}</td>'
         f'<td>{escape(powerchat_dashboard_event_amount_text(row) or "-")}</td>'
-        f'<td>{escape(str(row.get("platform") or "Powerchat"))}</td>'
+        f'<td>{escape(powerchat_dashboard_event_platform_text(row))}</td>'
         f'<td class="log-message">{escape(str(row.get("message") or "-"))}</td>'
         "</tr>"
         for row in rows
@@ -16765,6 +16852,13 @@ def powerchat_dashboard_event_amount_text(row: dict[str, Any]) -> str:
     return ""
 
 
+def powerchat_dashboard_event_platform_text(row: dict[str, Any]) -> str:
+    platform = str(row.get("platform") or "Powerchat")
+    if powerchat_export_event_is_test(row):
+        return "Test (not counted)"
+    return platform
+
+
 def format_powerchat_rates(rates: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for rate in rates:
@@ -16785,6 +16879,7 @@ def render_stream_powerchat_summary_cards(stats: dict[str, Any]) -> str:
         ("Duration", format_duration(int(float(stats.get("duration_seconds") or 0)))),
         ("Top donor", str(top_donor or "-")),
         ("No offset", str(stats.get("events_without_offset") or 0)),
+        ("Tests excluded", str(stats.get("test_event_count") or 0)),
     ]
     return "".join(
         f'<div class="powerchat-summary-card"><strong>{escape(value)}</strong><span class="muted">{escape(label)}</span></div>'
@@ -16834,6 +16929,8 @@ def render_powerchat_event(event: PowerchatEventStatus) -> str:
     )
     kind = event.kind if event.kind in {"money", "unit", "unknown"} else "unknown"
     platform = event.platform or "Powerchat"
+    if event.is_test:
+        platform = "Test (not counted)"
     donor = event.donor or "Unknown donor"
     message = event.message or "-"
     meta = " / ".join(part for part in [event.source, platform, event.kind] if part)

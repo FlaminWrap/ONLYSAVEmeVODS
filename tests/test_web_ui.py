@@ -647,10 +647,20 @@ class DashboardUiTests(unittest.TestCase):
             config = load_config(config_path)
 
             html = render_admin_page(config, "powerchat", {})
+            script = (
+                Path(__file__).parents[1]
+                / "src"
+                / "onlysavemevods"
+                / "assets"
+                / "dashboard.js"
+            ).read_text(encoding="utf-8")
 
         self.assertIn('/assets/dashboard.js', html)
         self.assertIn('id="powerchat-stats-json"', html)
         self.assertNotIn('const tabKey = "onlysavemevods.dashboardTab"', html)
+        self.assertIn("isPowerchatTestEvent", script)
+        self.assertIn("Tests excluded", script)
+        self.assertIn("Test (not counted)", script)
 
     def test_streamer_history_is_paginated_in_the_new_dashboard(self) -> None:
         with TemporaryDirectory() as temp_dir:

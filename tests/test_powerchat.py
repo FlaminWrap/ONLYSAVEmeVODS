@@ -8,6 +8,7 @@ from onlysavemevods.powerchat import (
     copy_powerchat_segment_sidecar,
     handle_powerchat_socket_message,
     load_powerchat_sidecar,
+    merge_powerchat_events,
     normalize_powerchat_payload,
     powerchat_totals,
     powerchat_ws_url,
@@ -65,6 +66,88 @@ class PowerchatTests(unittest.TestCase):
             "money": [{"currency": "USD", "amount": 5.5}],
             "units": [],
         })
+
+    def test_test_payment_platforms_are_recorded_but_not_counted(self) -> None:
+        for payment_platform in ("test", " TEST ", "powerchat-test", "POWERCHAT-TEST"):
+            with self.subTest(payment_platform=payment_platform):
+                event = normalize_powerchat_payload(
+                    {
+                        "messageId": f"test-{payment_platform.strip().lower()}",
+                        "message": "Test donation alert",
+                        "donator": "Test User",
+                        "amount": 50,
+                        "currency": "gbp",
+                        "paymentPlatform": payment_platform,
+                    },
+                    source="feed",
+                    received_at="2026-07-05T10:01:00+00:00",
+                )
+
+                assert event is not None
+                self.assertEqual(event["kind"], "money")
+                self.assertEqual(event["money_amount"], 50.0)
+                self.assertEqual(event["money_currency"], "GBP")
+                self.assertTrue(event["is_test"])
+                self.assertEqual(
+                    powerchat_totals([event]),
+                    {"money": [], "units": []},
+                )
+
+    def test_test_like_payload_fields_do_not_exclude_real_donations(self) -> None:
+        cases = [
+            (
+                "test text and amount",
+                {
+                    "message": "This is a test of the alerts",
+                    "donator": "Test User",
+                    "amount": 50,
+                    "currency": "USD",
+                    "paymentPlatform": "Powerchat",
+                },
+                "feed",
+            ),
+            (
+                "replay flag",
+                {
+                    "message": "Replayed real donation",
+                    "donator": "Alice",
+                    "amount": 50,
+                    "currency": "USD",
+                    "paymentPlatform": "square",
+                    "isReplay": True,
+                },
+                "feed",
+            ),
+            (
+                "tts transport",
+                {
+                    "message": "Real TTS donation",
+                    "donator": "Bob",
+                    "amount": 50,
+                    "currency": "USD",
+                    "paymentPlatform": "paypal",
+                },
+                "tts",
+            ),
+        ]
+
+        for label, payload, source in cases:
+            with self.subTest(label=label):
+                event = normalize_powerchat_payload(
+                    payload,
+                    source=source,
+                    received_at="2026-07-05T10:01:00+00:00",
+                )
+
+                assert event is not None
+                self.assertFalse(event["is_test"])
+                self.assertEqual(
+                    powerchat_totals([event]),
+                    {
+                        "money": [{"currency": "USD", "amount": 50.0}],
+                        "units": [],
+                    },
+                )
 
     def test_powerchat_paypal_payload_without_currency_defaults_to_usd(self) -> None:
         event = normalize_powerchat_payload(
@@ -168,6 +251,112 @@ class PowerchatTests(unittest.TestCase):
         self.assertEqual(payload["events"][1]["platform"], "PayPal")
         self.assertEqual(payload["events"][0]["offset_seconds"], 113.0)
 
+    def test_sidecar_records_test_events_but_excludes_them_from_totals(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "stream.powerchat-events.json"
+            real_event = normalize_powerchat_payload(
+                {
+                    "messageId": "real-1",
+                    "message": "Real donation",
+                    "donator": "Alice",
+                    "amount": "5.50",
+                    "currency": "usd",
+                    "paymentPlatform": "square",
+                },
+                source="feed",
+                received_at="2026-07-05T10:01:00+00:00",
+            )
+            test_event = normalize_powerchat_payload(
+                {
+                    "messageId": "test-1",
+                    "message": "Test donation",
+                    "donator": "Test User",
+                    "amount": 50,
+                    "currency": "gbp",
+                    "paymentPlatform": "test",
+                },
+                source="feed",
+                received_at="2026-07-05T10:02:00+00:00",
+            )
+            assert real_event is not None and test_event is not None
+
+            write_powerchat_sidecar(
+                sidecar,
+                events=[real_event, test_event],
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+            payload = load_powerchat_sidecar(sidecar)
+
+        self.assertEqual(payload["event_count"], 2)
+        self.assertEqual(payload["counted_event_count"], 1)
+        self.assertEqual(payload["test_event_count"], 1)
+        self.assertEqual(
+            payload["totals"],
+            {
+                "money": [{"currency": "USD", "amount": 5.5}],
+                "units": [],
+            },
+        )
+        self.assertEqual(
+            [event["is_test"] for event in payload["events"]],
+            [False, True],
+        )
+        self.assertEqual(
+            payload["events"][1]["raw"]["paymentPlatform"],
+            "test",
+        )
+
+    def test_load_sidecar_repairs_legacy_test_event_and_stale_totals(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "stream.powerchat-events.json"
+            sidecar.write_text(
+                json.dumps(
+                    {
+                        "event_count": 1,
+                        "totals": {
+                            "money": [{"currency": "USD", "amount": 50.0}],
+                            "units": [],
+                        },
+                        "events": [
+                            {
+                                "id": "legacy-test-1",
+                                "dedupe_key": "id:legacy-test-1",
+                                "kind": "money",
+                                "source": "feed",
+                                "received_at": "2026-07-05T10:01:00+00:00",
+                                "offset_seconds": 60.0,
+                                "donor": "Test User",
+                                "platform": "Powerchat",
+                                "message": "Legacy test alert",
+                                "money_amount": 50.0,
+                                "money_currency": "USD",
+                                "unit_amount": None,
+                                "unit": "",
+                                "raw": {
+                                    "id": "legacy-test-1",
+                                    "message": "Legacy test alert",
+                                    "donator": "Test User",
+                                    "amount": 50,
+                                    "paymentPlatform": "powerchat-test",
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            payload = load_powerchat_sidecar(sidecar)
+
+        self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(payload["counted_event_count"], 0)
+        self.assertEqual(payload["test_event_count"], 1)
+        self.assertEqual(payload["totals"], {"money": [], "units": []})
+        self.assertTrue(payload["events"][0]["is_test"])
+
     def test_recorder_dedupes_feed_and_tts_duplicates(self) -> None:
         with TemporaryDirectory() as tmp:
             sidecar = Path(tmp) / "segment-001.powerchat-events.json"
@@ -260,6 +449,70 @@ class PowerchatTests(unittest.TestCase):
             [event["observed_sources"] for event in payload_on_disk["events"]],
             [["tts", "feed"], ["tts", "feed"]],
         )
+
+    def test_duplicate_test_marker_updates_the_recorded_event(self) -> None:
+        with TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "segment-001.powerchat-events.json"
+            recorder = PowerchatRecorder(
+                sidecar_path=sidecar,
+                streamer_name="OUMB3rd",
+                username="oumb",
+                video_id="kick:oumb",
+                segment_index=1,
+            )
+            base_payload = {
+                "messageId": "shared-event-1",
+                "message": "Test donation",
+                "donator": "Test User",
+                "amount": 50,
+                "currency": "USD",
+            }
+
+            first = recorder.record_payload(
+                {**base_payload, "paymentPlatform": "Powerchat"},
+                source="tts",
+                received_at="2026-07-05T10:01:00+00:00",
+            )
+            duplicate = recorder.record_payload(
+                {**base_payload, "paymentPlatform": "test"},
+                source="feed",
+                received_at="2026-07-05T10:01:01+00:00",
+            )
+            payload = load_powerchat_sidecar(sidecar)
+
+        self.assertTrue(first)
+        self.assertFalse(duplicate)
+        self.assertEqual(payload["event_count"], 1)
+        self.assertEqual(payload["counted_event_count"], 0)
+        self.assertEqual(payload["test_event_count"], 1)
+        self.assertEqual(payload["totals"], {"money": [], "units": []})
+        self.assertTrue(payload["events"][0]["is_test"])
+
+    def test_sidecar_merge_preserves_a_later_test_marker(self) -> None:
+        base_payload = {
+            "messageId": "merged-event-1",
+            "message": "Test donation",
+            "donator": "Test User",
+            "amount": 50,
+            "currency": "USD",
+        }
+        first = normalize_powerchat_payload(
+            {**base_payload, "paymentPlatform": "Powerchat"},
+            source="tts",
+            received_at="2026-07-05T10:01:00+00:00",
+        )
+        second = normalize_powerchat_payload(
+            {**base_payload, "paymentPlatform": "powerchat-test"},
+            source="feed",
+            received_at="2026-07-05T10:01:01+00:00",
+        )
+        assert first is not None and second is not None
+
+        merged = merge_powerchat_events([first], [second])
+
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(merged[0]["is_test"])
+        self.assertEqual(powerchat_totals(merged), {"money": [], "units": []})
 
     def test_socket_message_preserves_unknown_raw_payload(self) -> None:
         with TemporaryDirectory() as tmp:

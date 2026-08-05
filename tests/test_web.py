@@ -1050,9 +1050,22 @@ class WebStatusTests(unittest.TestCase):
                 stream_started_at="2026-07-05T10:00:00+00:00",
             )
             assert event is not None
+            test_event = normalize_powerchat_payload(
+                {
+                    "messageId": "test-donation-1",
+                    "donator": "onlyusemeblade",
+                    "amount": "50",
+                    "currency": "USD",
+                    "paymentPlatform": "Test",
+                },
+                source="feed",
+                received_at="2026-07-05T10:00:45+00:00",
+                stream_started_at="2026-07-05T10:00:00+00:00",
+            )
+            assert test_event is not None
             write_powerchat_sidecar(
                 segment_dir / "Kick Stream [kick_oumb].powerchat-events.json",
-                events=[event],
+                events=[event, test_event],
                 streamer_name="OUMB3rd",
                 username="oumb",
                 video_id="kick:oumb",
@@ -1071,10 +1084,13 @@ class WebStatusTests(unittest.TestCase):
 
         stream_status = snapshot.streams[0]
         self.assertEqual(stream_status.powerchat_event_count, 1)
+        self.assertEqual(stream_status.powerchat_recorded_event_count, 2)
+        self.assertEqual(stream_status.powerchat_test_event_count, 1)
         self.assertEqual(stream_status.powerchat_unit_totals, [
             {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
         ])
         self.assertEqual(stream_status.powerchat_events[0].donor, "KDrizzy69")
+        self.assertTrue(stream_status.powerchat_events[1].is_test)
         self.assertEqual(file_kind("Kick Stream [kick_oumb].powerchat-events.json"), "state")
         self.assertIn("Powerchat", html)
         self.assertIn("stream-powerchat-dashboard", html)
@@ -1082,14 +1098,19 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("<h4>Event Ledger</h4>", html)
         self.assertIn("KDrizzy69", html)
         self.assertIn("Kick: 50 Kicks", html)
+        self.assertIn("Test (not counted)", html)
         self.assertIn("Overall Breakdown", html)
         self.assertIn("Event Ledger", html)
         self.assertIn("/powerchat-events?format=json", html)
         self.assertIn("/powerchat-events?format=csv", html)
         self.assertIn("data-powerchat-export=\"json\"", html)
         self.assertEqual(payload["streams"][0]["powerchat_event_count"], 1)
+        self.assertEqual(payload["streams"][0]["powerchat_recorded_event_count"], 2)
+        self.assertEqual(payload["streams"][0]["powerchat_test_event_count"], 1)
         self.assertEqual(payload["streams"][0]["powerchat_events"][0]["platform"], "Kick")
         self.assertEqual(payload["powerchat_stats"]["event_count"], 1)
+        self.assertEqual(payload["powerchat_stats"]["recorded_event_count"], 2)
+        self.assertEqual(payload["powerchat_stats"]["test_event_count"], 1)
         self.assertEqual(payload["powerchat_stats"]["unit_totals"], [
             {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
         ])
@@ -1099,11 +1120,15 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(payload["powerchat_stats"]["streamer_dashboards"][0]["hourly_totals"][0]["hour_label"], "0:00-0:59")
         self.assertIn("powerchat-streamer-card", html)
         self.assertEqual(export_payload["event_count"], 1)
+        self.assertEqual(export_payload["recorded_event_count"], 2)
+        self.assertEqual(export_payload["test_event_count"], 1)
+        self.assertEqual(export_payload["money_totals"], [])
         self.assertEqual(export_payload["unit_totals"], [
             {"platform": "Kick", "unit": "Kicks", "amount": 50.0}
         ])
-        self.assertIn("received_at,offset_seconds,hour_label,streamer", export_csv)
+        self.assertIn("platform,is_test,source", export_csv)
         self.assertIn("KDrizzy69", export_csv)
+        self.assertIn("onlyusemeblade", export_csv)
 
     def test_powerchat_csv_neutralizes_spreadsheet_formulas(self) -> None:
         exported = powerchat_export_csv(
@@ -1200,9 +1225,25 @@ class WebStatusTests(unittest.TestCase):
                     unit_amount=None,
                     unit="",
                 ),
+                PowerchatEventStatus(
+                    source="feed",
+                    received_at="2026-07-05T11:45:00+00:00",
+                    offset_seconds=6300.0,
+                    kind="money",
+                    donor="onlyusemeblade",
+                    platform="Test",
+                    message="",
+                    money_amount=50.0,
+                    money_currency="USD",
+                    unit_amount=None,
+                    unit="",
+                    is_test=True,
+                ),
             ],
             jobs=[],
             files=[],
+            powerchat_recorded_event_count=4,
+            powerchat_test_event_count=1,
         )
         streamer = StreamerStatStatus(
             name="OUMB3rd",
@@ -1240,6 +1281,8 @@ class WebStatusTests(unittest.TestCase):
         stream_stats = build_stream_powerchat_stats(stream, "OUMB3rd")
 
         self.assertEqual(stats["event_count"], 3)
+        self.assertEqual(stats["recorded_event_count"], 4)
+        self.assertEqual(stats["test_event_count"], 1)
         self.assertEqual(stats["money_totals"], [{"currency": "USD", "amount": 120.0}])
         self.assertEqual(stats["events_without_offset"], 1)
         self.assertEqual(stats["money_rates"], [
@@ -1254,9 +1297,15 @@ class WebStatusTests(unittest.TestCase):
         )
         self.assertEqual(stats["stream_totals"][0]["money_rates"][0]["amount_per_hour"], 60.0)
         self.assertEqual(stats["top_donors"][0]["donor"], "Alice")
+        self.assertNotIn(
+            "onlyusemeblade",
+            [row["donor"] for row in stats["top_donors"]],
+        )
         streamer_dashboard = stats["streamer_dashboards"][0]
         self.assertEqual(streamer_dashboard["streamer"], "OUMB3rd")
         self.assertEqual(streamer_dashboard["event_count"], 3)
+        self.assertEqual(streamer_dashboard["recorded_event_count"], 4)
+        self.assertEqual(streamer_dashboard["test_event_count"], 1)
         self.assertEqual(streamer_dashboard["events_without_offset"], 1)
         self.assertEqual(streamer_dashboard["money_rates"][0]["amount_per_hour"], 60.0)
         self.assertEqual(
@@ -1267,6 +1316,8 @@ class WebStatusTests(unittest.TestCase):
             ],
         )
         self.assertEqual(stream_stats["event_count"], 3)
+        self.assertEqual(stream_stats["recorded_event_count"], 4)
+        self.assertEqual(stream_stats["test_event_count"], 1)
         self.assertEqual(stream_stats["events_without_offset"], 1)
         self.assertEqual(stream_stats["money_rates"], [
             {"currency": "USD", "amount": 120.0, "duration_hours": 2.0, "amount_per_hour": 60.0}
@@ -1281,6 +1332,7 @@ class WebStatusTests(unittest.TestCase):
         self.assertEqual(stream_stats["top_donors"][0]["donor"], "Alice")
         self.assertEqual(stream_stats["events"][0]["stream_title"], "Donation Stream")
         self.assertEqual(stream_stats["events"][0]["video_id"], "kick:oumb")
+        self.assertTrue(stream_stats["events"][0]["is_test"])
 
     def test_status_snapshot_groups_streamer_sources(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2643,6 +2695,9 @@ class WebStatusTests(unittest.TestCase):
         self.assertIn("data-stream-filter-from", script)
         self.assertIn("data-stream-filter-to", script)
         self.assertIn("data-stream-page-next", script)
+        self.assertIn("powerchatEventIsTest", script)
+        self.assertIn("Tests excluded", script)
+        self.assertIn("Test (not counted)", script)
         self.assertNotIn("data-open-voice-manager", script)
         self.assertNotIn('join("' + "\n" + '")', script)
 
