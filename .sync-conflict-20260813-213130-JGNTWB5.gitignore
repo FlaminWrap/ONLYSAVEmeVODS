@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.deno/
+.cache/
+build/
+dist/
+*.egg-info/
+downloads/
+state/
+config.toml
