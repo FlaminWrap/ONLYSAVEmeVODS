@@ -684,6 +684,18 @@ class DashboardUiTests(unittest.TestCase):
                         source="kick:example",
                     )
                 )
+                state.conn.execute(
+                    """
+                    UPDATE streams
+                    SET first_seen_at = ?, updated_at = ?
+                    WHERE video_id = ?
+                    """,
+                    (
+                        f"2026-07-15T00:00:{index:02d}+00:00",
+                        f"2026-07-15T00:00:{index:02d}+00:00",
+                        f"kick:example:{index:02d}",
+                    ),
+                )
             state.upsert_vod_stream(
                 LiveStream(
                     video_id="youtube:codec-example",
@@ -700,6 +712,19 @@ class DashboardUiTests(unittest.TestCase):
                 codec="av1",
                 selector="399+140",
             )
+            state.conn.execute(
+                """
+                UPDATE streams
+                SET first_seen_at = ?, updated_at = ?
+                WHERE video_id = ?
+                """,
+                (
+                    "2026-07-14T00:00:00+00:00",
+                    "2026-07-14T00:00:00+00:00",
+                    "youtube:codec-example",
+                ),
+            )
+            state.conn.commit()
             state.close()
 
             first_page = render_admin_page(
@@ -724,13 +749,17 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('class="record-list stream-history-grid"', first_page)
         self.assertNotIn("Open complete history", first_page)
         self.assertNotIn("compatibility workspace for the complete", first_page)
-        self.assertIn('data-details-key="stream:kick:example:00"', first_page)
-        self.assertIn('data-details-key="stream:kick:example:00:jobs"', first_page)
+        newest_key = 'data-details-key="stream:kick:example:11"'
+        next_newest_key = 'data-details-key="stream:kick:example:10"'
+        self.assertIn(newest_key, first_page)
+        self.assertIn('data-details-key="stream:kick:example:11:jobs"', first_page)
+        self.assertLess(first_page.index(newest_key), first_page.index(next_newest_key))
         self.assertIn('class="stream-subsection processing-jobs-section"', first_page)
         self.assertIn('class="detail-list stream-detail-list"', first_page)
         self.assertIn("Showing 11–13 of 13", second_page)
         self.assertIn("Page 2 of 2", second_page)
         self.assertIn('rel="prev"', second_page)
+        self.assertIn('data-details-key="stream:kick:example:00"', second_page)
         self.assertIn('class="media-format-badge"', second_page)
         self.assertIn("AV1 · format 399", second_page)
         self.assertIn("Showing 11–13 of 13", fragment)

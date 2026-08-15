@@ -623,6 +623,54 @@ class StateWatermarkTests(unittest.TestCase):
             {"CHECKING01", "DOWNLOADING01"},
         )
 
+    def test_stream_lists_are_newest_first_despite_later_activity_on_an_older_stream(self) -> None:
+        with TemporaryDirectory() as tmp:
+            state = StateStore(Path(tmp) / "state.sqlite3")
+            for video_id in ("OLDER", "NEWER", "NEWEST"):
+                stream = LiveStream(
+                    video_id=video_id,
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    title=video_id.title(),
+                )
+                state.upsert_detected(stream)
+                state.mark_ended(video_id)
+            state.conn.executemany(
+                """
+                UPDATE streams
+                SET first_seen_at = ?, last_started_at = ?, updated_at = ?
+                WHERE video_id = ?
+                """,
+                [
+                    (
+                        "2026-01-01T00:00:00+00:00",
+                        "2026-08-01T00:00:00+00:00",
+                        "2026-08-01T00:00:00+00:00",
+                        "OLDER",
+                    ),
+                    (
+                        "2026-02-01T00:00:00+00:00",
+                        "2026-02-02T00:00:00+00:00",
+                        "2026-03-01T00:00:00+00:00",
+                        "NEWER",
+                    ),
+                    (
+                        "2026-04-01T00:00:00+00:00",
+                        None,
+                        "2026-04-01T00:00:00+00:00",
+                        "NEWEST",
+                    ),
+                ],
+            )
+            state.conn.commit()
+
+            all_records = state.list_streams()
+            ended_records = state.list_streams_by_status(["ended"])
+            state.close()
+
+        expected = ["NEWEST", "NEWER", "OLDER"]
+        self.assertEqual([record.video_id for record in all_records], expected)
+        self.assertEqual([record.video_id for record in ended_records], expected)
+
     def test_stale_watermark_jobs_are_marked_interrupted(self) -> None:
         with TemporaryDirectory() as tmp:
             state = StateStore(Path(tmp) / "state.sqlite3")

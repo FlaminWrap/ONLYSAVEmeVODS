@@ -1016,7 +1016,7 @@ class StateStore:
                    youtube_stale_detected_at,
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
-            ORDER BY updated_at DESC, first_seen_at DESC
+            ORDER BY first_seen_at DESC, rowid DESC
         """
         values: tuple[int, ...] = ()
         if limit is not None:
@@ -1045,7 +1045,7 @@ class StateStore:
                    first_seen_at, updated_at, last_started_at, last_exit_at, exit_code
             FROM streams
             WHERE status IN ({placeholders})
-            ORDER BY updated_at DESC, first_seen_at DESC
+            ORDER BY first_seen_at DESC, rowid DESC
         """
         values: list[str | int] = list(normalized)
         if limit is not None:
