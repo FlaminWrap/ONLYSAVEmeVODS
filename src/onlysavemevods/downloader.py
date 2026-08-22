@@ -1397,6 +1397,13 @@ class DownloadManager:
                 progress_checkpoint = tracker.last_fragment_progress_at
                 try:
                     first = await self.probe_youtube_live_edge(stream.url)
+                except TerminalVideoUnavailableError as exc:
+                    await self._stop_terminally_unavailable_youtube_process(
+                        stream,
+                        process,
+                        exc,
+                    )
+                    return
                 except Exception as exc:
                     self.logger.warning(
                         "Unable to inspect inactive YouTube live edge for %s: %s",
@@ -1413,6 +1420,13 @@ class DownloadManager:
 
                 try:
                     second = await self.probe_youtube_live_edge(stream.url)
+                except TerminalVideoUnavailableError as exc:
+                    await self._stop_terminally_unavailable_youtube_process(
+                        stream,
+                        process,
+                        exc,
+                    )
+                    return
                 except Exception as exc:
                     self.logger.warning(
                         "Unable to confirm inactive YouTube live edge for %s: %s",
@@ -1457,6 +1471,36 @@ class DownloadManager:
             raise
         except ProcessLookupError:
             return
+
+    async def _stop_terminally_unavailable_youtube_process(
+        self,
+        stream: LiveStream,
+        process: asyncio.subprocess.Process,
+        exc: TerminalVideoUnavailableError,
+    ) -> None:
+        message = (
+            "YouTube reported the inactive stream as terminally unavailable; "
+            "stopping its downloader"
+        )
+        self.logger.info("%s video_id=%s: %s", message, stream.video_id, exc)
+        try:
+            self.state.add_stream_event(
+                stream.video_id,
+                message,
+                level="warning",
+                segment_index=(
+                    self.active[stream.video_id].segment_index
+                    if stream.video_id in self.active
+                    else None
+                ),
+            )
+        except Exception as state_exc:  # noqa: BLE001 - process exit must continue.
+            self.logger.debug(
+                "Unable to record terminal YouTube event for %s: %s",
+                stream.video_id,
+                state_exc,
+            )
+        await self._stop_stale_live_process(stream.video_id, process)
 
     async def _stop_stale_live_process(
         self,
@@ -1998,14 +2042,16 @@ class DownloadManager:
         ):
             if process is None:
                 active.chat_task.cancel()
-            try:
-                await asyncio.wait_for(active.chat_task, timeout=5)
-            except asyncio.TimeoutError:
-                active.chat_task.cancel()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.logger.debug("live chat watcher exited with error: %s", exc)
+                await asyncio.gather(active.chat_task, return_exceptions=True)
+            else:
+                try:
+                    await asyncio.wait_for(active.chat_task, timeout=5)
+                except asyncio.TimeoutError:
+                    active.chat_task.cancel()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.debug("live chat watcher exited with error: %s", exc)
 
     async def _stop_powerchat_listener(self, active: ActiveDownload) -> None:
         task = active.powerchat_task

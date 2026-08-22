@@ -548,6 +548,80 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                 manager._start_chat_recorder.assert_not_awaited()
                 state.add_stream_event.assert_not_called()
 
+    async def test_media_exit_during_chat_retry_backoff_reaches_post_exit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                record_live_chat=True,
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                channel="Creator",
+                platform="youtube",
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(stream, 1)
+            retry_sleep_started = asyncio.Event()
+
+            async def blocked_retry(_delay: float) -> None:
+                retry_sleep_started.set()
+                await asyncio.Future()
+
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=blocked_retry,
+            )
+            media_process = ControlledProcess(0)
+            chat_process = ControlledProcess(0)
+            active = active_download(
+                stream,
+                media_process,
+                chat_process=chat_process,
+            )
+            manager.active[stream.video_id] = active
+            manager._start_chat_recorder = AsyncMock()  # type: ignore[method-assign]
+            manager._stop_powerchat_listener = AsyncMock()  # type: ignore[method-assign]
+            manager.handle_post_exit = AsyncMock()  # type: ignore[method-assign]
+            chat_watcher = asyncio.create_task(
+                manager._watch_chat_process(stream, 1, chat_process)  # type: ignore[arg-type]
+            )
+            active.chat_task = chat_watcher
+            media_watcher = asyncio.create_task(
+                manager._watch_process(stream, media_process, 1)  # type: ignore[arg-type]
+            )
+            active.task = media_watcher
+            try:
+                chat_process.finish()
+                await retry_sleep_started.wait()
+                self.assertIsNone(active.chat_process)
+
+                media_process.finish()
+                await media_watcher
+                await asyncio.sleep(0)
+                record = state.get_stream(stream.video_id)
+            finally:
+                for watcher in (chat_watcher, media_watcher):
+                    if not watcher.done():
+                        watcher.cancel()
+                await asyncio.gather(
+                    chat_watcher,
+                    media_watcher,
+                    return_exceptions=True,
+                )
+                state.close()
+
+        self.assertTrue(chat_watcher.cancelled())
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record.status, "checking_after_exit")
+        self.assertNotIn(stream.video_id, manager.active)
+        manager._start_chat_recorder.assert_not_awaited()  # type: ignore[attr-defined]
+        manager.handle_post_exit.assert_awaited_once()  # type: ignore[attr-defined]
+
     async def test_media_exit_timing_is_persisted_before_slow_chat_stop(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(

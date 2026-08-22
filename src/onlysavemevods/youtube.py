@@ -41,6 +41,7 @@ TERMINAL_VIDEO_UNAVAILABLE_PATTERNS = (
     re.compile(r"\bthis video has been (?:removed|deleted)\b", re.IGNORECASE),
     re.compile(r"\bvideo unavailable\b.*\b(?:removed|deleted)\b", re.IGNORECASE),
     re.compile(r"\bno longer available\b.*\bterminated\b", re.IGNORECASE),
+    re.compile(r"\bblocked due to (?:the )?claimed content\b", re.IGNORECASE),
 )
 
 

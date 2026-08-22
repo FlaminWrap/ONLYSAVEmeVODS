@@ -235,6 +235,12 @@ segment.ts
                 "This video has been removed by the uploader"
             )
         )
+        self.assertTrue(
+            is_terminal_video_unavailable_message(
+                "ERROR: [youtube] LIVEVIDEO01: Video unavailable. "
+                "It was blocked due to the claimed content by SME."
+            )
+        )
         self.assertFalse(
             is_terminal_video_unavailable_message(
                 "ERROR: [youtube] LIVEVIDEO01: HTTP Error 503: Service Unavailable"

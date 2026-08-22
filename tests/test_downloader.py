@@ -58,7 +58,7 @@ from onlysavemevods.powerchat import (
 )
 from onlysavemevods.state import StateStore
 from onlysavemevods.twitch_ad_repair import TwitchAdRepairResult
-from onlysavemevods.youtube import YouTubeLiveEdge
+from onlysavemevods.youtube import TerminalVideoUnavailableError, YouTubeLiveEdge
 
 
 class NullLogger:
@@ -1417,6 +1417,45 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_youtube_watchdog_probe_stops_downloader(self) -> None:
+        config = BotConfig(youtube_stale_live_timeout_seconds=10)
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+            is_live=True,
+        )
+        state = MagicMock()
+        now = [0.0]
+        tracker = CatchupTracker(
+            asyncio.Event(),
+            monotonic_func=lambda: now[0],
+        )
+        now[0] = 100.0
+        terminal_error = TerminalVideoUnavailableError(
+            "Video unavailable. It was blocked due to the claimed content by SME."
+        )
+        manager = DownloadManager(
+            config,
+            state,
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=AsyncMock(),
+            probe_youtube_live_edge_func=AsyncMock(side_effect=terminal_error),
+            monotonic_func=lambda: now[0],
+        )
+        process = MagicMock()
+        process.returncode = None
+
+        with patch.object(
+            manager,
+            "_stop_stale_live_process",
+            new=AsyncMock(),
+        ) as stop_process:
+            await manager._stale_youtube_live_watchdog(stream, process, tracker)
+
+        stop_process.assert_awaited_once_with(stream.video_id, process)
+        state.add_stream_event.assert_called_once()
+
     async def test_frozen_youtube_watchdog_stalls_and_stops_process(self) -> None:
         with TemporaryDirectory() as tmp:
             config = BotConfig(
