@@ -57,6 +57,12 @@ from .content_events import (
     detect_content_events_for_media,
     load_content_events,
 )
+from .download_progress import (
+    LIVE_EDGE_FRAGMENT_MARGIN,
+    clear_download_progress,
+    download_progress_path,
+    record_download_progress,
+)
 from .job_tracker import finish_tracked_job, start_tracked_job, update_tracked_job
 from .models import LiveStream
 from .powerchat import (
@@ -78,7 +84,7 @@ CHAT_RECORDER_RETRY_BACKOFF_SECONDS = (5, 15, 30, 60, 120)
 EXIT_STATE_RETRY_SECONDS = (0.25, 1.0, 5.0)
 FINALIZE_MUX_TIMEOUT_SECONDS = 60 * 60
 FINALIZE_DURATION_TOLERANCE_SECONDS = 5.0
-CATCHUP_FRAGMENT_MARGIN = 2
+CATCHUP_FRAGMENT_MARGIN = LIVE_EDGE_FRAGMENT_MARGIN
 MIXED_SEGMENT_WATCH_SECONDS = 10
 MIXED_SEGMENT_CONFIRM_SECONDS = 120
 STALE_LIVE_WATCH_INTERVAL_SECONDS = 30
@@ -103,6 +109,20 @@ SENSITIVE_COMMAND_OPTIONS = {
 FRAGMENT_PROGRESS_RE = re.compile(
     r"(?:(?P<context>\d+):\s*)?\[download\].*?"
     r"\(frag\s+(?P<fragment>\d+)\s*/\s*(?P<count>\d+)\)"
+)
+LIVE_PROGRESS_MARKER = "__ONLYSAVEmeVODS_LIVE_PROGRESS__"
+LIVE_PROGRESS_TEMPLATE = (
+    f"download:{LIVE_PROGRESS_MARKER}\t%(info.format_id)s\t%(info.vcodec)s\t"
+    "%(info.acodec)s\t%(progress.fragment_index)s\t"
+    "%(progress.fragment_count)s\t%(progress.progress_idx)s\t"
+    "%(progress.max_progress)s"
+)
+LIVE_PROGRESS_RE = re.compile(
+    rf"(?:(?P<line_context>\d+):\s*)?{re.escape(LIVE_PROGRESS_MARKER)}\t"
+    r"(?P<format_id>[^\t]*)\t"
+    r"(?P<vcodec>[^\t]*)\t(?P<acodec>[^\t]*)\t"
+    r"(?P<fragment>\d+)\t(?P<count>\d+)\t"
+    r"(?P<progress_index>[^\t]*)\t(?P<progress_count>[^\s]*)"
 )
 KEPT_FRAGMENT_RE = re.compile(r"-Frag(?P<fragment>\d+)$")
 CHANNEL_SOURCE_POST_EXIT_PLATFORMS = {"kick", "twitch"}
@@ -184,6 +204,7 @@ def server_local_now() -> datetime:
 
 
 ProgressCallback = Callable[[float], None]
+FragmentProgressCallback = Callable[[Mapping[str, tuple[int, int]]], None]
 YouTubeRestartDecision = Literal["restart", "defer", "stalled"]
 
 
@@ -263,6 +284,33 @@ class YouTubeVideoFormatChoice:
     fps: float
 
 
+def optional_positive_int(value: str) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def optional_nonnegative_int(value: str) -> int | None:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def download_track_from_codecs(vcodec: str, acodec: str) -> str:
+    missing = {"", "na", "none", "null", "unknown"}
+    has_video = vcodec.strip().casefold() not in missing
+    has_audio = acodec.strip().casefold() not in missing
+    if has_video and not has_audio:
+        return "video"
+    if has_audio and not has_video:
+        return "audio"
+    return "media"
+
+
 class CatchupTracker:
     def __init__(
         self,
@@ -271,12 +319,14 @@ class CatchupTracker:
         monotonic_func: MonotonicFunc = time.monotonic,
         initial_progress_at: float | None = None,
         progress_callback: ProgressCallback | None = None,
+        fragment_progress_callback: FragmentProgressCallback | None = None,
     ) -> None:
         self.ready_event = ready_event
         self.fragments: dict[str, tuple[int, int]] = {}
         self.has_prefixed_context = False
         self.monotonic = monotonic_func
         self.progress_callback = progress_callback
+        self.fragment_progress_callback = fragment_progress_callback
         self.last_fragment_progress_at = (
             self.monotonic()
             if initial_progress_at is None
@@ -284,24 +334,58 @@ class CatchupTracker:
         )
 
     def update(self, line: str) -> None:
-        match = FRAGMENT_PROGRESS_RE.search(line)
-        if not match:
-            return
-
-        context = match.group("context") or "0"
-        self.has_prefixed_context = self.has_prefixed_context or context != "0"
+        semantic_match = LIVE_PROGRESS_RE.search(line)
+        if semantic_match:
+            context = download_track_from_codecs(
+                semantic_match.group("vcodec"),
+                semantic_match.group("acodec"),
+            )
+            match = semantic_match
+            line_context = semantic_match.group("line_context")
+            progress_count = optional_positive_int(
+                semantic_match.group("progress_count")
+            )
+            progress_index = optional_nonnegative_int(
+                semantic_match.group("progress_index")
+            )
+            if context == "media" and line_context:
+                context = line_context
+            elif (
+                context == "media"
+                and progress_count is not None
+                and progress_count > 1
+                and progress_index is not None
+            ):
+                # Some extractors omit codec metadata from progress info. Keep
+                # concurrent formats distinct so catch-up cannot wait forever
+                # on two updates that otherwise collapse onto ``media``.
+                context = str(progress_index + 1)
+            self.has_prefixed_context = (
+                self.has_prefixed_context
+                or bool(line_context)
+                or (progress_count is not None and progress_count > 1)
+            )
+        else:
+            match = FRAGMENT_PROGRESS_RE.search(line)
+            if not match:
+                return
+            context = match.group("context") or "0"
+            self.has_prefixed_context = self.has_prefixed_context or context != "0"
         progress = (
             int(match.group("fragment")),
             int(match.group("count")),
         )
         previous = self.fragments.get(context)
         self.fragments[context] = progress
-        if (
+        advanced = (
             previous is None
             or progress[0] > previous[0]
             or progress[1] > previous[1]
-        ):
+        )
+        if advanced:
             self._note_progress()
+        if previous != progress and self.fragment_progress_callback is not None:
+            self.fragment_progress_callback(dict(self.fragments))
         if self.caught_up:
             self.ready_event.set()
 
@@ -439,6 +523,7 @@ class DownloadManager:
         self.monotonic = monotonic_func
         self.local_now = local_now_func
         self.logger = logger
+        self.download_progress_file = download_progress_path(config.state_dir)
         self.active: dict[str, ActiveDownload] = {}
         self._youtube_fragment_progress_at: dict[str, float] = {}
         self._youtube_restart_checks: set[str] = set()
@@ -511,11 +596,14 @@ class DownloadManager:
         self,
         stream: LiveStream,
         ready_event: asyncio.Event,
+        *,
+        fragment_progress_callback: FragmentProgressCallback | None = None,
     ) -> CatchupTracker:
         if stream.platform.casefold() != "youtube":
             return CatchupTracker(
                 ready_event,
                 monotonic_func=self.monotonic,
+                fragment_progress_callback=fragment_progress_callback,
             )
 
         initial_progress_at = self._youtube_fragment_progress_at.get(stream.video_id)
@@ -531,6 +619,7 @@ class DownloadManager:
             monotonic_func=self.monotonic,
             initial_progress_at=initial_progress_at,
             progress_callback=remember_progress,
+            fragment_progress_callback=fragment_progress_callback,
         )
 
     def _remember_youtube_edge_progress(self, video_id: str) -> None:
@@ -764,7 +853,20 @@ class DownloadManager:
         reconnect_ready = asyncio.Event()
         if not self.config.live_from_start:
             reconnect_ready.set()
-        catchup_tracker = self._catchup_tracker_for_stream(stream, reconnect_ready)
+        clear_download_progress(
+            stream.video_id,
+            progress_file=self.download_progress_file,
+        )
+        catchup_tracker = self._catchup_tracker_for_stream(
+            stream,
+            reconnect_ready,
+            fragment_progress_callback=lambda fragments: record_download_progress(
+                stream.video_id,
+                fragments,
+                segment_index=segment_index,
+                progress_file=self.download_progress_file,
+            ),
+        )
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -870,6 +972,10 @@ class DownloadManager:
                     side_task.cancel()
             if output_task is not None:
                 await self._finish_output_task(output_task)
+            clear_download_progress(
+                stream.video_id,
+                progress_file=self.download_progress_file,
+            )
             self.logger.warning(
                 "yt-dlp exited before startup completed video_id=%s segment=%03d",
                 stream.video_id,
@@ -1686,7 +1792,8 @@ class DownloadManager:
             return
 
         catchup_tracker.update(line)
-        self.logger.debug("yt-dlp %s: %s", video_id, line)
+        if LIVE_PROGRESS_MARKER not in line:
+            self.logger.debug("yt-dlp %s: %s", video_id, line)
 
     def _handle_sidecar_output_line(
         self,
@@ -1894,6 +2001,11 @@ class DownloadManager:
                     segment_index,
                 )
                 return
+
+        clear_download_progress(
+            stream.video_id,
+            progress_file=self.download_progress_file,
+        )
 
         if self._stopping:
             if self.active.get(stream.video_id) is active:
@@ -2582,6 +2694,10 @@ class DownloadManager:
             self.enqueue_finalized_post_processing(stream, finalized_files)
             self.state.mark_ended(stream.video_id)
             self._youtube_fragment_progress_at.pop(stream.video_id, None)
+            clear_download_progress(
+                stream.video_id,
+                progress_file=self.download_progress_file,
+            )
         finally:
             self._finalizing_video_ids.discard(stream.video_id)
         await self.process_pending_post_processing(stream)
@@ -4216,6 +4332,10 @@ class DownloadManager:
                 await active.process.wait()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
+            clear_download_progress(
+                active.stream.video_id,
+                progress_file=self.download_progress_file,
+            )
             await self._stop_powerchat_listener(active)
             await self._stop_chat_recorder(active)
 
@@ -4440,8 +4560,10 @@ def build_download_command(
             "--part",
             "--progress",
             "--newline",
+            "--progress-template",
+            LIVE_PROGRESS_TEMPLATE,
             "--progress-delta",
-            "5",
+            "0",
             "--no-playlist",
             "-o",
             str(output_template),

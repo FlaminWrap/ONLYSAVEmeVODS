@@ -29,6 +29,7 @@ from onlysavemevods.downloader import (
     choose_youtube_video_format,
     choose_restart_segment,
     CatchupTracker,
+    LIVE_PROGRESS_MARKER,
     command_for_log,
     output_template_for,
     post_exit_probe_target,
@@ -49,6 +50,16 @@ from onlysavemevods.downloader import (
     youtube_live_edge_is_confirmed_stale,
     youtube_live_edge_is_fresh,
     youtube_format_segment_index,
+)
+from onlysavemevods.download_progress import (
+    DOWNLOAD_PROGRESS_STALE_SECONDS,
+    clear_download_progress,
+    clear_all_download_progress,
+    download_progress_for,
+    download_progress_path,
+    download_progress_revision,
+    load_download_progress,
+    record_download_progress,
 )
 from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.powerchat import (
@@ -304,6 +315,14 @@ class DownloaderCommandTests(unittest.TestCase):
         self.assertIn("--keep-fragments", command)
         self.assertIn("--progress", command)
         self.assertIn("--newline", command)
+        self.assertIn("--progress-template", command)
+        progress_template = command[command.index("--progress-template") + 1]
+        self.assertIn(LIVE_PROGRESS_MARKER, progress_template)
+        self.assertIn("%(info.vcodec)s", progress_template)
+        self.assertIn("%(info.acodec)s", progress_template)
+        self.assertIn("%(progress.fragment_index)s", progress_template)
+        self.assertIn("%(progress.fragment_count)s", progress_template)
+        self.assertEqual(command[command.index("--progress-delta") + 1], "0")
         self.assertIn("--no-playlist", command)
         self.assertIn(str(expected_output), command)
         self.assertNotIn("--write-subs", command)
@@ -1329,6 +1348,298 @@ class DownloaderCommandTests(unittest.TestCase):
 
         tracker.update("2: [download] 400.00MiB at 200.00KiB/s (frag 4923/4924)")
         self.assertTrue(event.is_set())
+
+    def test_catchup_tracker_publishes_semantic_video_and_audio_progress(self) -> None:
+        event = asyncio.Event()
+        updates: list[dict[str, tuple[int, int]]] = []
+        tracker = CatchupTracker(
+            event,
+            fragment_progress_callback=updates.append,
+        )
+
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "4924\t4924\t0\t2"
+        )
+        self.assertFalse(event.is_set())
+        self.assertEqual(updates[-1], {"video": (4924, 4924)})
+
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "2175\t4924\t1\t2"
+        )
+        self.assertFalse(event.is_set())
+        self.assertEqual(
+            updates[-1],
+            {"video": (4924, 4924), "audio": (2175, 4924)},
+        )
+
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "4923\t4924\t1\t2"
+        )
+        self.assertTrue(event.is_set())
+
+    def test_catchup_tracker_uses_line_prefix_when_progress_count_is_missing(self) -> None:
+        event = asyncio.Event()
+        tracker = CatchupTracker(event)
+
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "100\t100\t0\tNA"
+        )
+
+        self.assertFalse(event.is_set())
+        self.assertTrue(tracker.has_prefixed_context)
+
+    def test_catchup_tracker_keeps_formats_distinct_when_codecs_are_missing(self) -> None:
+        event = asyncio.Event()
+        updates: list[dict[str, tuple[int, int]]] = []
+        tracker = CatchupTracker(
+            event,
+            fragment_progress_callback=updates.append,
+        )
+
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tNA\tNA\t100\t100\t0\t2"
+        )
+        self.assertFalse(event.is_set())
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tNA\tNA\t99\t100\t1\t2"
+        )
+
+        self.assertTrue(event.is_set())
+        self.assertEqual(updates[-1], {"1": (100, 100), "2": (99, 100)})
+
+    def test_download_progress_registry_labels_lag_and_deduplicates_revision(self) -> None:
+        clear_all_download_progress()
+        try:
+            record_download_progress(
+                "LIVEVIDEO01",
+                {"video": (4924, 4924), "audio": (2175, 4924)},
+                updated_at=100.0,
+            )
+            first = download_progress_for("LIVEVIDEO01")
+            first_revision = download_progress_revision(["LIVEVIDEO01"])
+            record_download_progress(
+                "LIVEVIDEO01",
+                {"video": (4924, 4924), "audio": (2175, 4924)},
+                updated_at=200.0,
+            )
+            repeated_revision = download_progress_revision(["LIVEVIDEO01"])
+        finally:
+            clear_all_download_progress()
+
+        self.assertEqual([item.track for item in first], ["video", "audio"])
+        self.assertTrue(first[0].caught_up)
+        self.assertEqual(first[0].lag_fragments, 0)
+        self.assertFalse(first[1].caught_up)
+        self.assertEqual(first[1].lag_fragments, 2749)
+        self.assertAlmostEqual(first[1].progress, 2175 / 4924)
+        self.assertEqual(first_revision, repeated_revision)
+
+    def test_download_progress_sidecar_preserves_track_scales_and_staleness(self) -> None:
+        clear_all_download_progress()
+        with TemporaryDirectory() as temp_dir:
+            progress_file = download_progress_path(Path(temp_dir))
+            record_download_progress(
+                "youtube:LIVEVIDEO01",
+                {"video": (100, 100), "audio": (50, 50)},
+                segment_index=3,
+                updated_at=100.0,
+                progress_file=progress_file,
+            )
+            clear_all_download_progress()
+
+            fresh = load_download_progress(
+                progress_file,
+                current_time=100.0 + DOWNLOAD_PROGRESS_STALE_SECONDS - 1,
+            )
+            fresh_tracks = download_progress_for(
+                "youtube:LIVEVIDEO01",
+                segment_index=3,
+                snapshot=fresh,
+            )
+            fresh_revision = download_progress_revision(
+                ["youtube:LIVEVIDEO01"],
+                segment_indexes={"youtube:LIVEVIDEO01": 3},
+                snapshot=fresh,
+            )
+            stale = load_download_progress(
+                progress_file,
+                current_time=100.0 + DOWNLOAD_PROGRESS_STALE_SECONDS,
+            )
+            stale_revision = download_progress_revision(
+                ["youtube:LIVEVIDEO01"],
+                segment_indexes={"youtube:LIVEVIDEO01": 3},
+                snapshot=stale,
+            )
+
+            self.assertEqual(
+                [(item.fragment_index, item.fragment_count) for item in fresh_tracks],
+                [(100, 100), (50, 50)],
+            )
+            self.assertTrue(all(item.caught_up for item in fresh_tracks))
+            self.assertTrue(all(not item.stale for item in fresh_tracks))
+            self.assertTrue(all(item.stale for item in stale["youtube:LIVEVIDEO01"]))
+            self.assertNotEqual(fresh_revision, stale_revision)
+            self.assertEqual(
+                download_progress_for(
+                    "youtube:LIVEVIDEO01",
+                    segment_index=4,
+                    snapshot=stale,
+                ),
+                [],
+            )
+
+    def test_download_progress_keeps_unchanged_track_timestamp(self) -> None:
+        clear_all_download_progress()
+        try:
+            record_download_progress(
+                "youtube:LIVEVIDEO01",
+                {"video": (100, 100), "audio": (100, 100)},
+                updated_at=100.0,
+            )
+            updated = record_download_progress(
+                "youtube:LIVEVIDEO01",
+                {"video": (200, 200), "audio": (100, 100)},
+                updated_at=200.0,
+            )
+        finally:
+            clear_all_download_progress()
+
+        self.assertEqual(updated[0].updated_at, 200.0)
+        self.assertEqual(updated[1].updated_at, 100.0)
+
+    def test_download_progress_sidecar_preserves_other_stream_on_clear(self) -> None:
+        clear_all_download_progress()
+        with TemporaryDirectory() as temp_dir:
+            progress_file = download_progress_path(Path(temp_dir))
+            record_download_progress(
+                "youtube:A",
+                {"media": (10, 10)},
+                segment_index=1,
+                progress_file=progress_file,
+            )
+            record_download_progress(
+                "youtube:B",
+                {"media": (20, 20)},
+                segment_index=2,
+                progress_file=progress_file,
+            )
+            clear_download_progress("youtube:A", progress_file=progress_file)
+            clear_all_download_progress()
+
+            loaded = load_download_progress(progress_file)
+
+        self.assertNotIn("youtube:A", loaded)
+        self.assertIn("youtube:B", loaded)
+
+    def test_download_progress_sidecar_ignores_invalid_numeric_values(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            progress_file = download_progress_path(Path(temp_dir))
+            progress_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "streams": {
+                            "youtube:INVALID-SEGMENT": {
+                                "segment_index": float("inf"),
+                                "tracks": [],
+                            },
+                            "youtube:MIXED": {
+                                "segment_index": 2,
+                                "tracks": [
+                                    {
+                                        "track": "video",
+                                        "fragment_index": float("inf"),
+                                        "fragment_count": 10,
+                                        "updated_at": 100.0,
+                                    },
+                                    {
+                                        "track": "audio",
+                                        "fragment_index": 5,
+                                        "fragment_count": 10,
+                                        "updated_at": float("nan"),
+                                    },
+                                    {
+                                        "track": "media",
+                                        "fragment_index": 7,
+                                        "fragment_count": 10,
+                                        "updated_at": 100.0,
+                                    },
+                                ],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = load_download_progress(progress_file, current_time=100.0)
+
+        self.assertNotIn("youtube:INVALID-SEGMENT", loaded)
+        self.assertEqual(
+            [(item.track, item.fragment_index) for item in loaded["youtube:MIXED"]],
+            [("media", 7)],
+        )
+
+    def test_download_progress_persistence_failure_does_not_interrupt_updates(self) -> None:
+        clear_all_download_progress()
+        try:
+            with TemporaryDirectory() as temp_dir:
+                progress_file = download_progress_path(Path(temp_dir))
+                with (
+                    patch(
+                        "onlysavemevods.download_progress.os.replace",
+                        side_effect=OSError("disk full"),
+                    ),
+                    patch("onlysavemevods.download_progress.LOGGER.warning") as warning,
+                ):
+                    progress = record_download_progress(
+                        "youtube:LIVEVIDEO01",
+                        {"media": (7, 10)},
+                        progress_file=progress_file,
+                    )
+                self.assertEqual(progress[0].fragment_index, 7)
+                self.assertFalse(progress_file.exists())
+                warning.assert_called_once()
+        finally:
+            clear_all_download_progress()
+
+    def test_download_progress_sidecar_writes_are_throttled(self) -> None:
+        clear_all_download_progress()
+        try:
+            with TemporaryDirectory() as temp_dir:
+                progress_file = download_progress_path(Path(temp_dir))
+                with (
+                    patch(
+                        "onlysavemevods.download_progress.time.monotonic",
+                        side_effect=[100.0, 100.25, 101.25, 101.25],
+                    ),
+                    patch(
+                        "onlysavemevods.download_progress._write_download_progress_file"
+                    ) as write_progress,
+                ):
+                    record_download_progress(
+                        "youtube:LIVEVIDEO01",
+                        {"media": (1, 10)},
+                        progress_file=progress_file,
+                    )
+                    record_download_progress(
+                        "youtube:LIVEVIDEO01",
+                        {"media": (2, 10)},
+                        progress_file=progress_file,
+                    )
+                    record_download_progress(
+                        "youtube:LIVEVIDEO01",
+                        {"media": (3, 10)},
+                        progress_file=progress_file,
+                    )
+        finally:
+            clear_all_download_progress()
+
+        self.assertEqual(write_progress.call_count, 2)
 
     def test_catchup_tracker_handles_single_unprefixed_format(self) -> None:
         event = asyncio.Event()

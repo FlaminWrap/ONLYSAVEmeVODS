@@ -830,8 +830,28 @@
     });
   };
 
+  const fragmentInteractionBlocksReplacement = (region) => (
+    region.matches(":focus-within")
+    || region.querySelector('[data-dirty="true"]')
+    || region.querySelector("[data-file-diagnostics-loaded][open]")
+  );
+
+  const patchLiveDownloadProgress = (region, html) => {
+    const template = document.createElement("template");
+    template.innerHTML = html;
+    const incoming = new Map(
+      [...template.content.querySelectorAll("[data-live-download-progress]")]
+        .map((progress) => [progress.dataset.liveDownloadProgress, progress]),
+    );
+    region.querySelectorAll("[data-live-download-progress]").forEach((progress) => {
+      const replacement = incoming.get(progress.dataset.liveDownloadProgress);
+      if (replacement) progress.replaceWith(replacement);
+      else progress.remove();
+    });
+  };
+
   const refreshFragment = async (region) => {
-    if (document.hidden || region.matches(":focus-within") || region.querySelector('[data-dirty="true"]') || region.querySelector("[data-file-diagnostics-loaded][open]")) return;
+    if (document.hidden) return;
     if (fragmentRequests.has(region)) return;
     const request = Symbol("fragment-request");
     fragmentRequests.set(region, request);
@@ -839,9 +859,15 @@
       const response = await fetch(region.dataset.fragmentUrl, { headers: { "X-Dashboard-Fragment": "1" }, cache: "no-store" });
       if (!response.ok) return;
       const revision = response.headers.get("X-Fragment-Revision") || "";
+      const stateRevision = response.headers.get("X-Fragment-State-Revision") || "";
       if (revision && revision === region.dataset.fragmentRevision) return;
       const html = await response.text();
-      if (region.matches(":focus-within") || region.querySelector('[data-dirty="true"]') || region.querySelector("[data-file-diagnostics-loaded][open]")) return;
+      if (stateRevision && stateRevision === region.dataset.fragmentStateRevision) {
+        patchLiveDownloadProgress(region, html);
+        if (revision) region.dataset.fragmentRevision = revision;
+        return;
+      }
+      if (fragmentInteractionBlocksReplacement(region)) return;
       const detailsState = captureDetailsState(region);
       region.innerHTML = html;
       restoreDetailsState(region, detailsState);
@@ -849,6 +875,7 @@
       initializeSourceManagers(region);
       if (region.querySelector("#powerchat-dashboard")) powerchatPage = 1;
       if (revision) region.dataset.fragmentRevision = revision;
+      if (stateRevision) region.dataset.fragmentStateRevision = stateRevision;
       applyActivityFilters();
       const stamp = document.querySelector("[data-last-refreshed]");
       if (stamp) stamp.textContent = `Updated ${new Date().toLocaleTimeString()}`;

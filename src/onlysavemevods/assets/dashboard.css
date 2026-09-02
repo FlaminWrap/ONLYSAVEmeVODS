@@ -297,6 +297,30 @@ button, a, input, select, textarea, summary { outline: none; }
 .notice.info { border-color: color-mix(in srgb, var(--info), transparent 50%); background: var(--info-soft); }
 .signals { padding: 9px 11px; border-left: 4px solid var(--warning); border-radius: 6px; background: var(--warning-soft); color: var(--warning); font-weight: 650; }
 
+.live-download-progress {
+  display: grid;
+  grid-column: 1 / -1;
+  width: 100%;
+  min-width: 0;
+  gap: 8px;
+  padding: 10px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-subtle);
+}
+.live-download-progress.has-lag, .live-download-progress.is-stale { border-color: color-mix(in srgb, var(--warning), transparent 35%); background: var(--warning-soft); }
+.live-download-progress-heading, .live-download-track-label { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; gap: 8px 14px; }
+.live-download-progress-heading strong, .live-download-track-label strong { color: var(--text); font-size: 12px; }
+.live-download-progress-heading span, .live-download-track-label span { min-width: 0; color: var(--muted); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+.live-download-progress.has-lag .live-download-progress-heading span, .live-download-progress.is-stale .live-download-progress-heading span, .live-download-track.is-behind .live-download-track-label span, .live-download-track.is-stale .live-download-track-label span { color: var(--warning); font-weight: 650; }
+.live-download-tracks { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px 14px; }
+.live-download-track { display: grid; min-width: 0; gap: 5px; }
+.live-download-track progress { width: 100%; height: 9px; overflow: hidden; border: 0; border-radius: 999px; accent-color: var(--accent); }
+.live-download-track.is-behind progress, .live-download-track.is-stale progress { accent-color: var(--warning); }
+.live-download-track.is-waiting progress { opacity: .55; }
+.stream-detail-header { margin-bottom: 0; }
+.stream-detail > .live-download-progress { margin-top: 12px; }
+
 .streamer-list, .record-list { display: grid; gap: 10px; }
 .streamer-summary {
   display: grid;
@@ -580,10 +604,12 @@ tr:last-child td { border-bottom: 0; }
 }
 .detail-list dt { font-weight: 650; }
 .detail-list dd { margin: 0; color: var(--muted); overflow-wrap: anywhere; }
-.stream-detail > summary { cursor: pointer; list-style: none; margin: -2px; padding: 2px; }
-.stream-detail > summary::-webkit-details-marker { display: none; }
-.stream-detail[open] > summary { padding-bottom: 13px; border-bottom: 1px solid var(--border); }
-.stream-detail > .section-stack { padding-top: 14px; }
+.stream-detail-disclosure { margin-top: 12px; }
+.stream-detail-disclosure > summary { display: flex; align-items: center; gap: 9px; cursor: pointer; list-style: none; color: var(--muted); }
+.stream-detail-disclosure > summary::-webkit-details-marker { display: none; }
+.stream-detail-disclosure > summary::before { content: "›"; font-size: 19px; line-height: 1; transform: rotate(0deg); transition: transform .15s ease; }
+.stream-detail-disclosure[open] > summary::before { transform: rotate(90deg); }
+.stream-detail-disclosure > .section-stack { padding-top: 14px; border-top: 1px solid var(--border); }
 .stream-detail details > summary { min-height: 40px; padding: 9px 0; cursor: pointer; }
 .stream-subsection { overflow: hidden; border: 1px solid var(--border); border-radius: 9px; background: var(--surface); }
 .stream-subsection > summary {
@@ -829,6 +855,8 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
   .form-grid { grid-template-columns: 1fr; }
   .form-field.wide { grid-column: auto; }
   .streamer-summary { grid-template-columns: 1fr; gap: 11px; }
+  .live-download-progress-heading, .live-download-track-label { display: grid; gap: 2px; }
+  .live-download-progress-heading span, .live-download-track-label span { text-align: left; }
   .streamer-summary-actions { grid-column: auto; }
   .streamer-summary-actions .button { flex: 1; }
   .search-bar { width: 100%; }

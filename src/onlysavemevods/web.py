@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, RLock, Thread
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from datetime import datetime, timedelta, timezone
@@ -103,6 +103,15 @@ from .downloader import (
     safe_filename_stem,
     segment_directory,
     segment_media_input_files,
+)
+from .download_progress import (
+    DOWNLOAD_PROGRESS_STALE_SECONDS,
+    DownloadProgressSnapshot,
+    DownloadTrackProgress,
+    download_progress_for,
+    download_progress_path,
+    download_progress_revision,
+    load_download_progress,
 )
 from .job_tracker import (
     COMPLETED_JOB_RETENTION_SECONDS,
@@ -649,6 +658,9 @@ class StreamStatus:
     file_size_totals_complete: bool = True
     powerchat_recorded_event_count: int = 0
     powerchat_test_event_count: int = 0
+    recording_kind: str = "live"
+    download_progress: list[DownloadTrackProgress] = field(default_factory=list)
+    download_progress_waiting_stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -757,6 +769,7 @@ class StreamerStreamPage:
     from_date: str
     to_date: str
     streams: list[StreamStatus]
+    revision: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1448,7 +1461,11 @@ def build_handler(
         def _send_admin_page(self, page: str, query: str) -> None:
             params = parse_qs(query, keep_blank_values=True)
             if self.headers.get("X-Dashboard-Fragment") == "1":
-                body, revision = render_admin_fragment(config, page, params)
+                body, revision, state_revision = render_admin_fragment_with_state(
+                    config,
+                    page,
+                    params,
+                )
                 encoded = body.encode("utf-8")
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1456,6 +1473,7 @@ def build_handler(
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header("X-Fragment-Revision", revision)
+                self.send_header("X-Fragment-State-Revision", state_revision)
                 self.end_headers()
                 self.wfile.write(encoded)
                 return
@@ -2435,9 +2453,15 @@ def build_status_snapshot(
     *,
     include_speaker_scan: bool = True,
     include_file_diagnostics: bool = True,
+    progress_snapshot: DownloadProgressSnapshot | None = None,
 ) -> StatusSnapshot:
     started_at = time.perf_counter()
+    generated_at = time.time()
     steps: list[tuple[str, float]] = []
+    if progress_snapshot is None:
+        progress_snapshot = load_download_progress(
+            download_progress_path(config.state_dir)
+        )
 
     step_started_at = time.perf_counter()
     state = StateStore(config.db_path)
@@ -2474,6 +2498,12 @@ def build_status_snapshot(
             stream_events.get(record.video_id, []),
             jobs_by_video.get(record.video_id, []),
             include_file_diagnostics=include_file_diagnostics,
+            live_download_progress=download_progress_for(
+                record.video_id,
+                segment_index=record.segment_index,
+                snapshot=progress_snapshot,
+            ),
+            progress_current_time=generated_at,
         )
         for record in records
     ]
@@ -2501,8 +2531,12 @@ def build_status_snapshot(
     step_started_at = time.perf_counter()
     recent_logs, log_revision = get_recent_log_snapshot(LOG_LIMIT)
     snapshot = StatusSnapshot(
-        generated_at=time.time(),
-        stream_revision=stream_revision_for_records(records),
+        generated_at=generated_at,
+        stream_revision=stream_revision_for_records(
+            records,
+            progress_snapshot=progress_snapshot,
+            current_time=generated_at,
+        ),
         job_revision=job_revision_for_jobs(jobs),
         app=build_app_info(),
         app_update=app_update_status(config, current_version=APP_VERSION),
@@ -2579,10 +2613,16 @@ def build_streamer_stream_page(
     params: dict[str, list[str]],
     *,
     include_file_diagnostics: bool = True,
+    progress_snapshot: DownloadProgressSnapshot | None = None,
 ) -> StreamerStreamPage:
     streamer_name = first_query_value(params, "streamer").strip()
     if not streamer_name:
         raise ConfigError("streamer is required")
+    if progress_snapshot is None:
+        progress_snapshot = load_download_progress(
+            download_progress_path(config.state_dir)
+        )
+    generated_at = time.time()
 
     page = stream_page_positive_int(params, "page", 1)
     page_size = stream_page_positive_int(
@@ -2679,6 +2719,12 @@ def build_streamer_stream_page(
             stream_events.get(record.video_id, []),
             jobs_by_video.get(record.video_id, []),
             include_file_diagnostics=include_file_diagnostics,
+            live_download_progress=download_progress_for(
+                record.video_id,
+                segment_index=record.segment_index,
+                snapshot=progress_snapshot,
+            ),
+            progress_current_time=generated_at,
         )
         for record in page_records
     ]
@@ -2695,6 +2741,11 @@ def build_streamer_stream_page(
         from_date=from_date,
         to_date=to_date,
         streams=streams,
+        revision=stream_revision_for_records(
+            page_records,
+            progress_snapshot=progress_snapshot,
+            current_time=generated_at,
+        ),
     )
 
 
@@ -2756,7 +2807,12 @@ def stream_platform_sort_key(platform: str) -> tuple[int, str]:
 
 
 
-def stream_revision_for_records(records: list[StreamRecord]) -> str:
+def stream_revision_for_records(
+    records: list[StreamRecord],
+    *,
+    progress_snapshot: DownloadProgressSnapshot | None = None,
+    current_time: float | None = None,
+) -> str:
     if not records:
         return ""
     latest = max((record.updated_at or "" for record in records), default="")
@@ -2765,7 +2821,74 @@ def stream_revision_for_records(records: list[StreamRecord]) -> str:
         for record in records
     )
     digest = hashlib.sha1(statuses.encode("utf-8")).hexdigest()[:16]
-    return f"{latest}|{len(records)}|{digest}"
+    active_records = [
+        record
+        for record in records
+        if record.status == "downloading" and record.recording_kind == "live"
+    ]
+    progress_revision = download_progress_revision(
+        [record.video_id for record in active_records],
+        segment_indexes={record.video_id: record.segment_index for record in records},
+        snapshot=progress_snapshot,
+    )
+    progress_time = time.time() if current_time is None else current_time
+    waiting_stale_ids = sorted(
+        record.video_id
+        for record in active_records
+        if live_download_progress_waiting_stale(
+            record.last_started_at,
+            record.platform,
+            download_progress_for(
+                record.video_id,
+                segment_index=record.segment_index,
+                snapshot=progress_snapshot,
+            ),
+            current_time=progress_time,
+        )
+    )
+    if waiting_stale_ids:
+        progress_revision = hashlib.sha1(
+            (
+                f"{progress_revision}|waiting-stale:"
+                + ";".join(waiting_stale_ids)
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+    progress_suffix = f"|progress:{progress_revision}" if progress_revision else ""
+    return f"{latest}|{len(records)}|{digest}{progress_suffix}"
+
+
+def stream_state_revision(revision: str) -> str:
+    return revision.partition("|progress:")[0]
+
+
+def expected_live_download_tracks(
+    platform_name: str,
+    progress: Sequence[DownloadTrackProgress],
+) -> tuple[str, ...]:
+    observed = {item.track for item in progress}
+    if "media" in observed:
+        return ("media",)
+    if observed & {"video", "audio"} or platform_name.casefold() == "youtube":
+        return ("video", "audio")
+    return ("media",)
+
+
+def live_download_progress_waiting_stale(
+    last_started_at: str | None,
+    platform_name: str,
+    progress: Sequence[DownloadTrackProgress],
+    *,
+    current_time: float,
+) -> bool:
+    expected_tracks = expected_live_download_tracks(platform_name, progress)
+    observed = {item.track for item in progress}
+    if all(track in observed for track in expected_tracks):
+        return False
+    started_at = iso_to_epoch(last_started_at)
+    return (
+        started_at is not None
+        and current_time - started_at >= DOWNLOAD_PROGRESS_STALE_SECONDS
+    )
 
 
 def job_revision_for_jobs(jobs: list[JobStatus]) -> str:
@@ -2791,7 +2914,11 @@ def job_revision_for_jobs(jobs: list[JobStatus]) -> str:
 
 def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
     started_at = time.perf_counter()
+    generated_at = time.time()
     steps: list[tuple[str, float]] = []
+    progress_snapshot = load_download_progress(
+        download_progress_path(config.state_dir)
+    )
 
     step_started_at = time.perf_counter()
     state = StateStore(config.db_path)
@@ -2816,8 +2943,12 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
     recent_logs, log_revision = get_recent_log_snapshot(LOG_LIMIT)
     payload = {
         "detail": "lite",
-        "generated_at": time.time(),
-        "stream_revision": stream_revision_for_records(records),
+        "generated_at": generated_at,
+        "stream_revision": stream_revision_for_records(
+            records,
+            progress_snapshot=progress_snapshot,
+            current_time=generated_at,
+        ),
         "job_revision": job_revision_for_jobs(jobs),
         "stream_count": len(records),
         "streamer_count": len(config.streamers),
@@ -4548,6 +4679,8 @@ def stream_status_from_record(
     job_records: list[JobStatus] | None = None,
     *,
     include_file_diagnostics: bool = True,
+    live_download_progress: list[DownloadTrackProgress] | None = None,
+    progress_current_time: float | None = None,
 ) -> StreamStatus:
     started_at = time.perf_counter()
     steps: list[tuple[str, float]] = []
@@ -4597,6 +4730,32 @@ def stream_status_from_record(
     recoverable_segments = recoverable_segment_indexes(file_summary)
     perf_step(steps, "resume_flags", step_started_at)
 
+    is_live_downloading = (
+        record.status == "downloading" and record.recording_kind == "live"
+    )
+    if is_live_downloading:
+        resolved_download_progress = (
+            download_progress_for(
+                record.video_id,
+                segment_index=record.segment_index,
+            )
+            if live_download_progress is None
+            else list(live_download_progress)
+        )
+        waiting_stale = live_download_progress_waiting_stale(
+            record.last_started_at,
+            record.platform,
+            resolved_download_progress,
+            current_time=(
+                time.time()
+                if progress_current_time is None
+                else progress_current_time
+            ),
+        )
+    else:
+        resolved_download_progress = []
+        waiting_stale = False
+
     status = StreamStatus(
         video_id=record.video_id,
         title=record.title,
@@ -4641,6 +4800,9 @@ def stream_status_from_record(
         file_size_totals_complete=file_summary.file_size_totals_complete,
         powerchat_recorded_event_count=len(powerchat_events),
         powerchat_test_event_count=sum(event.is_test for event in powerchat_events),
+        recording_kind=record.recording_kind,
+        download_progress=resolved_download_progress,
+        download_progress_waiting_stale=waiting_stale,
     )
     log_perf(
         "stream-status",
@@ -9707,14 +9869,19 @@ def render_admin_page(
     title = ADMIN_PAGE_TITLES[page]
     subtitle = ADMIN_PAGE_SUBTITLES[page]
     actions = ""
+    request_progress_snapshot: DownloadProgressSnapshot | None = None
     if page in {"settings", "tools", "about"}:
         snapshot: StatusSnapshot | AdminStaticSnapshot = build_admin_static_snapshot(config)
         extra_attributes = ""
     else:
+        request_progress_snapshot = load_download_progress(
+            download_progress_path(config.state_dir)
+        )
         snapshot = build_status_snapshot(
             config,
             include_speaker_scan=False,
             include_file_diagnostics=False,
+            progress_snapshot=request_progress_snapshot,
         )
         extra_attributes = (
             f'data-stream-revision="{escape(snapshot.stream_revision, quote=True)}" '
@@ -9735,6 +9902,7 @@ def render_admin_page(
                 config,
                 admin_streamer_stream_params(params, selected),
                 include_file_diagnostics=False,
+                progress_snapshot=request_progress_snapshot,
             )
             if selected and streamer_tab == "overview"
             else None
@@ -9776,16 +9944,41 @@ def render_admin_fragment(
     page: str,
     params: dict[str, list[str]],
 ) -> tuple[str, str]:
+    body, revision, _state_revision = render_admin_fragment_with_state(
+        config,
+        page,
+        params,
+    )
+    return body, revision
+
+
+def render_admin_fragment_with_state(
+    config: BotConfig,
+    page: str,
+    params: dict[str, list[str]],
+) -> tuple[str, str, str]:
+    progress_snapshot = load_download_progress(
+        download_progress_path(config.state_dir)
+    )
     snapshot = build_status_snapshot(
         config,
         include_speaker_scan=False,
         include_file_diagnostics=False,
+        progress_snapshot=progress_snapshot,
     )
     if page == "overview":
         body = render_admin_overview_dynamic(snapshot)
         revision = f"{snapshot.stream_revision}:{snapshot.job_revision}:{snapshot.log_revision}"
+        state_revision = (
+            f"{stream_state_revision(snapshot.stream_revision)}:"
+            f"{snapshot.job_revision}:{snapshot.log_revision}"
+        )
     elif page == "streamers":
         selected = first_query_value(params, "selected").strip()
+        base_stream_revision = stream_state_revision(snapshot.stream_revision)
+        streamer: StreamerStatStatus | None = None
+        tab = "overview"
+        stream_page = None
         if selected:
             streamer = next((item for item in snapshot.streamer_stats if item.name == selected), None)
             tab = admin_streamer_tab(params)
@@ -9798,6 +9991,7 @@ def render_admin_fragment(
                     config,
                     admin_streamer_stream_params(params, selected),
                     include_file_diagnostics=False,
+                    progress_snapshot=progress_snapshot,
                 )
                 body = render_admin_streamer_streams(streamer, stream_page)
         else:
@@ -9806,15 +10000,31 @@ def render_admin_fragment(
             streamer_powerchat_revision(snapshot.powerchat_stats, selected, streamer)
             if selected and tab == "powerchat" and streamer is not None
             else (
-                f"{snapshot.stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
+                f"{base_stream_revision}:{stream_page.revision}:"
+                f"{snapshot.job_revision}:{streamer.timezone}"
+                if selected and streamer is not None and stream_page is not None
+                else f"{base_stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
                 if selected and streamer is not None
-                else f"{snapshot.stream_revision}:{snapshot.job_revision}"
+                else f"{base_stream_revision}:{snapshot.job_revision}"
+            )
+        )
+        state_revision = (
+            streamer_powerchat_revision(snapshot.powerchat_stats, selected, streamer)
+            if selected and tab == "powerchat" and streamer is not None
+            else (
+                f"{base_stream_revision}:{stream_state_revision(stream_page.revision)}:"
+                f"{snapshot.job_revision}:{streamer.timezone}"
+                if selected and streamer is not None and stream_page is not None
+                else f"{base_stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
+                if selected and streamer is not None
+                else f"{base_stream_revision}:{snapshot.job_revision}"
             )
         )
     elif page == "activity":
         view = first_query_value(params, "view").strip().lower() or "jobs"
         body = render_admin_activity_records(snapshot, view)
         revision = f"{snapshot.job_revision}:{snapshot.log_revision}"
+        state_revision = revision
     elif page == "powerchat":
         body = render_powerchat_dashboard(snapshot.powerchat_stats) + (
             '<script type="application/json" id="powerchat-stats-json">'
@@ -9822,17 +10032,23 @@ def render_admin_fragment(
             + "</script>"
         )
         revision = hashlib.sha256(json_script_payload(snapshot.powerchat_stats).encode()).hexdigest()[:20]
+        state_revision = revision
     else:
         body = '<div class="notice">This page does not use live fragments.</div>'
         revision = config_file_revision(config)
-    return body, revision
+        state_revision = revision
+    return body, revision, state_revision
 
 
 def render_admin_overview(snapshot: StatusSnapshot) -> str:
     setup = render_admin_setup_checklist(snapshot)
+    state_revision = (
+        f"{stream_state_revision(snapshot.stream_revision)}:"
+        f"{snapshot.job_revision}:{snapshot.log_revision}"
+    )
     return f"""<div class="section-stack">
   {setup}
-  <section data-fragment-url="/?fragment=status" data-fragment-revision="{escape(f'{snapshot.stream_revision}:{snapshot.job_revision}:{snapshot.log_revision}', quote=True)}">
+  <section data-fragment-url="/?fragment=status" data-fragment-revision="{escape(f'{snapshot.stream_revision}:{snapshot.job_revision}:{snapshot.log_revision}', quote=True)}" data-fragment-state-revision="{escape(state_revision, quote=True)}">
     {render_admin_overview_dynamic(snapshot)}
   </section>
 </div>"""
@@ -9900,11 +10116,152 @@ def render_admin_setup_checklist(snapshot: StatusSnapshot) -> str:
     return f'<section class="notice info"><div class="card-header"><div><h2>{heading}</h2><p>{text}</p></div>{action}</div></section>'
 
 
+def render_live_download_progress(stream: StreamStatus) -> str:
+    if stream.status != "downloading" or stream.recording_kind != "live":
+        return ""
+
+    progress_by_track = {item.track: item for item in stream.download_progress}
+    track_names = list(
+        expected_live_download_tracks(stream.platform, stream.download_progress)
+    )
+    labels = {"video": "Video", "audio": "Audio", "media": "Audio + video"}
+    stream_label = stream.title or stream.video_id
+    rows: list[str] = []
+    lagging: list[DownloadTrackProgress] = []
+    stale: list[DownloadTrackProgress] = []
+    missing_labels: list[str] = []
+    for track_name in track_names:
+        label = labels[track_name]
+        item = progress_by_track.get(track_name)
+        if item is None:
+            missing_labels.append(label)
+            waiting_text = (
+                f"No progress reported for {DOWNLOAD_PROGRESS_STALE_SECONDS}s+"
+                if stream.download_progress_waiting_stale
+                else "Waiting for progress…"
+            )
+            waiting_class = (
+                "is-waiting is-stale"
+                if stream.download_progress_waiting_stale
+                else "is-waiting"
+            )
+            rows.append(
+                f'<span class="live-download-track {waiting_class}">'
+                f'<span class="live-download-track-label"><strong>{label}</strong>'
+                f"<span>{waiting_text}</span></span>"
+                f'<progress max="100" aria-label="{escape(f"{label} download progress for {stream_label}; {waiting_text}", quote=True)}"></progress>'
+                "</span>"
+            )
+            continue
+
+        if item.caught_up:
+            state = (
+                f"No fragment update for {DOWNLOAD_PROGRESS_STALE_SECONDS}s+"
+                if item.stale
+                else "At live edge"
+            )
+            state_class = "is-current"
+        else:
+            suffix = "fragment" if item.lag_fragments == 1 else "fragments"
+            state = f"{item.lag_fragments:,} {suffix} behind"
+            state_class = "is-behind"
+            lagging.append(item)
+        if item.stale:
+            stale.append(item)
+            if not item.caught_up:
+                state += " · no recent update"
+            state_class += " is-stale"
+        progress_label = (
+            f"{item.fragment_index:,} / {item.fragment_count:,} fragments · {state}"
+        )
+        percent = max(0, min(100, round(item.progress * 100)))
+        rows.append(
+            f'<span class="live-download-track {state_class}">'
+            f'<span class="live-download-track-label"><strong>{label}</strong>'
+            f"<span>{escape(progress_label)}</span></span>"
+            f'<progress max="{item.fragment_count}" value="{item.fragment_index}" '
+            f'aria-label="{escape(f"{label} download progress for {stream_label}: {progress_label}", quote=True)}">'
+            f"{percent}%</progress></span>"
+        )
+
+    def track_phrase(track_labels: list[str]) -> str:
+        if len(track_labels) < 2:
+            return track_labels[0] if track_labels else "Track"
+        return ", ".join(track_labels[:-1]) + f" and {track_labels[-1]}"
+
+    wrapper_classes: list[str] = []
+    if lagging:
+        worst = max(lagging, key=lambda item: item.lag_fragments)
+        worst_label = labels.get(worst.track, worst.track.title())
+        suffix = "fragment" if worst.lag_fragments == 1 else "fragments"
+        summary = f"{worst_label} is {worst.lag_fragments:,} {suffix} behind"
+        wrapper_classes.append("has-lag")
+        if worst.stale:
+            summary += " · no recent update"
+        other_stale_labels = [
+            labels.get(item.track, item.track.title())
+            for item in stale
+            if item.track != worst.track
+        ]
+        if other_stale_labels:
+            verb = "has" if len(other_stale_labels) == 1 else "have"
+            summary += (
+                f" · {track_phrase(other_stale_labels)} {verb} no recent update"
+            )
+        if stream.download_progress_waiting_stale and missing_labels:
+            verb = "has" if len(missing_labels) == 1 else "have"
+            summary += (
+                f" · {track_phrase(missing_labels)} {verb} not reported progress"
+            )
+    elif stream.download_progress_waiting_stale and missing_labels:
+        missing_phrase = track_phrase(missing_labels)
+        verb = "has" if len(missing_labels) == 1 else "have"
+        summary = (
+            f"{missing_phrase} {verb} not reported progress for "
+            f"{DOWNLOAD_PROGRESS_STALE_SECONDS}s+"
+        )
+        wrapper_classes.append("has-lag")
+        if stale:
+            stale_labels = [
+                labels.get(item.track, item.track.title()) for item in stale
+            ]
+            verb = "has" if len(stale_labels) == 1 else "have"
+            summary += f" · {track_phrase(stale_labels)} {verb} no recent update"
+    elif stale:
+        stale_labels = [labels.get(item.track, item.track.title()) for item in stale]
+        stale_phrase = track_phrase(stale_labels)
+        verb = "has" if len(stale_labels) == 1 else "have"
+        summary = (
+            f"{stale_phrase} {verb} no fragment update for "
+            f"{DOWNLOAD_PROGRESS_STALE_SECONDS}s+"
+        )
+    elif all(track_name in progress_by_track for track_name in track_names):
+        summary = "Tracks are at the live edge"
+    elif progress_by_track:
+        summary = "Waiting for both track updates"
+    else:
+        summary = "Waiting for the first fragment update"
+    if stale or stream.download_progress_waiting_stale:
+        wrapper_classes.append("is-stale")
+    wrapper_class = "".join(f" {name}" for name in wrapper_classes)
+
+    return (
+        f'<span class="live-download-progress{wrapper_class}" role="group" '
+        f'data-live-download-progress="{escape(stream.video_id, quote=True)}" '
+        f'aria-label="{escape(f"Live download progress for {stream_label}: {summary}", quote=True)}">'
+        '<span class="live-download-progress-heading">'
+        '<strong>Live-edge download</strong>'
+        f"<span>{escape(summary)}</span></span>"
+        f'<span class="live-download-tracks">{"".join(rows)}</span></span>'
+    )
+
+
 def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "") -> str:
     platform, platform_label, platform_initial = stream_platform_details(stream)
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
     status_class = "warning" if stream_needs_attention(stream) else "good"
     stored_label = "Stored" if stream.file_size_totals_complete else "Relevant storage"
+    download_progress = render_live_download_progress(stream)
     return f"""<article class="streamer-summary">
   <div>
     <h3>{escape(stream.title or stream.video_id)}</h3>
@@ -9912,6 +10269,7 @@ def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "")
   </div>
   <div class="summary-stats"><div class="summary-stat"><strong>{escape(format_bytes(stream.total_bytes))}</strong><span>{stored_label}</span></div><div class="summary-stat"><strong>{stream.file_count}</strong><span>Files</span></div></div>
   <div class="streamer-summary-actions"><span class="status-badge {status_class}">{escape(status_label)}</span><a class="button small secondary" href="/streamers?selected={quote(streamer_name or stream.channel or '', safe='')}">Details</a></div>
+  {download_progress}
 </article>"""
 
 
@@ -9986,10 +10344,12 @@ def render_admin_streamers(
     if selected:
         return render_admin_streamer_detail(snapshot, selected, stream_page, tab)
     list_html = render_admin_streamer_list(snapshot)
-    revision = f"{snapshot.stream_revision}:{snapshot.job_revision}"
+    revision = (
+        f"{stream_state_revision(snapshot.stream_revision)}:{snapshot.job_revision}"
+    )
     return f"""<div class="section-stack">
   <div class="search-bar"><label class="sr-only" for="streamer-search">Search streamers</label><input id="streamer-search" data-streamer-search type="search" placeholder="Search streamers or sources"></div>
-  <section data-fragment-url="/streamers?fragment=list" data-fragment-revision="{escape(revision, quote=True)}">{list_html}</section>
+  <section data-fragment-url="/streamers?fragment=list" data-fragment-revision="{escape(revision, quote=True)}" data-fragment-state-revision="{escape(revision, quote=True)}">{list_html}</section>
   {render_admin_add_streamer_dialog(snapshot)}
   {render_admin_legacy_migration(snapshot)}
 </div>"""
@@ -10071,8 +10431,10 @@ def render_admin_streamer_detail(
     if streamer.needs_grouping:
         return f'<div class="section-stack"><a href="/streamers">← All streamers</a><section class="notice warning"><h2>{escape(streamer.name)} needs grouping</h2><p>Use the migration assistant to create a shared streamer identity for these legacy sources.</p><a class="button" href="/streamers#migrate-legacy">Open migration assistant</a></section></div>'
     revision = (
-        f"{snapshot.stream_revision}:{snapshot.job_revision}:{streamer.timezone}"
+        f"{stream_state_revision(snapshot.stream_revision)}:"
+        f"{snapshot.job_revision}:{streamer.timezone}"
     )
+    state_revision = revision
     delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
       <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
     </form>"""
@@ -10088,6 +10450,7 @@ def render_admin_streamer_detail(
             streamer.name,
             streamer,
         )
+        state_revision = revision
         powerchat_fragment_url = (
             "/streamers?"
             + urlencode(
@@ -10098,14 +10461,24 @@ def render_admin_streamer_detail(
                 }
             )
         )
-        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(powerchat_fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
+        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(powerchat_fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}" data-fragment-state-revision="{escape(state_revision, quote=True)}">
     {render_admin_streamer_powerchat(streamer, snapshot.powerchat_stats)}
   </section>"""
     else:
         if stream_page is None:
             raise ConfigError("stream page is required for the streamer overview")
+        revision = (
+            f"{stream_state_revision(snapshot.stream_revision)}:"
+            f"{stream_page.revision}:"
+            f"{snapshot.job_revision}:{streamer.timezone}"
+        )
+        state_revision = (
+            f"{stream_state_revision(snapshot.stream_revision)}:"
+            f"{stream_state_revision(stream_page.revision)}:"
+            f"{snapshot.job_revision}:{streamer.timezone}"
+        )
         fragment_url = admin_streamer_stream_url(stream_page, fragment=True)
-        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}">
+        tab_content = f"""<section class="section-stack" data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}" data-fragment-state-revision="{escape(state_revision, quote=True)}">
     {render_admin_streamer_streams(streamer, stream_page)}
   </section>"""
     return f"""<div class="section-stack">
@@ -10653,8 +11026,13 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     ) or '<tr><td colspan="7">No relevant files found</td></tr>'
     file_diagnostics = render_file_diagnostics_control(stream)
     storage_label = "Storage" if stream.file_size_totals_complete else "Relevant storage"
-    return f"""<details class="card stream-detail" data-details-key="stream:{details_key}">
-  <summary class="card-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span>{format_badge}</div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></summary>
+    download_progress = render_live_download_progress(stream)
+    disclosure_label = stream.title or stream.video_id
+    return f"""<article class="card stream-detail">
+  <header class="card-header stream-detail-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span>{format_badge}</div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></header>
+  {download_progress}
+  <details class="stream-detail-disclosure" data-details-key="stream:{details_key}">
+  <summary><strong>Files, events, and actions<span class="sr-only"> for {escape(disclosure_label)}</span></strong></summary>
   <div class="section-stack">
     {render_stream_signals(stream)}
     <dl class="detail-list stream-detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>{storage_label}</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
@@ -10665,7 +11043,8 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     <details class="stream-subsection processing-jobs-section" data-details-key="stream:{details_key}:jobs"><summary><strong>Processing jobs</strong><span class="subsection-count">{len(stream.jobs)}</span></summary><div class="stream-subsection-body">{render_stream_jobs(stream.jobs, timezone_name)}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:log"><summary><strong>Stream log</strong><span class="subsection-count">{len(stream.events)}</span></summary><div class="stream-subsection-body">{render_stream_event_timeline(stream.events, timezone_name)}</div></details>
   </div>
-</details>"""
+  </details>
+</article>"""
 
 
 def render_admin_legacy_migration(snapshot: StatusSnapshot) -> str:
@@ -10794,8 +11173,9 @@ def render_admin_setting_control(field: ConfigFormField, value: Any) -> str:
 
 def render_admin_powerchat(snapshot: StatusSnapshot) -> str:
     stats_json = json_script_payload(snapshot.powerchat_stats)
+    revision = hashlib.sha256(stats_json.encode()).hexdigest()[:20]
     return f"""<div class="section-stack">
-  <section data-fragment-url="/powerchat?fragment=dashboard">{render_powerchat_dashboard(snapshot.powerchat_stats)}<script type="application/json" id="powerchat-stats-json">{stats_json}</script></section>
+  <section data-fragment-url="/powerchat?fragment=dashboard" data-fragment-revision="{revision}" data-fragment-state-revision="{revision}">{render_powerchat_dashboard(snapshot.powerchat_stats)}<script type="application/json" id="powerchat-stats-json">{stats_json}</script></section>
 </div>"""
 
 

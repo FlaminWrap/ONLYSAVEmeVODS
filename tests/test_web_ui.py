@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +15,13 @@ from onlysavemevods.config import (
     migrate_legacy_channels_to_streamer,
 )
 from onlysavemevods.downloader import segment_directory
+from onlysavemevods.download_progress import (
+    DOWNLOAD_PROGRESS_STALE_SECONDS,
+    clear_all_download_progress,
+    download_progress_path,
+    flush_download_progress,
+    record_download_progress,
+)
 from onlysavemevods.models import LiveStream
 from onlysavemevods.state import StateStore
 from onlysavemevods.web_ui import (
@@ -29,6 +37,7 @@ from onlysavemevods.web import (
     build_status_snapshot,
     config_file_revision,
     render_admin_fragment,
+    render_admin_fragment_with_state,
     render_admin_page,
     render_admin_settings,
     render_admin_streamer_powerchat,
@@ -138,10 +147,15 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn('event.target.closest("[data-load-file-diagnostics]")', script)
         self.assertIn('headers: { "X-Dashboard-Fragment": "1" }', script)
         self.assertIn("Scanning fragment and internal files", script)
-        self.assertGreaterEqual(
-            script.count('region.querySelector("[data-file-diagnostics-loaded][open]")'),
-            2,
+        self.assertIn(
+            'region.querySelector("[data-file-diagnostics-loaded][open]")',
+            script,
         )
+        progress_patch = script.index("patchLiveDownloadProgress(region, html);")
+        interaction_guard = script.index(
+            "if (fragmentInteractionBlocksReplacement(region)) return;"
+        )
+        self.assertLess(progress_patch, interaction_guard)
 
     def test_admin_stream_page_omits_diagnostic_rows_until_requested(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -398,6 +412,12 @@ class DashboardUiTests(unittest.TestCase):
         self.assertLess(capture, replace)
         self.assertLess(replace, restore)
         self.assertIn('details[data-details-key]', script)
+        self.assertIn(
+            'if (stateRevision && stateRevision === region.dataset.fragmentStateRevision)',
+            script,
+        )
+        self.assertIn("patchLiveDownloadProgress(region, html)", script)
+        self.assertIn("fragmentInteractionBlocksReplacement(region)", script)
 
     def test_autosave_and_fragment_refresh_are_generation_safe_and_delegated(self) -> None:
         script = (
@@ -647,6 +667,11 @@ class DashboardUiTests(unittest.TestCase):
             config = load_config(config_path)
 
             html = render_admin_page(config, "powerchat", {})
+            _fragment, revision, state_revision = render_admin_fragment_with_state(
+                config,
+                "powerchat",
+                {},
+            )
             script = (
                 Path(__file__).parents[1]
                 / "src"
@@ -657,6 +682,8 @@ class DashboardUiTests(unittest.TestCase):
 
         self.assertIn('/assets/dashboard.js', html)
         self.assertIn('id="powerchat-stats-json"', html)
+        self.assertIn(f'data-fragment-revision="{revision}"', html)
+        self.assertIn(f'data-fragment-state-revision="{state_revision}"', html)
         self.assertNotIn('const tabKey = "onlysavemevods.dashboardTab"', html)
         self.assertIn("isPowerchatTestEvent", script)
         self.assertIn("Tests excluded", script)
@@ -780,6 +807,244 @@ class DashboardUiTests(unittest.TestCase):
             "minmax(0, 1fr);",
             stylesheet,
         )
+
+    def test_live_download_progress_is_visible_on_current_stream_cards(self) -> None:
+        clear_all_download_progress()
+        progress_file = None
+        try:
+            with TemporaryDirectory() as temp_dir:
+                config_path = Path(temp_dir) / "config.toml"
+                config_path.write_text(
+                    BASE_CONFIG
+                    + '\n[streamers."Example"]\n'
+                    + 'sources = ["youtube:example"]\n',
+                    encoding="utf-8",
+                )
+                config = load_config(config_path)
+                progress_file = download_progress_path(config.state_dir)
+                stream = LiveStream(
+                    video_id="youtube:LIVEVIDEO01",
+                    url="https://www.youtube.com/watch?v=LIVEVIDEO01",
+                    title="Live progress",
+                    channel="example",
+                    platform="youtube",
+                    source="youtube:example",
+                )
+                state = StateStore(config.db_path)
+                state.mark_downloading(stream, 1)
+                state.lock_youtube_video_format(
+                    stream.video_id,
+                    format_id="137",
+                    codec="h264",
+                    selector="137+140",
+                )
+                started_record = state.get_stream(stream.video_id)
+                self.assertIsNotNone(started_record)
+                started_at = datetime.fromisoformat(
+                    started_record.last_started_at
+                ).timestamp()
+                state.close()
+
+                waiting = render_admin_page(config, "overview", {})
+                with patch(
+                    "onlysavemevods.web.time.time",
+                    return_value=started_at + DOWNLOAD_PROGRESS_STALE_SECONDS - 1,
+                ):
+                    (
+                        _waiting_fragment,
+                        waiting_revision,
+                        waiting_state_revision,
+                    ) = render_admin_fragment_with_state(config, "overview", {})
+                with patch(
+                    "onlysavemevods.web.time.time",
+                    return_value=started_at + DOWNLOAD_PROGRESS_STALE_SECONDS,
+                ):
+                    (
+                        no_progress_stale_fragment,
+                        no_progress_stale_revision,
+                        no_progress_stale_state_revision,
+                    ) = render_admin_fragment_with_state(config, "overview", {})
+
+                record_download_progress(
+                    stream.video_id,
+                    {"video": (4924, 4924), "audio": (2175, 4924)},
+                    segment_index=1,
+                    progress_file=progress_file,
+                )
+                clear_all_download_progress()
+                snapshot = build_status_snapshot(
+                    config,
+                    include_speaker_scan=False,
+                    include_file_diagnostics=False,
+                )
+                overview = render_admin_page(config, "overview", {})
+                detail = render_admin_page(
+                    config,
+                    "streamers",
+                    {"selected": ["Example"]},
+                )
+                (
+                    _first_fragment,
+                    first_revision,
+                    first_state_revision,
+                ) = render_admin_fragment_with_state(
+                    config,
+                    "overview",
+                    {},
+                )
+                (
+                    _first_detail_fragment,
+                    first_detail_revision,
+                    first_detail_state_revision,
+                ) = render_admin_fragment_with_state(
+                    config,
+                    "streamers",
+                    {"selected": ["Example"]},
+                )
+
+                record_download_progress(
+                    stream.video_id,
+                    {"video": (4924, 4924), "audio": (3000, 4924)},
+                    segment_index=1,
+                    progress_file=progress_file,
+                )
+                (
+                    _second_fragment,
+                    second_revision,
+                    second_state_revision,
+                ) = render_admin_fragment_with_state(
+                    config,
+                    "overview",
+                    {},
+                )
+                (
+                    _second_detail_fragment,
+                    second_detail_revision,
+                    second_detail_state_revision,
+                ) = render_admin_fragment_with_state(
+                    config,
+                    "streamers",
+                    {"selected": ["Example"]},
+                )
+                record_download_progress(
+                    stream.video_id,
+                    {"video": (4924, 4924), "audio": (3001, 4924)},
+                    segment_index=1,
+                    updated_at=0.0,
+                    progress_file=progress_file,
+                )
+                flush_download_progress(progress_file)
+                (
+                    stale_fragment,
+                    stale_revision,
+                    stale_state_revision,
+                ) = render_admin_fragment_with_state(
+                    config,
+                    "overview",
+                    {},
+                )
+                http_fragment = run_dashboard_request(
+                    config,
+                    b"GET / HTTP/1.1\r\n"
+                    b"Host: localhost\r\n"
+                    b"X-Dashboard-Fragment: 1\r\n\r\n",
+                )
+                state = StateStore(config.db_path)
+                state.mark_exited(stream.video_id, 0)
+                state.close()
+                (
+                    _exited_fragment,
+                    _exited_revision,
+                    exited_state_revision,
+                ) = render_admin_fragment_with_state(config, "overview", {})
+        finally:
+            clear_all_download_progress()
+            if progress_file is not None:
+                clear_all_download_progress(progress_file=progress_file)
+
+        tracks = snapshot.streams[0].download_progress
+        self.assertEqual([track.track for track in tracks], ["video", "audio"])
+        self.assertTrue(tracks[0].caught_up)
+        self.assertEqual(tracks[1].lag_fragments, 2749)
+        self.assertEqual(waiting.count("<progress"), 2)
+        self.assertIn("Waiting for the first fragment update", waiting)
+        self.assertIn("data-live-download-progress", waiting)
+        self.assertNotEqual(waiting_revision, no_progress_stale_revision)
+        self.assertEqual(waiting_state_revision, no_progress_stale_state_revision)
+        self.assertIn("have not reported progress for 30s+", no_progress_stale_fragment)
+        self.assertIn("live-download-progress has-lag is-stale", no_progress_stale_fragment)
+        for html in (overview, detail):
+            self.assertEqual(html.count("<progress"), 2)
+            self.assertIn("Live-edge download", html)
+            self.assertIn("Video", html)
+            self.assertIn("Audio", html)
+            self.assertIn('max="4924" value="4924"', html)
+            self.assertIn('max="4924" value="2175"', html)
+            self.assertIn("2,749 fragments behind", html)
+            self.assertIn("live-download-progress has-lag", html)
+            self.assertIn("data-fragment-state-revision=", html)
+            self.assertIn("Live download progress for Live progress", html)
+        detail_start = detail.index('<article class="card stream-detail">')
+        progress_start = detail.index("live-download-progress", detail_start)
+        disclosure_start = detail.index(
+            '<details class="stream-detail-disclosure"',
+            detail_start,
+        )
+        self.assertLess(detail_start, progress_start)
+        self.assertLess(progress_start, disclosure_start)
+        self.assertIn(
+            'Files, events, and actions<span class="sr-only"> for Live progress',
+            detail,
+        )
+        self.assertNotEqual(first_revision, second_revision)
+        self.assertNotEqual(first_detail_revision, second_detail_revision)
+        self.assertNotEqual(second_revision, stale_revision)
+        self.assertEqual(first_state_revision, second_state_revision)
+        self.assertEqual(first_detail_state_revision, second_detail_state_revision)
+        self.assertEqual(second_state_revision, stale_state_revision)
+        self.assertNotEqual(stale_state_revision, exited_state_revision)
+        self.assertIn("live-download-progress has-lag is-stale", stale_fragment)
+        self.assertIn("no recent update", stale_fragment)
+        self.assertIn("X-Fragment-Revision: ", http_fragment)
+        self.assertIn("X-Fragment-State-Revision: ", http_fragment)
+
+        stylesheet = (
+            Path(__file__).parents[1]
+            / "src"
+            / "onlysavemevods"
+            / "assets"
+            / "dashboard.css"
+        ).read_text(encoding="utf-8")
+        self.assertIn(".live-download-progress.has-lag", stylesheet)
+        self.assertIn(".live-download-track.is-behind progress", stylesheet)
+        self.assertIn(".live-download-progress.is-stale", stylesheet)
+
+    def test_live_download_progress_is_not_rendered_for_vod_downloads(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(
+                BASE_CONFIG
+                + '\n[streamers."Example"]\n'
+                + 'sources = ["youtube:example"]\n',
+                encoding="utf-8",
+            )
+            config = load_config(config_path)
+            stream = LiveStream(
+                video_id="youtube:VODVIDEO01",
+                url="https://www.youtube.com/watch?v=VODVIDEO01",
+                title="Manual VOD download",
+                channel="example",
+                platform="youtube",
+                source="youtube:example",
+            )
+            state = StateStore(config.db_path)
+            state.mark_vod_downloading(stream)
+            state.close()
+
+            overview = render_admin_page(config, "overview", {})
+
+        self.assertIn("Manual VOD download", overview)
+        self.assertNotIn("Live-edge download", overview)
 
     def test_streamer_history_uses_historical_timezone_and_dst(self) -> None:
         with TemporaryDirectory() as temp_dir:
