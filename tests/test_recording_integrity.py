@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -955,7 +956,10 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                     config,
                     state,
                     probe=None,  # type: ignore[arg-type]
-                    probe_video_func=AsyncMock(return_value=new_stream),
+                    sleep_func=AsyncMock(),
+                    probe_video_func=AsyncMock(
+                        side_effect=[new_stream, replace(old_stream, is_live=False), replace(old_stream, is_live=False)]
+                    ),
                 )
                 calls: list[tuple[str, str]] = []
 
@@ -987,6 +991,97 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                     ],
                 )
 
+    async def test_new_channel_session_does_not_finalize_still_live_old_video(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            old_stream = platform_session_stream(
+                "kick", "Morning session", 1_800_000_000
+            )
+            new_stream = platform_session_stream(
+                "kick", "Evening session", 1_800_043_200
+            )
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0],
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(old_stream, 1)
+            state.mark_exited(old_stream.video_id, 0)
+            source_probe = AsyncMock(side_effect=[new_stream, old_stream])
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                probe_video_func=source_probe,
+            )
+            manager.start_stream = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            manager.finish_ended_stream = AsyncMock()  # type: ignore[method-assign]
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
+            try:
+                await manager.handle_post_exit(
+                    old_stream, 1, expected_status="checking_after_exit"
+                )
+                status = state.get_stream(old_stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        manager.start_stream.assert_awaited_once_with(new_stream)
+        manager.finish_ended_stream.assert_not_awaited()
+        manager._defer_post_exit_retry.assert_called_once_with(old_stream, 1)
+        self.assertEqual(
+            [call.args[0] for call in source_probe.await_args_list],
+            [old_stream.source, old_stream.url],
+        )
+
+    async def test_ended_channel_result_for_another_video_does_not_end_old_video(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            old_stream = platform_session_stream(
+                "kick", "Morning session", 1_800_000_000
+            )
+            another_stream = replace(
+                platform_session_stream(
+                    "kick", "Evening session", 1_800_043_200
+                ),
+                is_live=False,
+            )
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0],
+            )
+            state = StateStore(config.db_path)
+            state.mark_downloading(old_stream, 1)
+            state.mark_exited(old_stream.video_id, 0)
+            source_probe = AsyncMock(side_effect=[another_stream, old_stream])
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                probe_video_func=source_probe,
+            )
+            manager.finish_ended_stream = AsyncMock()  # type: ignore[method-assign]
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
+            try:
+                await manager.handle_post_exit(
+                    old_stream, 1, expected_status="checking_after_exit"
+                )
+                status = state.get_stream(old_stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        manager.finish_ended_stream.assert_not_awaited()
+        manager._defer_post_exit_retry.assert_called_once_with(old_stream, 1)
+        self.assertEqual(
+            [call.args[0] for call in source_probe.await_args_list],
+            [old_stream.source, old_stream.url],
+        )
+
     async def test_planned_reconnect_treats_new_platform_session_independently(self) -> None:
         for platform in ("kick", "twitch"):
             with self.subTest(platform=platform), TemporaryDirectory() as tmp:
@@ -1011,7 +1106,10 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                     config,
                     state,
                     probe=None,  # type: ignore[arg-type]
-                    probe_video_func=AsyncMock(return_value=new_stream),
+                    sleep_func=AsyncMock(),
+                    probe_video_func=AsyncMock(
+                        side_effect=[new_stream, replace(old_stream, is_live=False), replace(old_stream, is_live=False)]
+                    ),
                 )
                 calls: list[tuple[str, str, dict[str, object]]] = []
 
@@ -1043,7 +1141,7 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                         (
                             "finish",
                             old_stream.video_id,
-                            {"expected_status": "checking_after_exit"},
+                            {"expected_status": "checking_after_exit", "end_confirmed": True},
                         ),
                     ],
                 )
@@ -1074,7 +1172,9 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                     state,
                     probe=None,  # type: ignore[arg-type]
                     sleep_func=AsyncMock(),
-                    probe_video_func=AsyncMock(return_value=new_stream),
+                    probe_video_func=AsyncMock(
+                        side_effect=[new_stream, replace(old_stream, is_live=False), replace(old_stream, is_live=False)]
+                    ),
                 )
                 calls: list[tuple[str, str, dict[str, object]]] = []
 
@@ -1106,7 +1206,7 @@ class RecordingIntegrityAsyncTests(unittest.IsolatedAsyncioTestCase):
                         (
                             "finish",
                             old_stream.video_id,
-                            {"expected_status": "waiting_retry"},
+                            {"expected_status": "waiting_retry", "end_confirmed": True},
                         ),
                     ],
                 )

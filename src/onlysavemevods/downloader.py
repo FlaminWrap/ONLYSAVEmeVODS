@@ -89,6 +89,8 @@ MIXED_SEGMENT_WATCH_SECONDS = 10
 MIXED_SEGMENT_CONFIRM_SECONDS = 120
 STALE_LIVE_WATCH_INTERVAL_SECONDS = 30
 STALE_LIVE_CONFIRM_SECONDS = 30
+LIVE_EDGE_RECOVERY_WATCH_INTERVAL_SECONDS = 5
+LIVE_EDGE_RECOVERY_CONFIRM_SECONDS = 5
 PROCESSING_WINDOW_RECHECK_SECONDS = 60
 DEFAULT_MEDIA_FORMAT = "bestvideo*+bestaudio/best"
 FORMAT_OPTIONS = {"-f", "--format"}
@@ -224,6 +226,17 @@ class ActiveDownload:
     output_task: asyncio.Task[None] | None = None
     mixed_segment_task: asyncio.Task[None] | None = None
     stale_live_task: asyncio.Task[None] | None = None
+    audio_process: asyncio.subprocess.Process | None = None
+    audio_task: asyncio.Task[None] | None = None
+    audio_output_task: asyncio.Task[None] | None = None
+    audio_drain_watchdog_task: asyncio.Task[None] | None = None
+    audio_tracker: CatchupTracker | None = None
+    audio_started_at: float = 0.0
+    audio_stopping: bool = False
+    audio_end_confirmed: bool = False
+    audio_end_attempts: int = 0
+    video_format_id: str = ""
+    video_restarting: bool = False
     chat_process: asyncio.subprocess.Process | None = None
     chat_task: asyncio.Task[None] | None = None
     chat_output_task: asyncio.Task[None] | None = None
@@ -237,6 +250,7 @@ class FinalizePlan:
     input_files: list[Path]
     cleanup_files: list[Path]
     mixed_inputs: bool = False
+    require_audio_video: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -320,9 +334,14 @@ class CatchupTracker:
         initial_progress_at: float | None = None,
         progress_callback: ProgressCallback | None = None,
         fragment_progress_callback: FragmentProgressCallback | None = None,
+        expected_tracks: frozenset[str] = frozenset(),
     ) -> None:
         self.ready_event = ready_event
+        self.expected_tracks = expected_tracks
         self.fragments: dict[str, tuple[int, int]] = {}
+        self.track_fragment_progress_at: dict[str, float] = {}
+        self.track_started_at: dict[str, float] = {}
+        self.track_live_edge_seen: set[str] = set()
         self.has_prefixed_context = False
         self.monotonic = monotonic_func
         self.progress_callback = progress_callback
@@ -333,7 +352,7 @@ class CatchupTracker:
             else initial_progress_at
         )
 
-    def update(self, line: str) -> None:
+    def update(self, line: str, *, track_hint: str = "") -> None:
         semantic_match = LIVE_PROGRESS_RE.search(line)
         if semantic_match:
             context = download_track_from_codecs(
@@ -360,6 +379,8 @@ class CatchupTracker:
                 # concurrent formats distinct so catch-up cannot wait forever
                 # on two updates that otherwise collapse onto ``media``.
                 context = str(progress_index + 1)
+            if track_hint:
+                context = track_hint
             self.has_prefixed_context = (
                 self.has_prefixed_context
                 or bool(line_context)
@@ -370,6 +391,8 @@ class CatchupTracker:
             if not match:
                 return
             context = match.group("context") or "0"
+            if track_hint:
+                context = track_hint
             self.has_prefixed_context = self.has_prefixed_context or context != "0"
         progress = (
             int(match.group("fragment")),
@@ -377,6 +400,14 @@ class CatchupTracker:
         )
         previous = self.fragments.get(context)
         self.fragments[context] = progress
+        if previous is None or progress[0] > previous[0]:
+            self.track_fragment_progress_at[context] = self.monotonic()
+        if (
+            progress[0] > 0
+            and progress[1] > 0
+            and progress[0] >= progress[1] - CATCHUP_FRAGMENT_MARGIN
+        ):
+            self.track_live_edge_seen.add(context)
         advanced = (
             previous is None
             or progress[0] > previous[0]
@@ -392,6 +423,97 @@ class CatchupTracker:
     def inactive_seconds(self) -> float:
         return max(0.0, self.monotonic() - self.last_fragment_progress_at)
 
+    def last_track_activity_at(self) -> float:
+        return max(
+            (
+                *self.track_fragment_progress_at.values(),
+                *self.track_started_at.values(),
+            ),
+            default=0.0,
+        )
+
+    def fragment_inactive_seconds(self) -> float:
+        if not (self.track_fragment_progress_at or self.track_started_at):
+            return 0.0
+        return max(0.0, self.monotonic() - self.last_track_activity_at())
+
+    def stalled_live_edge_track(self, timeout_seconds: float) -> str | None:
+        """Find a once-caught-up track that stopped as its companion advances."""
+        if {"video", "audio"} <= (
+            self.track_fragment_progress_at.keys() | self.track_started_at.keys()
+        ):
+            tracks = ("video", "audio")
+        elif {"1", "2"} <= self.track_fragment_progress_at.keys():
+            tracks = ("1", "2")
+        else:
+            return None
+        now = self.monotonic()
+        recent_seconds = min(
+            timeout_seconds, 2 * LIVE_EDGE_RECOVERY_WATCH_INTERVAL_SECONDS
+        )
+        for track, companion in (tracks, tracks[::-1]):
+            last_track = max(
+                self.track_fragment_progress_at.get(track, 0.0),
+                self.track_started_at.get(track, 0.0),
+            )
+            last_companion = self.track_fragment_progress_at.get(companion)
+            if (
+                last_companion is not None
+                and (
+                    track in self.track_live_edge_seen
+                    or (
+                        track in self.track_started_at
+                        and companion in self.track_live_edge_seen
+                    )
+                )
+                and now - last_track >= timeout_seconds
+                and last_companion > last_track
+                and now - last_companion < recent_seconds
+            ):
+                return {"1": "video", "2": "audio"}.get(track, track)
+        return None
+
+    def stalled_split_track(self, timeout_seconds: float) -> str | None:
+        """Find a track whose fragments stopped while its companion advances."""
+        if {"video", "audio"} <= (
+            self.track_fragment_progress_at.keys() | self.track_started_at.keys()
+        ):
+            tracks = ("video", "audio")
+        elif {"1", "2"} <= self.track_fragment_progress_at.keys():
+            tracks = ("1", "2")
+        else:
+            return None
+
+        now = self.monotonic()
+        recent_seconds = min(timeout_seconds, 2 * STALE_LIVE_WATCH_INTERVAL_SECONDS)
+        for track, companion in (tracks, tracks[::-1]):
+            last_track = max(
+                self.track_fragment_progress_at.get(track, 0.0),
+                self.track_started_at.get(track, 0.0),
+            )
+            last_companion = self.track_fragment_progress_at.get(companion)
+            if (
+                last_companion is not None
+                and now - last_track >= timeout_seconds
+                and last_companion > last_track
+                and now - last_companion < recent_seconds
+            ):
+                return {"1": "video", "2": "audio"}.get(track, track)
+        return None
+
+    def forget_track(self, track: str) -> None:
+        self.fragments.pop(track, None)
+        self.track_fragment_progress_at.pop(track, None)
+        self.track_started_at.pop(track, None)
+        self.track_live_edge_seen.discard(track)
+
+    def start_track(self, track: str) -> None:
+        was_at_edge = track in self.track_live_edge_seen
+        self.forget_track(track)
+        self.track_started_at[track] = self.monotonic()
+        if was_at_edge:
+            self.track_live_edge_seen.add(track)
+
     def note_external_progress(self) -> None:
         self._note_progress()
 
@@ -402,7 +524,7 @@ class CatchupTracker:
 
     @property
     def caught_up(self) -> bool:
-        if not self.fragments:
+        if not self.fragments or not self.expected_tracks <= self.fragments.keys():
             return False
         if self.has_prefixed_context and len(self.fragments) < 2:
             return False
@@ -525,6 +647,7 @@ class DownloadManager:
         self.logger = logger
         self.download_progress_file = download_progress_path(config.state_dir)
         self.active: dict[str, ActiveDownload] = {}
+        self._draining_audio: dict[str, ActiveDownload] = {}
         self._youtube_fragment_progress_at: dict[str, float] = {}
         self._youtube_restart_checks: set[str] = set()
         self._stalled_youtube_monitors: set[str] = set()
@@ -533,6 +656,7 @@ class DownloadManager:
         self._post_exit_tasks: set[asyncio.Task[None]] = set()
         self._post_processing_video_ids: set[str] = set()
         self._finalizing_video_ids: set[str] = set()
+        self._finalization_retry_tasks: dict[str, asyncio.Task[None]] = {}
         self._starting_video_ids: set[str] = set()
         self._planned_reconnects: set[str] = set()
         self._spawn_failures: dict[str, int] = {}
@@ -598,6 +722,7 @@ class DownloadManager:
         ready_event: asyncio.Event,
         *,
         fragment_progress_callback: FragmentProgressCallback | None = None,
+        expected_tracks: frozenset[str] = frozenset(),
     ) -> CatchupTracker:
         if stream.platform.casefold() != "youtube":
             return CatchupTracker(
@@ -620,6 +745,7 @@ class DownloadManager:
             initial_progress_at=initial_progress_at,
             progress_callback=remember_progress,
             fragment_progress_callback=fragment_progress_callback,
+            expected_tracks=expected_tracks,
         )
 
     def _remember_youtube_edge_progress(self, video_id: str) -> None:
@@ -694,6 +820,8 @@ class DownloadManager:
             return False
         if not await self._youtube_stalled_state_allows_start(stream):
             return False
+        if stream.video_id in self._draining_audio:
+            await self._stop_draining_audio(stream.video_id)
         if len(self.active) >= self.config.max_concurrent_downloads:
             self.logger.info(
                 "Concurrency limit reached; deferring %s (%s)",
@@ -799,6 +927,9 @@ class DownloadManager:
                 segment_index,
             )
 
+        split_format_ids = youtube_split_format_ids(
+            stream, youtube_video_format_selector, self.config
+        )
         output_template = output_template_for(self.config, stream, segment_index)
         output_template.parent.mkdir(parents=True, exist_ok=True)
         command = build_download_command(
@@ -806,6 +937,7 @@ class DownloadManager:
             stream,
             segment_index,
             youtube_video_format_selector=youtube_video_format_selector,
+            youtube_track_format_id=split_format_ids[0] if split_format_ids else "",
         )
         self.logger.debug(
             "Download output template for %s segment=%03d: %s",
@@ -866,8 +998,13 @@ class DownloadManager:
                 segment_index=segment_index,
                 progress_file=self.download_progress_file,
             ),
+            expected_tracks=(
+                frozenset({"video", "audio"}) if split_format_ids else frozenset()
+            ),
         )
 
+        if split_format_ids:
+            catchup_tracker.start_track("video")
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
@@ -925,6 +1062,7 @@ class DownloadManager:
                     stream.video_id,
                     process.stdout,
                     catchup_tracker,
+                    track_hint="video" if split_format_ids else "",
                 )
             )
             output_task.add_done_callback(discard_task_exception)
@@ -938,14 +1076,22 @@ class DownloadManager:
                 )
             )
             reconnect_task.add_done_callback(discard_task_exception)
-        mixed_segment_task = asyncio.create_task(
-            self._mixed_segment_watchdog(stream, process, segment_index)
-        )
-        mixed_segment_task.add_done_callback(discard_task_exception)
+        mixed_segment_task = None
+        if split_format_ids is None:
+            mixed_segment_task = asyncio.create_task(
+                self._mixed_segment_watchdog(stream, process, segment_index)
+            )
+            mixed_segment_task.add_done_callback(discard_task_exception)
         stale_live_task = None
         if (
             stream.platform.casefold() == "youtube"
-            and self.config.youtube_stale_live_timeout_seconds > 0
+            and (
+                self.config.youtube_stale_live_timeout_seconds > 0
+                or (
+                    split_format_ids is not None
+                    and self.config.youtube_live_edge_recovery_seconds > 0
+                )
+            )
         ):
             stale_live_task = asyncio.create_task(
                 self._stale_youtube_live_watchdog(
@@ -965,6 +1111,8 @@ class DownloadManager:
             output_task=output_task,
             mixed_segment_task=mixed_segment_task,
             stale_live_task=stale_live_task,
+            audio_tracker=catchup_tracker if split_format_ids else None,
+            video_format_id=split_format_ids[0] if split_format_ids else "",
         )
         if process.returncode is not None:
             for side_task in (reconnect_task, mixed_segment_task, stale_live_task):
@@ -986,6 +1134,11 @@ class DownloadManager:
         # The active registry now owns the concurrency slot; release the
         # shorter-lived startup reservation before sidecars are attached.
         self._starting_video_ids.discard(stream.video_id)
+        if split_format_ids is not None:
+            active.audio_task = asyncio.create_task(
+                self._record_audio_track(active, split_format_ids[1], catchup_tracker)
+            )
+            active.audio_task.add_done_callback(discard_task_exception)
         if record_chat:
             chat_process, _, chat_output_task = await self._start_chat_recorder(
                 stream,
@@ -1377,21 +1530,17 @@ class DownloadManager:
                 try:
                     latest = await self.probe_video(post_exit_probe_target(observed_stream))
                 except TerminalVideoUnavailableError as exc:
-                    self.logger.info(
-                        "Stalled YouTube stream %s is terminally unavailable: %s",
+                    latest = None
+                    consecutive_non_live_probes = 0
+                    self.logger.warning(
+                        "Stalled YouTube metadata for %s is unavailable: %s; "
+                        "checking the HLS end marker before finalization",
                         stream.video_id,
                         exc,
                     )
-                    if self._stream_status_matches(stream.video_id, "stalled"):
-                        await self.finish_ended_stream(
-                            observed_stream,
-                            segment_index,
-                            expected_status="stalled",
-                            allow_chat_replay=False,
-                        )
-                    return
                 except Exception as exc:
                     latest = None
+                    consecutive_non_live_probes = 0
                     self.logger.warning(
                         "Unable to check stalled YouTube metadata for %s: %s",
                         stream.video_id,
@@ -1416,6 +1565,7 @@ class DownloadManager:
                                     latest,
                                     segment_index,
                                     expected_status="stalled",
+                                    end_confirmed=True,
                                 )
                             return
                     else:
@@ -1447,6 +1597,7 @@ class DownloadManager:
                             observed_stream,
                             segment_index,
                             expected_status="stalled",
+                            end_confirmed=True,
                         )
                         return
                     if youtube_live_edge_advanced_from_record(record, edge):
@@ -1491,11 +1642,207 @@ class DownloadManager:
         tracker: CatchupTracker,
     ) -> None:
         timeout_seconds = self.config.youtube_stale_live_timeout_seconds
-        watch_interval = min(STALE_LIVE_WATCH_INTERVAL_SECONDS, timeout_seconds)
+        recovery_seconds = self.config.youtube_live_edge_recovery_seconds
+        active = self.active.get(stream.video_id)
+        split_active = bool(
+            active is not None
+            and active.process is process
+            and active.audio_task is not None
+        )
+        quick_recovery = split_active and recovery_seconds > 0
+        intervals = []
+        if timeout_seconds > 0:
+            intervals.append(min(STALE_LIVE_WATCH_INTERVAL_SECONDS, timeout_seconds))
+        if quick_recovery:
+            intervals.append(LIVE_EDGE_RECOVERY_WATCH_INTERVAL_SECONDS)
+        if not intervals:
+            return
+        watch_interval = min(intervals)
+        next_quick_probe_at = 0.0
         try:
             while not self._stopping and process.returncode is None:
                 await self.sleep(watch_interval)
                 if self._stopping or process.returncode is not None:
+                    return
+                active = self.active.get(stream.video_id)
+                split_active = bool(
+                    active is not None
+                    and active.process is process
+                    and active.audio_task is not None
+                )
+                if quick_recovery and split_active:
+                    fast_track = tracker.stalled_live_edge_track(recovery_seconds)
+                    if fast_track is not None:
+                        if fast_track == "audio" and active is not None:
+                            audio_process = active.audio_process
+                            if audio_process is None or audio_process.returncode is not None:
+                                tracker.forget_track("audio")
+                                continue
+                            message = (
+                                "YouTube audio stopped receiving fragments for "
+                                f"{recovery_seconds}s after reaching the live edge; "
+                                "restarting audio only"
+                            )
+                            self.logger.warning("%s video_id=%s", message, stream.video_id)
+                            try:
+                                self.state.add_stream_event(
+                                    stream.video_id,
+                                    message,
+                                    level="warning",
+                                    segment_index=active.segment_index,
+                                )
+                            except Exception as exc:  # noqa: BLE001 - retry must continue.
+                                self.logger.debug(
+                                    "Unable to record quick audio retry for %s: %s",
+                                    stream.video_id,
+                                    exc,
+                                )
+                            await self._stop_stale_live_process(stream.video_id, audio_process)
+                            tracker.forget_track("audio")
+                            continue
+                        message = (
+                            "YouTube video stopped receiving fragments for "
+                            f"{recovery_seconds}s after reaching the live edge; "
+                            "restarting video only"
+                        )
+                        self.logger.warning("%s video_id=%s", message, stream.video_id)
+                        try:
+                            self.state.add_stream_event(
+                                stream.video_id,
+                                message,
+                                level="warning",
+                                segment_index=active.segment_index if active else None,
+                            )
+                        except Exception as exc:  # noqa: BLE001 - reconnect must continue.
+                            self.logger.debug(
+                                "Unable to record quick video retry for %s: %s",
+                                stream.video_id,
+                                exc,
+                            )
+                        if active is not None:
+                            await self._restart_video_track(active, tracker)
+                        return
+                    if (
+                        bool(tracker.track_live_edge_seen & {"video", "audio"})
+                        and {"video", "audio"}
+                        <= (
+                            tracker.track_fragment_progress_at.keys()
+                            | tracker.track_started_at.keys()
+                        )
+                        and tracker.fragment_inactive_seconds() >= recovery_seconds
+                        and self.monotonic() >= next_quick_probe_at
+                    ):
+                        next_quick_probe_at = self.monotonic() + recovery_seconds
+                        progress_checkpoint = tracker.last_track_activity_at()
+                        try:
+                            first = await self.probe_youtube_live_edge(stream.url)
+                            await self.sleep(LIVE_EDGE_RECOVERY_CONFIRM_SECONDS)
+                            if self._stopping or process.returncode is not None:
+                                return
+                            if (
+                                tracker.last_track_activity_at() > progress_checkpoint
+                            ):
+                                continue
+                            second = await self.probe_youtube_live_edge(stream.url)
+                        except Exception as exc:
+                            self.logger.warning(
+                                "Unable to check YouTube live edge for quick recovery "
+                                "of %s: %s",
+                                stream.video_id,
+                                exc,
+                            )
+                        else:
+                            active = self.active.get(stream.video_id)
+                            if active is None or active.process is not process:
+                                return
+                            if (
+                                tracker.last_track_activity_at() > progress_checkpoint
+                            ):
+                                continue
+                            if second.has_endlist:
+                                self.logger.info(
+                                    "YouTube stream %s published an HLS end marker; "
+                                    "stopping the recorder for post-exit checks",
+                                    stream.video_id,
+                                )
+                                await self._stop_stale_live_process(
+                                    stream.video_id, process
+                                )
+                                return
+                            if youtube_live_edge_advanced(first, second):
+                                self.logger.warning(
+                                    "YouTube live edge advanced while neither track "
+                                    "saved fragments for %ss; restarting both tracks "
+                                    "video_id=%s",
+                                    recovery_seconds,
+                                    stream.video_id,
+                                )
+                                if active is not None:
+                                    audio_process = active.audio_process
+                                    if (
+                                        audio_process is not None
+                                        and audio_process.returncode is None
+                                    ):
+                                        await self._stop_stale_live_process(
+                                            stream.video_id, audio_process
+                                        )
+                                        tracker.forget_track("audio")
+                                    await self._restart_video_track(active, tracker)
+                                return
+                if timeout_seconds <= 0:
+                    continue
+                stalled_track = tracker.stalled_split_track(timeout_seconds)
+                if stalled_track is not None:
+                    active = self.active.get(stream.video_id)
+                    restart_audio = bool(
+                        stalled_track == "audio"
+                        and active is not None
+                        and active.process is process
+                        and active.audio_process is not None
+                        and active.audio_process.returncode is None
+                    )
+                    message = (
+                        f"YouTube {stalled_track} fragments stopped for "
+                        f"{timeout_seconds}s while the other track advanced; "
+                        + (
+                            "restarting the audio track"
+                            if restart_audio
+                            else (
+                                "restarting the video track"
+                                if stalled_track == "video" and split_active
+                                else "reconnecting the downloader"
+                            )
+                        )
+                    )
+                    self.logger.warning("%s video_id=%s", message, stream.video_id)
+                    try:
+                        active = self.active.get(stream.video_id)
+                        self.state.add_stream_event(
+                            stream.video_id,
+                            message,
+                            level="warning",
+                            segment_index=active.segment_index if active else None,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reconnect must continue.
+                        self.logger.debug(
+                            "Unable to record split-track reconnect event for %s: %s",
+                            stream.video_id,
+                            exc,
+                        )
+                    if restart_audio and active is not None:
+                        assert active.audio_process is not None
+                        await self._stop_stale_live_process(
+                            stream.video_id, active.audio_process
+                        )
+                        tracker.forget_track("audio")
+                        continue
+                    if stalled_track == "video" and split_active and active is not None:
+                        await self._restart_video_track(active, tracker)
+                        return
+                    if stalled_track == "audio" and split_active:
+                        tracker.forget_track("audio")
+                        continue
+                    await self._request_process_reconnect(stream.video_id, process)
                     return
                 if tracker.inactive_seconds() < timeout_seconds:
                     continue
@@ -1720,8 +2067,22 @@ class DownloadManager:
         video_id: str,
         process: asyncio.subprocess.Process,
     ) -> None:
+        if process.returncode is not None:
+            active = self.active.get(video_id)
+            if (
+                active is not None
+                and active.process is process
+                and active.video_restarting
+            ):
+                # Its restart worker will hand the completed process to the
+                # normal planned-reconnect lifecycle.
+                self._planned_reconnects.add(video_id)
+            return
         self._planned_reconnects.add(video_id)
-        process.terminate()
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            return
         try:
             await asyncio.wait_for(
                 process.wait(),
@@ -1739,11 +2100,197 @@ class DownloadManager:
                 except ProcessLookupError:
                     return
 
+    async def _restart_video_track(
+        self,
+        active: ActiveDownload,
+        tracker: CatchupTracker,
+    ) -> None:
+        """Replace one split video process without ending the recording session."""
+        stream = active.stream
+        video_id = stream.video_id
+        old_process = active.process
+        if (
+            self._stopping
+            or self.active.get(video_id) is not active
+            or active.video_restarting
+            or old_process.returncode is not None
+            or not active.video_format_id
+        ):
+            return
+
+        # The old watcher must see this before terminate() completes. It owns
+        # whole-session exit handling, which must not run for this track retry.
+        active.video_restarting = True
+        if active.reconnect_task:
+            active.reconnect_task.cancel()
+        try:
+            await self._stop_stale_live_process(video_id, old_process)
+        except ProcessLookupError:
+            await old_process.wait()
+        await active.task
+        if self._stopping or self.active.get(video_id) is not active:
+            return
+        if video_id in self._planned_reconnects:
+            active.video_restarting = False
+            await self._watch_process(stream, old_process, active.segment_index)
+            return
+
+        format_id = active.video_format_id
+        final_files = [
+            path
+            for path in segment_final_format_files(
+                self.config, video_id, active.segment_index, stream.channel
+            )
+            if path.name.startswith(
+                f"{segment_file_stem(active.segment_index)}.f{format_id}."
+            )
+        ]
+        if final_files:
+            try:
+                restored = restore_mixed_segment_for_resume(
+                    self.config,
+                    video_id,
+                    active.segment_index,
+                    stream.channel,
+                    format_id=format_id,
+                )
+            except OSError:
+                restored = False
+                self.logger.exception(
+                    "Unable to restore video track for %s segment=%03d",
+                    video_id,
+                    active.segment_index,
+                )
+            if not restored:
+                message = (
+                    "Video track completed without a safe fragment resume point; "
+                    "preserving this segment and starting a new one"
+                )
+                self.logger.warning("%s video_id=%s", message, video_id)
+                try:
+                    self.state.add_stream_event(
+                        video_id,
+                        message,
+                        level="warning",
+                        segment_index=active.segment_index,
+                    )
+                except Exception as exc:  # noqa: BLE001 - rollover must continue.
+                    self.logger.debug(
+                        "Unable to record video rollover event for %s: %s",
+                        video_id,
+                        exc,
+                    )
+                active.video_restarting = False
+                self._planned_reconnects.add(video_id)
+                await self._watch_process(stream, old_process, active.segment_index)
+                return
+
+        command = build_download_command(
+            self.config,
+            stream,
+            active.segment_index,
+            youtube_track_format_id=format_id,
+        )
+        retry_seconds = 5.0
+        while (
+            not self._stopping
+            and self.active.get(video_id) is active
+            and video_id not in self._planned_reconnects
+        ):
+            tracker.start_track("video")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:
+                self.logger.warning(
+                    "Unable to restart YouTube video track for %s: %s; "
+                    "retrying in %ss",
+                    video_id,
+                    exc,
+                    int(retry_seconds),
+                )
+                await self.sleep(retry_seconds)
+                retry_seconds = min(60.0, retry_seconds * 2)
+                continue
+
+            if (
+                self._stopping
+                or self.active.get(video_id) is not active
+                or video_id in self._planned_reconnects
+            ):
+                if process.returncode is None:
+                    try:
+                        await self._stop_stale_live_process(video_id, process)
+                    except ProcessLookupError:
+                        await process.wait()
+                if (
+                    not self._stopping
+                    and self.active.get(video_id) is active
+                    and video_id in self._planned_reconnects
+                ):
+                    active.video_restarting = False
+                    await self._watch_process(
+                        stream, old_process, active.segment_index
+                    )
+                return
+            active.process = process
+            active.task = asyncio.create_task(
+                self._watch_process(stream, process, active.segment_index)
+            )
+            active.task.add_done_callback(discard_task_exception)
+            active.output_task = None
+            if process.stdout is not None:
+                active.output_task = asyncio.create_task(
+                    self._monitor_process_output(
+                        video_id,
+                        process.stdout,
+                        tracker,
+                        track_hint="video",
+                    )
+                )
+                active.output_task.add_done_callback(discard_task_exception)
+            active.reconnect_task = None
+            if self.config.reconnect_interval_seconds > 0:
+                active.reconnect_task = asyncio.create_task(
+                    self._planned_reconnect_timer(
+                        video_id,
+                        process,
+                        tracker.ready_event,
+                    )
+                )
+                active.reconnect_task.add_done_callback(discard_task_exception)
+            active.stale_live_task = asyncio.create_task(
+                self._stale_youtube_live_watchdog(stream, process, tracker)
+            )
+            active.stale_live_task.add_done_callback(discard_task_exception)
+            active.video_restarting = False
+            self.logger.info(
+                "Restarted independent YouTube video video_id=%s segment=%03d "
+                "format=%s",
+                video_id,
+                active.segment_index,
+                format_id,
+            )
+            return
+
+        if (
+            not self._stopping
+            and self.active.get(video_id) is active
+            and video_id in self._planned_reconnects
+        ):
+            active.video_restarting = False
+            await self._watch_process(stream, old_process, active.segment_index)
+
     async def _monitor_process_output(
         self,
         video_id: str,
         stream: asyncio.StreamReader,
         catchup_tracker: CatchupTracker,
+        *,
+        track_hint: str = "",
     ) -> None:
         buffer = ""
         while not stream.at_eof():
@@ -1755,10 +2302,14 @@ class DownloadManager:
             lines = buffer.split("\n")
             buffer = lines.pop()
             for line in lines:
-                self._handle_process_output_line(video_id, line, catchup_tracker)
+                self._handle_process_output_line(
+                    video_id, line, catchup_tracker, track_hint=track_hint
+                )
 
         if buffer:
-            self._handle_process_output_line(video_id, buffer, catchup_tracker)
+            self._handle_process_output_line(
+                video_id, buffer, catchup_tracker, track_hint=track_hint
+            )
 
     async def _monitor_sidecar_output(
         self,
@@ -1786,12 +2337,14 @@ class DownloadManager:
         video_id: str,
         line: str,
         catchup_tracker: CatchupTracker,
+        *,
+        track_hint: str = "",
     ) -> None:
         line = line.strip()
         if not line:
             return
 
-        catchup_tracker.update(line)
+        catchup_tracker.update(line, track_hint=track_hint)
         if LIVE_PROGRESS_MARKER not in line:
             self.logger.debug("yt-dlp %s: %s", video_id, line)
 
@@ -1829,7 +2382,7 @@ class DownloadManager:
                 active is None
                 or active.chat_task is not asyncio.current_task()
                 or active.chat_process is not current_process
-                or active.process.returncode is not None
+                or (active.process.returncode is not None and not active.video_restarting)
             ):
                 return
 
@@ -1876,7 +2429,7 @@ class DownloadManager:
                 or active is None
                 or active.chat_task is not asyncio.current_task()
                 or active.chat_process is not None
-                or active.process.returncode is not None
+                or (active.process.returncode is not None and not active.video_restarting)
             ):
                 return
 
@@ -1902,7 +2455,7 @@ class DownloadManager:
                 self._stopping
                 or latest is not active
                 or latest.chat_task is not asyncio.current_task()
-                or latest.process.returncode is not None
+                or (latest.process.returncode is not None and not latest.video_restarting)
             ):
                 if replacement is not None:
                     orphaned = ActiveDownload(
@@ -1940,6 +2493,17 @@ class DownloadManager:
         segment_index: int,
     ) -> None:
         exit_code = await process.wait()
+        active = self.active.get(stream.video_id)
+        if (
+            active is not None
+            and active.process is process
+            and active.video_restarting
+            and not self._stopping
+            and stream.video_id not in self._planned_reconnects
+        ):
+            if active.output_task:
+                await self._finish_output_task(active.output_task)
+            return
         media_exited_at = utc_now_iso()
         self.update_segment_timing_if_exists(
             stream,
@@ -1956,6 +2520,21 @@ class DownloadManager:
             )
             return
         if active and active.process is process:
+            drain_audio = bool(
+                not self._stopping
+                and not planned_reconnect
+                and active.audio_task is not None
+                and not active.audio_task.done()
+            )
+            if drain_audio:
+                self._draining_audio[stream.video_id] = active
+                if self.config.youtube_stale_live_timeout_seconds > 0:
+                    active.audio_drain_watchdog_task = asyncio.create_task(
+                        self._audio_drain_watchdog(active)
+                    )
+                    active.audio_drain_watchdog_task.add_done_callback(
+                        discard_task_exception
+                    )
             if active.reconnect_task and active.reconnect_task is not asyncio.current_task():
                 active.reconnect_task.cancel()
             if (
@@ -1970,6 +2549,17 @@ class DownloadManager:
                 active.stale_live_task.cancel()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
+            if not drain_audio:
+                try:
+                    await self._stop_audio_track(active)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - video exit must still be recorded.
+                    self.logger.exception(
+                        "Audio cleanup failed after video exit video_id=%s segment=%03d",
+                        stream.video_id,
+                        segment_index,
+                    )
             try:
                 await self._stop_powerchat_listener(active)
             except asyncio.CancelledError:
@@ -2094,6 +2684,222 @@ class DownloadManager:
                 if self._stopping:
                     return False
         return False
+
+    def _audio_track_should_run(self, active: ActiveDownload) -> bool:
+        if self._stopping or active.audio_stopping:
+            return False
+        video_id = active.stream.video_id
+        return (
+            self.active.get(video_id) is active
+            and (active.process.returncode is None or active.video_restarting)
+        ) or self._draining_audio.get(video_id) is active
+
+    async def _record_audio_track(
+        self,
+        active: ActiveDownload,
+        format_id: str,
+        tracker: CatchupTracker,
+    ) -> None:
+        stream = active.stream
+        retry_seconds = 5.0
+        while self._audio_track_should_run(active):
+            final_files = [
+                path
+                for path in segment_final_format_files(
+                    self.config, stream.video_id, active.segment_index, stream.channel
+                )
+                if path.name.startswith(
+                    f"{segment_file_stem(active.segment_index)}.f{format_id}."
+                )
+            ]
+            if final_files:
+                try:
+                    restored = restore_mixed_segment_for_resume(
+                        self.config,
+                        stream.video_id,
+                        active.segment_index,
+                        stream.channel,
+                        format_id=format_id,
+                    )
+                except OSError:
+                    restored = False
+                    self.logger.exception(
+                        "Unable to restore audio track for %s segment=%03d",
+                        stream.video_id,
+                        active.segment_index,
+                    )
+                if not restored:
+                    message = (
+                        "Audio track completed without a safe fragment resume point; "
+                        "preserving this segment and starting a new one"
+                    )
+                    self.logger.warning("%s video_id=%s", message, stream.video_id)
+                    try:
+                        self.state.add_stream_event(
+                            stream.video_id,
+                            message,
+                            level="warning",
+                            segment_index=active.segment_index,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reconnect must continue.
+                        self.logger.debug(
+                            "Unable to record audio rollover event for %s: %s",
+                            stream.video_id,
+                            exc,
+                        )
+                    await self._request_process_reconnect(
+                        stream.video_id, active.process
+                    )
+                    return
+            command = build_download_command(
+                self.config,
+                stream,
+                active.segment_index,
+                youtube_track_format_id=format_id,
+            )
+            tracker.start_track("audio")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    *command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:
+                self.logger.warning(
+                    "Unable to start YouTube audio track for %s: %s; retrying in %ss",
+                    stream.video_id,
+                    exc,
+                    int(retry_seconds),
+                )
+                await self.sleep(retry_seconds)
+                retry_seconds = min(60.0, retry_seconds * 2)
+                continue
+            if not self._audio_track_should_run(active):
+                if process.returncode is None:
+                    process.terminate()
+                await process.wait()
+                return
+            active.audio_process = process
+            active.audio_started_at = self.monotonic()
+            self.logger.info(
+                "Recording independent YouTube audio video_id=%s segment=%03d format=%s",
+                stream.video_id,
+                active.segment_index,
+                format_id,
+            )
+            output_task = None
+            if process.stdout is not None:
+                output_task = asyncio.create_task(
+                    self._monitor_process_output(
+                        stream.video_id, process.stdout, tracker, track_hint="audio"
+                    )
+                )
+                active.audio_output_task = output_task
+                output_task.add_done_callback(discard_task_exception)
+            exit_code = await process.wait()
+            if output_task is not None:
+                await self._finish_output_task(output_task)
+            active.audio_process = None
+            active.audio_output_task = None
+            if not self._audio_track_should_run(active):
+                return
+            if active.audio_end_confirmed:
+                active.audio_end_attempts += 1
+                if exit_code == 0 or active.audio_end_attempts >= 3:
+                    return
+            self.logger.warning(
+                "YouTube audio track exited while video continues "
+                "video_id=%s segment=%03d exit_code=%s; retrying in %ss",
+                stream.video_id,
+                active.segment_index,
+                exit_code,
+                int(retry_seconds),
+            )
+            try:
+                self.state.add_stream_event(
+                    stream.video_id,
+                    f"Audio track exited with code {exit_code}; retrying independently",
+                    level="warning",
+                    segment_index=active.segment_index,
+                )
+            except Exception as exc:  # noqa: BLE001 - audio retry must continue.
+                self.logger.debug(
+                    "Unable to record audio retry event for %s: %s",
+                    stream.video_id,
+                    exc,
+                )
+            await self.sleep(retry_seconds)
+            retry_seconds = min(60.0, retry_seconds * 2)
+
+    async def _audio_drain_watchdog(self, active: ActiveDownload) -> None:
+        timeout_seconds = self.config.youtube_stale_live_timeout_seconds
+        interval = min(STALE_LIVE_WATCH_INTERVAL_SECONDS, timeout_seconds)
+        while (
+            not self._stopping
+            and not active.audio_stopping
+            and self._draining_audio.get(active.stream.video_id) is active
+            and active.audio_task is not None
+            and not active.audio_task.done()
+        ):
+            await self.sleep(interval)
+            process = active.audio_process
+            tracker = active.audio_tracker
+            if process is None or process.returncode is not None or tracker is None:
+                continue
+            last_progress = max(
+                active.audio_started_at,
+                tracker.track_fragment_progress_at.get("audio", 0.0),
+            )
+            if self.monotonic() - last_progress < timeout_seconds:
+                continue
+            self.logger.warning(
+                "Audio still has no new fragments after video exit "
+                "video_id=%s segment=%03d; restarting audio",
+                active.stream.video_id,
+                active.segment_index,
+            )
+            await self._stop_stale_live_process(active.stream.video_id, process)
+            tracker.forget_track("audio")
+
+    async def _stop_draining_audio(self, video_id: str) -> None:
+        active = self._draining_audio.pop(video_id, None)
+        if active is not None:
+            await self._stop_audio_track(active)
+
+    async def _stop_audio_track(self, active: ActiveDownload) -> None:
+        active.audio_stopping = True
+        watchdog_task = active.audio_drain_watchdog_task
+        if watchdog_task is not None and watchdog_task is not asyncio.current_task():
+            watchdog_task.cancel()
+        process = active.audio_process
+        if process is not None and process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+        if process is not None:
+            try:
+                await asyncio.wait_for(
+                    process.wait(), timeout=RECONNECT_STOP_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                if process.returncode is None:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+        task = active.audio_task
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            try:
+                await asyncio.wait_for(task, timeout=5)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if active.audio_output_task is not None:
+            await self._finish_output_task(active.audio_output_task)
+        if watchdog_task is not None and watchdog_task is not asyncio.current_task():
+            await asyncio.gather(watchdog_task, return_exceptions=True)
 
     async def _stop_chat_recorder(
         self,
@@ -2222,18 +3028,15 @@ class DownloadManager:
         if latest.is_live and latest.video_id != stream.video_id:
             self.logger.info(
                 "Planned reconnect for %s found a new live session %s; "
-                "starting it independently and finalizing the previous session",
+                "starting it independently and checking the previous session",
                 stream.video_id,
                 latest.video_id,
             )
             if not self._stopping:
                 await self.start_stream(latest)
-            if self._stream_status_matches(stream.video_id, "checking_after_exit"):
-                await self.finish_ended_stream(
-                    stream,
-                    segment_index,
-                    expected_status="checking_after_exit",
-                )
+            await self._confirm_replaced_session_end(
+                stream, segment_index, expected_status="checking_after_exit"
+            )
             return
 
         if latest.is_live:
@@ -2367,22 +3170,24 @@ class DownloadManager:
         async def retry() -> None:
             try:
                 delay = max(1, min(self.config.poll_interval_seconds, 30))
-                self.logger.info(
-                    "Deferring restart supervision for %s by %ss",
-                    stream.video_id,
-                    delay,
-                )
-                await self.sleep(delay)
-                if self._stopping or not self._stream_status_matches(
-                    stream.video_id,
-                    "checking_after_exit",
+                while not self._stopping and self._stream_status_matches(
+                    stream.video_id, "checking_after_exit"
                 ):
-                    return
-                await self.handle_post_exit(
-                    stream,
-                    segment_index,
-                    expected_status="checking_after_exit",
-                )
+                    self.logger.info(
+                        "Deferring restart supervision for %s by %ss",
+                        stream.video_id,
+                        delay,
+                    )
+                    await self.sleep(delay)
+                    if self._stopping or not self._stream_status_matches(
+                        stream.video_id, "checking_after_exit"
+                    ):
+                        return
+                    await self.handle_post_exit(
+                        stream,
+                        segment_index,
+                        expected_status="checking_after_exit",
+                    )
             finally:
                 self._deferred_post_exit_retries.discard(stream.video_id)
 
@@ -2495,6 +3300,7 @@ class DownloadManager:
             return
 
         previous_offset = 0.0
+        consecutive_non_live_probes = 0
         elapsed_since_exit_seconds = max(0.0, elapsed_since_exit_seconds)
         self.logger.debug(
             "Starting post-exit checks for %s segment=%03d schedule=%s elapsed=%.1fs",
@@ -2551,6 +3357,7 @@ class DownloadManager:
                     )
                 return
             except Exception as exc:
+                consecutive_non_live_probes = 0
                 self.logger.warning(
                     "Post-exit probe failed for %s at +%ss: %s",
                     stream.video_id,
@@ -2562,18 +3369,21 @@ class DownloadManager:
             if latest.is_live and latest.video_id != stream.video_id:
                 self.logger.info(
                     "Post-exit source for %s found a new live session %s; "
-                    "starting it independently and finalizing the previous session",
+                    "starting it independently and checking the previous session",
                     stream.video_id,
                     latest.video_id,
                 )
                 if not self._stopping:
                     await self.start_stream(latest)
-                if self._stream_status_matches(stream.video_id, expected_status):
-                    await self.finish_ended_stream(
-                        stream,
-                        segment_index,
-                        expected_status=expected_status,
-                    )
+                await self._confirm_replaced_session_end(
+                    stream, segment_index, expected_status=expected_status
+                )
+                return
+
+            if latest.video_id != stream.video_id:
+                await self._confirm_replaced_session_end(
+                    stream, segment_index, expected_status=expected_status
+                )
                 return
 
             if latest.is_live:
@@ -2621,18 +3431,30 @@ class DownloadManager:
                 stream.video_id,
                 offset,
             )
+            consecutive_non_live_probes += 1
 
         if not self._stream_status_matches(stream.video_id, expected_status):
             return
-        self.logger.info(
-            "Stream %s did not return live during post-exit window; marking ended",
+        if consecutive_non_live_probes >= 2:
+            self.logger.info(
+                "Stream %s repeatedly reported ended during post-exit checks; "
+                "finalizing",
+                stream.video_id,
+            )
+            await self.finish_ended_stream(
+                stream,
+                segment_index,
+                expected_status=expected_status,
+                end_confirmed=True,
+            )
+            return
+        self.logger.warning(
+            "Stream %s did not have a confirmed end after post-exit checks; "
+            "preserving media tracks and checking again",
             stream.video_id,
         )
-        await self.finish_ended_stream(
-            stream,
-            segment_index,
-            expected_status=expected_status,
-        )
+        if self._stream_status_matches(stream.video_id, "checking_after_exit"):
+            self._defer_post_exit_retry(stream, segment_index)
 
     async def _mark_terminal_unavailable(
         self,
@@ -2642,17 +3464,90 @@ class DownloadManager:
         *,
         expected_status: str | None = None,
     ) -> None:
-        self.logger.info(
-            "Stream %s is terminally unavailable; ending checks: %s",
+        self.logger.warning(
+            "Source metadata for %s is unavailable (%s); preserving tracks "
+            "until the stream end is confirmed",
             stream.video_id,
             exc,
         )
-        await self.finish_ended_stream(
-            stream,
-            segment_index,
-            expected_status=expected_status,
-            allow_chat_replay=False,
+        if await self._youtube_endlist_confirmed(stream):
+            await self.finish_ended_stream(
+                stream,
+                segment_index,
+                expected_status=expected_status,
+                allow_chat_replay=False,
+                end_confirmed=True,
+            )
+            return
+        record = self.state.get_stream(stream.video_id)
+        if record is not None and record.status == "waiting_retry":
+            self.state.mark_exited(stream.video_id, -1)
+            record = self.state.get_stream(stream.video_id)
+        if record is not None and record.status == "stalled":
+            self._defer_stalled_retry(stream, segment_index)
+        elif record is not None and record.status == "checking_after_exit":
+            self._defer_post_exit_retry(stream, segment_index)
+
+    async def _youtube_endlist_confirmed(self, stream: LiveStream) -> bool:
+        if stream.platform.casefold() != "youtube":
+            return False
+        try:
+            return (await self.probe_youtube_live_edge(stream.url)).has_endlist
+        except Exception as exc:
+            self.logger.debug(
+                "Unable to inspect HLS end marker for %s: %s",
+                stream.video_id,
+                exc,
+            )
+            return False
+
+    async def _old_session_end_confirmed(self, stream: LiveStream) -> bool:
+        """Check the old video's own URL, not the channel's latest session."""
+        if await self._youtube_endlist_confirmed(stream):
+            return True
+        for attempt in range(2):
+            try:
+                latest = await self.probe_video(stream.url)
+            except Exception as exc:
+                self.logger.warning(
+                    "Unable to confirm the old session %s ended: %s",
+                    stream.video_id,
+                    exc,
+                )
+                return False
+            if latest.video_id != stream.video_id or latest.is_live:
+                return False
+            if attempt == 0:
+                await self.sleep(max(1, min(self.config.poll_interval_seconds, 30)))
+        return True
+
+    async def _confirm_replaced_session_end(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        expected_status: str | None,
+    ) -> None:
+        if not self._stream_status_matches(stream.video_id, expected_status):
+            return
+        if await self._old_session_end_confirmed(stream):
+            await self.finish_ended_stream(
+                stream,
+                segment_index,
+                expected_status=expected_status,
+                end_confirmed=True,
+            )
+            return
+        self.logger.info(
+            "New channel session does not confirm old session %s ended; "
+            "preserving tracks and checking again",
+            stream.video_id,
         )
+        record = self.state.get_stream(stream.video_id)
+        if record is not None and record.status == "waiting_retry":
+            self.state.mark_exited(stream.video_id, -1)
+        if self._stream_status_matches(stream.video_id, "checking_after_exit"):
+            self._defer_post_exit_retry(stream, segment_index)
 
     async def finish_ended_stream(
         self,
@@ -2661,7 +3556,14 @@ class DownloadManager:
         *,
         expected_status: str | None = None,
         allow_chat_replay: bool = True,
+        end_confirmed: bool = False,
     ) -> None:
+        if not end_confirmed:
+            self.logger.warning(
+                "Skipping finalization for %s without a confirmed source end",
+                stream.video_id,
+            )
+            return
         if stream.video_id in self.active:
             self.logger.info(
                 "Skipping finalization for %s because a replacement recording is active",
@@ -2673,13 +3575,46 @@ class DownloadManager:
         if stream.video_id in self._finalizing_video_ids:
             return
 
+        draining_audio = self._draining_audio.get(stream.video_id)
+        if draining_audio is not None:
+            draining_audio.audio_end_confirmed = True
+            if draining_audio.audio_task is not None and not draining_audio.audio_task.done():
+                self.logger.info(
+                    "Waiting for the independent audio track before finalizing %s",
+                    stream.video_id,
+                )
+                self._schedule_finalization_retry(
+                    stream, segment_index, expected_status=expected_status
+                )
+                return
+            await self._stop_draining_audio(stream.video_id)
+
         self._finalizing_video_ids.add(stream.video_id)
         try:
-            await self.finalize_ended_segment(
-                stream.video_id,
-                segment_index,
-                stream.channel,
-            )
+            for index in range(1, segment_index + 1):
+                if await self.finalize_ended_segment(
+                    stream.video_id, index, stream.channel
+                ):
+                    continue
+                message = (
+                    f"Unable to finalize segment={index:03d}; "
+                    "preserving media tracks for recovery"
+                )
+                self.logger.warning("%s video_id=%s", message, stream.video_id)
+                existing_retry = self._finalization_retry_tasks.get(stream.video_id)
+                if existing_retry is None or existing_retry.done():
+                    self.state.add_stream_event(
+                        stream.video_id,
+                        message,
+                        level="error",
+                        segment_index=index,
+                    )
+                    self._schedule_finalization_retry(
+                        stream,
+                        segment_index,
+                        expected_status=expected_status,
+                    )
+                return
             finalized_files = self.rename_finalized_segments(stream, segment_index)
             self.finalize_powerchat_sidecars(stream, finalized_files)
             if should_record_chat_for_stream(self.config, stream):
@@ -2701,6 +3636,114 @@ class DownloadManager:
         finally:
             self._finalizing_video_ids.discard(stream.video_id)
         await self.process_pending_post_processing(stream)
+
+    def _schedule_finalization_retry(
+        self,
+        stream: LiveStream,
+        segment_index: int,
+        *,
+        expected_status: str | None,
+    ) -> None:
+        if self._stopping:
+            return
+        existing = self._finalization_retry_tasks.get(stream.video_id)
+        if existing is not None and not existing.done():
+            return
+        if expected_status is None:
+            record = self.state.get_stream(stream.video_id)
+            expected_status = record.status if record is not None else None
+
+        async def retry() -> None:
+            delay = max(30, min(self.config.poll_interval_seconds, 300))
+            while not self._stopping:
+                await self.sleep(delay)
+                if (
+                    self._stopping
+                    or stream.video_id in self.active
+                    or not self._stream_status_matches(stream.video_id, expected_status)
+                ):
+                    return
+                try:
+                    latest = await self.probe_video(post_exit_probe_target(stream))
+                except TerminalVideoUnavailableError as exc:
+                    if await self._youtube_endlist_confirmed(stream):
+                        latest = None
+                    else:
+                        self.logger.warning(
+                            "Source %s became unavailable before finalization retry; "
+                            "preserving tracks: %s",
+                            stream.video_id,
+                            exc,
+                        )
+                        delay = min(delay * 2, 900)
+                        continue
+                except Exception as exc:
+                    self.logger.warning(
+                        "Unable to reconfirm source end before finalization retry "
+                        "for %s: %s",
+                        stream.video_id,
+                        exc,
+                    )
+                    delay = min(delay * 2, 900)
+                    continue
+
+                if (
+                    latest is not None
+                    and latest.is_live
+                    and latest.video_id == stream.video_id
+                ):
+                    if not await self._youtube_endlist_confirmed(stream):
+                        self.logger.info(
+                            "Source %s resumed before finalization retry; "
+                            "resuming live checks",
+                            stream.video_id,
+                        )
+                        await self.handle_post_exit(
+                            stream,
+                            segment_index,
+                            expected_status=expected_status,
+                        )
+                        return
+                elif latest is not None and latest.video_id != stream.video_id:
+                    if latest.is_live and not self._stopping:
+                        await self.start_stream(latest)
+                    if not await self._old_session_end_confirmed(stream):
+                        self.logger.info(
+                            "Old session %s was not confirmed ended on "
+                            "finalization retry",
+                            stream.video_id,
+                        )
+                        if self._stream_status_matches(
+                            stream.video_id, "checking_after_exit"
+                        ):
+                            self._defer_post_exit_retry(stream, segment_index)
+                        return
+
+                if (
+                    self._stopping
+                    or stream.video_id in self.active
+                    or not self._stream_status_matches(stream.video_id, expected_status)
+                ):
+                    return
+                await self.finish_ended_stream(
+                    stream,
+                    segment_index,
+                    expected_status=expected_status,
+                    end_confirmed=True,
+                )
+                if not self._stream_status_matches(stream.video_id, expected_status):
+                    return
+                delay = min(delay * 2, 900)
+
+        task = asyncio.create_task(retry())
+        self._finalization_retry_tasks[stream.video_id] = task
+        self._track_lifecycle_task(task, stream, segment_index, "finalization retry")
+
+        def clear_retry(finished: asyncio.Task[None]) -> None:
+            if self._finalization_retry_tasks.get(stream.video_id) is finished:
+                self._finalization_retry_tasks.pop(stream.video_id, None)
+
+        task.add_done_callback(clear_retry)
 
     def enqueue_finalized_post_processing(
         self,
@@ -3907,21 +4950,10 @@ class DownloadManager:
 
             self.logger.warning(
                 "Unable to restore split-track segment for exact resume of %s "
-                "segment=%03d; finalizing this segment before starting a new "
+                "segment=%03d; preserving both tracks and starting a new "
                 "live-from-start segment",
                 stream.video_id,
                 segment_index,
-            )
-            if not await self.finalize_ended_segment(
-                stream.video_id,
-                segment_index,
-                channel,
-            ):
-                self.logger.warning(
-                    "Unable to finalize split-track segment for %s segment=%03d; "
-                    "continuing with the next segment",
-                    stream.video_id,
-                    segment_index,
             )
             return segment_index + 1
 
@@ -3996,6 +5028,22 @@ class DownloadManager:
                 segment_index,
             )
             return True
+        record = self.state.get_stream(video_id)
+        # The stream's selector can change after a segment rolls over. Format-
+        # specific input names retain evidence that this segment used separate
+        # tracks even when the current selector is now a muxed format.
+        format_track_name = re.compile(
+            rf"{re.escape(segment_file_stem(segment_index))}\.f"
+            r"[A-Za-z0-9][A-Za-z0-9._:-]*\.[A-Za-z0-9]+"
+        )
+        plan.require_audio_video = any(
+            format_track_name.fullmatch(normalize_part_file(path).name)
+            for path in plan.input_files
+        ) or bool(
+            record is not None
+            and record.platform.casefold() == "youtube"
+            and "+" in record.youtube_video_format_selector
+        )
         self.logger.debug(
             "Finalize plan for %s segment=%03d output=%s inputs=%s cleanup=%s "
             "mixed_inputs=%s",
@@ -4063,6 +5111,12 @@ class DownloadManager:
                 ffprobe_path,
             )
             selected_streams = select_finalize_media_streams(media_streams)
+            selected_types = {stream.codec_type for stream in selected_streams}
+            if plan.require_audio_video and selected_types != {"audio", "video"}:
+                raise VideoProbeError(
+                    "Locked YouTube split format requires both video and audio tracks"
+                )
+            validate_finalize_input_coverage(selected_streams)
         except VideoProbeError as exc:
             self.logger.warning(
                 "Unable to safely select partial segment inputs; preserving all "
@@ -4244,11 +5298,12 @@ class DownloadManager:
                     stream.video_id,
                     exc,
                 )
-                await self.finish_ended_stream(
+                self.state.mark_exited(stream.video_id, -1)
+                await self._mark_terminal_unavailable(
                     stream,
                     segment_index,
-                    expected_status="waiting_retry",
-                    allow_chat_replay=False,
+                    exc,
+                    expected_status="checking_after_exit",
                 )
                 return
             except Exception as exc:
@@ -4266,27 +5321,25 @@ class DownloadManager:
                 return
 
             if not latest.is_live:
-                await self.finish_ended_stream(
+                self.state.mark_exited(stream.video_id, -1)
+                await self.handle_post_exit(
                     stream,
                     segment_index,
-                    expected_status="waiting_retry",
+                    expected_status="checking_after_exit",
                 )
                 return
 
             if latest.video_id != stream.video_id:
                 self.logger.info(
                     "Start retry for %s found a new live session %s; "
-                    "starting it independently and finalizing the previous session",
+                    "starting it independently and checking the previous session",
                     stream.video_id,
                     latest.video_id,
                 )
                 await self.start_stream(latest)
-                if self._stream_status_matches(stream.video_id, "waiting_retry"):
-                    await self.finish_ended_stream(
-                        stream,
-                        segment_index,
-                        expected_status="waiting_retry",
-                    )
+                await self._confirm_replaced_session_end(
+                    stream, segment_index, expected_status="waiting_retry"
+                )
                 return
 
             if await self.start_stream(latest, segment_index=segment_index):
@@ -4313,6 +5366,13 @@ class DownloadManager:
                 active.mixed_segment_task.cancel()
             if active.stale_live_task:
                 active.stale_live_task.cancel()
+            active.audio_stopping = True
+            if active.audio_process and active.audio_process.returncode is None:
+                self.logger.info(
+                    "Terminating audio recorder for %s",
+                    active.stream.video_id,
+                )
+                active.audio_process.terminate()
             if active.chat_process and active.chat_process.returncode is None:
                 self.logger.info(
                     "Terminating live chat recorder for %s",
@@ -4332,12 +5392,16 @@ class DownloadManager:
                 await active.process.wait()
             if active.output_task:
                 await self._finish_output_task(active.output_task)
+            await self._stop_audio_track(active)
             clear_download_progress(
                 active.stream.video_id,
                 progress_file=self.download_progress_file,
             )
             await self._stop_powerchat_listener(active)
             await self._stop_chat_recorder(active)
+
+        for video_id in list(self._draining_audio):
+            await self._stop_draining_audio(video_id)
 
         for task in list(self._post_exit_tasks):
             task.cancel()
@@ -4523,6 +5587,23 @@ def youtube_audio_format_id(selector: str) -> str:
     return audio_format_id
 
 
+def youtube_split_format_ids(stream: LiveStream, selector: str, config: BotConfig) -> tuple[str, str] | None:
+    if (
+        stream.platform.casefold() != "youtube"
+        or yt_dlp_args_include_format(config.extra_yt_dlp_args)
+    ):
+        return None
+    exact_selector = selector.strip().partition("/")[0]
+    video_id, separator, audio_id = exact_selector.partition("+")
+    if (
+        not separator
+        or not YOUTUBE_FORMAT_ID_RE.fullmatch(video_id)
+        or not YOUTUBE_FORMAT_ID_RE.fullmatch(audio_id)
+    ):
+        return None
+    return video_id, audio_id
+
+
 def format_number(value: object, *, integer: bool = False) -> float:
     if isinstance(value, bool) or value is None:
         return 0.0
@@ -4541,12 +5622,21 @@ def build_download_command(
     segment_index: int,
     *,
     youtube_video_format_selector: str = "",
+    youtube_track_format_id: str = "",
 ) -> list[str]:
     output_template = output_template_for(config, stream, segment_index)
+    if youtube_track_format_id:
+        if not YOUTUBE_FORMAT_ID_RE.fullmatch(youtube_track_format_id):
+            raise ValueError("Invalid YouTube track format ID")
+        output_template = output_template.with_name(
+            f"{segment_file_stem(segment_index)}.f{youtube_track_format_id}.%(ext)s"
+        )
     command = [config.yt_dlp_path, *config.extra_yt_dlp_args]
     record_chat = should_record_chat_for_stream(config, stream)
     if not yt_dlp_args_include_format(config.extra_yt_dlp_args):
-        if stream.platform.casefold() == "youtube" and youtube_video_format_selector:
+        if stream.platform.casefold() == "youtube" and youtube_track_format_id:
+            command.extend(["--format", youtube_track_format_id])
+        elif stream.platform.casefold() == "youtube" and youtube_video_format_selector:
             command.extend(["--format", youtube_video_format_selector])
         elif record_chat:
             command.extend(["--format", DEFAULT_MEDIA_FORMAT])
@@ -4727,11 +5817,18 @@ def restore_mixed_segment_for_resume(
     video_id: str,
     segment_index: int,
     channel: str = "",
+    *,
+    format_id: str = "",
 ) -> bool:
     if not config.keep_fragments_for_resume:
         return False
 
     final_files = segment_final_format_files(config, video_id, segment_index, channel)
+    if format_id:
+        if not YOUTUBE_FORMAT_ID_RE.fullmatch(format_id):
+            return False
+        prefix = f"{segment_file_stem(segment_index)}.f{format_id}."
+        final_files = [path for path in final_files if path.name.startswith(prefix)]
     restore_plan: list[tuple[Path, Path, int]] = []
     for final_file in final_files:
         part_file = final_file.with_name(f"{final_file.name}.part")
@@ -5008,6 +6105,28 @@ def select_finalize_media_streams(
     return selected
 
 
+def validate_finalize_input_coverage(
+    selected_streams: list[FinalizeMediaStream],
+) -> None:
+    # A large gap would make ffmpeg -shortest discard the rest of one track.
+    durations = {stream.codec_type: stream.duration for stream in selected_streams}
+    if not {"video", "audio"} <= durations.keys():
+        return
+
+    video_duration = durations["video"]
+    audio_duration = durations["audio"]
+    tolerance = min(
+        FINALIZE_DURATION_TOLERANCE_SECONDS,
+        max(0.5, max(video_duration, audio_duration) * 0.01),
+    )
+    if abs(video_duration - audio_duration) > tolerance:
+        raise VideoProbeError(
+            "Audio/video duration mismatch would truncate recoverable media: "
+            f"video={video_duration:.3f}s audio={audio_duration:.3f}s "
+            f"tolerance={tolerance:.3f}s"
+        )
+
+
 def validate_finalize_output(
     output_file: Path,
     selected_streams: list[FinalizeMediaStream],
@@ -5224,6 +6343,7 @@ def recover_segment_from_fragments(
         progress("Inspecting recoverable tracks", 0.15)
         media_streams = probe_finalize_media_streams(input_files, ffprobe_path)
         selected_streams = select_finalize_media_streams(media_streams)
+        validate_finalize_input_coverage(selected_streams)
         selected_types = {stream.codec_type for stream in selected_streams}
         if selected_types != {"audio", "video"}:
             raise VideoProbeError(

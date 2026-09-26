@@ -221,21 +221,30 @@ keep_fragments_for_resume = true
 # for this many hours. Zero keeps them until they are cleaned manually.
 fragment_retention_hours = 0
 
-# Planned reconnects are disabled by default. The mixed-format watchdog still
-# reconnects when one format finalizes while another remains partial. Set this
-# above 0 only if you also want periodic forced reconnects after catch-up.
+# Planned reconnects are disabled by default. For locked YouTube video/audio
+# pairs, the bot records each track separately and retries a stalled audio
+# process while video continues. Set this above 0 only if you also want
+# periodic forced reconnects after both tracks catch up.
 reconnect_interval_seconds = 0
+
+# For independent YouTube video/audio jobs, retry a track when it reached the
+# live edge but saved no new fragment for this many seconds while its companion
+# advances. Only the stalled process restarts. If both stop, restart both
+# processes only when two HLS checks show the source edge moving. A process
+# that restarts but emits no fragments is checked again. Zero disables this check.
+youtube_live_edge_recovery_seconds = 30
 
 # Pause a YouTube recording as stalled when its HLS media sequence is frozen and
 # the edge is already this old. Fragment inactivity carries across yt-dlp
 # restarts. Stalled streams keep their resumable files and are monitored until
 # the edge advances again or YouTube truly ends the stream. Zero disables this
-# watchdog.
+# slower frozen-edge check.
 youtube_stale_live_timeout_seconds = 900
 
 # After yt-dlp exits, re-check the video at these offsets in seconds.
-# If any check says the stream is still live, the downloader restarts.
-# If all checks complete without seeing live, the stream is marked ended.
+# If a check says the stream is still live, the downloader restarts.
+# Tracks are merged only after repeated non-live results or another confirmed
+# platform end signal. Failed or inconclusive checks are retried.
 post_exit_check_seconds = [
   30, 60, 90, 120, 150, 180, 210, 240, 270, 300,
   330, 360, 390, 420, 450, 480, 510, 540, 570, 600,

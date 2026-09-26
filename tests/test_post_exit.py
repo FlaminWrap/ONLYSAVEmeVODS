@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
 import logging
 import unittest
@@ -828,7 +828,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(record)
         self.assertNotEqual(record.status, "ended")
 
-    async def test_probe_failures_do_not_end_early(self) -> None:
+    async def test_probe_failures_require_two_subsequent_end_reports(self) -> None:
         sleeps = 0
 
         async def fake_sleep(delay: float) -> None:
@@ -839,7 +839,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             config = BotConfig(
                 download_dir=Path(tmp) / "downloads",
                 state_dir=Path(tmp) / "state",
-                post_exit_check_seconds=[30, 60, 90],
+                post_exit_check_seconds=[30, 60, 90, 120],
             )
             stream = LiveStream(
                 video_id="LIVEVIDEO01",
@@ -854,7 +854,9 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             state = StateStore(config.db_path)
             state.upsert_detected(stream)
             state.mark_exited(stream.video_id, 0)
-            probe = SequenceProbe([RuntimeError("network"), RuntimeError("extractor"), non_live])
+            probe = SequenceProbe(
+                [RuntimeError("network"), RuntimeError("extractor"), non_live, non_live]
+            )
             manager = RecordingDownloadManager(
                 config,
                 state,
@@ -868,12 +870,224 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             record = state.get_stream(stream.video_id)
             state.close()
 
-        self.assertEqual(probe.calls, 3)
-        self.assertEqual(sleeps, 3)
+        self.assertEqual(probe.calls, 4)
+        self.assertEqual(sleeps, 4)
         self.assertIsNotNone(record)
         self.assertEqual(record.status, "ended")
 
-    async def test_terminal_unavailable_stops_post_exit_checks(self) -> None:
+    async def test_failed_probes_keep_tracks_for_later_confirmation(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0, 1],
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Creator",
+                is_live=True,
+            )
+            segment_dir = config.download_dir / "Creator" / stream.video_id
+            segment_dir.mkdir(parents=True)
+            audio = segment_dir / "segment-001.f140.mp4.part"
+            video = segment_dir / "segment-001.f299.mp4.part"
+            audio.write_bytes(b"audio")
+            video.write_bytes(b"video")
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            probe = SequenceProbe([RuntimeError("network"), RuntimeError("network")])
+            manager = DownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=AsyncMock(),
+                probe_video_func=probe.probe_video_async,
+                logger=NULL_LOGGER,
+            )
+            manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
+            try:
+                await manager.handle_post_exit(
+                    stream, 1, expected_status="checking_after_exit"
+                )
+                status = state.get_stream(stream.video_id).status
+                tracks_preserved = audio.exists() and video.exists()
+            finally:
+                state.close()
+
+        self.assertEqual(probe.calls, 2)
+        self.assertEqual(status, "checking_after_exit")
+        self.assertTrue(tracks_preserved)
+        manager.finalize_ended_segment.assert_not_awaited()
+        manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
+
+    async def test_inconclusive_checks_retry_until_end_is_confirmed(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0, 1],
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            ended = LiveStream(
+                video_id=stream.video_id,
+                url=stream.url,
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            probe = SequenceProbe(
+                [RuntimeError("network"), RuntimeError("network"), ended, ended]
+            )
+
+            async def quick_sleep(_delay: float) -> None:
+                await asyncio.sleep(0)
+
+            manager = DownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                sleep_func=quick_sleep,
+                probe_video_func=probe.probe_video_async,
+                logger=NULL_LOGGER,
+            )
+            try:
+                await manager.handle_post_exit(
+                    stream, 1, expected_status="checking_after_exit"
+                )
+                pending = list(manager._post_exit_tasks)
+                self.assertEqual(state.get_stream(stream.video_id).status, "checking_after_exit")
+                await asyncio.gather(*pending)
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(probe.calls, 4)
+        self.assertEqual(status, "ended")
+
+    async def test_single_non_live_probe_does_not_confirm_end(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0],
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            ended = LiveStream(
+                video_id=stream.video_id,
+                url=stream.url,
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                probe_video_func=AsyncMock(return_value=ended),
+                logger=NULL_LOGGER,
+            )
+            manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
+            try:
+                await manager.handle_post_exit(
+                    stream, 1, expected_status="checking_after_exit"
+                )
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        manager.finalize_ended_segment.assert_not_awaited()
+        manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
+
+    async def test_live_rollover_preserves_mixed_tracks_until_confirmed_end(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Creator",
+                is_live=True,
+            )
+            segment_dir = config.download_dir / "Creator" / stream.video_id
+            segment_dir.mkdir(parents=True)
+            audio = segment_dir / "segment-001.f140.mp4"
+            video = segment_dir / "segment-001.f299.mp4.part"
+            audio.write_bytes(b"audio")
+            video.write_bytes(b"video")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(
+                config, state, probe=None, logger=NULL_LOGGER  # type: ignore[arg-type]
+            )
+            manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+            try:
+                next_segment = await manager.choose_live_restart_segment(stream, 1)
+                audio_data = audio.read_bytes()
+                video_data = video.read_bytes()
+            finally:
+                state.close()
+
+        self.assertEqual(next_segment, 2)
+        self.assertEqual(audio_data, b"audio")
+        self.assertEqual(video_data, b"video")
+        manager.finalize_ended_segment.assert_not_awaited()
+
+    async def test_confirmed_end_finalizes_every_retained_segment(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            manager = DownloadManager(
+                config, state, probe=None, logger=NULL_LOGGER  # type: ignore[arg-type]
+            )
+            manager.finalize_ended_segment = AsyncMock(return_value=True)  # type: ignore[method-assign]
+            manager.rename_finalized_segments = MagicMock(return_value=[])  # type: ignore[method-assign]
+            manager.finalize_powerchat_sidecars = MagicMock()  # type: ignore[method-assign]
+            manager.enqueue_finalized_post_processing = MagicMock()  # type: ignore[method-assign]
+            manager.process_pending_post_processing = AsyncMock()  # type: ignore[method-assign]
+            try:
+                await manager.finish_ended_stream(stream, 2)
+                before = state.get_stream(stream.video_id).status
+                await manager.finish_ended_stream(stream, 2, end_confirmed=True)
+                after = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(before, "checking_after_exit")
+        self.assertEqual(after, "ended")
+        self.assertEqual(
+            [args.args[1] for args in manager.finalize_ended_segment.await_args_list],
+            [1, 2],
+        )
+
+    async def test_terminal_unavailable_preserves_tracks_after_post_exit_probe(self) -> None:
         sleeps: list[float] = []
 
         async def fake_sleep(delay: float) -> None:
@@ -903,6 +1117,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                 logger=NULL_LOGGER,
             )
 
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
             await manager.handle_post_exit(stream, 1)
             record = state.get_stream(stream.video_id)
             state.close()
@@ -910,10 +1125,11 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.calls, 1)
         self.assertEqual(sleeps, [30])
         self.assertIsNotNone(record)
-        self.assertEqual(record.status, "ended")
+        self.assertEqual(record.status, "checking_after_exit")
         self.assertEqual(manager.started, [])
+        manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
 
-    async def test_terminal_unavailable_stops_planned_reconnect_checks(self) -> None:
+    async def test_terminal_unavailable_preserves_tracks_during_reconnect(self) -> None:
         sleeps: list[float] = []
 
         async def fake_sleep(delay: float) -> None:
@@ -943,6 +1159,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                 logger=NULL_LOGGER,
             )
 
+            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
             await manager.handle_planned_reconnect(stream, 1)
             record = state.get_stream(stream.video_id)
             state.close()
@@ -950,8 +1167,47 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(probe.calls, 1)
         self.assertEqual(sleeps, [])
         self.assertIsNotNone(record)
-        self.assertEqual(record.status, "ended")
+        self.assertEqual(record.status, "checking_after_exit")
         self.assertEqual(manager.started, [])
+        manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
+
+    async def test_hls_endlist_confirms_end_when_metadata_is_unavailable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+                post_exit_check_seconds=[0],
+            )
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
+            probe = SequenceProbe([TerminalVideoUnavailableError("private video")])
+            edge_probe = AsyncMock(
+                return_value=YouTubeLiveEdge(None, None, has_endlist=True)
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe,  # type: ignore[arg-type]
+                probe_video_func=probe.probe_video_async,
+                probe_youtube_live_edge_func=edge_probe,
+                logger=NULL_LOGGER,
+            )
+            try:
+                await manager.handle_post_exit(
+                    stream, 1, expected_status="checking_after_exit"
+                )
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "ended")
+        edge_probe.assert_awaited_once_with(stream.url)
 
     async def test_finalizes_leftover_part_files_after_post_exit_window(self) -> None:
         async def fake_sleep(delay: float) -> None:
@@ -972,7 +1228,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             config = BotConfig(
                 download_dir=root / "downloads",
                 state_dir=root / "state",
-                post_exit_check_seconds=[0],
+                post_exit_check_seconds=[0, 1],
                 ffmpeg_path=str(fake_ffmpeg),
             )
             stream = LiveStream(
@@ -1001,7 +1257,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             state = StateStore(config.db_path)
             state.upsert_detected(stream)
             state.mark_exited(stream.video_id, 0)
-            probe = SequenceProbe([non_live])
+            probe = SequenceProbe([non_live, non_live])
             manager = DownloadManager(
                 config,
                 state,

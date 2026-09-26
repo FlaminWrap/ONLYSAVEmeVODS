@@ -19,6 +19,7 @@ from onlysavemevods.chat_refresh import ChatRefreshResult
 from onlysavemevods.chat_render import VideoProbeError
 from onlysavemevods.chat_timing import read_chat_timing
 from onlysavemevods.downloader import (
+    ActiveDownload,
     DownloadManager,
     FinalizeMediaStream,
     FinalizeOutputValidation,
@@ -218,6 +219,38 @@ class DownloaderCommandTests(unittest.TestCase):
 
         format_index = command.index("--format")
         self.assertEqual(command[format_index + 1], "303+bestaudio")
+
+    def test_independent_youtube_track_commands_keep_format_files_separate(self) -> None:
+        config = BotConfig()
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+        )
+        video = build_download_command(
+            config, stream, 2, youtube_track_format_id="303"
+        )
+        audio = build_download_command(
+            config, stream, 2, youtube_track_format_id="140"
+        )
+        self.assertEqual(video[video.index("--format") + 1], "303")
+        self.assertEqual(audio[audio.index("--format") + 1], "140")
+        self.assertTrue(any(arg.endswith("segment-002.f303.%(ext)s") for arg in video))
+        self.assertTrue(any(arg.endswith("segment-002.f140.%(ext)s") for arg in audio))
+        self.assertNotIn("303+140", video + audio)
+
+    def test_split_catchup_waits_for_both_independent_tracks(self) -> None:
+        tracker = CatchupTracker(
+            asyncio.Event(), expected_tracks=frozenset({"video", "audio"})
+        )
+        tracker.update(
+            f"{LIVE_PROGRESS_MARKER}\t303\tvp9\tnone\t100\t100\t0\t1"
+        )
+        self.assertFalse(tracker.caught_up)
+        tracker.update(
+            f"{LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t50\t50\t0\t1"
+        )
+        self.assertTrue(tracker.caught_up)
 
     def test_youtube_format_change_with_media_starts_new_segment(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1060,6 +1093,63 @@ class DownloaderCommandTests(unittest.TestCase):
             ],
         )
 
+    def test_finalize_input_coverage_rejects_short_audio(self) -> None:
+        from onlysavemevods.downloader import validate_finalize_input_coverage
+
+        selected = [
+            FinalizeMediaStream(
+                path=Path("segment-001.f303.webm.part"),
+                input_index=0,
+                stream_index=0,
+                codec_type="video",
+                duration=36_000.0,
+                size=3_000,
+                partial=True,
+            ),
+            FinalizeMediaStream(
+                path=Path("segment-001.f140.mp4.part"),
+                input_index=1,
+                stream_index=0,
+                codec_type="audio",
+                duration=1_500.0,
+                size=300,
+                partial=True,
+            ),
+        ]
+
+        with self.assertRaisesRegex(VideoProbeError, "duration mismatch"):
+            validate_finalize_input_coverage(selected)
+
+    def test_manual_recovery_preserves_mismatched_tracks(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(download_dir=Path(tmp))
+            segment_dir = Path(tmp) / "Example_Channel" / "LIVEVIDEO01"
+            segment_dir.mkdir(parents=True)
+            video = segment_dir / "segment-001.f303.webm.part"
+            audio = segment_dir / "segment-001.f140.mp4.part"
+            video.write_bytes(b"video")
+            audio.write_bytes(b"audio")
+            streams = [
+                FinalizeMediaStream(video, 1, 0, "video", 36_000.0, 5, True),
+                FinalizeMediaStream(audio, 0, 0, "audio", 1_500.0, 5, True),
+            ]
+            with (
+                patch(
+                    "onlysavemevods.downloader.probe_finalize_media_streams",
+                    return_value=streams,
+                ),
+                patch("onlysavemevods.downloader.subprocess.run") as run,
+                self.assertRaisesRegex(VideoProbeError, "duration mismatch"),
+            ):
+                recover_segment_from_fragments(
+                    config, "LIVEVIDEO01", 1, "Example Channel"
+                )
+
+            run.assert_not_called()
+            self.assertTrue(video.exists())
+            self.assertTrue(audio.exists())
+            self.assertFalse((segment_dir / "segment-001-recovered.mkv").exists())
+
     def test_finalize_validation_rejects_shortened_output(self) -> None:
         output = Path("segment-001.mkv")
         selected = [
@@ -1603,7 +1693,7 @@ class DownloaderCommandTests(unittest.TestCase):
                     )
                 self.assertEqual(progress[0].fragment_index, 7)
                 self.assertFalse(progress_file.exists())
-                warning.assert_called_once()
+                self.assertEqual(warning.call_count, 2)
         finally:
             clear_all_download_progress()
 
@@ -1664,6 +1754,54 @@ class DownloaderCommandTests(unittest.TestCase):
 
         tracker.update("[download] 101.00MiB at 1.00MiB/s (frag 100/101)")
         self.assertEqual(tracker.inactive_seconds(), 0.0)
+
+    def test_split_track_stall_requires_both_tracks_and_fragment_downloads(self) -> None:
+        now = [0.0]
+        tracker = CatchupTracker(
+            asyncio.Event(),
+            monotonic_func=lambda: now[0],
+        )
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "100\t100\t0\t2"
+        )
+        now[0] = 10.0
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "101\t101\t0\t2"
+        )
+        self.assertIsNone(tracker.stalled_split_track(10))
+
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "772\t772\t1\t2"
+        )
+        now[0] = 20.0
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "102\t102\t0\t2"
+        )
+        self.assertEqual(tracker.stalled_split_track(10), "audio")
+
+        # A growing playlist count does not mean another fragment was saved.
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "772\t773\t1\t2"
+        )
+        self.assertEqual(tracker.stalled_split_track(10), "audio")
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "773\t773\t1\t2"
+        )
+        self.assertIsNone(tracker.stalled_split_track(10))
+
+        now[0] = 30.0
+        self.assertIsNone(tracker.stalled_split_track(10))
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "774\t774\t1\t2"
+        )
+        self.assertEqual(tracker.stalled_split_track(10), "video")
 
     def test_youtube_fragment_inactivity_carries_across_process_trackers(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1728,6 +1866,264 @@ class DownloaderCommandTests(unittest.TestCase):
 
 
 class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
+    async def test_locked_youtube_pair_starts_independent_track_processes(self) -> None:
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.stdout = None
+                self.returncode: int | None = None
+                self.exited = asyncio.Event()
+
+            async def wait(self) -> int:
+                await self.exited.wait()
+                assert self.returncode is not None
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.returncode = -15
+                self.exited.set()
+
+            def kill(self) -> None:
+                self.terminate()
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(
+                download_dir=root / "downloads",
+                state_dir=root / "state",
+                youtube_stale_live_timeout_seconds=0,
+                youtube_live_edge_recovery_seconds=0,
+            )
+            state = StateStore(config.db_path)
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                channel="Example",
+                is_live=True,
+                raw={
+                    "formats": [
+                        {
+                            "format_id": "303",
+                            "vcodec": "vp9",
+                            "acodec": "none",
+                            "height": 1080,
+                        },
+                        {
+                            "format_id": "140",
+                            "vcodec": "none",
+                            "acodec": "mp4a.40.2",
+                        },
+                    ]
+                },
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=AsyncMock(),
+            )
+            video_process = FakeProcess()
+            audio_process = FakeProcess()
+            restarted_audio_process = FakeProcess()
+            with patch(
+                "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                new=AsyncMock(
+                    side_effect=[video_process, audio_process, restarted_audio_process]
+                ),
+            ) as spawn:
+                self.assertTrue(await manager.start_stream(stream))
+                for _ in range(5):
+                    if spawn.await_count == 2:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(spawn.await_count, 2)
+                commands = [call.args for call in spawn.await_args_list]
+                self.assertEqual(
+                    [command[command.index("--format") + 1] for command in commands],
+                    ["303", "140"],
+                )
+                self.assertTrue(any(any(arg.endswith("segment-001.f303.%(ext)s") for arg in command) for command in commands))
+                self.assertTrue(any(any(arg.endswith("segment-001.f140.%(ext)s") for arg in command) for command in commands))
+                self.assertIsNone(manager.active[stream.video_id].mixed_segment_task)
+                audio_process.terminate()
+                for _ in range(10):
+                    if spawn.await_count == 3:
+                        break
+                    await asyncio.sleep(0)
+                self.assertEqual(spawn.await_count, 3)
+                self.assertIsNone(video_process.returncode)
+                self.assertIs(
+                    manager.active[stream.video_id].audio_process,
+                    restarted_audio_process,
+                )
+                await manager.stop_all()
+                await asyncio.sleep(0)
+            self.assertEqual(video_process.returncode, -15)
+            self.assertEqual(audio_process.returncode, -15)
+            self.assertEqual(restarted_audio_process.returncode, -15)
+            state.close()
+
+    async def test_split_track_watchdog_reconnects_without_marking_edge_stalled(
+        self,
+    ) -> None:
+        config = BotConfig(youtube_stale_live_timeout_seconds=10)
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+            is_live=True,
+        )
+        now = [0.0]
+        tracker = CatchupTracker(
+            asyncio.Event(),
+            monotonic_func=lambda: now[0],
+        )
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "100\t100\t0\t2"
+        )
+        tracker.update(
+            f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+            "772\t772\t1\t2"
+        )
+        now[0] = 10.0
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "101\t101\t0\t2"
+        )
+        state = MagicMock()
+        edge_probe = AsyncMock()
+        manager = DownloadManager(
+            config,
+            state,
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=AsyncMock(),
+            probe_youtube_live_edge_func=edge_probe,
+            monotonic_func=lambda: now[0],
+        )
+        process = MagicMock()
+        process.returncode = None
+
+        with patch.object(
+            manager,
+            "_request_process_reconnect",
+            new=AsyncMock(),
+        ) as reconnect:
+            await manager._stale_youtube_live_watchdog(stream, process, tracker)
+
+        reconnect.assert_awaited_once_with(stream.video_id, process)
+        edge_probe.assert_not_awaited()
+        state.mark_youtube_stale_live.assert_not_called()
+        self.assertIn("audio fragments stopped", state.add_stream_event.call_args.args[1])
+
+    async def test_split_audio_watchdog_stops_only_audio(self) -> None:
+        config = BotConfig(youtube_stale_live_timeout_seconds=10)
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+            is_live=True,
+        )
+        now = [0.0]
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.update(
+            f"{LIVE_PROGRESS_MARKER}\t303\tvp9\tnone\t100\t100\t0\t1"
+        )
+        tracker.update(
+            f"{LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t50\t50\t0\t1"
+        )
+        now[0] = 10.0
+        tracker.update(
+            f"{LIVE_PROGRESS_MARKER}\t303\tvp9\tnone\t101\t101\t0\t1"
+        )
+        video_process = MagicMock(returncode=None)
+        audio_process = MagicMock(returncode=None)
+        ticks = [0]
+
+        async def advance(_seconds: float) -> None:
+            ticks[0] += 1
+            if ticks[0] == 2:
+                video_process.returncode = 0
+
+        manager = DownloadManager(
+            config,
+            MagicMock(),
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=advance,
+            monotonic_func=lambda: now[0],
+        )
+        active = ActiveDownload(
+            stream=stream,
+            process=video_process,
+            segment_index=1,
+            output_template=Path("segment-001.%(ext)s"),
+            task=MagicMock(),
+            audio_process=audio_process,
+        )
+        manager.active[stream.video_id] = active
+        with (
+            patch.object(manager, "_stop_stale_live_process", new=AsyncMock()) as stop,
+            patch.object(manager, "_request_process_reconnect", new=AsyncMock()) as reconnect,
+        ):
+            await manager._stale_youtube_live_watchdog(
+                stream, video_process, tracker
+            )
+        stop.assert_awaited_once_with(stream.video_id, audio_process)
+        reconnect.assert_not_awaited()
+        self.assertNotIn("audio", tracker.fragments)
+
+    async def test_split_track_watchdog_waits_for_both_tracks(self) -> None:
+        config = BotConfig(youtube_stale_live_timeout_seconds=10)
+        stream = LiveStream(
+            video_id="youtube:LIVEVIDEO01",
+            url=video_url("LIVEVIDEO01"),
+            platform="youtube",
+            is_live=True,
+        )
+        now = [0.0]
+        tracker = CatchupTracker(
+            asyncio.Event(),
+            monotonic_func=lambda: now[0],
+        )
+        tracker.update(
+            f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+            "100\t100\t0\t2"
+        )
+        process = MagicMock()
+        process.returncode = None
+        ticks = [0]
+
+        async def advance_video(_seconds: float) -> None:
+            ticks[0] += 1
+            now[0] += 10.0
+            tracker.update(
+                f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+                f"{100 + ticks[0]}\t{100 + ticks[0]}\t0\t2"
+            )
+            if ticks[0] == 2:
+                process.returncode = 0
+
+        edge_probe = AsyncMock()
+        manager = DownloadManager(
+            config,
+            MagicMock(),
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=advance_video,
+            probe_youtube_live_edge_func=edge_probe,
+            monotonic_func=lambda: now[0],
+        )
+
+        with patch.object(
+            manager,
+            "_request_process_reconnect",
+            new=AsyncMock(),
+        ) as reconnect:
+            await manager._stale_youtube_live_watchdog(stream, process, tracker)
+
+        self.assertEqual(ticks[0], 2)
+        reconnect.assert_not_awaited()
+        edge_probe.assert_not_awaited()
+
     async def test_terminal_youtube_watchdog_probe_stops_downloader(self) -> None:
         config = BotConfig(youtube_stale_live_timeout_seconds=10)
         stream = LiveStream(
@@ -1787,6 +2183,14 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
             tracker = CatchupTracker(
                 asyncio.Event(),
                 monotonic_func=lambda: now[0],
+            )
+            tracker.update(
+                f"1: {LIVE_PROGRESS_MARKER}\t137\tavc1.640028\tnone\t"
+                "100\t100\t0\t2"
+            )
+            tracker.update(
+                f"2: {LIVE_PROGRESS_MARKER}\t140\tnone\tmp4a.40.2\t"
+                "100\t100\t1\t2"
             )
             now[0] = 100.0
             edge = YouTubeLiveEdge(
@@ -1991,6 +2395,55 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(record)
         assert record is not None
         self.assertEqual(record.status, "ended")
+
+    async def test_stalled_monitor_error_breaks_non_live_confirmation(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            config = BotConfig(
+                download_dir=Path(tmp) / "downloads",
+                state_dir=Path(tmp) / "state",
+            )
+            stream = LiveStream(
+                video_id="youtube:LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                platform="youtube",
+                is_live=True,
+            )
+            ended = LiveStream(
+                video_id=stream.video_id,
+                url=stream.url,
+                platform="youtube",
+                is_live=False,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_youtube_stale_live(
+                stream.video_id,
+                media_sequence=9655,
+                edge_at="2026-08-01T08:29:04.025+00:00",
+            )
+            metadata_probe = AsyncMock(
+                side_effect=[ended, RuntimeError("network"), ended, ended]
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=AsyncMock(),
+                probe_video_func=metadata_probe,
+                probe_youtube_live_edge_func=AsyncMock(
+                    return_value=YouTubeLiveEdge(None, None)
+                ),
+            )
+            try:
+                await manager.monitor_stalled_youtube(stream, 1)
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(metadata_probe.await_count, 4)
+        self.assertEqual(status, "ended")
 
     async def test_stalled_monitor_keeps_frozen_live_stream_stalled(self) -> None:
         async def stop_after_one_check(_delay: float) -> None:
@@ -2204,6 +2657,192 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("0:0", command)
         self.assertNotIn("2:0", command)
+
+    async def test_finalize_rejects_duration_mismatch_before_mux(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video = root / "segment-001.f303.webm.part"
+            audio = root / "segment-001.f140.mp4.part"
+            video.write_bytes(b"video")
+            audio.write_bytes(b"audio")
+            plan = FinalizePlan(
+                output_file=root / "segment-001.mkv",
+                input_files=[audio, video],
+                cleanup_files=[],
+            )
+            streams = [
+                FinalizeMediaStream(audio, 0, 0, "audio", 1_500.0, 5, True),
+                FinalizeMediaStream(video, 1, 0, "video", 36_000.0, 5, True),
+            ]
+            config = BotConfig(download_dir=root, state_dir=root / "state")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=streams,
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(),
+                    ) as spawn,
+                ):
+                    finalized = await manager._mux_finalize_inputs(plan)
+                video_preserved = video.exists()
+                audio_preserved = audio.exists()
+                output_exists = plan.output_file.exists()
+            finally:
+                state.close()
+
+        self.assertFalse(finalized)
+        spawn.assert_not_awaited()
+        self.assertTrue(video_preserved)
+        self.assertTrue(audio_preserved)
+        self.assertFalse(output_exists)
+
+    async def test_locked_youtube_split_format_requires_audio(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="303",
+                codec="vp9",
+                selector="303+140",
+            )
+            segment_dir = segment_directory(
+                config, stream.video_id, stream.channel
+            )
+            segment_dir.mkdir(parents=True)
+            video = segment_dir / "segment-001.f303.webm.part"
+            video.write_bytes(b"video")
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            streams = [
+                FinalizeMediaStream(video, 0, 0, "video", 36_000.0, 5, True),
+            ]
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=streams,
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(),
+                    ) as spawn,
+                ):
+                    finalized = await manager.finalize_ended_segment(
+                        stream.video_id, 1, stream.channel
+                    )
+                video_preserved = video.exists()
+                output_exists = (segment_dir / "segment-001.webm").exists()
+            finally:
+                state.close()
+
+        self.assertFalse(finalized)
+        spawn.assert_not_awaited()
+        self.assertTrue(video_preserved)
+        self.assertFalse(output_exists)
+
+    async def test_earlier_split_segment_still_requires_audio_after_format_change(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="303",
+                codec="vp9",
+                selector="303+140",
+            )
+            state.update_youtube_video_format(
+                stream.video_id,
+                format_id="18",
+                codec="avc1",
+                selector="18",
+            )
+            segment_dir = segment_directory(config, stream.video_id, stream.channel)
+            segment_dir.mkdir(parents=True)
+            video = segment_dir / "segment-001.f303.webm.part"
+            video.write_bytes(b"video")
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            video_streams = [
+                FinalizeMediaStream(video, 0, 0, "video", 300.0, 5, True)
+            ]
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=video_streams,
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(),
+                    ) as spawn,
+                ):
+                    finalized = await manager.finalize_ended_segment(
+                        stream.video_id, 1, stream.channel
+                    )
+                preserved = video.exists()
+            finally:
+                state.close()
+
+        self.assertFalse(finalized)
+        self.assertTrue(preserved)
+        spawn.assert_not_awaited()
+
+    async def test_plain_flv_segment_does_not_imply_split_tracks(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.lock_youtube_video_format(
+                stream.video_id,
+                format_id="18",
+                codec="avc1",
+                selector="18",
+            )
+            segment_dir = segment_directory(config, stream.video_id, stream.channel)
+            segment_dir.mkdir(parents=True)
+            part = segment_dir / "segment-001.flv.part"
+            part.write_bytes(b"media")
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            manager._finalize_single_input = AsyncMock(return_value=False)  # type: ignore[method-assign]
+            try:
+                finalized = await manager.finalize_ended_segment(
+                    stream.video_id, 1, stream.channel
+                )
+                requires_both = (
+                    manager._finalize_single_input.await_args.args[0].require_audio_video
+                )
+            finally:
+                state.close()
+
+        self.assertFalse(finalized)
+        self.assertFalse(requires_both)
 
     async def test_finalize_probe_failure_preserves_every_input(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -2720,6 +3359,190 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(killed, [(4343, signal.SIGKILL)])
         self.assertEqual(process.calls, 2)
 
+    async def test_failed_finalization_keeps_stream_pending_and_retries(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+            manager.rename_finalized_segments = MagicMock()  # type: ignore[method-assign]
+            manager.enqueue_finalized_post_processing = MagicMock()  # type: ignore[method-assign]
+            manager._schedule_finalization_retry = MagicMock()  # type: ignore[method-assign]
+            try:
+                await manager.finish_ended_stream(
+                    stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                )
+                status = state.get_stream(stream.video_id).status
+                events = state.list_stream_events([stream.video_id])[stream.video_id]
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        self.assertTrue(
+            any("preserving media tracks" in event.message for event in events)
+        )
+        manager.rename_finalized_segments.assert_not_called()
+        manager.enqueue_finalized_post_processing.assert_not_called()
+        manager._schedule_finalization_retry.assert_called_once()
+
+    async def test_failed_finalization_retry_completes_when_tracks_recover(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                title="Late Night Stream",
+                channel="Example Channel",
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            sleep = AsyncMock()
+            ended = LiveStream(
+                video_id=stream.video_id,
+                url=stream.url,
+                channel=stream.channel,
+                is_live=False,
+            )
+            source_probe = AsyncMock(return_value=ended)
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=sleep,
+                probe_video_func=source_probe,
+            )
+            manager.finalize_ended_segment = AsyncMock(  # type: ignore[method-assign]
+                side_effect=[False, True]
+            )
+            manager.rename_finalized_segments = MagicMock(  # type: ignore[method-assign]
+                return_value=[]
+            )
+            manager.finalize_powerchat_sidecars = MagicMock()  # type: ignore[method-assign]
+            manager.enqueue_finalized_post_processing = MagicMock()  # type: ignore[method-assign]
+            manager.process_pending_post_processing = AsyncMock()  # type: ignore[method-assign]
+            try:
+                await manager.finish_ended_stream(
+                    stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                )
+                retry = manager._finalization_retry_tasks[stream.video_id]
+                await asyncio.wait_for(retry, timeout=1)
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "ended")
+        self.assertEqual(manager.finalize_ended_segment.await_count, 2)
+        source_probe.assert_awaited_once()
+        self.assertGreaterEqual(sleep.await_args.args[0], 30)
+
+    async def test_finalization_retry_skips_merge_when_source_resumes_live(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                channel="Example Channel",
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            source_probe = AsyncMock(return_value=stream)
+            edge_probe = AsyncMock(
+                return_value=YouTubeLiveEdge(None, None, has_endlist=False)
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=AsyncMock(),
+                probe_video_func=source_probe,
+                probe_youtube_live_edge_func=edge_probe,
+            )
+            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+            manager.handle_post_exit = AsyncMock()  # type: ignore[method-assign]
+            try:
+                await manager.finish_ended_stream(
+                    stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                )
+                retry = manager._finalization_retry_tasks[stream.video_id]
+                await asyncio.wait_for(retry, timeout=1)
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        self.assertEqual(manager.finalize_ended_segment.await_count, 1)
+        source_probe.assert_awaited_once_with(stream.url)
+        edge_probe.assert_awaited_once_with(stream.url)
+        manager.handle_post_exit.assert_awaited_once_with(
+            stream, 1, expected_status="checking_after_exit"
+        )
+
+    async def test_finalization_retry_preserves_tracks_when_source_is_unavailable(
+        self,
+    ) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            stream = LiveStream(
+                video_id="LIVEVIDEO01",
+                url=video_url("LIVEVIDEO01"),
+                is_live=True,
+            )
+            state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 1)
+            sleep_calls = 0
+
+            async def stop_after_one_retry(_delay: float) -> None:
+                nonlocal sleep_calls
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise asyncio.CancelledError
+
+            source_probe = AsyncMock(
+                side_effect=TerminalVideoUnavailableError("private video")
+            )
+            edge_probe = AsyncMock(
+                return_value=YouTubeLiveEdge(None, None, has_endlist=False)
+            )
+            manager = DownloadManager(
+                config,
+                state,
+                probe=None,  # type: ignore[arg-type]
+                sleep_func=stop_after_one_retry,
+                probe_video_func=source_probe,
+                probe_youtube_live_edge_func=edge_probe,
+            )
+            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+            try:
+                await manager.finish_ended_stream(
+                    stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                )
+                retry = manager._finalization_retry_tasks[stream.video_id]
+                await asyncio.gather(retry, return_exceptions=True)
+                status = state.get_stream(stream.video_id).status
+            finally:
+                state.close()
+
+        self.assertEqual(status, "checking_after_exit")
+        self.assertEqual(manager.finalize_ended_segment.await_count, 1)
+        source_probe.assert_awaited_once_with(stream.url)
+        edge_probe.assert_awaited_once_with(stream.url)
+
     async def test_finish_finalizes_sidecars_before_enqueuing_post_processing(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2758,7 +3581,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                     "mark_ended",
                     side_effect=lambda *_args: order.append("ended"),
                 ):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
             finally:
                 state.close()
 
@@ -2864,7 +3687,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                     patch("onlysavemevods.downloader.refresh_chat_sidecar", fake_refresh),
                     patch("onlysavemevods.downloader.asyncio.to_thread", fake_to_thread),
                 ):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
             finally:
                 state.close()
 
@@ -2921,7 +3744,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
 
             try:
-                await manager.finish_ended_stream(stream, 1)
+                await manager.finish_ended_stream(stream, 1, end_confirmed=True)
                 events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
                     stream.video_id
                 ]
@@ -2984,7 +3807,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                     patch("onlysavemevods.downloader.repair_twitch_ads_for_media", fake_repair),
                     patch("onlysavemevods.downloader.asyncio.to_thread", fake_to_thread),
                 ):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
                 jobs = list_tracked_jobs()
                 events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
                     stream.video_id
@@ -3026,7 +3849,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
                 jobs = list_tracked_jobs()
             finally:
                 state.close()
@@ -3078,7 +3901,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
                 events = state.list_stream_events([stream.video_id], limit_per_stream=10)[
                     stream.video_id
                 ]
@@ -3134,7 +3957,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                 ),
             )
             finish_task = asyncio.create_task(
-                first_manager.finish_ended_stream(stream, 1)
+                first_manager.finish_ended_stream(stream, 1, end_confirmed=True)
             )
             await sleep_started.wait()
             finish_task.cancel()
@@ -3333,7 +4156,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
             finally:
                 state.close()
 
@@ -3363,7 +4186,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
 
             try:
                 with patch("onlysavemevods.downloader.transcribe_media_file", transcribe):
-                    await manager.finish_ended_stream(stream, 1)
+                    await manager.finish_ended_stream(stream, 1, end_confirmed=True)
             finally:
                 state.close()
 

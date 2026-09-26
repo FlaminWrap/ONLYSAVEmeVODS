@@ -65,6 +65,7 @@ DEFAULT_TWITCH_AD_REPAIR_SAMPLE_SECONDS = 2
 DEFAULT_TWITCH_AD_REPAIR_MAX_SECONDS = 180
 DEFAULT_TWITCH_AD_REPAIR_VOD_SEARCH_LIMIT = 5
 DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS = 15 * 60
+DEFAULT_YOUTUBE_LIVE_EDGE_RECOVERY_SECONDS = 30
 DEFAULT_PROCESSING_QUIET_HOURS_START = "01:00"
 DEFAULT_PROCESSING_QUIET_HOURS_END = "07:00"
 APP_UPDATE_MODES = {"disabled", "manual", "check_only", "auto_install"}
@@ -213,6 +214,7 @@ class BotConfig:
     fragment_retention_hours: int = 0
     reconnect_interval_seconds: int = 0
     youtube_stale_live_timeout_seconds: int = DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS
+    youtube_live_edge_recovery_seconds: int = DEFAULT_YOUTUBE_LIVE_EDGE_RECOVERY_SECONDS
     post_exit_check_seconds: list[int] = field(
         default_factory=lambda: list(DEFAULT_POST_EXIT_CHECK_SECONDS)
     )
@@ -503,6 +505,13 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
                 DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS,
             ),
             "youtube_stale_live_timeout_seconds",
+        ),
+        youtube_live_edge_recovery_seconds=_as_non_negative_int(
+            raw.get(
+                "youtube_live_edge_recovery_seconds",
+                DEFAULT_YOUTUBE_LIVE_EDGE_RECOVERY_SECONDS,
+            ),
+            "youtube_live_edge_recovery_seconds",
         ),
         post_exit_check_seconds=_as_offset_list(
             raw.get("post_exit_check_seconds", DEFAULT_POST_EXIT_CHECK_SECONDS),

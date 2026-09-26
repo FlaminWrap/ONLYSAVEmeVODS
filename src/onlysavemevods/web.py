@@ -10174,6 +10174,14 @@ def render_live_download_progress(stream: StreamStatus) -> str:
         progress_label = (
             f"{item.fragment_index:,} / {item.fragment_count:,} fragments · {state}"
         )
+        if (
+            item.highest_fragment_index > item.fragment_index
+            or item.highest_fragment_count > item.fragment_count
+        ):
+            progress_label += (
+                f" · highest reported {item.highest_fragment_index:,} / "
+                f"{item.highest_fragment_count:,}"
+            )
         percent = max(0, min(100, round(item.progress * 100)))
         rows.append(
             f'<span class="live-download-track {state_class}">'

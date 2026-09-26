@@ -776,11 +776,32 @@ scripts/uninstall-systemd.sh
   segments. A frozen but still-recent edge remains under observation until it
   advances or reaches the configured stale age. A stalled stream retains its
   resumable files and is monitored indefinitely. It resumes automatically if
-  the edge advances, and is finalized only after YouTube reports it non-live,
-  terminally unavailable, or publishes an HLS end marker.
-  Change `youtube_stale_live_timeout_seconds`, or set it to `0` to disable the
-  watchdog. If the service restarts while a live download or retry is active,
-  that record re-enters the post-exit recovery checks instead of being abandoned;
+  the edge advances, and is finalized only after repeated non-live checks or an
+  HLS end marker. With a locked YouTube video/audio format pair, a
+  track that has reached the live edge and then saves no new fragment for 30
+  seconds is retried if the other track advances. The stalled track restarts
+  independently while the healthy track continues. If both tracks stop, two
+  HLS probes must show that the source edge is advancing before both track
+  processes restart. A restarted process that reports no fragments is checked
+  again after the same interval. Locked
+  YouTube video/audio format pairs run in separate yt-dlp processes, so yt-dlp
+  cannot merge them during a live reconnect. If an audio process exits early,
+  it is retried while video continues. A completed track
+  is restored from kept fragments before retry; if that is unsafe, the current
+  segment is preserved and recording moves to a new segment. The app merges
+  tracks only after YouTube confirms the broadcast ended, then checks that the
+  required audio and video tracks are present with similar durations. Incomplete
+  inputs are kept for recovery and finalization is retried.
+  The dashboard also keeps each track's highest **reported** yt-dlp fragment
+  index and count in `state/live-fragment-high-water/` across reconnects and
+  service restarts. These counters are local to a yt-dlp run, so a high value
+  does not prove all fragments were saved or identify YouTube's absolute media
+  sequence.
+  Change `youtube_live_edge_recovery_seconds` (default `30`, `0` disables quick
+  recovery) independently of `youtube_stale_live_timeout_seconds` (default
+  `900`, `0` disables frozen-edge detection). If the service restarts while a
+  live download or retry is active, that record re-enters the post-exit recovery
+  checks instead of being abandoned;
   an interrupted manual VOD download is marked separately as interrupted.
 - YouTube recordings prefer VP9 by default. On the first download attempt, the
   app selects only from the formats in the current probe and records the exact
@@ -796,9 +817,10 @@ scripts/uninstall-systemd.sh
 - Once the post-exit checks decide a stream has ended, leftover `.part` format
   files are finalized with FFmpeg and temporary `.ytdl`/fragment files are
   removed.
-- If YouTube reports the video as private, removed, deleted, or otherwise
-  terminally unavailable during a post-exit check, the bot stops checking and
-  marks the stream ended immediately.
+- If source metadata is private, removed, deleted, or otherwise unavailable
+  during a post-exit check, the bot preserves the media tracks and retries.
+  A new channel session starts independently; the previous session is merged
+  only after checks of its own video URL confirm that it ended.
 - If one format, such as audio, reaches the live edge and finalizes before the
   other format, a watchdog cuts that mixed segment quickly. When kept fragments
   are available, the bot turns finalized format files back into resumable

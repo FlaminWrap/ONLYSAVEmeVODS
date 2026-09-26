@@ -362,6 +362,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.post_exit_check_seconds[-1], 600)
         self.assertEqual(len(config.post_exit_check_seconds), 20)
         self.assertEqual(config.reconnect_interval_seconds, 0)
+        self.assertEqual(config.youtube_live_edge_recovery_seconds, 30)
         self.assertEqual(
             config.youtube_stale_live_timeout_seconds,
             DEFAULT_YOUTUBE_STALE_LIVE_TIMEOUT_SECONDS,
@@ -487,6 +488,23 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(disabled.youtube_stale_live_timeout_seconds, 0)
         self.assertEqual(configured.youtube_stale_live_timeout_seconds, 1200)
+
+    def test_youtube_live_edge_recovery_can_be_configured_or_disabled(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.toml"
+            config_path.write_text(
+                "youtube_live_edge_recovery_seconds = 0\n",
+                encoding="utf-8",
+            )
+            disabled = load_config(config_path)
+            config_path.write_text(
+                "youtube_live_edge_recovery_seconds = 45\n",
+                encoding="utf-8",
+            )
+            configured = load_config(config_path)
+
+        self.assertEqual(disabled.youtube_live_edge_recovery_seconds, 0)
+        self.assertEqual(configured.youtube_live_edge_recovery_seconds, 45)
 
     def test_keep_fragments_for_resume_can_be_disabled(self) -> None:
         with TemporaryDirectory() as tmp:
