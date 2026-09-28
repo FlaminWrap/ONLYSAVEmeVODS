@@ -11494,13 +11494,6 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       border-color: color-mix(in srgb, var(--bad), transparent 55%);
       background: color-mix(in srgb, var(--bad), transparent 94%);
     }}
-    .about-update-force-warning {{
-      padding: 9px 10px;
-      border: 1px solid color-mix(in srgb, var(--bad), transparent 55%);
-      border-radius: 8px;
-      background: color-mix(in srgb, var(--bad), transparent 94%);
-      color: var(--bad);
-    }}
     .about-update-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
     .about-update-footer {{ display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); }}
     @media (max-width: 520px) {{
@@ -15341,7 +15334,6 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     message_text = error or message or app_update_mode_message(mode)
     message_class = " error" if error or status == "failed" else ""
     install_form = ""
-    force_warning = ""
     if mode in {"manual", "auto_install"}:
         force_tag = str(update.get("pending_tag") or "") if pending else latest_tag
         install_form = f"""
@@ -15349,15 +15341,11 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
       <input type="hidden" name="tag" value="{escape(latest_tag, quote=True)}">
       <button class="download action-button" type="submit"{install_disabled}{install_title}>Install update</button>
     </form>
-    <form class="inline-form" method="post" action="/app-update/request-force" onsubmit="return confirm('Force install will stop active recordings and jobs. Live fragments may be missed while the service restarts and updates. Continue?');">
+    <form class="inline-form" method="post" action="/app-update/request-force" data-confirm="Force install will stop active recordings and jobs. Live fragments may be missed while the service restarts and updates. Are you sure you want to continue?" data-confirm-label="Force install">
       <input type="hidden" name="tag" value="{escape(force_tag, quote=True)}">
       <input type="hidden" name="confirm_force" value="interrupt-active-work">
       <button class="download action-button danger-action" type="submit"{force_disabled}{force_title}>Force install</button>
     </form>"""
-        force_warning = (
-            '<div class="about-update-force-warning">Force install stops active recordings '
-            'and jobs. Live fragments may be missed until the service restarts.</div>'
-        )
     return f"""<section class="about-update-panel">
   <div class="about-update-header">
     <div class="about-update-title">
@@ -15381,7 +15369,6 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     </form>
     {install_form}
   </div>
-  {force_warning}
   <div class="about-update-footer">
     <span>Current version: {escape(str(update.get('current_version') or APP_VERSION))}</span>
     <span>Last installed: {escape(installed)}</span>
