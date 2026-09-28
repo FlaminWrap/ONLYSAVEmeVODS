@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import unittest
 
 from onlysavemevods.sources import (
+    KickChannelOfflineError,
     SourceError,
     SourceMonitor,
     canonical_source,
@@ -105,6 +106,34 @@ class SourceMonitorTests(unittest.TestCase):
         monitor = SourceMonitor(runner)
 
         self.assertEqual(monitor.discover_live_streams("kick:OUMB3rd"), [])
+
+    def test_kick_offline_extractor_error_is_distinct(self) -> None:
+        for message in (
+            "ERROR: [kick:live] oumb: The channel is not currently live",
+            "yt-dlp failed with code 1: ERROR: [kick:live] oumb: "
+            "The channel is not currently live",
+        ):
+            with self.subTest(message=message):
+                runner = FakeRunner({"https://kick.com/oumb": YtDlpError(message)})
+                monitor = SourceMonitor(runner)
+                with self.assertRaises(KickChannelOfflineError):
+                    monitor.probe_video("kick:oumb")
+
+    def test_kick_probe_errors_other_than_explicit_offline_remain_inconclusive(self) -> None:
+        messages = (
+            "yt-dlp failed with code 1: ERROR: [kick:live] oumb: HTTP Error 403: Forbidden",
+            "yt-dlp failed with code 1: ERROR: [kick:live] oumb: The channel is not "
+            "currently live: HTTP Error 403: Forbidden",
+            "yt-dlp timed out after 120s",
+            "ERROR: [youtube] oumb: The channel is not currently live",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                runner = FakeRunner({"https://kick.com/oumb": YtDlpError(message)})
+                monitor = SourceMonitor(runner)
+                with self.assertRaises(YtDlpError) as caught:
+                    monitor.probe_video("kick:oumb")
+                self.assertNotIsInstance(caught.exception, KickChannelOfflineError)
 
     def test_kick_live_source_uses_stable_livestream_id(self) -> None:
         start_timestamp = datetime(2026, 7, 5, 5, 18, tzinfo=timezone.utc).timestamp()

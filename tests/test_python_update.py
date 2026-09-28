@@ -3,17 +3,75 @@ from tempfile import TemporaryDirectory
 import tomllib
 import unittest
 
+from onlysavemevods.config import BotConfig
 from onlysavemevods.models import LiveStream
 from onlysavemevods.python_update import (
     idle_result_from_state,
     idle_result_from_status_snapshot,
     render_python_update_service_unit,
     render_python_update_timer_unit,
+    status_url_for_config,
 )
 from onlysavemevods.state import StateStore
 
 
 class PythonUpdateIdleTests(unittest.TestCase):
+    def test_status_url_uses_lightweight_snapshot_on_loopback(self) -> None:
+        config = BotConfig(web_host="0.0.0.0", web_port=8088)
+
+        self.assertEqual(
+            status_url_for_config(config),
+            "http://127.0.0.1:8088/status.json?lite=1",
+        )
+
+    def test_status_url_uses_lightweight_snapshot_on_ipv6(self) -> None:
+        config = BotConfig(web_host="::1", web_port=8088)
+
+        self.assertEqual(
+            status_url_for_config(config),
+            "http://[::1]:8088/status.json?lite=1",
+        )
+
+    def test_lite_snapshot_idle_without_active_streams_or_jobs(self) -> None:
+        result = idle_result_from_status_snapshot(
+            {"detail": "lite", "counts": {"ended": 3}, "jobs": []}
+        )
+
+        self.assertTrue(result.known)
+        self.assertTrue(result.idle)
+        self.assertEqual(result.exit_code, 0)
+
+    def test_lite_snapshot_busy_for_active_stream_and_job(self) -> None:
+        result = idle_result_from_status_snapshot(
+            {
+                "detail": "lite",
+                "counts": {"downloading": 1, "waiting_retry": 2},
+                "jobs": [{"status": "running"}, {"status": "done"}],
+            }
+        )
+
+        self.assertTrue(result.known)
+        self.assertFalse(result.idle)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("downloading streams=1", result.reasons)
+        self.assertIn("waiting_retry streams=2", result.reasons)
+        self.assertIn("active jobs=1", result.reasons)
+
+    def test_lite_snapshot_malformed_payload_fails_closed(self) -> None:
+        malformed = (
+            {"detail": "lite", "jobs": []},
+            {"detail": "lite", "counts": {}},
+            {"detail": "lite", "counts": {"downloading": "invalid"}, "jobs": []},
+            {"detail": "lite", "counts": {}, "jobs": [None]},
+        )
+
+        for snapshot in malformed:
+            with self.subTest(snapshot=snapshot):
+                result = idle_result_from_status_snapshot(snapshot)
+                self.assertFalse(result.known)
+                self.assertFalse(result.idle)
+                self.assertEqual(result.exit_code, 2)
+
     def test_status_snapshot_idle_when_no_busy_streams_or_jobs(self) -> None:
         result = idle_result_from_status_snapshot(
             {

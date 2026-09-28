@@ -36,6 +36,7 @@ except Exception:  # pragma: no cover - fallback is covered without packaging.
 
 
 APP_UPDATE_REQUEST_FILENAME = "app-update-request.json"
+APP_UPDATE_TRIGGER_FILENAME = "app-update-trigger"
 APP_UPDATE_STATUS_FILENAME = "app-update-status.json"
 APP_UPDATE_BACKUP_DIRNAME = "app-update-backups"
 APP_UPDATE_STATE_DIR_ENV = "ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR"
@@ -65,7 +66,7 @@ FALLBACK_VERSION_RE = re.compile(
     """,
     flags=re.IGNORECASE | re.VERBOSE,
 )
-CHECK_STATUSES = {"checked", "update_available", "up_to_date", "failed", "disabled"}
+CHECK_STATUSES = {"checked", "update_available", "up_to_date", "failed", "disabled", "requested"}
 EXECUTABLE_SCRIPT_NAMES = (
     "app-update.sh",
     "install-almalinux.sh",
@@ -233,6 +234,7 @@ def update_status(
         "pending_tag": request.get("tag") if request else "",
         "pending_version": request.get("version") if request else "",
         "pending_source": request.get("source") if request else "",
+        "pending_force": request.get("force") is True if request else False,
         "requested_at": request.get("requested_at") if request else None,
         "last_error": status.get("last_error") or "",
         "last_installed_version": status.get("last_installed_version") or "",
@@ -319,34 +321,71 @@ def request_update(
     *,
     tag: str | None = None,
     source: str = "manual",
+    force: bool = False,
     current_version: str = APP_VERSION,
 ) -> dict[str, Any]:
+    if source not in REQUEST_SOURCES:
+        raise ConfigError("Invalid app update request source")
+    if type(force) is not bool or (force and source != "manual"):
+        raise ConfigError("Force install requires a manual update request")
     if config.app_update_mode == "disabled":
         raise ConfigError("App updater is disabled")
     if config.app_update_mode == "check_only":
         raise ConfigError("App updater is in check-only mode")
 
     status = update_status(config, current_version=current_version)
-    if not status.get("latest_tag") or (tag and tag != status.get("latest_tag")):
-        status = check_for_updates(config, current_version=current_version)
-    if tag and tag != status.get("latest_tag"):
-        raise ConfigError(f"Release {tag} is not the latest checked update")
-    if not status.get("available"):
-        raise ConfigError("No newer checked release is available to install")
+    if status.get("pending_force") and not force:
+        raise ConfigError("Force install is already requested")
+
+    pending_tag = str(status.get("pending_tag") or "")
+    escalating_pending = (
+        force
+        and status.get("pending")
+        and pending_tag
+        and (tag is None or tag == pending_tag)
+    )
+    if escalating_pending:
+        if RELEASE_TAG_RE.fullmatch(pending_tag) is None:
+            raise ConfigError("Pending update has an invalid release tag")
+        if status.get("pending_source") not in REQUEST_SOURCES:
+            raise ConfigError("Pending update has an invalid source")
+        if not is_newer_version(version_from_tag(pending_tag), current_version):
+            raise ConfigError("Pending update is not newer than the current version")
+        selected_tag = pending_tag
+    else:
+        if not status.get("latest_tag") or (tag and tag != status.get("latest_tag")):
+            status = check_for_updates(config, current_version=current_version)
+        if tag and tag != status.get("latest_tag"):
+            raise ConfigError(f"Release {tag} is not the latest checked update")
+        if not status.get("available"):
+            raise ConfigError("No newer checked release is available to install")
+        selected_tag = status["latest_tag"]
 
     request = {
-        "tag": status["latest_tag"],
+        "tag": selected_tag,
         "source": source,
         "requested_at": utc_now_iso(),
     }
+    if force:
+        request["force"] = True
     _atomic_write_json(request_path(config), request)
     merged = dict(status)
     merged.update(
         status="requested",
-        message=f"Update {request['tag']} requested; installer will apply it when idle.",
+        last_error="",
+        message=(
+            f"Force install of {request['tag']} requested; the updater will stop "
+            "the recording service, including active recordings and jobs."
+            if force
+            else f"Update {request['tag']} requested; installer will apply it when idle."
+        ),
         updated_at=utc_now_iso(),
     )
     write_update_status(config, merged)
+    _atomic_write_json(
+        app_update_state_dir(config) / APP_UPDATE_TRIGGER_FILENAME,
+        {"requested_at": request["requested_at"]},
+    )
     return update_status(config, current_version=current_version)
 
 
@@ -445,10 +484,7 @@ def apply_requested_update(
 
     tag = "requested release"
     try:
-        request = _load_update_request(request_file)
-        tag = _required_str(request, "tag")
-        source = _required_str(request, "source")
-        validate_requested_update(tag=tag, source=source, policy=policy)
+        _, tag, _, _ = validated_update_request(request_file, policy=policy)
 
         raw_releases = (
             release_fetcher(policy.repository, policy.token_env)
@@ -614,6 +650,7 @@ def validate_requested_update(
     tag: str,
     source: str,
     policy: TrustedUpdatePolicy,
+    force: bool = False,
 ) -> None:
     if policy.mode not in INSTALLING_UPDATE_MODES:
         raise AppUpdateError(
@@ -623,8 +660,25 @@ def validate_requested_update(
         raise AppUpdateError("Update request contains an invalid release tag")
     if source not in REQUEST_SOURCES:
         raise AppUpdateError("Update request contains an invalid source")
+    if type(force) is not bool:
+        raise AppUpdateError("Update request force flag must be boolean")
+    if force and source != "manual":
+        raise AppUpdateError("Force install requires a manual update request")
     if source == "auto" and policy.mode != "auto_install":
         raise AppUpdateError("Automatic update request is not allowed by privileged policy")
+
+
+def validated_update_request(
+    path: Path,
+    *,
+    policy: TrustedUpdatePolicy,
+) -> tuple[dict[str, Any], str, str, bool]:
+    request = _load_update_request(path)
+    tag = _required_str(request, "tag")
+    source = _required_str(request, "source")
+    force = request.get("force", False)
+    validate_requested_update(tag=tag, source=source, force=force, policy=policy)
+    return request, tag, source, force
 
 
 def validate_trusted_release(release: GitHubRelease, *, repository: str) -> None:
@@ -1267,6 +1321,17 @@ def has_request_command(args: argparse.Namespace) -> int:
     return 0 if (state_dir / APP_UPDATE_REQUEST_FILENAME).is_file() else 1
 
 
+def request_intent_command(args: argparse.Namespace) -> int:
+    config = load_config(args.config)
+    policy = trusted_policy_from_args(args).restricted_by(config)
+    _, _, _, force = validated_update_request(
+        request_path(config, state_dir=Path(args.state_dir)),
+        policy=policy,
+    )
+    print("force" if force else "normal")
+    return 0
+
+
 def apply_command(args: argparse.Namespace) -> int:
     config = load_config(args.config)
     print(
@@ -1350,6 +1415,10 @@ def build_parser() -> argparse.ArgumentParser:
     has_request.add_argument("--config", required=True)
     has_request.add_argument("--state-dir")
 
+    request_intent = subparsers.add_parser("request-intent")
+    request_intent.add_argument("--config", required=True)
+    add_trusted_policy_args(request_intent)
+
     apply = subparsers.add_parser("apply")
     apply.add_argument("--config", required=True)
     apply.add_argument("--install-dir", required=True)
@@ -1375,6 +1444,8 @@ def main(argv: list[str] | None = None) -> int:
             return check_trusted_auto_command(args)
         if args.command == "has-request":
             return has_request_command(args)
+        if args.command == "request-intent":
+            return request_intent_command(args)
         if args.command == "apply":
             return apply_command(args)
     except (AppUpdateError, ConfigError) as exc:

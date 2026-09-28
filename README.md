@@ -467,7 +467,7 @@ ONLYSAVEMEVODS_PYTHON_UPDATE_RANDOM_DELAY=20m scripts/install-systemd.sh
 
 The installer also enables a GitHub Release app updater. It checks
 `FlaminWrap/ONLYSAVEmeVODS` release tarballs, verifies the `.sha256` checksum,
-and applies updates only when the service is idle. Configure behavior in
+and normally applies updates when the service is idle. Configure behavior in
 `config.toml` with `app_update_mode`:
 
 Source checkouts identify themselves as development builds for the next release,
@@ -487,6 +487,22 @@ web service and privileged updater by root-owned units. It is intentionally
 independent of configurable `state_dir`, so changing the application state
 folder cannot strand an update request or hide its status. Source/non-systemd
 runs use `state_dir` instead.
+
+The About tab has a separate **Force install** button in `manual` and
+`auto_install` modes. It can escalate an existing pending request when the
+service is busy or its idle check is unavailable. After confirmation, the
+privileged updater stops the service even while recordings or jobs are active,
+installs the checked release, and restarts the service. Active work is
+interrupted and live fragments may be missed during the update. The normal
+**Install update** button still waits until the service is idle. Force install
+also requires a newer release and remains subject to the root-owned updater
+policy. The button queues a request for the systemd app updater; it does not
+install inside the web process. A short-lived trigger file wakes the updater;
+the pending request stays in the mailbox for the scheduled retry if needed.
+
+After upgrading an existing systemd installation to a release with Force
+install, rerun `scripts/install-systemd.sh` once to install the updated path
+unit. App-only release updates do not replace root-owned systemd units.
 
 The web process does not replace root-owned app files itself and its request
 cannot supply download URLs. The systemd updater resolves the requested tag

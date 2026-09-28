@@ -1032,7 +1032,7 @@ EOF
 Description=Watch for ONLYSAVEmeVODS app update requests
 
 [Path]
-PathExists=${APP_UPDATE_STATE_DIR}/app-update-request.json
+PathExists=${APP_UPDATE_STATE_DIR}/app-update-trigger
 Unit=${APP_UPDATE_SERVICE_NAME}
 
 [Install]
@@ -1161,7 +1161,9 @@ SERVICE_RESTARTED=1
 if python_updater_enabled; then
   sudo systemctl enable "${PYTHON_UPDATE_TIMER_NAME}" --now
 fi
+sudo systemctl reset-failed "${APP_UPDATE_SERVICE_NAME}" "${APP_UPDATE_PATH_NAME}"
 sudo systemctl enable "${APP_UPDATE_PATH_NAME}" --now
+sudo systemctl restart "${APP_UPDATE_PATH_NAME}"
 sudo systemctl enable "${APP_UPDATE_TIMER_NAME}" --now
 
 echo "Installed and restarted ${SERVICE_NAME}"

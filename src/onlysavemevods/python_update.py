@@ -126,7 +126,9 @@ def status_url_for_config(config: BotConfig) -> str:
         host = "127.0.0.1"
     if ":" in host and not (host.startswith("[") and host.endswith("]")):
         host = f"[{host}]"
-    return f"http://{host}:{config.web_port}/status.json"
+    # The full status page scans media files and speaker data for the dashboard.
+    # Idle checks need only counts and jobs, which the lite response provides.
+    return f"http://{host}:{config.web_port}/status.json?lite=1"
 
 
 def fetch_status_snapshot(url: str, *, timeout: float = 5.0) -> Mapping[str, Any]:

@@ -7,6 +7,7 @@ VENV_DIR="${ONLYSAVEMEVODS_VENV_DIR:-${INSTALL_DIR}/.venv}"
 CONFIG_FILE="${ONLYSAVEMEVODS_CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 SERVICE_NAME="${ONLYSAVEMEVODS_SERVICE_NAME:-onlysavemevods.service}"
 APP_UPDATE_STATE_DIR="${ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR:-${ONLYSAVEMEVODS_STATE_DIR:-${INSTALL_DIR}/state}}"
+APP_UPDATE_TRIGGER_FILE="${APP_UPDATE_STATE_DIR}/app-update-trigger"
 UPDATE_LOCK_FILE="${ONLYSAVEMEVODS_UPDATE_LOCK_FILE:-${INSTALL_DIR}/.update.lock}"
 TRUSTED_REPOSITORY="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY:-FlaminWrap/ONLYSAVEmeVODS}"
 TRUSTED_MODE="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE:-manual}"
@@ -49,6 +50,15 @@ take_lock() {
     skip "Another installer or updater is already running; skipping."
   fi
   trap cleanup EXIT
+}
+
+consume_update_trigger() {
+  # Rename first so a trigger created during this run remains for the next start.
+  local claimed_file="${APP_UPDATE_TRIGGER_FILE}.claimed.$$"
+  if [[ -e "${APP_UPDATE_TRIGGER_FILE}" ]]; then
+    mv -T -- "${APP_UPDATE_TRIGGER_FILE}" "${claimed_file}" || die "Could not consume app update trigger."
+    rm -f -- "${claimed_file}"
+  fi
 }
 
 service_is_active() {
@@ -95,6 +105,7 @@ restart_service_if_needed() {
 }
 
 require_root
+consume_update_trigger
 [[ -x "${PYTHON_BIN}" ]] || die "Python venv not found or not executable: ${PYTHON_BIN}"
 [[ -d "${APP_DIR}" ]] || die "Application directory not found: ${APP_DIR}"
 [[ -f "${CONFIG_FILE}" ]] || die "Config file not found: ${CONFIG_FILE}"
@@ -107,19 +118,47 @@ POLICY_ARGS=(
   --trusted-token-env "${TRUSTED_TOKEN_ENV}"
 )
 
-if ! "${PYTHON_BIN}" -m onlysavemevods.app_update check-trusted-auto \
-  --config "${CONFIG_FILE}" \
-  --state-dir "${APP_UPDATE_STATE_DIR}" \
-  "${POLICY_ARGS[@]}" >/dev/null; then
-  echo "Trusted update check failed; attempting any pending request independently." >&2
-fi
-if ! "${PYTHON_BIN}" -m onlysavemevods.app_update has-request \
-  --config "${CONFIG_FILE}" \
-  --state-dir "${APP_UPDATE_STATE_DIR}"; then
-  skip "No pending app update request."
+has_pending_request() {
+  "${PYTHON_BIN}" -m onlysavemevods.app_update has-request \
+    --config "${CONFIG_FILE}" \
+    --state-dir "${APP_UPDATE_STATE_DIR}"
+}
+
+if ! has_pending_request; then
+  if ! "${PYTHON_BIN}" -m onlysavemevods.app_update check-trusted-auto \
+    --config "${CONFIG_FILE}" \
+    --state-dir "${APP_UPDATE_STATE_DIR}" \
+    "${POLICY_ARGS[@]}" >/dev/null; then
+    echo "Trusted update check failed; attempting any pending request independently." >&2
+  fi
+  if ! has_pending_request; then
+    skip "No pending app update request."
+  fi
 fi
 
-ensure_idle_if_service_active
+if ! REQUEST_INTENT="$("${PYTHON_BIN}" -m onlysavemevods.app_update request-intent \
+  --config "${CONFIG_FILE}" \
+  --state-dir "${APP_UPDATE_STATE_DIR}" \
+  "${POLICY_ARGS[@]}")"; then
+  die "Could not validate pending app update request intent; refusing to stop ${SERVICE_NAME}."
+fi
+case "${REQUEST_INTENT}" in
+  normal)
+    ensure_idle_if_service_active
+    ;;
+  force)
+    if service_is_active; then
+      echo "Force install requested; stopping ${SERVICE_NAME} even if it is recording. Active recordings will be interrupted." >&2
+      STOPPED_SERVICE=1
+      systemctl stop "${SERVICE_NAME}"
+    else
+      echo "${SERVICE_NAME} is not active; applying forced app update."
+    fi
+    ;;
+  *)
+    die "Invalid pending app update request intent: ${REQUEST_INTENT}"
+    ;;
+esac
 "${PYTHON_BIN}" -m onlysavemevods.app_update apply \
   --config "${CONFIG_FILE}" \
   --install-dir "${INSTALL_DIR}" \

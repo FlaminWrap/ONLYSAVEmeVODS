@@ -1,7 +1,9 @@
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 import hashlib
+import io
 import json
 import shutil
 import tarfile
@@ -10,6 +12,7 @@ import unittest
 
 from onlysavemevods.app_update import (
     APP_UPDATE_STATE_DIR_ENV,
+    APP_UPDATE_TRIGGER_FILENAME,
     AppUpdateError,
     TransientAppUpdateError,
     TrustedUpdatePolicy,
@@ -18,6 +21,7 @@ from onlysavemevods.app_update import (
     check_or_request_auto,
     check_or_request_trusted_update,
     is_newer_version,
+    main as app_update_main,
     extract_and_validate_bundle,
     parse_release,
     request_path,
@@ -25,6 +29,7 @@ from onlysavemevods.app_update import (
     select_latest_release,
     status_path,
     update_status,
+    validate_requested_update,
     versions_equal,
 )
 from onlysavemevods.config import BotConfig, ConfigError
@@ -229,6 +234,115 @@ class AppUpdateModeTests(unittest.TestCase):
             self.assertEqual(requested["pending_source"], "manual")
             request = json.loads(request_path(config).read_text(encoding="utf-8"))
             self.assertEqual(set(request), {"tag", "source", "requested_at"})
+
+    def test_force_request_upgrades_pending_manual_request_for_same_release(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = updater_config(Path(tmp), mode="manual")
+            check_for_updates(
+                config,
+                current_version="1.0.0",
+                fetcher=lambda _config: [fake_release("v2.0.0")],
+            )
+            request_update(config, tag="v2.0.0", current_version="1.0.0")
+            status_path(config).write_text(
+                json.dumps({"status": "failed", "last_error": "Release check timed out"}),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "onlysavemevods.app_update.fetch_github_releases",
+                side_effect=AssertionError("Pending escalation must not fetch"),
+            ):
+                requested = request_update(
+                    config,
+                    tag="v2.0.0",
+                    source="manual",
+                    force=True,
+                    current_version="1.0.0",
+                )
+
+            self.assertTrue(requested["pending"])
+            self.assertEqual(requested["pending_tag"], "v2.0.0")
+            self.assertEqual(requested["pending_source"], "manual")
+            self.assertTrue(requested["pending_force"])
+            self.assertEqual(requested["last_error"], "")
+            self.assertIn("Force install", requested["message"])
+            request = json.loads(request_path(config).read_text(encoding="utf-8"))
+            self.assertEqual(request["tag"], "v2.0.0")
+            self.assertEqual(request["source"], "manual")
+            self.assertIs(request["force"], True)
+            self.assertTrue((config.state_dir / APP_UPDATE_TRIGGER_FILENAME).exists())
+
+    def test_force_request_is_rejected_in_noninstalling_modes(self) -> None:
+        for mode in ("check_only", "disabled"):
+            with self.subTest(mode=mode), TemporaryDirectory() as tmp:
+                config = updater_config(Path(tmp), mode=mode)
+                with self.assertRaises(ConfigError):
+                    request_update(config, tag="v2.0.0", force=True)
+                self.assertFalse(request_path(config).exists())
+
+    def test_privileged_policy_validates_force_request_source_and_tag(self) -> None:
+        for mode in ("manual", "auto_install"):
+            with self.subTest(mode=mode):
+                validate_requested_update(
+                    tag="v2.0.0",
+                    source="manual",
+                    force=True,
+                    policy=TrustedUpdatePolicy(mode=mode),
+                )
+        for mode in ("check_only", "disabled"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(AppUpdateError):
+                    validate_requested_update(
+                        tag="v2.0.0",
+                        source="manual",
+                        force=True,
+                        policy=TrustedUpdatePolicy(mode=mode),
+                    )
+        with self.assertRaises(AppUpdateError):
+            validate_requested_update(
+                tag="v2.0.0",
+                source="auto",
+                force=True,
+                policy=TrustedUpdatePolicy(mode="auto_install"),
+            )
+        with self.assertRaisesRegex(AppUpdateError, "invalid release tag"):
+            validate_requested_update(
+                tag="../v2.0.0",
+                source="manual",
+                force=True,
+                policy=TrustedUpdatePolicy(mode="manual"),
+            )
+
+    def test_request_intent_cli_reads_and_validates_force_flag(self) -> None:
+        with TemporaryDirectory() as tmp:
+            config = updater_config(Path(tmp), mode="manual")
+            args = [
+                "request-intent",
+                "--config", str(config.config_path),
+                "--state-dir", str(config.state_dir),
+            ]
+            for force, expected in ((None, "normal"), (True, "force")):
+                with self.subTest(force=force):
+                    request = {"tag": "v2.0.0", "source": "manual"}
+                    if force is not None:
+                        request["force"] = force
+                    request_path(config).write_text(json.dumps(request), encoding="utf-8")
+                    output = io.StringIO()
+                    with redirect_stdout(output):
+                        self.assertEqual(app_update_main(args), 0)
+                    self.assertEqual(output.getvalue().strip(), expected)
+
+            request_path(config).write_text(
+                json.dumps({"tag": "v2.0.0", "source": "manual", "force": "true"}),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            error = io.StringIO()
+            with redirect_stdout(output), redirect_stderr(error):
+                self.assertEqual(app_update_main(args), 2)
+            self.assertEqual(output.getvalue(), "")
+            self.assertIn("force flag must be boolean", error.getvalue())
 
     def test_check_only_mode_never_creates_install_request(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -449,6 +563,51 @@ class AppUpdateApplyTests(unittest.TestCase):
             fetcher.assert_called_once_with("Trusted/Repo", "GITHUB_TOKEN")
             self.assertTrue(downloaded)
             self.assertTrue(all(url.startswith("https://github.com/Trusted/Repo/") for url in downloaded))
+
+    def test_force_request_still_requires_latest_trusted_release(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config, app_dir, venv_dir = prepare_install(root)
+            write_request(config, "v2.0.0", extra={"force": True})
+            fetcher = Mock(return_value=[fake_release("v3.0.0")])
+
+            with patch("onlysavemevods.app_update.download_file") as download:
+                with self.assertRaisesRegex(AppUpdateError, "not the latest trusted release"):
+                    apply_requested_update(
+                        config,
+                        install_dir=root,
+                        app_dir=app_dir,
+                        venv_dir=venv_dir,
+                        trusted_policy=TrustedUpdatePolicy(mode="manual"),
+                        current_version="1.0.0",
+                        release_fetcher=fetcher,
+                    )
+
+            fetcher.assert_called_once()
+            download.assert_not_called()
+            self.assertFalse(request_path(config).exists())
+
+    def test_force_request_flag_must_be_boolean(self) -> None:
+        for force in ("true", 1, [], {}):
+            with self.subTest(force=force), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                config, app_dir, venv_dir = prepare_install(root)
+                write_request(config, "v2.0.0", extra={"force": force})
+                fetcher = Mock()
+
+                with self.assertRaisesRegex(AppUpdateError, "force"):
+                    apply_requested_update(
+                        config,
+                        install_dir=root,
+                        app_dir=app_dir,
+                        venv_dir=venv_dir,
+                        trusted_policy=TrustedUpdatePolicy(mode="manual"),
+                        current_version="1.0.0",
+                        release_fetcher=fetcher,
+                    )
+
+                fetcher.assert_not_called()
+                self.assertFalse(request_path(config).exists())
 
     def test_malformed_request_is_removed_and_records_failure(self) -> None:
         with TemporaryDirectory() as tmp:

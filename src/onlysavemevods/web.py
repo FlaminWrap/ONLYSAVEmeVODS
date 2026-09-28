@@ -1567,6 +1567,9 @@ def build_handler(
                 if path == "/app-update/request":
                     self._request_app_update()
                     return
+                if path == "/app-update/request-force":
+                    self._request_app_update(force=True)
+                    return
                 if path == "/watermark":
                     self._start_watermark()
                     return
@@ -2244,14 +2247,22 @@ def build_handler(
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
 
-        def _request_app_update(self) -> None:
+        def _request_app_update(self, *, force: bool = False) -> None:
             body = self._read_request_body(4096)
             if body is None:
                 return
             try:
                 params = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+                if force and first_query_value(params, "confirm_force") != "interrupt-active-work":
+                    raise ConfigError("Force install requires confirmation of active work interruption")
                 tag = first_query_value(params, "tag").strip() or None
-                request_update(config, tag=tag, source="manual", current_version=APP_VERSION)
+                request_update(
+                    config,
+                    tag=tag,
+                    source="manual",
+                    force=force,
+                    current_version=APP_VERSION,
+                )
             except ConfigError as exc:
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -11483,6 +11494,13 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       border-color: color-mix(in srgb, var(--bad), transparent 55%);
       background: color-mix(in srgb, var(--bad), transparent 94%);
     }}
+    .about-update-force-warning {{
+      padding: 9px 10px;
+      border: 1px solid color-mix(in srgb, var(--bad), transparent 55%);
+      border-radius: 8px;
+      background: color-mix(in srgb, var(--bad), transparent 94%);
+      color: var(--bad);
+    }}
     .about-update-actions {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }}
     .about-update-footer {{ display: flex; flex-wrap: wrap; gap: 12px; color: var(--muted); }}
     @media (max-width: 520px) {{
@@ -15274,11 +15292,24 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     latest_version = str(update.get("latest_version") or "")
     release_url = str(update.get("release_url") or update.get("latest_url") or "")
     pending = bool(update.get("pending"))
+    pending_force = bool(update.get("pending_force"))
     available = bool(update.get("available"))
     disabled = mode == "disabled"
     check_disabled = " disabled" if disabled else ""
     install_allowed = mode in {"manual", "auto_install"} and available and not pending
     install_disabled = "" if install_allowed else " disabled"
+    force_allowed = (
+        mode in {"manual", "auto_install"}
+        and (available or pending)
+        and not pending_force
+        and status != "installing"
+    )
+    force_disabled = "" if force_allowed else " disabled"
+    force_title = ""
+    if pending_force:
+        force_title = ' title="Force install is already requested"'
+    elif not (available or pending):
+        force_title = ' title="No checked update is available"'
     install_title = ""
     if mode == "check_only":
         install_title = ' title="Updater is in check-only mode"'
@@ -15296,7 +15327,10 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
         latest_html = f'<a href="{escape(release_url, quote=True)}">{latest_html}</a>'
     pending_label = "yes" if pending else "no"
     if pending and update.get("pending_tag"):
-        pending_label = f"{update.get('pending_tag')} ({update.get('pending_source') or 'manual'})"
+        pending_source = str(update.get("pending_source") or "manual")
+        if pending_force:
+            pending_source += ", force"
+        pending_label = f"{update.get('pending_tag')} ({pending_source})"
     error = str(update.get("last_error") or "")
     repo = str(update.get("repository") or "-")
     checked_at = str(update.get("checked_at") or "-")
@@ -15307,12 +15341,23 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     message_text = error or message or app_update_mode_message(mode)
     message_class = " error" if error or status == "failed" else ""
     install_form = ""
+    force_warning = ""
     if mode in {"manual", "auto_install"}:
+        force_tag = str(update.get("pending_tag") or "") if pending else latest_tag
         install_form = f"""
     <form class="inline-form" method="post" action="/app-update/request">
       <input type="hidden" name="tag" value="{escape(latest_tag, quote=True)}">
       <button class="download action-button" type="submit"{install_disabled}{install_title}>Install update</button>
+    </form>
+    <form class="inline-form" method="post" action="/app-update/request-force" onsubmit="return confirm('Force install will stop active recordings and jobs. Live fragments may be missed while the service restarts and updates. Continue?');">
+      <input type="hidden" name="tag" value="{escape(force_tag, quote=True)}">
+      <input type="hidden" name="confirm_force" value="interrupt-active-work">
+      <button class="download action-button danger-action" type="submit"{force_disabled}{force_title}>Force install</button>
     </form>"""
+        force_warning = (
+            '<div class="about-update-force-warning">Force install stops active recordings '
+            'and jobs. Live fragments may be missed until the service restarts.</div>'
+        )
     return f"""<section class="about-update-panel">
   <div class="about-update-header">
     <div class="about-update-title">
@@ -15336,6 +15381,7 @@ def render_app_update_panel(update: dict[str, Any]) -> str:
     </form>
     {install_form}
   </div>
+  {force_warning}
   <div class="about-update-footer">
     <span>Current version: {escape(str(update.get('current_version') or APP_VERSION))}</span>
     <span>Last installed: {escape(installed)}</span>

@@ -211,12 +211,48 @@ class WebStatusTests(unittest.TestCase):
         disabled = render_app_update_panel({**base, "mode": "disabled"})
 
         self.assertIn("/app-update/check", manual)
-        self.assertIn("/app-update/request", manual)
+        self.assertIn('action="/app-update/request"', manual)
         self.assertIn("Install update", manual)
+        self.assertIn('action="/app-update/request-force"', manual)
+        self.assertIn("Force install", manual)
+        self.assertIn("confirm(", manual)
+        self.assertIn("recording", manual.lower())
+        self.assertIn("job", manual.lower())
         self.assertIn("/app-update/check", check_only)
-        self.assertNotIn("/app-update/request", check_only)
+        self.assertNotIn('action="/app-update/request"', check_only)
+        self.assertNotIn('action="/app-update/request-force"', check_only)
+        self.assertNotIn('action="/app-update/request-force"', disabled)
         self.assertIn("Check for updates", disabled)
         self.assertIn("disabled", disabled)
+
+        pending_manual = render_app_update_panel(
+            {
+                **base,
+                "mode": "manual",
+                "status": "requested",
+                "available": False,
+                "pending": True,
+                "pending_tag": "v2.0.0",
+                "pending_source": "manual",
+                "pending_force": False,
+            }
+        )
+        self.assertIn('action="/app-update/request-force"', pending_manual)
+        self.assertIn("Force install", pending_manual)
+
+        forced = render_app_update_panel(
+            {
+                **base,
+                "mode": "manual",
+                "status": "requested",
+                "pending": True,
+                "pending_tag": "v2.0.0",
+                "pending_source": "manual",
+                "pending_force": True,
+            }
+        )
+        self.assertIn("v2.0.0 (manual, force)", forced)
+        self.assertIn('disabled title="Force install is already requested"', forced)
 
     def test_vod_download_helpers_build_command_template_and_progress(self) -> None:
         with TemporaryDirectory() as tmp:

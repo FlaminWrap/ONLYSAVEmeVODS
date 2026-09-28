@@ -4,12 +4,14 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from onlysavemevods.youtube import (
+    ConfirmedLiveTerminationError,
     TerminalVideoUnavailableError,
     YoutubeProbe,
     YtDlpError,
     YtDlpRunner,
     channel_live_url,
     channel_streams_url,
+    is_confirmed_live_termination_message,
     is_terminal_video_unavailable_message,
     live_stream_from_info,
     parse_youtube_hls_live_edge,
@@ -247,6 +249,65 @@ segment.ts
             )
         )
 
+    def test_explicit_live_termination_is_confirmed(self) -> None:
+        message = (
+            "ERROR: [youtube] 8YbgANWF8pk: Video unavailable. "
+            "This live stream has been terminated due to use of "
+            "3rd party audio or video content."
+        )
+        self.assertTrue(is_confirmed_live_termination_message(message))
+        self.assertTrue(is_terminal_video_unavailable_message(message))
+        self.assertTrue(
+            is_confirmed_live_termination_message(
+                "ERROR: [youtube] 8YbgANWF8pk: The live stream was "
+                "terminated due to a policy violation."
+            )
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message(
+                "Video unavailable. This video has been removed by the uploader"
+            )
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message("Private video")
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message(
+                "HTTP Error 503: Service Unavailable"
+            )
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message(
+                "The live stream was terminated due to a policy violation."
+            )
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message(
+                "ERROR: [kick:live] oumb: The live stream was terminated due to policy."
+            )
+        )
+        self.assertFalse(
+            is_confirmed_live_termination_message(
+                "ERROR: [youtube] 8YbgANWF8pk: The live stream was terminated unexpectedly"
+            )
+        )
+
+    def test_runner_raises_confirmed_live_termination_for_youtube_message(self) -> None:
+        completed = CompletedProcess(
+            args=["yt-dlp"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "ERROR: [youtube] 8YbgANWF8pk: Video unavailable. "
+                "This live stream has been terminated due to use of "
+                "3rd party audio or video content."
+            ),
+        )
+
+        with patch("subprocess.run", return_value=completed):
+            with self.assertRaises(ConfirmedLiveTerminationError):
+                YtDlpRunner().run_json(["--dump-json", "https://example.test"])
+
     def test_runner_raises_terminal_error_for_private_video(self) -> None:
         completed = CompletedProcess(
             args=["yt-dlp"],
@@ -256,8 +317,9 @@ segment.ts
         )
 
         with patch("subprocess.run", return_value=completed):
-            with self.assertRaises(TerminalVideoUnavailableError):
+            with self.assertRaises(TerminalVideoUnavailableError) as caught:
                 YtDlpRunner().run_json(["--dump-json", "https://example.test"])
+        self.assertIs(type(caught.exception), TerminalVideoUnavailableError)
 
     def test_runner_raises_terminal_error_for_removed_video(self) -> None:
         completed = CompletedProcess(
@@ -271,8 +333,9 @@ segment.ts
         )
 
         with patch("subprocess.run", return_value=completed):
-            with self.assertRaises(TerminalVideoUnavailableError):
+            with self.assertRaises(TerminalVideoUnavailableError) as caught:
                 YtDlpRunner().run_json(["--dump-json", "https://example.test"])
+        self.assertIs(type(caught.exception), TerminalVideoUnavailableError)
 
     def test_runner_reports_empty_json_output(self) -> None:
         completed = CompletedProcess(

@@ -33,7 +33,7 @@ class SystemdInstallerTests(unittest.TestCase):
         self.assertIn("onlysavemevods-app-update.timer", script)
         self.assertIn('APP_UPDATE_STATE_DIR="${INSTALL_DIR}/state"', script)
         self.assertIn(
-            "PathExists=${APP_UPDATE_STATE_DIR}/app-update-request.json",
+            "PathExists=${APP_UPDATE_STATE_DIR}/app-update-trigger",
             script,
         )
         self.assertIn("ExecStart=/usr/bin/env bash ${APP_DIR}/scripts/app-update.sh", script)
@@ -52,12 +52,14 @@ class SystemdInstallerTests(unittest.TestCase):
             "ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE=${TRUSTED_APP_UPDATE_MODE}",
             script,
         )
+        self.assertIn('sudo systemctl reset-failed "${APP_UPDATE_SERVICE_NAME}" "${APP_UPDATE_PATH_NAME}"', script)
         self.assertIn('sudo systemctl enable "${APP_UPDATE_PATH_NAME}" --now', script)
+        self.assertIn('sudo systemctl restart "${APP_UPDATE_PATH_NAME}"', script)
         self.assertIn('sudo systemctl enable "${APP_UPDATE_TIMER_NAME}" --now', script)
 
         app_updater = (SCRIPTS_DIR / "app-update.sh").read_text(encoding="utf-8")
         self.assertIn("ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR", app_updater)
-        self.assertEqual(app_updater.count('--state-dir "${APP_UPDATE_STATE_DIR}"'), 3)
+        self.assertEqual(app_updater.count('--state-dir "${APP_UPDATE_STATE_DIR}"'), 4)
 
     def test_installer_and_updaters_share_stale_safe_flock(self) -> None:
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")

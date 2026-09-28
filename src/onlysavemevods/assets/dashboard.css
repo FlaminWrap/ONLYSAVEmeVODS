@@ -778,6 +778,8 @@ dialog::backdrop { background: rgba(3, 8, 16, .58); }
 .powerchat-summary-card strong { font-size: 18px; line-height: 1.35; }
 .about-update-message { padding: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-subtle); color: var(--muted); }
 .about-update-message.error { color: var(--danger); background: var(--danger-soft); }
+.about-update-force-warning { padding: 10px; border: 1px solid color-mix(in srgb, var(--danger), transparent 55%); border-radius: 8px; background: var(--danger-soft); color: var(--danger); }
+.about-update-actions .danger-action { border-color: var(--danger); color: var(--danger); }
 .powerchat-dashboard { display: grid; gap: 14px; }
 .powerchat-dashboard-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: 9px; align-items: end; }
 .powerchat-dashboard-controls label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }

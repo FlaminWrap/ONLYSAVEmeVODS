@@ -30,6 +30,16 @@ class SourceError(ValueError):
     pass
 
 
+class KickChannelOfflineError(YtDlpError):
+    """Raised when Kick explicitly reports that a channel is offline."""
+
+
+KICK_CHANNEL_OFFLINE_RE = re.compile(
+    r"(?:yt-dlp failed with code [1-9]\d*: )?"
+    r"ERROR: \[kick:live\] [A-Za-z0-9_-]+: The channel is not currently live"
+)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceSpec:
     raw: str
@@ -135,15 +145,22 @@ class SourceMonitor:
             stream = self.youtube.probe_video(spec.url)
             return stream_with_source(stream, source or spec.raw)
 
-        info = self.runner.run_json(
-            [
-                "--dump-json",
-                "--skip-download",
-                "--no-playlist",
-                "--no-warnings",
-                spec.url,
-            ]
-        )
+        try:
+            info = self.runner.run_json(
+                [
+                    "--dump-json",
+                    "--skip-download",
+                    "--no-playlist",
+                    "--no-warnings",
+                    spec.url,
+                ]
+            )
+        except YtDlpError as exc:
+            if spec.platform == "kick" and KICK_CHANNEL_OFFLINE_RE.fullmatch(
+                str(exc).strip()
+            ):
+                raise KickChannelOfflineError(str(exc)) from exc
+            raise
         return live_stream_from_generic_info(
             info,
             platform=spec.platform,

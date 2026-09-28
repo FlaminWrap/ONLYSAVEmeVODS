@@ -34,6 +34,17 @@ class TerminalVideoUnavailableError(YtDlpError):
     """Raised when YouTube reports a video is permanently unavailable."""
 
 
+class ConfirmedLiveTerminationError(TerminalVideoUnavailableError):
+    """Raised when YouTube explicitly says a live stream was terminated."""
+
+
+CONFIRMED_LIVE_TERMINATION_PATTERN = re.compile(
+    r"^ERROR:\s*\[youtube\]\s+[A-Za-z0-9_-]{11}:[^\n]*"
+    r"\blive\s+stream\s+(?:has\s+been|was|is)\s+terminated\s+due\s+to\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
 TERMINAL_VIDEO_UNAVAILABLE_PATTERNS = (
     re.compile(r"\bprivate video\b", re.IGNORECASE),
     re.compile(r"\bthis video is private\b", re.IGNORECASE),
@@ -73,6 +84,12 @@ class YtDlpRunner:
                 completed.returncode,
                 truncate_for_log(message),
             )
+            if is_confirmed_live_termination_message(message):
+                LOGGER.info(
+                    "yt-dlp reported confirmed live termination: %s",
+                    first_log_line(message),
+                )
+                raise ConfirmedLiveTerminationError(error)
             if is_terminal_video_unavailable_message(message):
                 LOGGER.info(
                     "yt-dlp reported terminal video unavailable: %s",
@@ -102,8 +119,12 @@ class YouTubeLiveEdge:
     has_endlist: bool = False
 
 
+def is_confirmed_live_termination_message(message: str) -> bool:
+    return bool(CONFIRMED_LIVE_TERMINATION_PATTERN.search(message))
+
+
 def is_terminal_video_unavailable_message(message: str) -> bool:
-    return any(
+    return is_confirmed_live_termination_message(message) or any(
         pattern.search(message)
         for pattern in TERMINAL_VIDEO_UNAVAILABLE_PATTERNS
     )
