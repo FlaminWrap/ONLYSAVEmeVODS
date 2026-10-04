@@ -24,6 +24,8 @@ YOUTUBE_ID_IN_URL_RE = re.compile(
 CACHEABLE_NON_LIVE_STATUSES = {"not_live", "was_live"}
 CHANNEL_PAGE_SUFFIXES = ("/streams", "/videos", "/live", "/featured")
 HLS_MANIFEST_READ_LIMIT = 2 * 1024 * 1024
+WATCH_PAGE_READ_LIMIT = 2 * 1024 * 1024
+WATCH_PAGE_TIMEOUT_SECONDS = 15
 
 
 class YtDlpError(RuntimeError):
@@ -38,10 +40,32 @@ class ConfirmedLiveTerminationError(TerminalVideoUnavailableError):
     """Raised when YouTube explicitly says a live stream was terminated."""
 
 
+class ConfirmedVideoRemovalError(TerminalVideoUnavailableError):
+    """Raised when YouTube explicitly says the requested video was removed."""
+
+
 CONFIRMED_LIVE_TERMINATION_PATTERN = re.compile(
     r"^ERROR:\s*\[youtube\]\s+[A-Za-z0-9_-]{11}:[^\n]*"
     r"\blive\s+stream\s+(?:has\s+been|was|is)\s+terminated\s+due\s+to\b",
     re.IGNORECASE | re.MULTILINE,
+)
+
+VIDEO_REMOVAL_REASON_PATTERN = re.compile(
+    r"\bthis\s+video\s+(?:has\s+been|was|is)\s+(?:removed|deleted)\b",
+    re.IGNORECASE,
+)
+YOUTUBE_ERROR_LINE_PATTERN = re.compile(
+    r"^ERROR:[ \t]*\[youtube\][ \t]+(?P<video_id>[A-Za-z0-9_-]{11}):[ \t]*(?P<reason>[^\r\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+GENERIC_VIDEO_UNAVAILABLE_PATTERN = re.compile(
+    r"^(?:yt-dlp failed with code \d+:[ \t]*)?"
+    r"ERROR:[ \t]*\[youtube\][ \t]+(?P<video_id>[A-Za-z0-9_-]{11}):"
+    r"[ \t]*Video unavailable\.?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+INITIAL_PLAYER_RESPONSE_PATTERN = re.compile(
+    r"\bytInitialPlayerResponse[ \t]*=[ \t]*"
 )
 
 
@@ -90,6 +114,14 @@ class YtDlpRunner:
                     first_log_line(message),
                 )
                 raise ConfirmedLiveTerminationError(error)
+            if is_confirmed_video_removal_message(
+                message, video_id=extract_video_id(args[-1]) if args else None
+            ):
+                LOGGER.info(
+                    "yt-dlp reported confirmed video removal: %s",
+                    first_log_line(message),
+                )
+                raise ConfirmedVideoRemovalError(error)
             if is_terminal_video_unavailable_message(message):
                 LOGGER.info(
                     "yt-dlp reported terminal video unavailable: %s",
@@ -123,10 +155,24 @@ def is_confirmed_live_termination_message(message: str) -> bool:
     return bool(CONFIRMED_LIVE_TERMINATION_PATTERN.search(message))
 
 
+def is_confirmed_video_removal_message(
+    message: str, *, video_id: str | None = None
+) -> bool:
+    return any(
+        VIDEO_REMOVAL_REASON_PATTERN.search(match.group("reason"))
+        for match in YOUTUBE_ERROR_LINE_PATTERN.finditer(message)
+        if video_id is None or video_id == match.group("video_id")
+    )
+
+
 def is_terminal_video_unavailable_message(message: str) -> bool:
-    return is_confirmed_live_termination_message(message) or any(
-        pattern.search(message)
-        for pattern in TERMINAL_VIDEO_UNAVAILABLE_PATTERNS
+    return (
+        is_confirmed_live_termination_message(message)
+        or is_confirmed_video_removal_message(message)
+        or any(
+            pattern.search(message)
+            for pattern in TERMINAL_VIDEO_UNAVAILABLE_PATTERNS
+        )
     )
 
 
@@ -243,7 +289,7 @@ class YoutubeProbe:
         if self.live_from_start:
             args.append("--live-from-start")
         args.append(target)
-        info = self.runner.run_json(args)
+        info = self._run_video_metadata(args, target)
         stream = live_stream_from_info(info, fallback_url=target)
         LOGGER.debug(
             "Probed video id=%s is_live=%s live_status=%r title=%r channel=%r",
@@ -262,14 +308,15 @@ class YoutubeProbe:
             if url_or_id.startswith(("http://", "https://"))
             else video_url(url_or_id)
         )
-        info = self.runner.run_json(
+        info = self._run_video_metadata(
             [
                 "--dump-json",
                 "--skip-download",
                 "--no-playlist",
                 "--no-warnings",
                 target,
-            ]
+            ],
+            target,
         )
         manifest_url, headers = youtube_hls_media_manifest(info)
         if not manifest_url:
@@ -284,6 +331,49 @@ class YoutubeProbe:
         if len(payload) > HLS_MANIFEST_READ_LIMIT:
             raise YtDlpError("YouTube HLS media manifest exceeded the safety limit")
         return parse_youtube_hls_live_edge(payload.decode("utf-8", "replace"))
+
+    def _run_video_metadata(self, args: list[str], target: str) -> dict[str, Any]:
+        try:
+            return self.runner.run_json(args)
+        except YtDlpError as exc:
+            match = GENERIC_VIDEO_UNAVAILABLE_PATTERN.search(str(exc))
+            video_id = extract_video_id(target)
+            if match is None or video_id != match.group("video_id"):
+                raise
+            reason = self._watch_page_removal_reason(video_id)
+            if reason:
+                raise ConfirmedVideoRemovalError(
+                    f"YouTube watch page confirmed removal of {video_id}: {reason}"
+                ) from exc
+            raise
+
+    def _watch_page_removal_reason(self, video_id: str) -> str | None:
+        request = Request(
+            f"https://www.youtube.com/watch?v={video_id}&hl=en",
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+        )
+        try:
+            with urlopen(request, timeout=WATCH_PAGE_TIMEOUT_SECONDS) as response:
+                final_url = urlsplit(response.geturl())
+                if (
+                    final_url.hostname not in {"www.youtube.com", "youtube.com"}
+                    or final_url.path != "/watch"
+                    or parse_qs(final_url.query).get("v") != [video_id]
+                ):
+                    return None
+                payload = response.read(WATCH_PAGE_READ_LIMIT + 1)
+            if len(payload) > WATCH_PAGE_READ_LIMIT:
+                return None
+            return watch_page_video_removal_reason(
+                payload.decode("utf-8", "replace"), video_id
+            )
+        except (OSError, ValueError, TypeError, RecursionError) as exc:
+            LOGGER.debug(
+                "Unable to confirm YouTube removal from watch page for %s: %s",
+                video_id,
+                exc,
+            )
+            return None
 
     def _probe_candidate_videos(self, video_ids: list[str]) -> list[LiveStream]:
         if not video_ids:
@@ -357,6 +447,76 @@ def live_stream_from_info(info: dict[str, Any], *, fallback_url: str = "") -> Li
         source=fallback_url,
         raw=info,
     )
+
+
+def watch_page_video_removal_reason(page: str, video_id: str) -> str | None:
+    """Read an explicit removal reason from the requested video's player error."""
+    match = INITIAL_PLAYER_RESPONSE_PATTERN.search(page)
+    if match is None:
+        return None
+    try:
+        player, _end = json.JSONDecoder().raw_decode(page[match.end():].lstrip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(player, dict):
+        return None
+    details = player.get("videoDetails")
+    if isinstance(details, dict) and details.get("videoId") not in (None, video_id):
+        return None
+    status = player.get("playabilityStatus")
+    if (
+        not isinstance(status, dict)
+        or not isinstance(status.get("status"), str)
+        or status["status"] not in {"ERROR", "UNPLAYABLE"}
+    ):
+        return None
+
+    reasons: list[str] = []
+    if isinstance(status.get("reason"), str):
+        reasons.append(status["reason"])
+    screen = status.get("errorScreen")
+    if isinstance(screen, dict):
+        legacy = screen.get("playerErrorMessageRenderer")
+        if isinstance(legacy, dict):
+            reasons.extend(
+                _player_error_text(legacy.get(key))
+                for key in ("reason", "subreason")
+            )
+        interstitial = screen.get("playerInterstitialRenderer")
+        if isinstance(interstitial, dict):
+            content = interstitial.get("content")
+            model = (
+                content.get("interstitialViewModel")
+                if isinstance(content, dict)
+                else None
+            )
+            if isinstance(model, dict):
+                reasons.extend(
+                    _player_error_text(model.get(key))
+                    for key in ("title", "description")
+                )
+    return next(
+        (reason for reason in reasons if VIDEO_REMOVAL_REASON_PATTERN.search(reason)),
+        None,
+    )
+
+
+def _player_error_text(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    for key in ("simpleText", "content"):
+        if isinstance(value.get(key), str):
+            return value[key]
+    runs = value.get("runs")
+    if isinstance(runs, list):
+        return "".join(
+            run["text"]
+            for run in runs
+            if isinstance(run, dict) and isinstance(run.get("text"), str)
+        )
+    return ""
 
 
 def youtube_hls_media_manifest(

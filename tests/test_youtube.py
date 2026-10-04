@@ -1,20 +1,27 @@
 from datetime import datetime, timezone
+from io import BytesIO
+import json
 import unittest
 from subprocess import CompletedProcess
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from onlysavemevods.youtube import (
     ConfirmedLiveTerminationError,
+    ConfirmedVideoRemovalError,
     TerminalVideoUnavailableError,
     YoutubeProbe,
     YtDlpError,
     YtDlpRunner,
+    WATCH_PAGE_READ_LIMIT,
+    WATCH_PAGE_TIMEOUT_SECONDS,
     channel_live_url,
     channel_streams_url,
     is_confirmed_live_termination_message,
+    is_confirmed_video_removal_message,
     is_terminal_video_unavailable_message,
     live_stream_from_info,
     parse_youtube_hls_live_edge,
+    watch_page_video_removal_reason,
     youtube_hls_media_manifest,
 )
 
@@ -86,6 +93,164 @@ class CacheRunner:
 
 
 class YoutubeProbeTests(unittest.TestCase):
+    @staticmethod
+    def removal_page(reason: str = "This video has been removed by the uploader") -> str:
+        return "var ytInitialPlayerResponse = " + json.dumps(
+            {
+                "playabilityStatus": {
+                    "status": "ERROR",
+                    "reason": "Video unavailable",
+                    "errorScreen": {
+                        "playerInterstitialRenderer": {
+                            "content": {
+                                "interstitialViewModel": {
+                                    "title": {"content": "Video unavailable"},
+                                    "description": {"content": reason},
+                                }
+                            }
+                        }
+                    },
+                }
+            }
+        ) + ";"
+
+    @staticmethod
+    def unavailable_runner(video_id: str = "r2ORTHCeg_A") -> tuple[MagicMock, YtDlpError]:
+        error = YtDlpError(
+            f"yt-dlp failed with code 1: ERROR: [youtube] {video_id}: Video unavailable"
+        )
+        runner = MagicMock()
+        runner.run_json.side_effect = error
+        return runner, error
+
+    @staticmethod
+    def watch_response(page: str, video_id: str = "r2ORTHCeg_A") -> MagicMock:
+        response = MagicMock()
+        response.geturl.return_value = f"https://www.youtube.com/watch?v={video_id}&hl=en"
+        response.read.side_effect = BytesIO(page.encode()).read
+        response.__enter__.return_value = response
+        return response
+
+    def test_watch_page_new_interstitial_confirms_explicit_removal(self) -> None:
+        reason = "This video has been removed by the uploader"
+        self.assertEqual(
+            watch_page_video_removal_reason(self.removal_page(reason), "r2ORTHCeg_A"),
+            reason,
+        )
+
+    def test_watch_page_legacy_error_confirms_explicit_platform_removal(self) -> None:
+        reason = "This video has been removed for violating YouTube's policy"
+        page = "var ytInitialPlayerResponse = " + json.dumps(
+            {
+                "playabilityStatus": {
+                    "status": "UNPLAYABLE",
+                    "errorScreen": {
+                        "playerErrorMessageRenderer": {
+                            "subreason": {"runs": [{"text": reason}]}
+                        }
+                    },
+                }
+            }
+        )
+        self.assertEqual(watch_page_video_removal_reason(page, "r2ORTHCeg_A"), reason)
+
+    def test_watch_page_does_not_confirm_generic_or_restricted_errors(self) -> None:
+        for reason in (
+            "Video unavailable",
+            "Private video",
+            "Sign in to confirm you're not a bot",
+            "YouTube is requiring a captcha challenge before playback",
+            "This content isn't available, try again later",
+            "The current session has been rate-limited by YouTube",
+            "The video could not be loaded due to a network error",
+        ):
+            with self.subTest(reason=reason):
+                self.assertIsNone(
+                    watch_page_video_removal_reason(self.removal_page(reason), "r2ORTHCeg_A")
+                )
+
+    def test_watch_page_requires_valid_player_error_for_same_video(self) -> None:
+        reason = "This video has been removed by the uploader"
+        pages = (
+            reason,
+            'var ytInitialPlayerResponse = {"playabilityStatus":',
+            "var ytInitialPlayerResponse = null;",
+            "var ytInitialPlayerResponse = " + json.dumps(
+                {"playabilityStatus": {"status": "OK", "reason": reason}}
+            ),
+            "var ytInitialPlayerResponse = " + json.dumps(
+                {"videoDetails": {"videoId": "EeMqyZVAsMk"},
+                 "playabilityStatus": {"status": "ERROR", "reason": reason}}
+            ),
+        )
+        for page in pages:
+            with self.subTest(page=page):
+                self.assertIsNone(watch_page_video_removal_reason(page, "r2ORTHCeg_A"))
+
+    def test_generic_unavailable_checks_watch_page_for_metadata_and_hls(self) -> None:
+        for method in ("probe_video", "probe_live_edge"):
+            with self.subTest(method=method):
+                runner, original = self.unavailable_runner()
+                response = self.watch_response(self.removal_page())
+                with patch("onlysavemevods.youtube.urlopen", return_value=response) as opened:
+                    with self.assertRaises(ConfirmedVideoRemovalError) as caught:
+                        getattr(YoutubeProbe(runner), method)("r2ORTHCeg_A")
+                self.assertIs(caught.exception.__cause__, original)
+                request = opened.call_args.args[0]
+                self.assertEqual(request.full_url, "https://www.youtube.com/watch?v=r2ORTHCeg_A&hl=en")
+                self.assertEqual(opened.call_args.kwargs["timeout"], WATCH_PAGE_TIMEOUT_SECONDS)
+                response.read.assert_called_once_with(WATCH_PAGE_READ_LIMIT + 1)
+
+    def test_watch_fallback_preserves_original_error_without_explicit_removal(self) -> None:
+        runner, original = self.unavailable_runner()
+        response = self.watch_response(self.removal_page("Video unavailable"))
+        with patch("onlysavemevods.youtube.urlopen", return_value=response):
+            with self.assertRaises(YtDlpError) as caught:
+                YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+        self.assertIs(caught.exception, original)
+
+    def test_watch_fallback_preserves_original_error_on_network_failure(self) -> None:
+        runner, original = self.unavailable_runner()
+        with patch("onlysavemevods.youtube.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(YtDlpError) as caught:
+                YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+        self.assertIs(caught.exception, original)
+
+    def test_watch_fallback_rejects_redirect_to_different_video(self) -> None:
+        runner, original = self.unavailable_runner()
+        response = self.watch_response(self.removal_page(), "EeMqyZVAsMk")
+        with patch("onlysavemevods.youtube.urlopen", return_value=response):
+            with self.assertRaises(YtDlpError) as caught:
+                YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+        self.assertIs(caught.exception, original)
+        response.read.assert_not_called()
+
+    def test_watch_fallback_rejects_oversized_page(self) -> None:
+        runner, original = self.unavailable_runner()
+        response = self.watch_response(self.removal_page() + " " * WATCH_PAGE_READ_LIMIT)
+        with patch("onlysavemevods.youtube.urlopen", return_value=response):
+            with self.assertRaises(YtDlpError) as caught:
+                YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+        self.assertIs(caught.exception, original)
+
+    def test_nonmatching_probe_errors_do_not_fetch_watch_page(self) -> None:
+        for message in (
+            "ERROR: [youtube] r2ORTHCeg_A: Private video",
+            "ERROR: [youtube] r2ORTHCeg_A: HTTP Error 503: Service Unavailable",
+            "ERROR: [youtube] r2ORTHCeg_A: Video unavailable. Sign in to continue",
+            "ERROR: [youtube] EeMqyZVAsMk: Video unavailable",
+            "ERROR: [kick:live] r2ORTHCeg_A: Video unavailable",
+        ):
+            with self.subTest(message=message):
+                original = YtDlpError(message)
+                runner = MagicMock()
+                runner.run_json.side_effect = original
+                with patch("onlysavemevods.youtube.urlopen") as opened:
+                    with self.assertRaises(YtDlpError) as caught:
+                        YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+                self.assertIs(caught.exception, original)
+                opened.assert_not_called()
+
     def test_parses_hls_live_edge_timestamp_and_sequence(self) -> None:
         edge = parse_youtube_hls_live_edge(
             """#EXTM3U
@@ -292,6 +457,33 @@ segment.ts
             )
         )
 
+    def test_explicit_youtube_removal_is_confirmed(self) -> None:
+        for reason in (
+            "Video unavailable. This video has been removed by the uploader",
+            "This video has been removed for violating YouTube's policy",
+            "This video has been deleted",
+            "This video was removed by the uploader",
+            "This video is deleted",
+        ):
+            with self.subTest(reason=reason):
+                message = f"ERROR: [youtube] r2ORTHCeg_A: {reason}"
+                self.assertTrue(is_confirmed_video_removal_message(message))
+                self.assertTrue(is_terminal_video_unavailable_message(message))
+        self.assertFalse(is_confirmed_video_removal_message(
+            "ERROR: [youtube] r2ORTHCeg_A: This video has been removed",
+            video_id="EeMqyZVAsMk",
+        ))
+        for message in (
+            "This video has been removed by the uploader",
+            "ERROR: [kick:live] r2ORTHCeg_A: This video has been removed",
+            "ERROR: [youtube] invalid: This video has been removed",
+            "ERROR: [youtube] r2ORTHCeg_A: Video unavailable",
+            "ERROR: [youtube] r2ORTHCeg_A: Private video",
+            "ERROR: [youtube] r2ORTHCeg_A: HTTP Error 503: Service Unavailable",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(is_confirmed_video_removal_message(message))
+
     def test_runner_raises_confirmed_live_termination_for_youtube_message(self) -> None:
         completed = CompletedProcess(
             args=["yt-dlp"],
@@ -321,7 +513,7 @@ segment.ts
                 YtDlpRunner().run_json(["--dump-json", "https://example.test"])
         self.assertIs(type(caught.exception), TerminalVideoUnavailableError)
 
-    def test_runner_raises_terminal_error_for_removed_video(self) -> None:
+    def test_runner_raises_confirmed_removal_error_for_removed_video(self) -> None:
         completed = CompletedProcess(
             args=["yt-dlp"],
             returncode=1,
@@ -335,7 +527,7 @@ segment.ts
         with patch("subprocess.run", return_value=completed):
             with self.assertRaises(TerminalVideoUnavailableError) as caught:
                 YtDlpRunner().run_json(["--dump-json", "https://example.test"])
-        self.assertIs(type(caught.exception), TerminalVideoUnavailableError)
+        self.assertIs(type(caught.exception), ConfirmedVideoRemovalError)
 
     def test_runner_reports_empty_json_output(self) -> None:
         completed = CompletedProcess(

@@ -792,8 +792,16 @@ scripts/uninstall-systemd.sh
   segments. A frozen but still-recent edge remains under observation until it
   advances or reaches the configured stale age. A stalled stream retains its
   resumable files and is monitored indefinitely. It resumes automatically if
-  the edge advances, and is finalized only after repeated non-live checks or an
-  HLS end marker. With a locked YouTube video/audio format pair, a
+  the edge advances, and is finalized only after repeated non-live checks, an
+  HLS end marker, or two explicit YouTube termination/removal confirmations.
+  If yt-dlp only reports `Video unavailable`, the app checks the watch page's
+  player error for an explicit removal message. Generic unavailability,
+  private-video, sign-in, and network errors do not confirm an end. Confirmed
+  removal stops independent audio retries; saved tracks are merged if they
+  validate, or kept for recovery with the recording marked ended.
+  Fragment inactivity counts saved fragment indices; growing playlist totals
+  and advancing remote timestamps cannot reset it. With a locked YouTube
+  video/audio format pair, a
   track that has reached the live edge and then saves no new fragment for 30
   seconds is retried if the other track advances. The stalled track restarts
   independently while the healthy track continues. If both tracks stop, two

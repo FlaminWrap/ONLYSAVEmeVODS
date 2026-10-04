@@ -77,6 +77,7 @@ from .transcription import transcribe_media_file, transcription_config_for_chann
 from .twitch_ad_repair import repair_twitch_ads_for_media
 from .youtube import (
     ConfirmedLiveTerminationError,
+    ConfirmedVideoRemovalError,
     TerminalVideoUnavailableError,
     YouTubeLiveEdge,
 )
@@ -405,7 +406,10 @@ class CatchupTracker:
         )
         previous = self.fragments.get(context)
         self.fragments[context] = progress
-        if previous is None or progress[0] > previous[0]:
+        saved_fragment = progress[0] > 0 and (
+            previous is None or progress[0] > previous[0]
+        )
+        if saved_fragment:
             self.track_fragment_progress_at[context] = self.monotonic()
         if (
             progress[0] > 0
@@ -413,12 +417,7 @@ class CatchupTracker:
             and progress[0] >= progress[1] - CATCHUP_FRAGMENT_MARGIN
         ):
             self.track_live_edge_seen.add(context)
-        advanced = (
-            previous is None
-            or progress[0] > previous[0]
-            or progress[1] > previous[1]
-        )
-        if advanced:
+        if saved_fragment:
             self._note_progress()
         if previous != progress and self.fragment_progress_callback is not None:
             self.fragment_progress_callback(dict(self.fragments))
@@ -1521,7 +1520,7 @@ class DownloadManager:
         resume_segment = segment_index
         observed_stream = stream
         consecutive_non_live_probes = 0
-        confirmed_termination_seen = False
+        confirmed_source_end_seen = False
         try:
             while not self._stopping:
                 record = self.state.get_stream(stream.video_id)
@@ -1535,12 +1534,12 @@ class DownloadManager:
 
                 try:
                     latest = await self.probe_video(post_exit_probe_target(observed_stream))
-                except ConfirmedLiveTerminationError as exc:
+                except (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError) as exc:
                     latest = None
                     consecutive_non_live_probes += 1
-                    confirmed_termination_seen = True
+                    confirmed_source_end_seen = True
                     self.logger.warning(
-                        "Stalled YouTube stream %s was explicitly terminated "
+                        "Stalled YouTube stream %s was explicitly removed or terminated "
                         "(confirmation %s/2): %s",
                         stream.video_id,
                         min(consecutive_non_live_probes, 2),
@@ -1560,7 +1559,7 @@ class DownloadManager:
                 except TerminalVideoUnavailableError as exc:
                     latest = None
                     consecutive_non_live_probes = 0
-                    confirmed_termination_seen = False
+                    confirmed_source_end_seen = False
                     self.logger.warning(
                         "Stalled YouTube metadata for %s is unavailable: %s; "
                         "checking the HLS end marker before finalization",
@@ -1570,7 +1569,7 @@ class DownloadManager:
                 except Exception as exc:
                     latest = None
                     consecutive_non_live_probes = 0
-                    confirmed_termination_seen = False
+                    confirmed_source_end_seen = False
                     self.logger.warning(
                         "Unable to check stalled YouTube metadata for %s: %s",
                         stream.video_id,
@@ -1595,15 +1594,15 @@ class DownloadManager:
                                     latest,
                                     segment_index,
                                     expected_status="stalled",
-                                    allow_chat_replay=not confirmed_termination_seen,
+                                    allow_chat_replay=not confirmed_source_end_seen,
                                     end_confirmed=True,
-                                    stop_draining_audio=confirmed_termination_seen,
-                                    end_with_recoverable_media=confirmed_termination_seen,
+                                    stop_draining_audio=confirmed_source_end_seen,
+                                    end_with_recoverable_media=confirmed_source_end_seen,
                                 )
                             return
                     else:
                         consecutive_non_live_probes = 0
-                        confirmed_termination_seen = False
+                        confirmed_source_end_seen = False
 
                 try:
                     edge = await self.probe_youtube_live_edge(observed_stream.url)
@@ -1631,10 +1630,10 @@ class DownloadManager:
                             observed_stream,
                             segment_index,
                             expected_status="stalled",
-                            allow_chat_replay=not confirmed_termination_seen,
+                            allow_chat_replay=not confirmed_source_end_seen,
                             end_confirmed=True,
-                            stop_draining_audio=confirmed_termination_seen,
-                            end_with_recoverable_media=confirmed_termination_seen,
+                            stop_draining_audio=confirmed_source_end_seen,
+                            end_with_recoverable_media=confirmed_source_end_seen,
                         )
                         return
                     if youtube_live_edge_advanced_from_record(record, edge):
@@ -1883,8 +1882,10 @@ class DownloadManager:
                     return
                 if tracker.inactive_seconds() < timeout_seconds:
                     continue
+                if split_active and tracker.fragment_inactive_seconds() < timeout_seconds:
+                    continue
 
-                progress_checkpoint = tracker.last_fragment_progress_at
+                progress_checkpoint = tracker.last_track_activity_at()
                 try:
                     first = await self.probe_youtube_live_edge(stream.url)
                 except TerminalVideoUnavailableError as exc:
@@ -1905,7 +1906,7 @@ class DownloadManager:
                 await self.sleep(STALE_LIVE_CONFIRM_SECONDS)
                 if self._stopping or process.returncode is not None:
                     return
-                if tracker.last_fragment_progress_at > progress_checkpoint:
+                if tracker.last_track_activity_at() > progress_checkpoint:
                     continue
 
                 try:
@@ -1925,7 +1926,7 @@ class DownloadManager:
                     )
                     continue
 
-                if tracker.last_fragment_progress_at > progress_checkpoint:
+                if tracker.last_track_activity_at() > progress_checkpoint:
                     continue
                 now = datetime.now(timezone.utc)
                 if youtube_live_edge_is_confirmed_stale(
@@ -1951,12 +1952,43 @@ class DownloadManager:
                     await self._stop_stale_live_process(stream.video_id, process)
                     return
 
-                if youtube_live_edge_advanced(first, second) or youtube_live_edge_is_fresh(
-                    second,
-                    stale_after_seconds=timeout_seconds,
-                    now=now,
-                ):
-                    tracker.note_external_progress()
+                if youtube_live_edge_advanced(first, second):
+                    active = self.active.get(stream.video_id)
+                    if active is not None and active.process is not process:
+                        return
+                    message = (
+                        "YouTube live edge advanced while no fragments were saved "
+                        f"for {timeout_seconds}s; restarting the downloader"
+                    )
+                    self.logger.warning("%s video_id=%s", message, stream.video_id)
+                    try:
+                        self.state.add_stream_event(
+                            stream.video_id,
+                            message,
+                            level="warning",
+                            segment_index=active.segment_index if active else None,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - reconnect must continue.
+                        self.logger.debug(
+                            "Unable to record inactive-track reconnect for %s: %s",
+                            stream.video_id,
+                            exc,
+                        )
+                    if (
+                        active is not None
+                        and active.audio_task is not None
+                        and active.video_format_id
+                    ):
+                        audio_process = active.audio_process
+                        if audio_process is not None and audio_process.returncode is None:
+                            await self._stop_stale_live_process(
+                                stream.video_id, audio_process
+                            )
+                            tracker.forget_track("audio")
+                        await self._restart_video_track(active, tracker)
+                    else:
+                        await self._request_process_reconnect(stream.video_id, process)
+                    return
         except asyncio.CancelledError:
             raise
         except ProcessLookupError:
@@ -3338,7 +3370,7 @@ class DownloadManager:
 
         previous_offset = 0.0
         consecutive_non_live_probes = 0
-        confirmed_termination_seen = False
+        confirmed_source_end_seen = False
         elapsed_since_exit_seconds = max(0.0, elapsed_since_exit_seconds)
         self.logger.debug(
             "Starting post-exit checks for %s segment=%03d schedule=%s elapsed=%.1fs",
@@ -3385,11 +3417,11 @@ class DownloadManager:
                     offset,
                 )
                 latest = await self.probe_video(post_exit_probe_target(stream))
-            except ConfirmedLiveTerminationError as exc:
+            except (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError) as exc:
                 consecutive_non_live_probes += 1
-                confirmed_termination_seen = True
+                confirmed_source_end_seen = True
                 self.logger.warning(
-                    "Post-exit probe confirmed YouTube termination for %s "
+                    "Post-exit probe confirmed YouTube removal or termination for %s "
                     "at +%ss (%s/2): %s",
                     stream.video_id,
                     offset,
@@ -3439,7 +3471,7 @@ class DownloadManager:
                 continue
             except Exception as exc:
                 consecutive_non_live_probes = 0
-                confirmed_termination_seen = False
+                confirmed_source_end_seen = False
                 self.logger.warning(
                     "Post-exit probe failed for %s at +%ss: %s",
                     stream.video_id,
@@ -3469,7 +3501,7 @@ class DownloadManager:
                 return
 
             if latest.is_live:
-                confirmed_termination_seen = False
+                confirmed_source_end_seen = False
                 if not self._stream_status_matches(stream.video_id, expected_status):
                     return
                 restart_decision = (
@@ -3528,10 +3560,10 @@ class DownloadManager:
                 stream,
                 segment_index,
                 expected_status=expected_status,
-                allow_chat_replay=not confirmed_termination_seen,
+                allow_chat_replay=not confirmed_source_end_seen,
                 end_confirmed=True,
-                stop_draining_audio=confirmed_termination_seen,
-                end_with_recoverable_media=confirmed_termination_seen,
+                stop_draining_audio=confirmed_source_end_seen,
+                end_with_recoverable_media=confirmed_source_end_seen,
             )
             return
         self.logger.warning(
@@ -3556,6 +3588,18 @@ class DownloadManager:
             stream.video_id,
             exc,
         )
+        if isinstance(exc, (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError)):
+            record = self.state.get_stream(stream.video_id)
+            if record is not None and record.status == "waiting_retry":
+                self.state.mark_exited(stream.video_id, -1)
+                record = self.state.get_stream(stream.video_id)
+            if record is not None and record.status in {"checking_after_exit", "stalled"}:
+                await self.handle_post_exit(
+                    stream,
+                    segment_index,
+                    expected_status=record.status,
+                )
+            return
         if await self._youtube_endlist_confirmed(stream):
             await self.finish_ended_stream(
                 stream,
@@ -3773,7 +3817,11 @@ class DownloadManager:
                 explicit_end = False
                 try:
                     latest = await self.probe_video(post_exit_probe_target(stream))
-                except (ConfirmedLiveTerminationError, KickChannelOfflineError):
+                except (
+                    ConfirmedLiveTerminationError,
+                    ConfirmedVideoRemovalError,
+                    KickChannelOfflineError,
+                ):
                     latest = None
                     explicit_end = True
                 except TerminalVideoUnavailableError as exc:

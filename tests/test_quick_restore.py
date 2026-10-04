@@ -1,6 +1,6 @@
 """Fast recovery after a YouTube download reaches the live edge."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 import asyncio
@@ -41,6 +41,36 @@ def live_stream() -> LiveStream:
 class QuickRestoreTrackerTests(unittest.TestCase):
     def test_quick_recovery_defaults_to_thirty_seconds(self) -> None:
         self.assertEqual(BotConfig().youtube_live_edge_recovery_seconds, 30)
+
+    def test_playlist_growth_does_not_reset_saved_fragment_inactivity(self) -> None:
+        now = [10.0]
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.update(progress("video", 99, 100))
+
+        now[0] = 20.0
+        tracker.update(progress("video", 99, 101))
+
+        self.assertEqual(tracker.fragments["video"], (99, 101))
+        self.assertEqual(tracker.inactive_seconds(), 10.0)
+        self.assertEqual(tracker.fragment_inactive_seconds(), 10.0)
+
+    def test_zero_fragment_updates_do_not_count_as_saved_progress(self) -> None:
+        now = [10.0]
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.start_track("audio")
+
+        now[0] = 20.0
+        tracker.update(progress("audio", 0, 100))
+        now[0] = 25.0
+        tracker.update(progress("audio", 0, 101))
+
+        self.assertNotIn("audio", tracker.track_fragment_progress_at)
+        self.assertEqual(tracker.inactive_seconds(), 15.0)
+        self.assertEqual(tracker.fragment_inactive_seconds(), 15.0)
+
+        tracker.update(progress("audio", 1, 101))
+        self.assertEqual(tracker.inactive_seconds(), 0.0)
+        self.assertEqual(tracker.fragment_inactive_seconds(), 0.0)
 
     def test_stalled_audio_at_live_edge_is_detected_after_thirty_seconds(self) -> None:
         now = [0.0]
@@ -116,6 +146,238 @@ class QuickRestoreTrackerTests(unittest.TestCase):
 
 
 class QuickRestoreWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_watchdog_restarts_idle_tracks_when_source_edge_advances(
+        self,
+    ) -> None:
+        for recovery_seconds, saved, count in ((0, 100, 100), (30, 10, 1000)):
+            with self.subTest(recovery_seconds=recovery_seconds):
+                now = [0.0]
+                stream = live_stream()
+                tracker = CatchupTracker(
+                    asyncio.Event(), monotonic_func=lambda: now[0]
+                )
+                tracker.update(progress("video", saved, count))
+                tracker.update(progress("audio", saved, count))
+                source_time = datetime.now(timezone.utc)
+                edge_probe = AsyncMock(
+                    side_effect=[
+                        YouTubeLiveEdge(100, source_time),
+                        YouTubeLiveEdge(101, source_time),
+                    ]
+                )
+
+                async def advance(seconds: float) -> None:
+                    now[0] += seconds
+                    # Remote fragment totals keep increasing while both saved
+                    # counters stay fixed.
+                    for track in ("video", "audio"):
+                        tracker.update(progress(track, saved, count + int(now[0])))
+
+                state = MagicMock()
+                manager = DownloadManager(
+                    BotConfig(
+                        youtube_live_edge_recovery_seconds=recovery_seconds,
+                        youtube_stale_live_timeout_seconds=10,
+                    ),
+                    state,
+                    probe=None,  # type: ignore[arg-type]
+                    sleep_func=advance,
+                    probe_youtube_live_edge_func=edge_probe,
+                    monotonic_func=lambda: now[0],
+                )
+                video_process = MagicMock(returncode=None)
+                audio_process = MagicMock(returncode=None)
+                active = ActiveDownload(
+                    stream=stream,
+                    process=video_process,
+                    segment_index=1,
+                    output_template=Path("segment-001.%(ext)s"),
+                    task=MagicMock(),
+                    audio_process=audio_process,
+                    audio_task=MagicMock(),
+                    video_format_id="303",
+                )
+                manager.active[stream.video_id] = active
+                with (
+                    patch.object(manager, "_restart_video_track", new=AsyncMock()) as restart_video,
+                    patch.object(manager, "_stop_stale_live_process", new=AsyncMock()) as stop_audio,
+                    patch.object(manager, "_request_process_reconnect", new=AsyncMock()) as reconnect,
+                ):
+                    await manager._stale_youtube_live_watchdog(
+                        stream, video_process, tracker
+                    )
+
+                restart_video.assert_awaited_once_with(active, tracker)
+                stop_audio.assert_awaited_once_with(stream.video_id, audio_process)
+                reconnect.assert_not_awaited()
+                state.mark_youtube_stale_live.assert_not_called()
+                self.assertEqual(edge_probe.await_count, 2)
+                self.assertEqual(tracker.last_fragment_progress_at, 0.0)
+
+    async def test_long_probe_does_not_stop_audio_started_during_confirmation(
+        self,
+    ) -> None:
+        now = [0.0]
+        stream = live_stream()
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.update(progress("video", 100, 100))
+        tracker.update(progress("audio", 100, 100))
+        video_process = MagicMock(returncode=None)
+        fresh_audio = MagicMock(returncode=None)
+        source_time = datetime.now(timezone.utc)
+        edge_probe = AsyncMock(
+            side_effect=[
+                YouTubeLiveEdge(100, source_time),
+                YouTubeLiveEdge(101, source_time),
+            ]
+        )
+
+        async def advance(seconds: float) -> None:
+            now[0] += seconds
+            if seconds == 30:
+                active.audio_process = fresh_audio
+                tracker.start_track("audio")
+            elif now[0] >= 50:
+                video_process.returncode = 0
+
+        manager = DownloadManager(
+            BotConfig(
+                youtube_live_edge_recovery_seconds=0,
+                youtube_stale_live_timeout_seconds=10,
+            ),
+            MagicMock(),
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=advance,
+            probe_youtube_live_edge_func=edge_probe,
+            monotonic_func=lambda: now[0],
+        )
+        active = ActiveDownload(
+            stream=stream,
+            process=video_process,
+            segment_index=1,
+            output_template=Path("segment-001.%(ext)s"),
+            task=MagicMock(),
+            audio_process=MagicMock(returncode=-15),
+            audio_task=MagicMock(),
+            video_format_id="303",
+        )
+        manager.active[stream.video_id] = active
+        with (
+            patch.object(manager, "_restart_video_track", new=AsyncMock()) as restart_video,
+            patch.object(manager, "_stop_stale_live_process", new=AsyncMock()) as stop_track,
+            patch.object(manager, "_request_process_reconnect", new=AsyncMock()) as reconnect,
+        ):
+            await manager._stale_youtube_live_watchdog(stream, video_process, tracker)
+
+        self.assertIs(active.audio_process, fresh_audio)
+        self.assertIsNone(fresh_audio.returncode)
+        self.assertEqual(edge_probe.await_count, 1)
+        restart_video.assert_not_awaited()
+        stop_track.assert_not_awaited()
+        reconnect.assert_not_awaited()
+
+    async def test_long_watchdog_waits_for_audio_started_before_first_probe(
+        self,
+    ) -> None:
+        now = [0.0]
+        stream = live_stream()
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.update(progress("video", 100, 100))
+        tracker.update(progress("audio", 100, 100))
+        video_process = MagicMock(returncode=None)
+        fresh_audio = MagicMock(returncode=None)
+        edge_probe = AsyncMock()
+
+        async def advance(seconds: float) -> None:
+            if now[0] == 0.0:
+                # Audio starts midway through the first watchdog interval.
+                now[0] = 5.0
+                active.audio_process = fresh_audio
+                tracker.start_track("audio")
+                now[0] = seconds
+            else:
+                video_process.returncode = 0
+
+        manager = DownloadManager(
+            BotConfig(
+                youtube_live_edge_recovery_seconds=0,
+                youtube_stale_live_timeout_seconds=10,
+            ),
+            MagicMock(),
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=advance,
+            probe_youtube_live_edge_func=edge_probe,
+            monotonic_func=lambda: now[0],
+        )
+        active = ActiveDownload(
+            stream=stream,
+            process=video_process,
+            segment_index=1,
+            output_template=Path("segment-001.%(ext)s"),
+            task=MagicMock(),
+            audio_process=MagicMock(returncode=-15),
+            audio_task=MagicMock(),
+            video_format_id="303",
+        )
+        manager.active[stream.video_id] = active
+        with (
+            patch.object(manager, "_restart_video_track", new=AsyncMock()) as restart_video,
+            patch.object(manager, "_stop_stale_live_process", new=AsyncMock()) as stop_track,
+            patch.object(manager, "_request_process_reconnect", new=AsyncMock()) as reconnect,
+        ):
+            await manager._stale_youtube_live_watchdog(stream, video_process, tracker)
+
+        self.assertEqual(tracker.inactive_seconds(), 10.0)
+        self.assertEqual(tracker.fragment_inactive_seconds(), 5.0)
+        self.assertIs(active.audio_process, fresh_audio)
+        self.assertIsNone(fresh_audio.returncode)
+        edge_probe.assert_not_awaited()
+        restart_video.assert_not_awaited()
+        stop_track.assert_not_awaited()
+        reconnect.assert_not_awaited()
+
+    async def test_frozen_live_source_is_paused_without_finalizing_media(self) -> None:
+        now = [0.0]
+        stream = live_stream()
+        tracker = CatchupTracker(asyncio.Event(), monotonic_func=lambda: now[0])
+        tracker.update(progress("video", 100, 100))
+        tracker.update(progress("audio", 100, 100))
+        edge = YouTubeLiveEdge(
+            100, datetime.now(timezone.utc) - timedelta(hours=1)
+        )
+        edge_probe = AsyncMock(return_value=edge)
+
+        async def advance(seconds: float) -> None:
+            now[0] += seconds
+
+        state = MagicMock()
+        manager = DownloadManager(
+            BotConfig(
+                youtube_live_edge_recovery_seconds=0,
+                youtube_stale_live_timeout_seconds=10,
+            ),
+            state,
+            probe=None,  # type: ignore[arg-type]
+            sleep_func=advance,
+            probe_youtube_live_edge_func=edge_probe,
+            monotonic_func=lambda: now[0],
+        )
+        video_process = MagicMock(returncode=None)
+        with (
+            patch.object(manager, "_stop_stale_live_process", new=AsyncMock()) as stop_track,
+            patch.object(manager, "_request_process_reconnect", new=AsyncMock()) as reconnect,
+            patch.object(manager, "finish_ended_stream", new=AsyncMock()) as finish,
+            patch.object(manager, "finalize_ended_segment", new=AsyncMock()) as finalize,
+        ):
+            await manager._stale_youtube_live_watchdog(stream, video_process, tracker)
+
+        state.mark_youtube_stale_live.assert_called_once()
+        stop_track.assert_awaited_once_with(stream.video_id, video_process)
+        reconnect.assert_not_awaited()
+        finish.assert_not_awaited()
+        finalize.assert_not_awaited()
+        self.assertEqual(edge_probe.await_count, 2)
+
     async def test_output_monitor_uses_process_track_when_codecs_are_missing(self) -> None:
         tracker = CatchupTracker(asyncio.Event())
         manager = DownloadManager(
