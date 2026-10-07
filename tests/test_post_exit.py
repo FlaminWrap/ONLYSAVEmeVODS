@@ -18,6 +18,7 @@ from onlysavemevods.models import LiveStream, video_url
 from onlysavemevods.sources import KickChannelOfflineError
 from onlysavemevods.state import StateStore
 from onlysavemevods.youtube import (
+    ConfirmedLiveEndError,
     ConfirmedLiveTerminationError,
     ConfirmedVideoRemovalError,
     TerminalVideoUnavailableError,
@@ -301,78 +302,18 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         assert record is not None
         self.assertEqual(record.status, "stalled")
 
-    async def test_stalled_removed_video_ends_and_preserves_unmerged_tracks(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-            )
-            stream = LiveStream(
-                video_id="youtube:r2ORTHCeg_A",
-                url=video_url("r2ORTHCeg_A"),
-                platform="youtube",
-                is_live=True,
-            )
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_youtube_stale_live(
-                stream.video_id,
-                media_sequence=9655,
-                edge_at="2026-10-04T22:17:00+00:00",
-            )
-            directory = segment_directory(config, stream.video_id)
-            directory.mkdir(parents=True)
-            saved_audio = directory / "segment-001.f140.m4a.part"
-            saved_video = directory / "segment-001.f299.mp4.part"
-            saved_audio.write_bytes(b"saved audio")
-            saved_video.write_bytes(b"saved video")
-            probe = SequenceProbe([
-                ConfirmedVideoRemovalError("This video has been removed by the uploader"),
-                ConfirmedVideoRemovalError("This video has been removed by the uploader"),
-            ])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                probe_youtube_live_edge_func=AsyncMock(
-                    side_effect=RuntimeError("no playlist is available for a removed video")
-                ),
-                logger=NULL_LOGGER,
-            )
-            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
-            manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
-            audio_task = MagicMock()
-            audio_task.done.return_value = False
-            manager._draining_audio[stream.video_id] = SimpleNamespace(  # type: ignore[assignment]
-                audio_end_confirmed=False, audio_task=audio_task
-            )
-            try:
-                await manager.monitor_stalled_youtube(stream, 1)
-                status = state.get_stream(stream.video_id).status
-            finally:
-                state.close()
-
-            self.assertEqual(probe.calls, 2)
-            self.assertEqual(status, "ended")
-            manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
-            self.assertEqual(saved_audio.read_bytes(), b"saved audio")
-            self.assertEqual(saved_video.read_bytes(), b"saved video")
-            self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
-
-    async def test_stalled_removal_confirmation_resets_after_error_or_live_reply(self) -> None:
-        stream = LiveStream(
-            video_id="youtube:r2ORTHCeg_A",
-            url=video_url("r2ORTHCeg_A"),
-            platform="youtube",
-            is_live=True,
-        )
-        for interruption in (RuntimeError("network timeout"), stream):
-            with self.subTest(interruption=type(interruption).__name__), TemporaryDirectory() as tmp:
+    async def test_stalled_explicit_youtube_end_preserves_unmerged_tracks(self) -> None:
+        for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
                 config = BotConfig(
                     download_dir=Path(tmp) / "downloads",
                     state_dir=Path(tmp) / "state",
+                )
+                stream = LiveStream(
+                    video_id="youtube:r2ORTHCeg_A",
+                    url=video_url("r2ORTHCeg_A"),
+                    platform="youtube",
+                    is_live=True,
                 )
                 state = StateStore(config.db_path)
                 state.upsert_detected(stream)
@@ -381,157 +322,251 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     media_sequence=9655,
                     edge_at="2026-10-04T22:17:00+00:00",
                 )
+                directory = segment_directory(config, stream.video_id)
+                directory.mkdir(parents=True)
+                saved_audio = directory / "segment-001.f140.m4a.part"
+                saved_video = directory / "segment-001.f299.mp4.part"
+                saved_audio.write_bytes(b"saved audio")
+                saved_video.write_bytes(b"saved video")
                 probe = SequenceProbe([
-                    ConfirmedVideoRemovalError("removed by the uploader"),
-                    interruption,
-                    ConfirmedVideoRemovalError("removed by the uploader"),
+                    end_error("YouTube explicitly confirmed this stream ended"),
+                    end_error("YouTube explicitly confirmed this stream ended"),
                 ])
-                async def sleep(_delay: float) -> None:
-                    if probe.calls >= 3:
-                        manager._stopping = True
-
                 manager = DownloadManager(
                     config,
                     state,
                     probe,  # type: ignore[arg-type]
-                    sleep_func=sleep,
+                    sleep_func=AsyncMock(),
                     probe_video_func=probe.probe_video_async,
                     probe_youtube_live_edge_func=AsyncMock(
-                        return_value=YouTubeLiveEdge(None, None)
+                        side_effect=RuntimeError("no playlist is available for an ended video")
                     ),
                     logger=NULL_LOGGER,
                 )
-                manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+                manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+                manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
+                audio_task = MagicMock()
+                audio_task.done.return_value = False
+                manager._draining_audio[stream.video_id] = SimpleNamespace(  # type: ignore[assignment]
+                    audio_end_confirmed=False, audio_task=audio_task
+                )
                 try:
                     await manager.monitor_stalled_youtube(stream, 1)
                     status = state.get_stream(stream.video_id).status
                 finally:
                     state.close()
 
-                self.assertEqual(status, "stalled")
-                manager.finalize_ended_segment.assert_not_awaited()
+                self.assertEqual(probe.calls, 2)
+                self.assertEqual(status, "ended")
+                manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
+                self.assertEqual(saved_audio.read_bytes(), b"saved audio")
+                self.assertEqual(saved_video.read_bytes(), b"saved video")
+                self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
 
-    async def test_removed_video_finishes_after_service_restart_checks(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-                post_exit_check_seconds=[30, 60, 90],
-            )
-            stream = LiveStream(
-                video_id="youtube:r2ORTHCeg_A",
-                url=video_url("r2ORTHCeg_A"),
-                platform="youtube",
-                is_live=True,
-            )
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_exited(stream.video_id, 1)
-            probe = SequenceProbe([
-                ConfirmedVideoRemovalError("removed by the uploader"),
-                ConfirmedVideoRemovalError("removed by the uploader"),
-            ])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                logger=NULL_LOGGER,
-            )
-            try:
-                await manager.handle_post_exit(
-                    stream, 1,
-                    expected_status="checking_after_exit",
-                    elapsed_since_exit_seconds=3600,
+    async def test_stalled_explicit_youtube_end_resets_after_error_or_live_reply(self) -> None:
+        for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__):
+                stream = LiveStream(
+                    video_id="youtube:r2ORTHCeg_A",
+                    url=video_url("r2ORTHCeg_A"),
+                    platform="youtube",
+                    is_live=True,
                 )
-                status = state.get_stream(stream.video_id).status
-            finally:
-                state.close()
+                for interruption in (RuntimeError("network timeout"), stream):
+                    with self.subTest(interruption=type(interruption).__name__), TemporaryDirectory() as tmp:
+                        config = BotConfig(
+                            download_dir=Path(tmp) / "downloads",
+                            state_dir=Path(tmp) / "state",
+                        )
+                        state = StateStore(config.db_path)
+                        state.upsert_detected(stream)
+                        state.mark_youtube_stale_live(
+                            stream.video_id,
+                            media_sequence=9655,
+                            edge_at="2026-10-04T22:17:00+00:00",
+                        )
+                        probe = SequenceProbe([
+                            end_error("YouTube explicitly confirmed this stream ended"),
+                            interruption,
+                            end_error("YouTube explicitly confirmed this stream ended"),
+                        ])
+                        async def sleep(_delay: float) -> None:
+                            if probe.calls >= 3:
+                                manager._stopping = True
 
-            self.assertEqual(status, "ended")
-            self.assertEqual(probe.calls, 2)
+                        manager = DownloadManager(
+                            config,
+                            state,
+                            probe,  # type: ignore[arg-type]
+                            sleep_func=sleep,
+                            probe_video_func=probe.probe_video_async,
+                            probe_youtube_live_edge_func=AsyncMock(
+                                return_value=YouTubeLiveEdge(None, None)
+                            ),
+                            logger=NULL_LOGGER,
+                        )
+                        manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+                        try:
+                            await manager.monitor_stalled_youtube(stream, 1)
+                            status = state.get_stream(stream.video_id).status
+                        finally:
+                            state.close()
 
-    async def test_finalization_retry_finishes_removed_video_with_tracks_preserved(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-            )
-            stream = LiveStream(
-                video_id="youtube:r2ORTHCeg_A",
-                url=video_url("r2ORTHCeg_A"),
-                platform="youtube",
-                is_live=True,
-            )
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_exited(stream.video_id, 1)
-            directory = segment_directory(config, stream.video_id)
-            directory.mkdir(parents=True)
-            saved_video = directory / "segment-001.f299.mp4.part"
-            saved_video.write_bytes(b"recoverable saved video")
-            probe = SequenceProbe([ConfirmedVideoRemovalError("removed by the uploader")])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                logger=NULL_LOGGER,
-            )
-            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
-            try:
-                await manager.finish_ended_stream(
-                    stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                        self.assertEqual(status, "stalled")
+                        manager.finalize_ended_segment.assert_not_awaited()
+
+    async def test_explicit_youtube_end_finishes_after_service_restart_checks(self) -> None:
+        for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
+                config = BotConfig(
+                    download_dir=Path(tmp) / "downloads",
+                    state_dir=Path(tmp) / "state",
+                    post_exit_check_seconds=[30, 60, 90],
                 )
-                await asyncio.wait_for(manager._finalization_retry_tasks[stream.video_id], 1)
-                status = state.get_stream(stream.video_id).status
-            finally:
-                state.close()
+                stream = LiveStream(
+                    video_id="youtube:r2ORTHCeg_A",
+                    url=video_url("r2ORTHCeg_A"),
+                    platform="youtube",
+                    is_live=True,
+                )
+                state = StateStore(config.db_path)
+                state.upsert_detected(stream)
+                state.mark_exited(stream.video_id, 1)
+                probe = SequenceProbe([
+                    end_error("YouTube confirms this live stream ended"),
+                    end_error("YouTube confirms this live stream ended"),
+                ])
+                sleep = AsyncMock()
+                manager = RecordingDownloadManager(
+                    config,
+                    state,
+                    probe,  # type: ignore[arg-type]
+                    sleep_func=sleep,
+                    probe_video_func=probe.probe_video_async,
+                    logger=NULL_LOGGER,
+                )
+                actions: list[str] = []
 
-            self.assertEqual(status, "ended")
-            self.assertEqual(probe.calls, 1)
-            self.assertEqual(saved_video.read_bytes(), b"recoverable saved video")
-            self.assertEqual(manager.finalize_ended_segment.await_count, 2)
+                async def stop_audio(video_id: str) -> None:
+                    self.assertEqual(video_id, stream.video_id)
+                    actions.append("stop_audio")
 
-    async def test_removed_video_during_planned_reconnect_is_reconfirmed(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-                post_exit_check_seconds=[0, 1],
-            )
-            stream = LiveStream(
-                video_id="youtube:r2ORTHCeg_A",
-                url=video_url("r2ORTHCeg_A"),
-                platform="youtube",
-                is_live=True,
-            )
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_exited(stream.video_id, 1)
-            probe = SequenceProbe([
-                ConfirmedVideoRemovalError("removed by the uploader") for _ in range(3)
-            ])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                probe_youtube_live_edge_func=AsyncMock(),
-                logger=NULL_LOGGER,
-            )
-            try:
-                await manager.handle_planned_reconnect(stream, 1)
-                status = state.get_stream(stream.video_id).status
-            finally:
-                state.close()
+                async def merge(video_id: str, index: int, channel: str) -> bool:
+                    self.assertEqual(probe.calls, 2)
+                    self.assertEqual(actions, ["stop_audio"])
+                    actions.append("merge")
+                    return True
 
-            self.assertEqual(status, "ended")
-            self.assertEqual(probe.calls, 3)
-            manager.probe_youtube_live_edge.assert_not_awaited()
+                manager._stop_draining_audio = AsyncMock(side_effect=stop_audio)  # type: ignore[method-assign]
+                manager.finalize_ended_segment = AsyncMock(side_effect=merge)  # type: ignore[method-assign]
+                manager.rename_finalized_segments = MagicMock(return_value=[])  # type: ignore[method-assign]
+                manager.finalize_powerchat_sidecars = MagicMock()  # type: ignore[method-assign]
+                manager.enqueue_finalized_post_processing = MagicMock()  # type: ignore[method-assign]
+                manager.process_pending_post_processing = AsyncMock()  # type: ignore[method-assign]
+                audio_task = MagicMock()
+                audio_task.done.return_value = False
+                draining = SimpleNamespace(audio_end_confirmed=False, audio_task=audio_task)
+                manager._draining_audio[stream.video_id] = draining  # type: ignore[assignment]
+                try:
+                    await manager.handle_post_exit(
+                        stream, 1,
+                        expected_status="checking_after_exit",
+                        elapsed_since_exit_seconds=3600,
+                    )
+                    status = state.get_stream(stream.video_id).status
+                finally:
+                    state.close()
+
+                self.assertEqual(status, "ended")
+                self.assertEqual(probe.calls, 2)
+                self.assertEqual(actions, ["stop_audio", "merge"])
+                self.assertTrue(draining.audio_end_confirmed)
+                self.assertEqual(manager.started, [])
+                sleep.assert_not_awaited()
+                self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
+
+    async def test_finalization_retry_accepts_explicit_youtube_end_with_tracks_preserved(self) -> None:
+        for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
+                config = BotConfig(
+                    download_dir=Path(tmp) / "downloads",
+                    state_dir=Path(tmp) / "state",
+                )
+                stream = LiveStream(
+                    video_id="youtube:r2ORTHCeg_A",
+                    url=video_url("r2ORTHCeg_A"),
+                    platform="youtube",
+                    is_live=True,
+                )
+                state = StateStore(config.db_path)
+                state.upsert_detected(stream)
+                state.mark_exited(stream.video_id, 1)
+                directory = segment_directory(config, stream.video_id)
+                directory.mkdir(parents=True)
+                saved_video = directory / "segment-001.f299.mp4.part"
+                saved_video.write_bytes(b"recoverable saved video")
+                probe = SequenceProbe([end_error("YouTube explicitly confirmed this stream ended")])
+                manager = DownloadManager(
+                    config,
+                    state,
+                    probe,  # type: ignore[arg-type]
+                    sleep_func=AsyncMock(),
+                    probe_video_func=probe.probe_video_async,
+                    logger=NULL_LOGGER,
+                )
+                manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+                try:
+                    await manager.finish_ended_stream(
+                        stream, 1, expected_status="checking_after_exit", end_confirmed=True
+                    )
+                    await asyncio.wait_for(manager._finalization_retry_tasks[stream.video_id], 1)
+                    status = state.get_stream(stream.video_id).status
+                finally:
+                    state.close()
+
+                self.assertEqual(status, "ended")
+                self.assertEqual(probe.calls, 1)
+                self.assertEqual(saved_video.read_bytes(), b"recoverable saved video")
+                self.assertEqual(manager.finalize_ended_segment.await_count, 2)
+
+    async def test_explicit_youtube_end_during_planned_reconnect_is_reconfirmed(self) -> None:
+        for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
+                config = BotConfig(
+                    download_dir=Path(tmp) / "downloads",
+                    state_dir=Path(tmp) / "state",
+                    post_exit_check_seconds=[0, 1],
+                )
+                stream = LiveStream(
+                    video_id="youtube:r2ORTHCeg_A",
+                    url=video_url("r2ORTHCeg_A"),
+                    platform="youtube",
+                    is_live=True,
+                )
+                state = StateStore(config.db_path)
+                state.upsert_detected(stream)
+                state.mark_exited(stream.video_id, 1)
+                probe = SequenceProbe([
+                    end_error("YouTube explicitly confirmed this stream ended") for _ in range(3)
+                ])
+                manager = DownloadManager(
+                    config,
+                    state,
+                    probe,  # type: ignore[arg-type]
+                    sleep_func=AsyncMock(),
+                    probe_video_func=probe.probe_video_async,
+                    probe_youtube_live_edge_func=AsyncMock(),
+                    logger=NULL_LOGGER,
+                )
+                try:
+                    await manager.handle_planned_reconnect(stream, 1)
+                    status = state.get_stream(stream.video_id).status
+                finally:
+                    state.close()
+
+                self.assertEqual(status, "ended")
+                self.assertEqual(probe.calls, 3)
+                manager.probe_youtube_live_edge.assert_not_awaited()
 
     async def test_stalled_youtube_explicit_termination_finishes_without_endlist(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -1269,106 +1304,108 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             manager.finalize_ended_segment.assert_not_awaited()
             manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
 
-    async def test_youtube_termination_ends_with_unmerged_tracks_available(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-                post_exit_check_seconds=[0, 1, 2],
-            )
-            stream = LiveStream(
-                video_id="youtube:8YbgANWF8pk",
-                url=video_url("8YbgANWF8pk"),
-                channel="Creator",
-                platform="youtube",
-                is_live=True,
-            )
-            directory = segment_directory(config, stream.video_id, stream.channel)
-            directory.mkdir(parents=True)
-            audio = directory / "segment-001.f140.m4a.part"
-            video = directory / "segment-001.f299.mp4.part"
-            audio.write_bytes(b"saved audio")
-            video.write_bytes(b"saved video")
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_exited(stream.video_id, 1)
-            probe = SequenceProbe([
-                ConfirmedLiveTerminationError("terminated due to third-party content"),
-                ConfirmedLiveTerminationError("terminated due to third-party content"),
-            ])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                logger=NULL_LOGGER,
-            )
-            manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
-            manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
-            fake_audio_task = MagicMock()
-            fake_audio_task.done.return_value = False
-            draining = SimpleNamespace(audio_end_confirmed=False, audio_task=fake_audio_task)
-            manager._draining_audio[stream.video_id] = draining  # type: ignore[assignment]
-            try:
-                await manager.handle_post_exit(
-                    stream, 1, expected_status="checking_after_exit"
+    async def test_explicit_youtube_end_keeps_unmerged_tracks_available(self) -> None:
+        for end_error in (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
+                config = BotConfig(
+                    download_dir=Path(tmp) / "downloads",
+                    state_dir=Path(tmp) / "state",
+                    post_exit_check_seconds=[0, 1, 2],
                 )
-                status = state.get_stream(stream.video_id).status
-                events = state.list_stream_events([stream.video_id])[stream.video_id]
-            finally:
-                state.close()
-
-            self.assertEqual(probe.calls, 2)
-            self.assertEqual(status, "ended")
-            self.assertTrue(draining.audio_end_confirmed)
-            manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
-            self.assertEqual(audio.read_bytes(), b"saved audio")
-            self.assertEqual(video.read_bytes(), b"saved video")
-            self.assertTrue(any("available for recovery" in event.message for event in events))
-            self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
-
-    async def test_single_youtube_termination_is_not_confirmed(self) -> None:
-        with TemporaryDirectory() as tmp:
-            config = BotConfig(
-                download_dir=Path(tmp) / "downloads",
-                state_dir=Path(tmp) / "state",
-                post_exit_check_seconds=[0, 1],
-            )
-            stream = LiveStream(
-                video_id="youtube:8YbgANWF8pk",
-                url=video_url("8YbgANWF8pk"),
-                platform="youtube",
-                is_live=True,
-            )
-            state = StateStore(config.db_path)
-            state.upsert_detected(stream)
-            state.mark_exited(stream.video_id, 1)
-            probe = SequenceProbe([
-                ConfirmedLiveTerminationError("terminated due to third-party content"),
-                RuntimeError("network timeout"),
-            ])
-            manager = DownloadManager(
-                config,
-                state,
-                probe,  # type: ignore[arg-type]
-                sleep_func=AsyncMock(),
-                probe_video_func=probe.probe_video_async,
-                logger=NULL_LOGGER,
-            )
-            manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
-            manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
-            try:
-                await manager.handle_post_exit(
-                    stream, 1, expected_status="checking_after_exit"
+                stream = LiveStream(
+                    video_id="youtube:8YbgANWF8pk",
+                    url=video_url("8YbgANWF8pk"),
+                    channel="Creator",
+                    platform="youtube",
+                    is_live=True,
                 )
-                status = state.get_stream(stream.video_id).status
-            finally:
-                state.close()
+                directory = segment_directory(config, stream.video_id, stream.channel)
+                directory.mkdir(parents=True)
+                audio = directory / "segment-001.f140.m4a.part"
+                video = directory / "segment-001.f299.mp4.part"
+                audio.write_bytes(b"saved audio")
+                video.write_bytes(b"saved video")
+                state = StateStore(config.db_path)
+                state.upsert_detected(stream)
+                state.mark_exited(stream.video_id, 1)
+                probe = SequenceProbe([
+                    end_error("YouTube explicitly confirmed this stream ended"),
+                    end_error("YouTube explicitly confirmed this stream ended"),
+                ])
+                manager = DownloadManager(
+                    config,
+                    state,
+                    probe,  # type: ignore[arg-type]
+                    sleep_func=AsyncMock(),
+                    probe_video_func=probe.probe_video_async,
+                    logger=NULL_LOGGER,
+                )
+                manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
+                manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
+                fake_audio_task = MagicMock()
+                fake_audio_task.done.return_value = False
+                draining = SimpleNamespace(audio_end_confirmed=False, audio_task=fake_audio_task)
+                manager._draining_audio[stream.video_id] = draining  # type: ignore[assignment]
+                try:
+                    await manager.handle_post_exit(
+                        stream, 1, expected_status="checking_after_exit"
+                    )
+                    status = state.get_stream(stream.video_id).status
+                    events = state.list_stream_events([stream.video_id])[stream.video_id]
+                finally:
+                    state.close()
 
-            self.assertEqual(status, "checking_after_exit")
-            manager.finalize_ended_segment.assert_not_awaited()
-            manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
+                self.assertEqual(probe.calls, 2)
+                self.assertEqual(status, "ended")
+                self.assertTrue(draining.audio_end_confirmed)
+                manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
+                self.assertEqual(audio.read_bytes(), b"saved audio")
+                self.assertEqual(video.read_bytes(), b"saved video")
+                self.assertTrue(any("available for recovery" in event.message for event in events))
+                self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
+
+    async def test_single_explicit_youtube_end_is_not_confirmed(self) -> None:
+        for end_error in (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(end_error=end_error.__name__), TemporaryDirectory() as tmp:
+                config = BotConfig(
+                    download_dir=Path(tmp) / "downloads",
+                    state_dir=Path(tmp) / "state",
+                    post_exit_check_seconds=[0, 1],
+                )
+                stream = LiveStream(
+                    video_id="youtube:8YbgANWF8pk",
+                    url=video_url("8YbgANWF8pk"),
+                    platform="youtube",
+                    is_live=True,
+                )
+                state = StateStore(config.db_path)
+                state.upsert_detected(stream)
+                state.mark_exited(stream.video_id, 1)
+                probe = SequenceProbe([
+                    end_error("YouTube explicitly confirmed this stream ended"),
+                    RuntimeError("network timeout"),
+                ])
+                manager = DownloadManager(
+                    config,
+                    state,
+                    probe,  # type: ignore[arg-type]
+                    sleep_func=AsyncMock(),
+                    probe_video_func=probe.probe_video_async,
+                    logger=NULL_LOGGER,
+                )
+                manager.finalize_ended_segment = AsyncMock()  # type: ignore[method-assign]
+                manager._defer_post_exit_retry = MagicMock()  # type: ignore[method-assign]
+                try:
+                    await manager.handle_post_exit(
+                        stream, 1, expected_status="checking_after_exit"
+                    )
+                    status = state.get_stream(stream.video_id).status
+                finally:
+                    state.close()
+
+                self.assertEqual(status, "checking_after_exit")
+                manager.finalize_ended_segment.assert_not_awaited()
+                manager._defer_post_exit_retry.assert_called_once_with(stream, 1)
 
     async def test_probe_failures_require_two_subsequent_end_reports(self) -> None:
         sleeps = 0
@@ -1591,6 +1628,62 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(audio_data, b"audio")
         self.assertEqual(video_data, b"video")
         manager.finalize_ended_segment.assert_not_awaited()
+
+    async def test_old_session_explicit_youtube_end_requires_two_confirmations(self) -> None:
+        stream = LiveStream(
+            video_id="youtube:r2ORTHCeg_A",
+            url=video_url("r2ORTHCeg_A"),
+            platform="youtube",
+            source="https://www.youtube.com/@Creator/live",
+            is_live=True,
+        )
+        for end_error in (
+            ConfirmedLiveEndError,
+            ConfirmedVideoRemovalError,
+            ConfirmedLiveTerminationError,
+        ):
+            for second_result, expected in (
+                (end_error("Source explicitly confirmed ended"), True),
+                (RuntimeError("network timeout"), False),
+                (TerminalVideoUnavailableError("generic unavailable video"), False),
+                (stream, False),
+                (LiveStream(video_id="youtube:NEWVIDEO001", url=video_url("NEWVIDEO001"), is_live=False), False),
+            ):
+                with self.subTest(
+                    end_error=end_error.__name__,
+                    second_result=type(second_result).__name__,
+                    expected=expected,
+                ), TemporaryDirectory() as tmp:
+                    config = BotConfig(
+                        download_dir=Path(tmp) / "downloads",
+                        state_dir=Path(tmp) / "state",
+                    )
+                    state = StateStore(config.db_path)
+                    probe = SequenceProbe([
+                        end_error("Source explicitly confirmed ended"), second_result,
+                    ])
+                    sleep = AsyncMock()
+                    manager = DownloadManager(
+                        config,
+                        state,
+                        probe,  # type: ignore[arg-type]
+                        sleep_func=sleep,
+                        probe_video_func=probe.probe_video_async,
+                        probe_youtube_live_edge_func=AsyncMock(
+                            return_value=YouTubeLiveEdge(None, None)
+                        ),
+                        logger=NULL_LOGGER,
+                    )
+                    try:
+                        confirmed = await manager._old_session_end_confirmed(stream)
+                    finally:
+                        state.close()
+
+                    self.assertEqual(confirmed, expected)
+                    self.assertEqual(probe.urls, [stream.url, stream.url])
+                    sleep.assert_awaited_once_with(
+                        max(1, min(config.poll_interval_seconds, 30))
+                    )
 
     async def test_confirmed_end_finalizes_every_retained_segment(self) -> None:
         with TemporaryDirectory() as tmp:

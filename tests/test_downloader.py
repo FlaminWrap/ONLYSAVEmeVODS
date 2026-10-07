@@ -35,6 +35,7 @@ from onlysavemevods.downloader import (
     output_template_for,
     post_exit_probe_target,
     prepare_finalize_plan,
+    probe_finalize_media_streams,
     probe_packet_duration,
     recover_segment_from_fragments,
     rename_finalized_segment_file,
@@ -1201,6 +1202,117 @@ class DownloaderCommandTests(unittest.TestCase):
             self.assertRaises(VideoProbeError),
         ):
             validate_finalize_output(output, selected)
+
+    def test_finalize_validation_preserves_unequal_audio_and_video_tails(self) -> None:
+        output = Path("segment-001.mp4")
+        selected = [
+            FinalizeMediaStream(Path("video.part"), 0, 0, "video", 7868.533, 100, True),
+            FinalizeMediaStream(Path("audio.part"), 1, 0, "audio", 7876.325, 100, True),
+        ]
+        output_streams = [
+            FinalizeMediaStream(output, 0, 0, "video", 7868.533, 100, False),
+            FinalizeMediaStream(output, 0, 1, "audio", 7876.325, 100, False),
+        ]
+        with patch(
+            "onlysavemevods.downloader.probe_finalize_media_streams",
+            return_value=output_streams,
+        ):
+            validation = validate_finalize_output(output, selected)
+
+        self.assertEqual(validation.duration, 7876.325)
+        self.assertEqual(validation.video_streams, 1)
+        self.assertEqual(validation.audio_streams, 1)
+
+    def test_finalize_validation_rejects_truncated_longer_track(self) -> None:
+        output = Path("segment-001.mp4")
+        for longer_type in ("video", "audio"):
+            with self.subTest(longer_type=longer_type):
+                selected = [
+                    FinalizeMediaStream(
+                        Path(f"{codec_type}.part"), index, 0, codec_type,
+                        7876.325 if codec_type == longer_type else 7868.533,
+                        100, True,
+                    )
+                    for index, codec_type in enumerate(("video", "audio"))
+                ]
+                truncated_output = [
+                    FinalizeMediaStream(output, 0, index, codec_type, 7868.533, 100, False)
+                    for index, codec_type in enumerate(("video", "audio"))
+                ]
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=truncated_output,
+                    ),
+                    self.assertRaisesRegex(VideoProbeError, f"{longer_type} media"),
+                ):
+                    validate_finalize_output(output, selected)
+
+    def test_finalize_validation_rejects_invalid_duration(self) -> None:
+        output = Path("segment-001.mp4")
+        selected = [FinalizeMediaStream(Path("video.part"), 0, 0, "video", 100, 100, True)]
+        for invalid_duration in (0, -1, float("inf"), float("nan")):
+            with self.subTest(duration=invalid_duration):
+                output_streams = [
+                    FinalizeMediaStream(output, 0, 0, "video", invalid_duration, 100, False)
+                ]
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        return_value=output_streams,
+                    ),
+                    self.assertRaisesRegex(VideoProbeError, "Invalid video duration"),
+                ):
+                    validate_finalize_output(output, selected)
+
+    def test_muxed_output_missing_track_duration_uses_packets_instead_of_container(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "segment-001.mp4"
+            output.write_bytes(b"muxed output")
+            payload = {
+                "format": {"duration": "7876.325"},
+                "streams": [
+                    {"index": 0, "codec_type": "video", "duration": "N/A"},
+                    {"index": 1, "codec_type": "audio", "duration": "N/A"},
+                ],
+            }
+            completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+            selected = [
+                FinalizeMediaStream(Path("video.part"), 0, 0, "video", 7868.533, 100, True),
+                FinalizeMediaStream(Path("audio.part"), 1, 0, "audio", 7876.325, 100, True),
+            ]
+            with (
+                patch("onlysavemevods.downloader.subprocess.run", return_value=completed),
+                patch(
+                    "onlysavemevods.downloader.probe_packet_duration",
+                    side_effect=[7868.533, 7868.533],
+                ) as packets,
+                self.assertRaisesRegex(VideoProbeError, "audio media"),
+            ):
+                validate_finalize_output(output, selected)
+
+            self.assertEqual(
+                [call.args for call in packets.call_args_list],
+                [(output, 0, "ffprobe"), (output, 1, "ffprobe")],
+            )
+
+    def test_single_track_container_duration_remains_usable(self) -> None:
+        with TemporaryDirectory() as tmp:
+            input_file = Path(tmp) / "audio.mp4"
+            input_file.write_bytes(b"audio")
+            payload = {
+                "format": {"duration": "7876.325"},
+                "streams": [{"index": 0, "codec_type": "audio", "duration": "N/A"}],
+            }
+            completed = subprocess.CompletedProcess([], 0, json.dumps(payload), "")
+            with (
+                patch("onlysavemevods.downloader.subprocess.run", return_value=completed),
+                patch("onlysavemevods.downloader.probe_packet_duration") as packets,
+            ):
+                streams = probe_finalize_media_streams([input_file])
+
+            self.assertEqual(streams[0].duration, 7876.325)
+            packets.assert_not_called()
 
     def test_packet_duration_falls_back_to_last_packet_end(self) -> None:
         completed = subprocess.CompletedProcess(
@@ -2658,7 +2770,7 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("0:0", command)
         self.assertNotIn("2:0", command)
 
-    async def test_finalize_rejects_duration_mismatch_before_mux(self) -> None:
+    async def test_finalize_retains_both_unequal_tracks_without_shortest(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             video = root / "segment-001.f303.webm.part"
@@ -2677,15 +2789,28 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
             config = BotConfig(download_dir=root, state_dir=root / "state")
             state = StateStore(config.db_path)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            process = AsyncMock()
+            process.returncode = 0
+            process.communicate.return_value = (b"", b"")
+
+            def inspect_media(paths: list[Path], _ffprobe_path: str):
+                if paths == [plan.output_file.with_name("segment-001.muxing.mkv")]:
+                    paths[0].write_bytes(b"full video and audio")
+                    return [
+                        FinalizeMediaStream(paths[0], 0, 0, "video", 36_000.0, 19, False),
+                        FinalizeMediaStream(paths[0], 0, 1, "audio", 1_500.0, 19, False),
+                    ]
+                return streams
+
             try:
                 with (
                     patch(
                         "onlysavemevods.downloader.probe_finalize_media_streams",
-                        return_value=streams,
+                        side_effect=inspect_media,
                     ),
                     patch(
                         "onlysavemevods.downloader.asyncio.create_subprocess_exec",
-                        new=AsyncMock(),
+                        new=AsyncMock(return_value=process),
                     ) as spawn,
                 ):
                     finalized = await manager._mux_finalize_inputs(plan)
@@ -2695,11 +2820,103 @@ class DownloadManagerRestartTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 state.close()
 
-        self.assertFalse(finalized)
-        spawn.assert_not_awaited()
+        self.assertTrue(finalized)
+        spawn.assert_awaited_once()
+        self.assertNotIn("-shortest", spawn.await_args.args)
         self.assertTrue(video_preserved)
         self.assertTrue(audio_preserved)
-        self.assertFalse(output_exists)
+        self.assertTrue(output_exists)
+
+    async def test_finalize_truncated_longer_track_preserves_sources_and_sidecars(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = BotConfig(download_dir=root / "downloads", state_dir=root / "state")
+            directory = segment_directory(config, "LIVEVIDEO01", "Example Channel")
+            directory.mkdir(parents=True)
+            audio = directory / "segment-001.f140.mp4.part"
+            video = directory / "segment-001.f299.mp4.part"
+            ytdl = directory / "segment-001.f140.mp4.ytdl"
+            fragment = directory / "segment-001.f140.mp4.part-Frag1"
+            audio.write_bytes(b"full audio")
+            video.write_bytes(b"full video")
+            ytdl.write_text("{}", encoding="utf-8")
+            fragment.write_bytes(b"recoverable fragment")
+            temporary_output = directory / "segment-001.muxing.mp4"
+            selected = [
+                FinalizeMediaStream(audio, 0, 0, "audio", 7876.325, 10, True),
+                FinalizeMediaStream(video, 1, 0, "video", 7868.533, 10, True),
+            ]
+            shortened_output = [
+                FinalizeMediaStream(temporary_output, 0, 0, "audio", 7868.533, 10, False),
+                FinalizeMediaStream(temporary_output, 0, 1, "video", 7868.533, 10, False),
+            ]
+            process = AsyncMock()
+            process.returncode = 0
+
+            async def remux():
+                temporary_output.write_bytes(b"truncated output")
+                return b"", b""
+
+            process.communicate.side_effect = remux
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            try:
+                with (
+                    patch(
+                        "onlysavemevods.downloader.probe_finalize_media_streams",
+                        side_effect=[selected, shortened_output],
+                    ),
+                    patch(
+                        "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                        new=AsyncMock(return_value=process),
+                    ),
+                ):
+                    finalized = await manager.finalize_ended_segment(
+                        "LIVEVIDEO01", 1, "Example Channel"
+                    )
+            finally:
+                state.close()
+
+            self.assertFalse(finalized)
+            self.assertEqual(audio.read_bytes(), b"full audio")
+            self.assertEqual(video.read_bytes(), b"full video")
+            self.assertTrue(ytdl.exists())
+            self.assertTrue(fragment.exists())
+            self.assertFalse((directory / "segment-001.mp4").exists())
+            self.assertFalse(temporary_output.exists())
+
+    async def test_finalize_invalid_source_duration_preserves_input_without_mux(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            input_file = root / "segment-001.mp4.part"
+            input_file.write_bytes(b"recoverable source")
+            plan = FinalizePlan(root / "segment-001.mp4", [input_file], [])
+            config = BotConfig(download_dir=root, state_dir=root / "state")
+            state = StateStore(config.db_path)
+            manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
+            try:
+                for invalid_duration in (0, -1, float("inf"), float("nan")):
+                    with self.subTest(duration=invalid_duration):
+                        selected = [
+                            FinalizeMediaStream(input_file, 0, 0, "video", invalid_duration, 18, True)
+                        ]
+                        with (
+                            patch(
+                                "onlysavemevods.downloader.probe_finalize_media_streams",
+                                return_value=selected,
+                            ),
+                            patch(
+                                "onlysavemevods.downloader.asyncio.create_subprocess_exec",
+                                new=AsyncMock(),
+                            ) as spawn,
+                        ):
+                            finalized = await manager._mux_finalize_inputs(plan)
+                        self.assertFalse(finalized)
+                        spawn.assert_not_awaited()
+                        self.assertEqual(input_file.read_bytes(), b"recoverable source")
+                        self.assertFalse(plan.output_file.exists())
+            finally:
+                state.close()
 
     async def test_locked_youtube_split_format_requires_audio(self) -> None:
         with TemporaryDirectory() as tmp:

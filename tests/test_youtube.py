@@ -6,6 +6,7 @@ from subprocess import CompletedProcess
 from unittest.mock import MagicMock, patch
 
 from onlysavemevods.youtube import (
+    ConfirmedLiveEndError,
     ConfirmedLiveTerminationError,
     ConfirmedVideoRemovalError,
     TerminalVideoUnavailableError,
@@ -21,6 +22,7 @@ from onlysavemevods.youtube import (
     is_terminal_video_unavailable_message,
     live_stream_from_info,
     parse_youtube_hls_live_edge,
+    watch_page_confirmed_live_end,
     watch_page_video_removal_reason,
     youtube_hls_media_manifest,
 )
@@ -131,6 +133,213 @@ class YoutubeProbeTests(unittest.TestCase):
         response.__enter__.return_value = response
         return response
 
+    @staticmethod
+    def ended_broadcast_player(
+        video_id: str = "wsY_4jPsH6Y",
+        status: str = "UNPLAYABLE",
+    ) -> dict:
+        start = "2026-10-07T09:48:00+00:00"
+        end = "2026-10-07T19:32:34+00:00"
+        if video_id == "bHgxdHvO4fQ":
+            start = "2026-10-04T23:15:59+00:00"
+            end = "2026-10-05T01:23:36+00:00"
+        return {
+            "playabilityStatus": {"status": status, "reason": "Video unavailable"},
+            "videoDetails": {
+                "videoId": video_id,
+                "isLiveContent": True,
+                "isLowLatencyLiveStream": True,
+            },
+            "microformat": {
+                "playerMicroformatRenderer": {
+                    "externalVideoId": video_id,
+                    "liveBroadcastDetails": {
+                        "isLiveNow": False,
+                        "startTimestamp": start,
+                        "endTimestamp": end,
+                    },
+                }
+            },
+        }
+
+    @staticmethod
+    def player_page(player: object) -> str:
+        return "var ytInitialPlayerResponse = " + json.dumps(player) + ";"
+
+    def test_watch_page_confirms_explicit_end_of_restricted_broadcasts(self) -> None:
+        now = datetime(2026, 10, 8, tzinfo=timezone.utc)
+        for video_id, status in (
+            ("wsY_4jPsH6Y", "UNPLAYABLE"),
+            ("bHgxdHvO4fQ", "LOGIN_REQUIRED"),
+        ):
+            with self.subTest(video_id=video_id, status=status):
+                page = self.player_page(self.ended_broadcast_player(video_id, status))
+                self.assertEqual(
+                    watch_page_confirmed_live_end(page, video_id, now=now),
+                    datetime(2026, 10, 7, 19, 32, 34, tzinfo=timezone.utc)
+                    if video_id == "wsY_4jPsH6Y"
+                    else datetime(2026, 10, 5, 1, 23, 36, tzinfo=timezone.utc),
+                )
+
+    def test_watch_page_end_requires_exact_video_identity(self) -> None:
+        for mismatch in ("missing_details", "missing_id", "wrong_id", "wrong_external_id"):
+            with self.subTest(mismatch=mismatch):
+                player = self.ended_broadcast_player()
+                if mismatch == "missing_details":
+                    del player["videoDetails"]
+                elif mismatch == "missing_id":
+                    del player["videoDetails"]["videoId"]
+                elif mismatch == "wrong_id":
+                    player["videoDetails"]["videoId"] = "bHgxdHvO4fQ"
+                else:
+                    player["microformat"]["playerMicroformatRenderer"]["externalVideoId"] = "bHgxdHvO4fQ"
+                self.assertIsNone(
+                    watch_page_confirmed_live_end(
+                        self.player_page(player), "wsY_4jPsH6Y",
+                        now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    )
+                )
+
+    def test_watch_page_end_requires_boolean_false_live_now(self) -> None:
+        for value in (None, True, "false", 0, "missing"):
+            with self.subTest(value=value):
+                player = self.ended_broadcast_player()
+                broadcast = player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"]
+                if value == "missing":
+                    del broadcast["isLiveNow"]
+                else:
+                    broadcast["isLiveNow"] = value
+                self.assertIsNone(
+                    watch_page_confirmed_live_end(
+                        self.player_page(player), "wsY_4jPsH6Y",
+                        now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    )
+                )
+
+    def test_watch_page_end_requires_valid_past_timestamp(self) -> None:
+        for value in (
+            None, True, 1791390000, "bad date", "2026-10-07", "2026-10-07T19:32:34",
+            "2026-10-09T00:00:00Z", "2026-10-08T00:00:00Z",
+            "9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59", "missing",
+        ):
+            with self.subTest(value=value):
+                player = self.ended_broadcast_player()
+                broadcast = player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"]
+                if value == "missing":
+                    del broadcast["endTimestamp"]
+                else:
+                    broadcast["endTimestamp"] = value
+                self.assertIsNone(
+                    watch_page_confirmed_live_end(
+                        self.player_page(player), "wsY_4jPsH6Y",
+                        now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    )
+                )
+
+    def test_watch_page_end_rejects_contradictory_live_flags(self) -> None:
+        for location in ("player", "details", "renderer", "broadcast"):
+            for flag in ("isLive", "isLiveNow", "isUpcoming"):
+                with self.subTest(location=location, flag=flag):
+                    player = self.ended_broadcast_player()
+                    renderer = player["microformat"]["playerMicroformatRenderer"]
+                    target = {
+                        "player": player,
+                        "details": player["videoDetails"],
+                        "renderer": renderer,
+                        "broadcast": renderer["liveBroadcastDetails"],
+                    }[location]
+                    target[flag] = True
+                    self.assertIsNone(
+                        watch_page_confirmed_live_end(
+                            self.player_page(player), "wsY_4jPsH6Y",
+                            now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                        )
+                    )
+
+    def test_watch_page_end_rejects_contradictory_start_timestamp(self) -> None:
+        for value in (None, "bad date", "2026-10-08T00:00:00Z"):
+            with self.subTest(value=value):
+                player = self.ended_broadcast_player()
+                player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"]["startTimestamp"] = value
+                self.assertIsNone(
+                    watch_page_confirmed_live_end(
+                        self.player_page(player), "wsY_4jPsH6Y",
+                        now=datetime(2026, 10, 8, tzinfo=timezone.utc),
+                    )
+                )
+
+    def test_watch_page_does_not_infer_end_from_duration_or_live_content(self) -> None:
+        player = self.ended_broadcast_player()
+        del player["microformat"]
+        player["videoDetails"]["lengthSeconds"] = "5000"
+        self.assertIsNone(watch_page_confirmed_live_end(self.player_page(player), "wsY_4jPsH6Y"))
+        for page in ("", 'var ytInitialPlayerResponse = {"videoDetails":', self.player_page(None)):
+            with self.subTest(page=page):
+                self.assertIsNone(watch_page_confirmed_live_end(page, "wsY_4jPsH6Y"))
+
+    def test_unavailable_and_age_restricted_metadata_confirm_watch_page_end(self) -> None:
+        for video_id, message, status in (
+            ("wsY_4jPsH6Y", "Video unavailable", "UNPLAYABLE"),
+            ("bHgxdHvO4fQ", "Sign in to confirm your age. This video may be inappropriate for some users.", "LOGIN_REQUIRED"),
+        ):
+            for method in ("probe_video", "probe_live_edge"):
+                with self.subTest(video_id=video_id, method=method):
+                    original = YtDlpError(f"yt-dlp failed with code 1: ERROR: [youtube] {video_id}: {message}")
+                    runner = MagicMock()
+                    runner.run_json.side_effect = original
+                    player = self.ended_broadcast_player(video_id, status)
+                    # A past timestamp keeps this integration test independent of wall-clock time.
+                    player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"] = {
+                        "isLiveNow": False, "endTimestamp": "2000-01-01T00:00:00Z",
+                    }
+                    response = self.watch_response(self.player_page(player), video_id)
+                    with patch("onlysavemevods.youtube.urlopen", return_value=response) as opened:
+                        with self.assertRaises(ConfirmedLiveEndError) as caught:
+                            getattr(YoutubeProbe(runner), method)(video_id)
+                    self.assertIs(caught.exception.__cause__, original)
+                    opened.assert_called_once()
+                    self.assertEqual(opened.call_args.kwargs["timeout"], WATCH_PAGE_TIMEOUT_SECONDS)
+                    response.read.assert_called_once_with(WATCH_PAGE_READ_LIMIT + 1)
+
+    def test_age_restriction_alone_preserves_original_probe_error(self) -> None:
+        video_id = "bHgxdHvO4fQ"
+        original = YtDlpError(f"ERROR: [youtube] {video_id}: Sign in to confirm your age.")
+        runner = MagicMock()
+        runner.run_json.side_effect = original
+        player = self.ended_broadcast_player(video_id, "LOGIN_REQUIRED")
+        del player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"]["endTimestamp"]
+        response = self.watch_response(self.player_page(player), video_id)
+        with patch("onlysavemevods.youtube.urlopen", return_value=response):
+            with self.assertRaises(YtDlpError) as caught:
+                YoutubeProbe(runner).probe_video(video_id)
+        self.assertIs(caught.exception, original)
+
+    def test_watch_page_removal_takes_precedence_over_end_timestamp(self) -> None:
+        runner, original = self.unavailable_runner()
+        player = json.loads(self.removal_page().partition(" = ")[2].removesuffix(";"))
+        ended = self.ended_broadcast_player("r2ORTHCeg_A")
+        player.update({key: value for key, value in ended.items() if key != "playabilityStatus"})
+        player["microformat"]["playerMicroformatRenderer"]["liveBroadcastDetails"] = {
+            "isLiveNow": False, "endTimestamp": "2000-01-01T00:00:00Z",
+        }
+        response = self.watch_response(self.player_page(player))
+        with patch("onlysavemevods.youtube.urlopen", return_value=response):
+            with self.assertRaises(ConfirmedVideoRemovalError) as caught:
+                YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+        self.assertIs(caught.exception.__cause__, original)
+
+    def test_confirmed_probe_errors_do_not_fetch_watch_page(self) -> None:
+        for error_type in (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError, ConfirmedLiveEndError):
+            with self.subTest(error_type=error_type):
+                original = error_type("ERROR: [youtube] r2ORTHCeg_A: Video unavailable")
+                runner = MagicMock()
+                runner.run_json.side_effect = original
+                with patch("onlysavemevods.youtube.urlopen") as opened:
+                    with self.assertRaises(error_type) as caught:
+                        YoutubeProbe(runner).probe_video("r2ORTHCeg_A")
+                opened.assert_not_called()
+                self.assertIs(caught.exception, original)
+
     def test_watch_page_new_interstitial_confirms_explicit_removal(self) -> None:
         reason = "This video has been removed by the uploader"
         self.assertEqual(
@@ -240,6 +449,8 @@ class YoutubeProbeTests(unittest.TestCase):
             "ERROR: [youtube] r2ORTHCeg_A: Video unavailable. Sign in to continue",
             "ERROR: [youtube] EeMqyZVAsMk: Video unavailable",
             "ERROR: [kick:live] r2ORTHCeg_A: Video unavailable",
+            "ERROR: [youtube] EeMqyZVAsMk: Sign in to confirm your age.",
+            "ERROR: [youtube] r2ORTHCeg_A: Sign in to confirm you are not a bot.",
         ):
             with self.subTest(message=message):
                 original = YtDlpError(message)

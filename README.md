@@ -500,9 +500,21 @@ policy. The button queues a request for the systemd app updater; it does not
 install inside the web process. A short-lived trigger file wakes the updater;
 the pending request stays in the mailbox for the scheduled retry if needed.
 
-After upgrading an existing systemd installation to a release with Force
-install, rerun `scripts/install-systemd.sh` once to install the updated path
-unit. App-only release updates do not replace root-owned systemd units.
+The privileged updater repairs its request watcher when it runs, including
+older path units that watched the persistent request instead of the temporary
+trigger. It preserves the root-owned updater service and its trusted policy.
+If an older installation leaves a force request queued, run this on the server:
+
+```bash
+sudo systemctl reset-failed onlysavemevods-app-update.service
+sudo systemctl start onlysavemevods-app-update.service
+sudo journalctl -u onlysavemevods-app-update.service -n 60 --no-pager
+```
+
+The queued force request stops and restarts the recording service itself.
+Versions predating watcher repair still need `scripts/install-systemd.sh` run
+once to refresh the path unit. App-only updates do not otherwise replace
+root-owned systemd units.
 
 The web process does not replace root-owned app files itself and its request
 cannot supply download URLs. The systemd updater resolves the requested tag
@@ -793,12 +805,15 @@ scripts/uninstall-systemd.sh
   advances or reaches the configured stale age. A stalled stream retains its
   resumable files and is monitored indefinitely. It resumes automatically if
   the edge advances, and is finalized only after repeated non-live checks, an
-  HLS end marker, or two explicit YouTube termination/removal confirmations.
-  If yt-dlp only reports `Video unavailable`, the app checks the watch page's
-  player error for an explicit removal message. Generic unavailability,
-  private-video, sign-in, and network errors do not confirm an end. Confirmed
-  removal stops independent audio retries; saved tracks are merged if they
-  validate, or kept for recovery with the recording marked ended.
+  HLS end marker, or two explicit YouTube end/termination/removal confirmations.
+  If yt-dlp reports `Video unavailable` or an age-verification requirement,
+  the app checks that video's watch page for an explicit removal message or
+  an ended broadcast with a past end timestamp. The video ID must match and
+  the page must explicitly report that the broadcast is no longer live.
+  Generic unavailability, private-video, sign-in, and network errors alone do
+  not confirm an end. A confirmed end stops independent audio retries; saved
+  tracks are merged if they validate, or kept for recovery with the recording
+  marked ended.
   Fragment inactivity counts saved fragment indices; growing playlist totals
   and advancing remote timestamps cannot reset it. With a locked YouTube
   video/audio format pair, a
@@ -814,8 +829,9 @@ scripts/uninstall-systemd.sh
   is restored from kept fragments before retry; if that is unsafe, the current
   segment is preserved and recording moves to a new segment. The app merges
   tracks only after YouTube confirms the broadcast ended, then checks that the
-  required audio and video tracks are present with similar durations. Incomplete
-  inputs are kept for recovery and finalization is retried.
+  required audio and video tracks are present and each keeps its saved duration.
+  Unequal track durations are preserved without cutting off the longer track.
+  Incomplete inputs are kept for recovery and finalization is retried.
   The dashboard also keeps each track's highest **reported** yt-dlp fragment
   index and count in `state/live-fragment-high-water/` across reconnects and
   service restarts. These counters are local to a yt-dlp run, so a high value
@@ -853,7 +869,7 @@ scripts/uninstall-systemd.sh
   segments also use `--live-from-start` to prefer duplicates over missing
   content. During finalization, every leftover is probed and only the longest
   recoverable video and audio streams are selected. The remuxed output must
-  contain exactly those streams and retain their common duration before source
+  contain exactly those streams and retain each track's duration before source
   files or fragments are removed. Failed probing or validation leaves all
   recoverable inputs untouched.
 - `-k` is not used by default. Add it to `extra_yt_dlp_args` only if you want

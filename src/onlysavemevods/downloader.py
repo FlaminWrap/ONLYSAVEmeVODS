@@ -7,6 +7,7 @@ from typing import Awaitable, Callable, Literal, Mapping, Protocol
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -76,6 +77,7 @@ from .state import PostProcessingJobRecord, StateStore, StreamRecord
 from .transcription import transcribe_media_file, transcription_config_for_channel
 from .twitch_ad_repair import repair_twitch_ads_for_media
 from .youtube import (
+    ConfirmedLiveEndError,
     ConfirmedLiveTerminationError,
     ConfirmedVideoRemovalError,
     TerminalVideoUnavailableError,
@@ -1534,12 +1536,16 @@ class DownloadManager:
 
                 try:
                     latest = await self.probe_video(post_exit_probe_target(observed_stream))
-                except (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError) as exc:
+                except (
+                    ConfirmedLiveEndError,
+                    ConfirmedLiveTerminationError,
+                    ConfirmedVideoRemovalError,
+                ) as exc:
                     latest = None
                     consecutive_non_live_probes += 1
                     confirmed_source_end_seen = True
                     self.logger.warning(
-                        "Stalled YouTube stream %s was explicitly removed or terminated "
+                        "Stalled YouTube stream %s was confirmed ended, removed or terminated "
                         "(confirmation %s/2): %s",
                         stream.video_id,
                         min(consecutive_non_live_probes, 2),
@@ -3417,11 +3423,15 @@ class DownloadManager:
                     offset,
                 )
                 latest = await self.probe_video(post_exit_probe_target(stream))
-            except (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError) as exc:
+            except (
+                ConfirmedLiveEndError,
+                ConfirmedLiveTerminationError,
+                ConfirmedVideoRemovalError,
+            ) as exc:
                 consecutive_non_live_probes += 1
                 confirmed_source_end_seen = True
                 self.logger.warning(
-                    "Post-exit probe confirmed YouTube removal or termination for %s "
+                    "Post-exit probe confirmed YouTube end, removal or termination for %s "
                     "at +%ss (%s/2): %s",
                     stream.video_id,
                     offset,
@@ -3588,7 +3598,10 @@ class DownloadManager:
             stream.video_id,
             exc,
         )
-        if isinstance(exc, (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError)):
+        if isinstance(
+            exc,
+            (ConfirmedLiveEndError, ConfirmedLiveTerminationError, ConfirmedVideoRemovalError),
+        ):
             record = self.state.get_stream(stream.video_id)
             if record is not None and record.status == "waiting_retry":
                 self.state.mark_exited(stream.video_id, -1)
@@ -3638,6 +3651,12 @@ class DownloadManager:
         for attempt in range(2):
             try:
                 latest = await self.probe_video(stream.url)
+            except (
+                ConfirmedLiveEndError,
+                ConfirmedLiveTerminationError,
+                ConfirmedVideoRemovalError,
+            ):
+                latest = None
             except Exception as exc:
                 self.logger.warning(
                     "Unable to confirm the old session %s ended: %s",
@@ -3645,7 +3664,9 @@ class DownloadManager:
                     exc,
                 )
                 return False
-            if latest.video_id != stream.video_id or latest.is_live:
+            if latest is not None and (
+                latest.video_id != stream.video_id or latest.is_live
+            ):
                 return False
             if attempt == 0:
                 await self.sleep(max(1, min(self.config.poll_interval_seconds, 30)))
@@ -3818,6 +3839,7 @@ class DownloadManager:
                 try:
                     latest = await self.probe_video(post_exit_probe_target(stream))
                 except (
+                    ConfirmedLiveEndError,
                     ConfirmedLiveTerminationError,
                     ConfirmedVideoRemovalError,
                     KickChannelOfflineError,
@@ -5282,7 +5304,11 @@ class DownloadManager:
                 raise VideoProbeError(
                     "Locked YouTube split format requires both video and audio tracks"
                 )
-            validate_finalize_input_coverage(selected_streams)
+            if any(
+                not math.isfinite(stream.duration) or stream.duration <= 0
+                for stream in selected_streams
+            ):
+                raise VideoProbeError("Selected media stream has an invalid duration")
         except VideoProbeError as exc:
             self.logger.warning(
                 "Unable to safely select partial segment inputs; preserving all "
@@ -5321,8 +5347,8 @@ class DownloadManager:
         for stream in selected_streams:
             command.extend(["-map", f"{stream.input_index}:{stream.stream_index}"])
         command.extend(["-c", "copy"])
-        if len({stream.codec_type for stream in selected_streams}) > 1:
-            command.append("-shortest")
+        # Independent recorders can stop at different fragment boundaries. Copy
+        # each complete track so a longer audio or video tail stays recoverable.
         command.append(str(temp_output))
         self.logger.debug("ffmpeg finalize command: %s", command_for_log(command))
 
@@ -6098,6 +6124,11 @@ def probe_finalize_media_streams(
             raise VideoProbeError(f"Unable to inspect finalization input {path}") from exc
 
         found_media = False
+        media_stream_count = sum(
+            isinstance(raw_stream, Mapping)
+            and str(raw_stream.get("codec_type") or "").casefold() in {"audio", "video"}
+            for raw_stream in raw_streams
+        )
         for raw_stream in raw_streams:
             if not isinstance(raw_stream, Mapping):
                 continue
@@ -6111,7 +6142,12 @@ def probe_finalize_media_streams(
                 raise VideoProbeError(
                     f"Invalid stream index while inspecting {path}"
                 ) from exc
-            duration = finalize_stream_duration(raw_stream, format_duration)
+            # A muxed container's duration is its longest track. Using that
+            # value for every track can hide a shortened audio or video tail.
+            duration = finalize_stream_duration(
+                raw_stream,
+                format_duration if media_stream_count == 1 else 0.0,
+            )
             if duration <= 0:
                 duration = probe_packet_duration(path, stream_index, ffprobe_path)
             if duration <= 0:
@@ -6325,25 +6361,36 @@ def validate_finalize_output(
             f"Finalized output contained unexpected media streams: {actual_counts}"
         )
 
-    expected_duration = min(stream.duration for stream in selected_streams)
-    output_durations = [
-        stream.duration
+    actual_durations = {
+        stream.codec_type: stream.duration
         for stream in output_streams
         if stream.codec_type in expected_types
-    ]
-    actual_duration = min(output_durations)
-    tolerance = min(
-        FINALIZE_DURATION_TOLERANCE_SECONDS,
-        max(0.25, expected_duration * 0.01),
-    )
-    if actual_duration + tolerance < expected_duration:
-        raise VideoProbeError(
-            "Finalized output was shorter than the selected recoverable media: "
-            f"expected={expected_duration:.3f}s actual={actual_duration:.3f}s "
-            f"tolerance={tolerance:.3f}s"
+    }
+    # Comparing only the shortest input/output track hides truncation of the
+    # longer one. Validate each output against its selected source instead.
+    for selected in selected_streams:
+        expected_duration = selected.duration
+        actual_duration = actual_durations[selected.codec_type]
+        if any(
+            not math.isfinite(duration) or duration <= 0
+            for duration in (expected_duration, actual_duration)
+        ):
+            raise VideoProbeError(
+                f"Invalid {selected.codec_type} duration while validating finalized output"
+            )
+        tolerance = min(
+            FINALIZE_DURATION_TOLERANCE_SECONDS,
+            max(0.25, expected_duration * 0.01),
         )
+        if actual_duration + tolerance < expected_duration:
+            raise VideoProbeError(
+                "Finalized output was shorter than the selected recoverable "
+                f"{selected.codec_type} media: "
+                f"expected={expected_duration:.3f}s actual={actual_duration:.3f}s "
+                f"tolerance={tolerance:.3f}s"
+            )
     return FinalizeOutputValidation(
-        duration=actual_duration,
+        duration=max(actual_durations.values()),
         audio_streams=audio_streams,
         video_streams=video_streams,
     )

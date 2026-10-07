@@ -44,6 +44,10 @@ class ConfirmedVideoRemovalError(TerminalVideoUnavailableError):
     """Raised when YouTube explicitly says the requested video was removed."""
 
 
+class ConfirmedLiveEndError(TerminalVideoUnavailableError):
+    """Raised when the requested video explicitly reports its broadcast ended."""
+
+
 CONFIRMED_LIVE_TERMINATION_PATTERN = re.compile(
     r"^ERROR:\s*\[youtube\]\s+[A-Za-z0-9_-]{11}:[^\n]*"
     r"\blive\s+stream\s+(?:has\s+been|was|is)\s+terminated\s+due\s+to\b",
@@ -62,6 +66,12 @@ GENERIC_VIDEO_UNAVAILABLE_PATTERN = re.compile(
     r"^(?:yt-dlp failed with code \d+:[ \t]*)?"
     r"ERROR:[ \t]*\[youtube\][ \t]+(?P<video_id>[A-Za-z0-9_-]{11}):"
     r"[ \t]*Video unavailable\.?[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+AGE_RESTRICTED_VIDEO_PATTERN = re.compile(
+    r"^(?:yt-dlp failed with code \d+:[ \t]*)?"
+    r"ERROR:[ \t]*\[youtube\][ \t]+(?P<video_id>[A-Za-z0-9_-]{11}):"
+    r"[^\r\n]*\bSign in to confirm your age\b[^\r\n]*$",
     re.IGNORECASE | re.MULTILINE,
 )
 INITIAL_PLAYER_RESPONSE_PATTERN = re.compile(
@@ -336,18 +346,37 @@ class YoutubeProbe:
         try:
             return self.runner.run_json(args)
         except YtDlpError as exc:
-            match = GENERIC_VIDEO_UNAVAILABLE_PATTERN.search(str(exc))
+            if isinstance(
+                exc,
+                (
+                    ConfirmedLiveTerminationError,
+                    ConfirmedVideoRemovalError,
+                    ConfirmedLiveEndError,
+                ),
+            ):
+                raise
+            match = GENERIC_VIDEO_UNAVAILABLE_PATTERN.search(str(exc)) or (
+                AGE_RESTRICTED_VIDEO_PATTERN.search(str(exc))
+            )
             video_id = extract_video_id(target)
             if match is None or video_id != match.group("video_id"):
                 raise
-            reason = self._watch_page_removal_reason(video_id)
-            if reason:
-                raise ConfirmedVideoRemovalError(
-                    f"YouTube watch page confirmed removal of {video_id}: {reason}"
-                ) from exc
+            page = self._read_watch_page(video_id)
+            if page is not None:
+                reason = watch_page_video_removal_reason(page, video_id)
+                if reason:
+                    raise ConfirmedVideoRemovalError(
+                        f"YouTube watch page confirmed removal of {video_id}: {reason}"
+                    ) from exc
+                ended_at = watch_page_confirmed_live_end(page, video_id)
+                if ended_at is not None:
+                    raise ConfirmedLiveEndError(
+                        f"YouTube watch page confirmed broadcast end of {video_id} "
+                        f"at {ended_at.isoformat()}"
+                    ) from exc
             raise
 
-    def _watch_page_removal_reason(self, video_id: str) -> str | None:
+    def _read_watch_page(self, video_id: str) -> str | None:
         request = Request(
             f"https://www.youtube.com/watch?v={video_id}&hl=en",
             headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
@@ -364,12 +393,10 @@ class YoutubeProbe:
                 payload = response.read(WATCH_PAGE_READ_LIMIT + 1)
             if len(payload) > WATCH_PAGE_READ_LIMIT:
                 return None
-            return watch_page_video_removal_reason(
-                payload.decode("utf-8", "replace"), video_id
-            )
+            return payload.decode("utf-8", "replace")
         except (OSError, ValueError, TypeError, RecursionError) as exc:
             LOGGER.debug(
-                "Unable to confirm YouTube removal from watch page for %s: %s",
+                "Unable to read YouTube watch page for %s: %s",
                 video_id,
                 exc,
             )
@@ -449,16 +476,21 @@ def live_stream_from_info(info: dict[str, Any], *, fallback_url: str = "") -> Li
     )
 
 
-def watch_page_video_removal_reason(page: str, video_id: str) -> str | None:
-    """Read an explicit removal reason from the requested video's player error."""
+def _watch_page_player(page: str) -> dict[str, Any] | None:
     match = INITIAL_PLAYER_RESPONSE_PATTERN.search(page)
     if match is None:
         return None
     try:
         player, _end = json.JSONDecoder().raw_decode(page[match.end():].lstrip())
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
-    if not isinstance(player, dict):
+    return player if isinstance(player, dict) else None
+
+
+def watch_page_video_removal_reason(page: str, video_id: str) -> str | None:
+    """Read an explicit removal reason from the requested video's player error."""
+    player = _watch_page_player(page)
+    if player is None:
         return None
     details = player.get("videoDetails")
     if isinstance(details, dict) and details.get("videoId") not in (None, video_id):
@@ -499,6 +531,61 @@ def watch_page_video_removal_reason(page: str, video_id: str) -> str | None:
         (reason for reason in reasons if VIDEO_REMOVAL_REASON_PATTERN.search(reason)),
         None,
     )
+
+
+def watch_page_confirmed_live_end(
+    page: str,
+    video_id: str,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Require an explicit past end for the exact requested broadcast."""
+    player = _watch_page_player(page)
+    if player is None:
+        return None
+    details = player.get("videoDetails")
+    if not isinstance(details, dict) or details.get("videoId") != video_id:
+        return None
+    microformat = player.get("microformat")
+    renderer = (
+        microformat.get("playerMicroformatRenderer")
+        if isinstance(microformat, dict)
+        else None
+    )
+    if not isinstance(renderer, dict):
+        return None
+    if renderer.get("externalVideoId") not in (None, video_id):
+        return None
+    broadcast = renderer.get("liveBroadcastDetails")
+    if not isinstance(broadcast, dict) or broadcast.get("isLiveNow") is not False:
+        return None
+    for metadata in (player, details, renderer, broadcast):
+        for key in ("isLive", "isLiveNow", "isUpcoming"):
+            if key in metadata and metadata[key] is not False:
+                return None
+
+    def timestamp(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                return None
+            return parsed.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            return None
+
+    ended_at = timestamp(broadcast.get("endTimestamp"))
+    current_time = now if now is not None else datetime.now(timezone.utc)
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        return None
+    if ended_at is None or ended_at >= current_time:
+        return None
+    if "startTimestamp" in broadcast:
+        started_at = timestamp(broadcast["startTimestamp"])
+        if started_at is None or started_at > ended_at:
+            return None
+    return ended_at
 
 
 def _player_error_text(value: object) -> str:

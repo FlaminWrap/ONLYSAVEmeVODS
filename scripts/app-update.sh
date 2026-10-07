@@ -8,6 +8,9 @@ CONFIG_FILE="${ONLYSAVEMEVODS_CONFIG_FILE:-${INSTALL_DIR}/config.toml}"
 SERVICE_NAME="${ONLYSAVEMEVODS_SERVICE_NAME:-onlysavemevods.service}"
 APP_UPDATE_STATE_DIR="${ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR:-${ONLYSAVEMEVODS_STATE_DIR:-${INSTALL_DIR}/state}}"
 APP_UPDATE_TRIGGER_FILE="${APP_UPDATE_STATE_DIR}/app-update-trigger"
+SYSTEMD_UNIT_DIR="${ONLYSAVEMEVODS_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+APP_UPDATE_SERVICE_NAME="${ONLYSAVEMEVODS_APP_UPDATE_SERVICE_NAME:-onlysavemevods-app-update.service}"
+APP_UPDATE_PATH_NAME="${ONLYSAVEMEVODS_APP_UPDATE_PATH_NAME:-onlysavemevods-app-update.path}"
 UPDATE_LOCK_FILE="${ONLYSAVEMEVODS_UPDATE_LOCK_FILE:-${INSTALL_DIR}/.update.lock}"
 TRUSTED_REPOSITORY="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY:-FlaminWrap/ONLYSAVEmeVODS}"
 TRUSTED_MODE="${ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE:-manual}"
@@ -61,6 +64,52 @@ consume_update_trigger() {
   fi
 }
 
+repair_update_watcher() {
+  # App-only updates replace this script, but leave root-owned systemd units
+  # installed by earlier releases in place. Keep their trusted service policy;
+  # migrate only the watcher to the trigger consumed above.
+  local service_unit="${SYSTEMD_UNIT_DIR}/${APP_UPDATE_SERVICE_NAME}"
+  local path_unit="${SYSTEMD_UNIT_DIR}/${APP_UPDATE_PATH_NAME}"
+  [[ -f "${service_unit}" ]] || return 0
+
+  local generated_unit changed=0
+  generated_unit="$(mktemp "${SYSTEMD_UNIT_DIR}/.${APP_UPDATE_PATH_NAME}.XXXXXX")" || die "Could not prepare app update watcher repair."
+  cat >"${generated_unit}" <<EOF
+[Unit]
+Description=Watch for ONLYSAVEmeVODS app update requests
+
+[Path]
+PathExists=${APP_UPDATE_TRIGGER_FILE}
+Unit=${APP_UPDATE_SERVICE_NAME}
+
+[Install]
+WantedBy=multi-user.target
+
+EOF
+  if ! cmp -s -- "${generated_unit}" "${path_unit}"; then
+    chmod 0644 "${generated_unit}"
+    if ! mv -T -- "${generated_unit}" "${path_unit}"; then
+      rm -f -- "${generated_unit}"
+      die "Could not install repaired app update watcher; request remains pending."
+    fi
+    changed=1
+  else
+    rm -f -- "${generated_unit}"
+  fi
+
+  if [[ "${changed}" == "0" ]] && \
+    systemctl is-active --quiet "${APP_UPDATE_PATH_NAME}" && \
+    ! systemctl is-failed --quiet "${APP_UPDATE_SERVICE_NAME}"; then
+    return 0
+  fi
+
+  echo "Repairing ${APP_UPDATE_PATH_NAME} to watch ${APP_UPDATE_TRIGGER_FILE}..."
+  systemctl daemon-reload || die "Could not reload app update watcher; request remains pending."
+  systemctl reset-failed "${APP_UPDATE_SERVICE_NAME}" "${APP_UPDATE_PATH_NAME}" || die "Could not reset app updater units; request remains pending."
+  systemctl enable "${APP_UPDATE_PATH_NAME}" || die "Could not enable app update watcher; request remains pending."
+  systemctl restart "${APP_UPDATE_PATH_NAME}" || die "Could not start app update watcher; request remains pending."
+}
+
 service_is_active() {
   systemctl is-active --quiet "${SERVICE_NAME}"
 }
@@ -110,6 +159,7 @@ consume_update_trigger
 [[ -d "${APP_DIR}" ]] || die "Application directory not found: ${APP_DIR}"
 [[ -f "${CONFIG_FILE}" ]] || die "Config file not found: ${CONFIG_FILE}"
 take_lock
+repair_update_watcher
 
 POLICY_ARGS=(
   --trusted-repository "${TRUSTED_REPOSITORY}"

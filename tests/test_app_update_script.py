@@ -11,6 +11,18 @@ SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "app-update.sh"
 
 
 class AppUpdateScriptTests(unittest.TestCase):
+    @staticmethod
+    def watcher_unit(state_dir: Path, service_name: str) -> str:
+        return (
+            "[Unit]\n"
+            "Description=Watch for ONLYSAVEmeVODS app update requests\n\n"
+            "[Path]\n"
+            f"PathExists={state_dir}/app-update-trigger\n"
+            f"Unit={service_name}\n\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n\n"
+        )
+
     def run_updater(
         self,
         *,
@@ -24,6 +36,14 @@ class AppUpdateScriptTests(unittest.TestCase):
         lock_busy: bool = False,
         pending_request: bool = True,
         auto_creates_request: bool = False,
+        watcher: str | None = None,
+        watcher_active: bool = True,
+        updater_failed: bool = False,
+        repair_fail_command: str = "",
+        runs: int = 1,
+        observed_units: dict[str, object] | None = None,
+        updater_service_name: str = "onlysavemevods-app-update.service",
+        updater_path_name: str = "onlysavemevods-app-update.path",
     ) -> tuple[subprocess.CompletedProcess[str], list[str], bool]:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -42,6 +62,31 @@ class AppUpdateScriptTests(unittest.TestCase):
             trigger.touch()
             if pending_request:
                 (state_dir / "app-update-request.json").write_text("{}", encoding="utf-8")
+
+            unit_dir = root / "units"
+            unit_dir.mkdir()
+            service_unit = unit_dir / updater_service_name
+            path_unit = unit_dir / updater_path_name
+            trusted_service_text = (
+                "[Service]\nType=oneshot\n"
+                'Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_REPOSITORY=trusted/repo"\n'
+                'Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_MODE=manual"\n'
+                'Environment="ONLYSAVEMEVODS_TRUSTED_APP_UPDATE_INCLUDE_PRERELEASES=false"\n'
+                "ExecStart=/root/trusted-app-update.sh\n"
+            )
+            if watcher is not None:
+                service_unit.write_text(trusted_service_text, encoding="utf-8")
+                if watcher != "missing":
+                    path_text = self.watcher_unit(state_dir, updater_service_name)
+                    if watcher == "legacy":
+                        path_text = path_text.replace("app-update-trigger", "app-update-request.json")
+                    path_unit.write_text(path_text, encoding="utf-8")
+            path_active_marker = root / "path-active"
+            if watcher_active:
+                path_active_marker.touch()
+            updater_failed_marker = root / "updater-failed"
+            if updater_failed:
+                updater_failed_marker.touch()
 
             fake_python = venv_bin / "python"
             fake_python.write_text(
@@ -70,10 +115,19 @@ class AppUpdateScriptTests(unittest.TestCase):
             systemctl = fake_bin / "systemctl"
             systemctl.write_text(
                 "#!/usr/bin/env bash\n"
-                "printf 'systemctl %s\\n' \"${1:-}\" >>\"${FAKE_LOG}\"\n"
-                "if [[ \"${1:-}\" == is-active ]]; then\n"
-                "  [[ \"${FAKE_SERVICE_ACTIVE}\" == 1 ]]\n"
-                "fi\n",
+                "if [[ \"${FAKE_DETAILED_SYSTEMCTL}\" == 1 ]]; then\n"
+                "  printf 'systemctl %s\\n' \"$*\" >>\"${FAKE_LOG}\"\n"
+                "else printf 'systemctl %s\\n' \"${1:-}\" >>\"${FAKE_LOG}\"; fi\n"
+                "if [[ -n \"${FAKE_REPAIR_FAIL_COMMAND}\" && \"${1:-}\" == \"${FAKE_REPAIR_FAIL_COMMAND}\" ]]; then exit 5; fi\n"
+                "case \"${1:-}\" in\n"
+                "  is-active)\n"
+                "    if [[ \"${3:-}\" == \"${ONLYSAVEMEVODS_APP_UPDATE_PATH_NAME}\" ]]; then\n"
+                "      [[ -f \"${FAKE_PATH_ACTIVE_MARKER}\" ]]\n"
+                "    else [[ \"${FAKE_SERVICE_ACTIVE}\" == 1 ]]; fi ;;\n"
+                "  is-failed) [[ -f \"${FAKE_UPDATER_FAILED_MARKER}\" ]] ;;\n"
+                "  reset-failed) rm -f \"${FAKE_UPDATER_FAILED_MARKER}\" ;;\n"
+                "  restart) touch \"${FAKE_PATH_ACTIVE_MARKER}\" ;;\n"
+                "esac\n",
                 encoding="utf-8",
             )
             systemctl.chmod(0o755)
@@ -94,6 +148,9 @@ class AppUpdateScriptTests(unittest.TestCase):
                     "ONLYSAVEMEVODS_VENV_DIR": str(venv_bin.parent),
                     "ONLYSAVEMEVODS_CONFIG_FILE": str(config_file),
                     "ONLYSAVEMEVODS_APP_UPDATE_STATE_DIR": str(state_dir),
+                    "ONLYSAVEMEVODS_SYSTEMD_UNIT_DIR": str(unit_dir),
+                    "ONLYSAVEMEVODS_APP_UPDATE_SERVICE_NAME": updater_service_name,
+                    "ONLYSAVEMEVODS_APP_UPDATE_PATH_NAME": updater_path_name,
                     "FAKE_RECREATE_TRIGGER": "1" if recreate_trigger else "0",
                     "FAKE_AUTO_CREATES_REQUEST": "1" if auto_creates_request else "0",
                     "FAKE_LOG": str(log_file),
@@ -102,16 +159,32 @@ class AppUpdateScriptTests(unittest.TestCase):
                     "FAKE_IDLE_CODE": str(idle_code),
                     "FAKE_INTENT_CODE": str(intent_code),
                     "FAKE_APPLY_CODE": str(apply_code),
+                    "FAKE_DETAILED_SYSTEMCTL": "1" if watcher is not None else "0",
+                    "FAKE_REPAIR_FAIL_COMMAND": repair_fail_command,
+                    "FAKE_PATH_ACTIVE_MARKER": str(path_active_marker),
+                    "FAKE_UPDATER_FAILED_MARKER": str(updater_failed_marker),
                 }
             )
-            result = subprocess.run(
-                ["bash", str(test_script)],
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
+            for _ in range(runs):
+                result = subprocess.run(
+                    ["bash", str(test_script)],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
             calls = log_file.read_text(encoding="utf-8").splitlines() if log_file.exists() else []
+            if observed_units is not None:
+                observed_units.update(
+                    {
+                        "service": service_unit.read_text(encoding="utf-8") if service_unit.exists() else None,
+                        "original_service": trusted_service_text,
+                        "path": path_unit.read_text(encoding="utf-8") if path_unit.exists() else None,
+                        "expected_path": self.watcher_unit(state_dir, updater_service_name),
+                        "path_mode": path_unit.stat().st_mode & 0o777 if path_unit.exists() else None,
+                        "request_exists": (state_dir / "app-update-request.json").exists(),
+                    }
+                )
             return result, calls, trigger.exists()
 
     def test_force_request_stops_busy_service_then_restarts_after_apply(self) -> None:
@@ -193,6 +266,117 @@ class AppUpdateScriptTests(unittest.TestCase):
                 self.assertEqual(calls, [])
                 self.assertNotIn("systemctl stop", calls)
                 self.assertEqual(result.returncode, 1 if options.get("missing_python") else 0)
+
+    def test_legacy_or_missing_watcher_is_repaired_without_pending_request(self) -> None:
+        for watcher in ("legacy", "missing"):
+            with self.subTest(watcher=watcher):
+                units: dict[str, object] = {}
+                result, calls, trigger_exists = self.run_updater(
+                    watcher=watcher,
+                    pending_request=False,
+                    observed_units=units,
+                    runs=2,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(units["path"], units["expected_path"])
+                self.assertEqual(units["path_mode"], 0o644)
+                self.assertEqual(units["service"], units["original_service"])
+                self.assertEqual(calls.count("systemctl daemon-reload"), 1)
+                self.assertEqual(calls.count("systemctl reset-failed onlysavemevods-app-update.service onlysavemevods-app-update.path"), 1)
+                self.assertEqual(calls.count("systemctl enable onlysavemevods-app-update.path"), 1)
+                self.assertEqual(calls.count("systemctl restart onlysavemevods-app-update.path"), 1)
+                self.assertNotIn("systemctl stop onlysavemevods.service", calls)
+                self.assertFalse(trigger_exists)
+
+    def test_current_active_watcher_is_left_running(self) -> None:
+        units: dict[str, object] = {}
+        result, calls, _ = self.run_updater(
+            watcher="current", pending_request=False, observed_units=units
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(units["service"], units["original_service"])
+        self.assertNotIn("systemctl daemon-reload", calls)
+        self.assertFalse(any(call.startswith("systemctl restart") for call in calls))
+        self.assertFalse(any(call.startswith("systemctl enable") for call in calls))
+
+    def test_current_failed_or_inactive_watcher_is_restarted_once(self) -> None:
+        for options in ({"watcher_active": False}, {"updater_failed": True}):
+            with self.subTest(options=options):
+                units: dict[str, object] = {}
+                result, calls, _ = self.run_updater(
+                    watcher="current",
+                    pending_request=False,
+                    observed_units=units,
+                    runs=2,
+                    **options,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(units["service"], units["original_service"])
+                self.assertEqual(calls.count("systemctl daemon-reload"), 1)
+                self.assertEqual(calls.count("systemctl restart onlysavemevods-app-update.path"), 1)
+
+    def test_watcher_repair_honors_root_unit_names(self) -> None:
+        units: dict[str, object] = {}
+        result, calls, _ = self.run_updater(
+            watcher="legacy",
+            pending_request=False,
+            observed_units=units,
+            updater_service_name="trusted-app-update.service",
+            updater_path_name="trusted-app-update.path",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(units["path"], units["expected_path"])
+        self.assertEqual(units["service"], units["original_service"])
+        self.assertIn("systemctl reset-failed trusted-app-update.service trusted-app-update.path", calls)
+        self.assertIn("systemctl restart trusted-app-update.path", calls)
+
+    def test_watcher_repair_failure_keeps_request_and_main_service_running(self) -> None:
+        for command in ("daemon-reload", "reset-failed", "enable", "restart"):
+            with self.subTest(command=command):
+                units: dict[str, object] = {}
+                result, calls, _ = self.run_updater(
+                    intent="force",
+                    watcher="legacy",
+                    repair_fail_command=command,
+                    observed_units=units,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("request remains pending", result.stderr)
+                self.assertTrue(units["request_exists"])
+                self.assertEqual(units["service"], units["original_service"])
+                self.assertNotIn("systemctl stop onlysavemevods.service", calls)
+                self.assertNotIn("python apply", calls)
+
+    def test_no_watcher_is_created_without_updater_service_unit(self) -> None:
+        units: dict[str, object] = {}
+        result, calls, _ = self.run_updater(pending_request=False, observed_units=units)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(units["path"])
+        self.assertIsNone(units["service"])
+        self.assertFalse(any(call.startswith("systemctl") for call in calls))
+
+    def test_watcher_repair_requires_essential_paths_and_update_lock(self) -> None:
+        for options in ({"missing_python": True}, {"lock_busy": True}):
+            with self.subTest(options=options):
+                units: dict[str, object] = {}
+                result, calls, trigger_exists = self.run_updater(
+                    watcher="legacy", observed_units=units, **options
+                )
+
+                self.assertEqual(result.returncode, 1 if options.get("missing_python") else 0)
+                self.assertEqual(calls, [])
+                self.assertFalse(trigger_exists)
+                self.assertEqual(units["service"], units["original_service"])
+                self.assertEqual(
+                    units["path"],
+                    str(units["expected_path"]).replace("app-update-trigger", "app-update-request.json"),
+                )
 
 
 if __name__ == "__main__":
