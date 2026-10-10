@@ -343,6 +343,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     ),
                     logger=NULL_LOGGER,
                 )
+                manager._schedule_finalization_retry = MagicMock()
                 manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
                 manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
                 audio_task = MagicMock()
@@ -357,11 +358,13 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     state.close()
 
                 self.assertEqual(probe.calls, 2)
-                self.assertEqual(status, "ended")
+                self.assertEqual(status, "finalization_failed")
                 manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
                 self.assertEqual(saved_audio.read_bytes(), b"saved audio")
                 self.assertEqual(saved_video.read_bytes(), b"saved video")
-                self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
+                manager._schedule_finalization_retry.assert_called_once_with(
+                    stream, 1, expected_status="finalization_failed"
+                )
 
     async def test_stalled_explicit_youtube_end_resets_after_error_or_live_reply(self) -> None:
         for end_error in (ConfirmedVideoRemovalError, ConfirmedLiveEndError):
@@ -506,11 +509,15 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                 saved_video = directory / "segment-001.f299.mp4.part"
                 saved_video.write_bytes(b"recoverable saved video")
                 probe = SequenceProbe([end_error("YouTube explicitly confirmed this stream ended")])
+                async def sleep(_delay: float) -> None:
+                    if probe.calls:
+                        raise asyncio.CancelledError
+
                 manager = DownloadManager(
                     config,
                     state,
                     probe,  # type: ignore[arg-type]
-                    sleep_func=AsyncMock(),
+                    sleep_func=sleep,
                     probe_video_func=probe.probe_video_async,
                     logger=NULL_LOGGER,
                 )
@@ -519,12 +526,13 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     await manager.finish_ended_stream(
                         stream, 1, expected_status="checking_after_exit", end_confirmed=True
                     )
-                    await asyncio.wait_for(manager._finalization_retry_tasks[stream.video_id], 1)
+                    with self.assertRaises(asyncio.CancelledError):
+                        await asyncio.wait_for(manager._finalization_retry_tasks[stream.video_id], 1)
                     status = state.get_stream(stream.video_id).status
                 finally:
                     state.close()
 
-                self.assertEqual(status, "ended")
+                self.assertEqual(status, "finalization_failed")
                 self.assertEqual(probe.calls, 1)
                 self.assertEqual(saved_video.read_bytes(), b"recoverable saved video")
                 self.assertEqual(manager.finalize_ended_segment.await_count, 2)
@@ -666,9 +674,6 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
             manager.finish_ended_stream.assert_awaited_once()
             self.assertTrue(
                 manager.finish_ended_stream.await_args.kwargs["stop_draining_audio"]
-            )
-            self.assertTrue(
-                manager.finish_ended_stream.await_args.kwargs["end_with_recoverable_media"]
             )
             self.assertFalse(
                 manager.finish_ended_stream.await_args.kwargs["allow_chat_replay"]
@@ -1340,6 +1345,7 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     probe_video_func=probe.probe_video_async,
                     logger=NULL_LOGGER,
                 )
+                manager._schedule_finalization_retry = MagicMock()
                 manager.finalize_ended_segment = AsyncMock(return_value=False)  # type: ignore[method-assign]
                 manager._stop_draining_audio = AsyncMock()  # type: ignore[method-assign]
                 fake_audio_task = MagicMock()
@@ -1356,13 +1362,15 @@ class PostExitTests(unittest.IsolatedAsyncioTestCase):
                     state.close()
 
                 self.assertEqual(probe.calls, 2)
-                self.assertEqual(status, "ended")
+                self.assertEqual(status, "finalization_failed")
                 self.assertTrue(draining.audio_end_confirmed)
                 manager._stop_draining_audio.assert_awaited_once_with(stream.video_id)
                 self.assertEqual(audio.read_bytes(), b"saved audio")
                 self.assertEqual(video.read_bytes(), b"saved video")
-                self.assertTrue(any("available for recovery" in event.message for event in events))
-                self.assertNotIn(stream.video_id, manager._finalization_retry_tasks)
+                self.assertTrue(any("preserving media tracks for recovery" in event.message for event in events))
+                manager._schedule_finalization_retry.assert_called_once_with(
+                    stream, 1, expected_status="finalization_failed"
+                )
 
     async def test_single_explicit_youtube_end_is_not_confirmed(self) -> None:
         for end_error in (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError, ConfirmedLiveEndError):

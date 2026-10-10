@@ -323,6 +323,30 @@ class StateStore:
 
     def reconcile_stale_downloads(self) -> None:
         now = utc_now()
+        finalizing_rows = self.conn.execute(
+            """
+            SELECT video_id, segment_index
+            FROM streams WHERE status = 'finalizing'
+            """
+        ).fetchall()
+        self.conn.execute(
+            """
+            UPDATE streams
+            SET status = 'finalization_failed', updated_at = ?,
+                youtube_stale_media_sequence = NULL,
+                youtube_stale_edge_at = '', youtube_stale_detected_at = ''
+            WHERE status = 'finalizing'
+            """,
+            (now,),
+        )
+        for row in finalizing_rows:
+            self._insert_stream_event(
+                row["video_id"],
+                "Finalization interrupted by service restart; saved media preserved for retry",
+                level="warning",
+                segment_index=int(row["segment_index"]),
+                created_at=now,
+            )
         file_operation_rows = self.conn.execute(
             """
             SELECT video_id, segment_index, status
@@ -556,7 +580,7 @@ class StateStore:
                 updated_at = ?,
                 exit_code = NULL
             WHERE video_id = ?
-              AND status NOT IN ('downloading', 'deleting', 'cleaning_fragments')
+              AND status NOT IN ('downloading', 'deleting', 'cleaning_fragments', 'finalizing')
             """,
             (segment_index, now, now, stream.video_id),
         )
@@ -589,6 +613,24 @@ class StateStore:
             WHERE video_id = ? AND status = ?
             """,
             (new_status, now, video_id, expected_status),
+        )
+        self.conn.commit()
+        return bool(cursor.rowcount)
+
+    def mark_finalization_failed(self, video_id: str) -> bool:
+        """Preserve a confirmed ended recording whose saved media needs recovery."""
+
+        cursor = self.conn.execute(
+            """
+            UPDATE streams
+            SET status = 'finalization_failed', updated_at = ?,
+                youtube_stale_media_sequence = NULL,
+                youtube_stale_edge_at = '', youtube_stale_detected_at = ''
+            WHERE video_id = ? AND status IN (
+                'finalizing', 'checking_after_exit', 'stalled', 'finalization_failed'
+            )
+            """,
+            (utc_now(), video_id),
         )
         self.conn.commit()
         return bool(cursor.rowcount)
@@ -735,7 +777,7 @@ class StateStore:
         assert record is not None
         return record
 
-    def mark_vod_downloading(self, stream: LiveStream, *, message: str = "Started VOD download") -> None:
+    def mark_vod_downloading(self, stream: LiveStream, *, message: str = "Started VOD download") -> bool:
         now = utc_now()
         existing = self.get_stream(stream.video_id)
         if existing is None:
@@ -744,14 +786,37 @@ class StateStore:
                 status="downloading",
                 event_message=message,
             )
-            return
-        self.conn.execute(
+            return True
+        if existing.status == "finalization_failed":
+            # A replacement copy must not overwrite the original live session's
+            # identity or segment count, which finalization retries still need.
+            cursor = self.conn.execute(
+                """
+                UPDATE streams SET status = 'downloading', updated_at = ?
+                WHERE video_id = ? AND status = 'finalization_failed'
+                """,
+                (now, stream.video_id),
+            )
+            if cursor.rowcount:
+                self._insert_stream_event(
+                    stream.video_id,
+                    message,
+                    segment_index=existing.segment_index,
+                    created_at=now,
+                )
+            self.conn.commit()
+            return bool(cursor.rowcount)
+        cursor = self.conn.execute(
             """
             UPDATE streams
             SET title = ?, channel = ?, url = ?, platform = ?, source = ?,
                 status = 'downloading', segment_index = 1, last_started_at = ?,
                 updated_at = ?, exit_code = NULL, recording_kind = 'vod'
-            WHERE video_id = ?
+            WHERE video_id = ? AND status = ?
+              AND status NOT IN (
+                  'detected', 'downloading', 'checking_after_exit', 'stalled',
+                  'waiting_retry', 'finalizing', 'deleting', 'cleaning_fragments'
+              )
             """,
             (
                 stream.title,
@@ -762,8 +827,12 @@ class StateStore:
                 now,
                 now,
                 stream.video_id,
+                existing.status,
             ),
         )
+        if not cursor.rowcount:
+            self.conn.commit()
+            return False
         self._insert_stream_event(
             stream.video_id,
             message,
@@ -771,6 +840,7 @@ class StateStore:
             created_at=now,
         )
         self.conn.commit()
+        return True
 
     def mark_vod_download_finished(self, video_id: str, *, message: str = "VOD download completed") -> None:
         now = utc_now()
@@ -803,10 +873,13 @@ class StateStore:
         self.conn.execute(
             """
             UPDATE streams
-            SET status = ?, last_exit_at = ?, updated_at = ?, exit_code = ?
+            SET status = ?,
+                last_exit_at = CASE WHEN ? = 'finalization_failed' THEN last_exit_at ELSE ? END,
+                updated_at = ?,
+                exit_code = CASE WHEN ? = 'finalization_failed' THEN exit_code ELSE ? END
             WHERE video_id = ?
             """,
-            (status, now, now, exit_code, video_id),
+            (status, status, now, now, status, exit_code, video_id),
         )
         self._insert_stream_event(
             video_id,

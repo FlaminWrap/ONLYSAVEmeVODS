@@ -160,7 +160,7 @@ FINALIZED_MEDIA_SUFFIXES = {
     ".ts",
     ".webm",
 }
-STREAM_FILE_OPERATION_STATUSES = {"deleting", "cleaning_fragments"}
+STREAM_FILE_OPERATION_STATUSES = {"deleting", "cleaning_fragments", "finalizing"}
 
 
 def post_exit_probe_target(stream: LiveStream) -> str:
@@ -259,6 +259,7 @@ class FinalizePlan:
     cleanup_files: list[Path]
     mixed_inputs: bool = False
     require_audio_video: bool = False
+    failure_reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -663,6 +664,7 @@ class DownloadManager:
         self._post_processing_video_ids: set[str] = set()
         self._finalizing_video_ids: set[str] = set()
         self._finalization_retry_tasks: dict[str, asyncio.Task[None]] = {}
+        self._finalization_failure_reasons: dict[tuple[str, int], str] = {}
         self._starting_video_ids: set[str] = set()
         self._planned_reconnects: set[str] = set()
         self._spawn_failures: dict[str, int] = {}
@@ -1559,7 +1561,6 @@ class DownloadManager:
                             allow_chat_replay=False,
                             end_confirmed=True,
                             stop_draining_audio=True,
-                            end_with_recoverable_media=True,
                         )
                         return
                 except TerminalVideoUnavailableError as exc:
@@ -1603,7 +1604,6 @@ class DownloadManager:
                                     allow_chat_replay=not confirmed_source_end_seen,
                                     end_confirmed=True,
                                     stop_draining_audio=confirmed_source_end_seen,
-                                    end_with_recoverable_media=confirmed_source_end_seen,
                                 )
                             return
                     else:
@@ -1639,7 +1639,6 @@ class DownloadManager:
                             allow_chat_replay=not confirmed_source_end_seen,
                             end_confirmed=True,
                             stop_draining_audio=confirmed_source_end_seen,
-                            end_with_recoverable_media=confirmed_source_end_seen,
                         )
                         return
                     if youtube_live_edge_advanced_from_record(record, edge):
@@ -2421,7 +2420,9 @@ class DownloadManager:
 
         catchup_tracker.update(line, track_hint=track_hint)
         if LIVE_PROGRESS_MARKER not in line:
-            self.logger.debug("yt-dlp %s: %s", video_id, line)
+            log_yt_dlp_output_line(
+                self.logger, video_id, line, label=track_hint
+            )
 
     def _handle_sidecar_output_line(
         self,
@@ -2433,7 +2434,7 @@ class DownloadManager:
         if not line:
             return
 
-        self.logger.debug("yt-dlp %s %s: %s", label, video_id, line)
+        log_yt_dlp_output_line(self.logger, video_id, line, label=label)
 
     async def _watch_chat_process(
         self,
@@ -2883,7 +2884,7 @@ class DownloadManager:
                 if exit_code == 0 or active.audio_end_attempts >= 3:
                     return
             self.logger.warning(
-                "YouTube audio track exited while video continues "
+                "YouTube audio track exited; retrying independently "
                 "video_id=%s segment=%03d exit_code=%s; retrying in %ss",
                 stream.video_id,
                 active.segment_index,
@@ -3183,6 +3184,12 @@ class DownloadManager:
             "recovered post-exit checks",
         )
 
+    def resume_finalization_retry(self, stream: LiveStream, segment_index: int) -> None:
+        if self._stream_status_matches(stream.video_id, "finalization_failed"):
+            self._schedule_finalization_retry(
+                stream, segment_index, expected_status="finalization_failed"
+            )
+
     def _track_lifecycle_task(
         self,
         task: asyncio.Task[None],
@@ -3230,6 +3237,13 @@ class DownloadManager:
                 self._defer_post_exit_retry(stream, segment_index)
             elif record.status == "stalled":
                 self._defer_stalled_retry(stream, segment_index)
+            elif record.status in {"finalizing", "finalization_failed"}:
+                self.state.mark_finalization_failed(stream.video_id)
+                # The failed task can still occupy its retry slot until its
+                # remaining completion callbacks run.
+                if self._finalization_retry_tasks.get(stream.video_id) is finished:
+                    self._finalization_retry_tasks.pop(stream.video_id, None)
+                self.resume_finalization_retry(stream, segment_index)
 
         task.add_done_callback(completed)
 
@@ -3446,7 +3460,6 @@ class DownloadManager:
                         allow_chat_replay=False,
                         end_confirmed=True,
                         stop_draining_audio=True,
-                        end_with_recoverable_media=True,
                     )
                     return
                 continue
@@ -3475,7 +3488,6 @@ class DownloadManager:
                         segment_index,
                         expected_status=expected_status,
                         end_confirmed=True,
-                        end_with_recoverable_media=True,
                     )
                     return
                 continue
@@ -3573,7 +3585,6 @@ class DownloadManager:
                 allow_chat_replay=not confirmed_source_end_seen,
                 end_confirmed=True,
                 stop_draining_audio=confirmed_source_end_seen,
-                end_with_recoverable_media=confirmed_source_end_seen,
             )
             return
         self.logger.warning(
@@ -3709,7 +3720,6 @@ class DownloadManager:
         allow_chat_replay: bool = True,
         end_confirmed: bool = False,
         stop_draining_audio: bool = False,
-        end_with_recoverable_media: bool = False,
     ) -> None:
         if not end_confirmed:
             self.logger.warning(
@@ -3746,46 +3756,58 @@ class DownloadManager:
                 return
             await self._stop_draining_audio(stream.video_id)
 
+        claimed = False
         self._finalizing_video_ids.add(stream.video_id)
         try:
+            # Share the short claim with dashboard copy/recovery registration.
+            # The database status protects the files while ffmpeg is awaited.
+            from .web import claim_stream_finalization
+
+            record = self.state.get_stream(stream.video_id)
+            if record is None:
+                return
+            previous_status = record.status
+            if expected_status is not None and previous_status != expected_status:
+                return
+            if not claim_stream_finalization(
+                self.config, stream.video_id, previous_status
+            ):
+                self._schedule_finalization_retry(
+                    stream, segment_index, expected_status=previous_status
+                )
+                return
+            claimed = True
             for index in range(1, segment_index + 1):
                 if await self.finalize_ended_segment(
                     stream.video_id, index, stream.channel
                 ):
                     continue
                 message = (
-                    f"Unable to finalize segment={index:03d}; "
+                    f"Source confirmed ended; unable to finalize segment={index:03d}; "
                     "preserving media tracks for recovery"
                 )
+                reason = self._finalization_failure_reasons.get((stream.video_id, index))
+                if reason:
+                    message += f": {reason}"
                 self.logger.warning("%s video_id=%s", message, stream.video_id)
-                if end_with_recoverable_media:
-                    self.state.add_stream_event(
-                        stream.video_id,
-                        f"Source confirmed ended; segment={index:03d} tracks remain "
-                        "available for recovery",
-                        level="error",
-                        segment_index=index,
-                    )
-                    self.state.mark_ended(stream.video_id)
-                    self._youtube_fragment_progress_at.pop(stream.video_id, None)
-                    clear_download_progress(
-                        stream.video_id,
-                        progress_file=self.download_progress_file,
-                    )
+                if not self.state.mark_finalization_failed(stream.video_id):
                     return
-                existing_retry = self._finalization_retry_tasks.get(stream.video_id)
-                if existing_retry is None or existing_retry.done():
+                if previous_status != "finalization_failed":
                     self.state.add_stream_event(
                         stream.video_id,
                         message,
                         level="error",
                         segment_index=index,
                     )
-                    self._schedule_finalization_retry(
-                        stream,
-                        segment_index,
-                        expected_status=expected_status,
-                    )
+                self._youtube_fragment_progress_at.pop(stream.video_id, None)
+                clear_download_progress(
+                    stream.video_id, progress_file=self.download_progress_file
+                )
+                self._schedule_finalization_retry(
+                    stream,
+                    segment_index,
+                    expected_status="finalization_failed",
+                )
                 return
             finalized_files = self.rename_finalized_segments(stream, segment_index)
             self.finalize_powerchat_sidecars(stream, finalized_files)
@@ -3807,6 +3829,11 @@ class DownloadManager:
             )
         finally:
             self._finalizing_video_ids.discard(stream.video_id)
+            # A cancellation or an exception must leave a recoverable state,
+            # including when it happens after ffmpeg has produced an output.
+            if claimed and self._stream_status_matches(stream.video_id, "finalizing"):
+                self.state.mark_finalization_failed(stream.video_id)
+                self.resume_finalization_retry(stream, segment_index)
         await self.process_pending_post_processing(stream)
 
     def _schedule_finalization_retry(
@@ -3826,13 +3853,14 @@ class DownloadManager:
             expected_status = record.status if record is not None else None
 
         async def retry() -> None:
+            retry_status = expected_status
             delay = max(30, min(self.config.poll_interval_seconds, 300))
             while not self._stopping:
                 await self.sleep(delay)
                 if (
                     self._stopping
                     or stream.video_id in self.active
-                    or not self._stream_status_matches(stream.video_id, expected_status)
+                    or not self._stream_status_matches(stream.video_id, retry_status)
                 ):
                     return
                 explicit_end = False
@@ -3879,10 +3907,18 @@ class DownloadManager:
                             "resuming live checks",
                             stream.video_id,
                         )
+                        if retry_status == "finalization_failed":
+                            if not self.state.compare_and_set_stream_status(
+                                stream.video_id,
+                                expected_status=retry_status,
+                                new_status="checking_after_exit",
+                            ):
+                                return
+                            retry_status = "checking_after_exit"
                         await self.handle_post_exit(
                             stream,
                             segment_index,
-                            expected_status=expected_status,
+                            expected_status=retry_status,
                         )
                         return
                 elif latest is not None and latest.video_id != stream.video_id:
@@ -3894,22 +3930,27 @@ class DownloadManager:
                             "finalization retry",
                             stream.video_id,
                         )
-                        if self._stream_status_matches(
-                            stream.video_id, "checking_after_exit"
-                        ):
+                        if retry_status == "finalization_failed":
+                            if not self.state.compare_and_set_stream_status(
+                                stream.video_id,
+                                expected_status=retry_status,
+                                new_status="checking_after_exit",
+                            ):
+                                return
+                        if self._stream_status_matches(stream.video_id, "checking_after_exit"):
                             self._defer_post_exit_retry(stream, segment_index)
                         return
 
                 if (
                     self._stopping
                     or stream.video_id in self.active
-                    or not self._stream_status_matches(stream.video_id, expected_status)
+                    or not self._stream_status_matches(stream.video_id, retry_status)
                 ):
                     return
                 await self.finish_ended_stream(
                     stream,
                     segment_index,
-                    expected_status=expected_status,
+                    expected_status=retry_status,
                     end_confirmed=True,
                     allow_chat_replay=not (
                         explicit_end and stream.platform.casefold() == "youtube"
@@ -3917,9 +3958,10 @@ class DownloadManager:
                     stop_draining_audio=(
                         explicit_end and stream.platform.casefold() == "youtube"
                     ),
-                    end_with_recoverable_media=explicit_end,
                 )
-                if not self._stream_status_matches(stream.video_id, expected_status):
+                if self._stream_status_matches(stream.video_id, "finalization_failed"):
+                    retry_status = "finalization_failed"
+                if not self._stream_status_matches(stream.video_id, retry_status):
                     return
                 delay = min(delay * 2, 900)
 
@@ -5199,6 +5241,8 @@ class DownloadManager:
         segment_index: int,
         channel: str = "",
     ) -> bool:
+        failure_key = (video_id, segment_index)
+        self._finalization_failure_reasons.pop(failure_key, None)
         try:
             plan = prepare_finalize_plan(self.config, video_id, segment_index, channel)
         except OSError:
@@ -5245,6 +5289,8 @@ class DownloadManager:
 
         if len(plan.input_files) == 1:
             if not await self._finalize_single_input(plan):
+                if plan.failure_reason:
+                    self._finalization_failure_reasons[failure_key] = plan.failure_reason
                 return False
             cleanup_files(
                 [
@@ -5271,6 +5317,8 @@ class DownloadManager:
             )
             return True
 
+        if plan.failure_reason:
+            self._finalization_failure_reasons[failure_key] = plan.failure_reason
         return False
 
     async def _finalize_single_input(self, plan: FinalizePlan) -> bool:
@@ -5301,8 +5349,10 @@ class DownloadManager:
             selected_streams = select_finalize_media_streams(media_streams)
             selected_types = {stream.codec_type for stream in selected_streams}
             if plan.require_audio_video and selected_types != {"audio", "video"}:
+                missing = ", ".join(sorted({"audio", "video"} - selected_types))
                 raise VideoProbeError(
-                    "Locked YouTube split format requires both video and audio tracks"
+                    f"Missing {missing} track; locked YouTube split format requires "
+                    "both video and audio tracks"
                 )
             if any(
                 not math.isfinite(stream.duration) or stream.duration <= 0
@@ -5310,6 +5360,7 @@ class DownloadManager:
             ):
                 raise VideoProbeError("Selected media stream has an invalid duration")
         except VideoProbeError as exc:
+            plan.failure_reason = str(exc)
             self.logger.warning(
                 "Unable to safely select partial segment inputs; preserving all "
                 "source files: %s",
@@ -7036,6 +7087,43 @@ def command_for_log(command: list[str]) -> str:
             redact_next = True
 
     return shlex.join(redacted)
+
+
+def log_yt_dlp_output_line(
+    logger: logging.Logger, video_id: str, line: str, *, label: str = ""
+) -> None:
+    plain_line = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", line)
+    if plain_line.startswith("ERROR:"):
+        level = logging.ERROR
+    elif plain_line.startswith("WARNING:"):
+        level = logging.WARNING
+    else:
+        level = logging.DEBUG
+    if level != logging.DEBUG:
+        # Download errors may contain signed media URLs, proxy credentials, or
+        # echoed options. Keep the cause visible without publishing those values.
+        sensitive_options = "|".join(
+            re.escape(option) for option in sorted(SENSITIVE_COMMAND_OPTIONS)
+        )
+        line = re.sub(
+            rf"({sensitive_options})(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|\S+)",
+            r"\1=<redacted>",
+            plain_line,
+        )
+        line = re.sub(
+            r"(?:https?|socks4a?|socks5h?)://[^\s<>\"']+",
+            "<redacted URL>",
+            line,
+            flags=re.IGNORECASE,
+        )
+        line = re.sub(
+            r"\b(authorization|cookie|set-cookie)\s*:\s*[^\r\n]*",
+            r"\1: <redacted>",
+            line,
+            flags=re.IGNORECASE,
+        )
+    context = f" {label}" if label else ""
+    logger.log(level, "yt-dlp %s%s: %s", video_id, context, line)
 
 
 def log_process_output(

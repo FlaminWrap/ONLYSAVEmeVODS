@@ -296,6 +296,10 @@ for service-wide diagnostics:
 journalctl -u onlysavemevods.service -f
 ```
 
+yt-dlp errors and warnings are visible at the default log level, with the
+stream ID and video, audio, or chat track identified. Signed URLs and echoed
+credentials are redacted from these messages.
+
 For web performance issues, set `log_level = "DEBUG"`, restart the service, and
 look for `Slow web ...` warnings in the journal. Large stream folders with many
 fragments can slow dashboard scans; use **Clean fragments** on ended streams
@@ -828,7 +832,7 @@ scripts/uninstall-systemd.sh
   Generic unavailability, private-video, sign-in, and network errors alone do
   not confirm an end. A confirmed end stops independent audio retries; saved
   tracks are merged if they validate, or kept for recovery with the recording
-  marked ended.
+  marked `finalization_failed`.
   Fragment inactivity counts saved fragment indices; growing playlist totals
   and advancing remote timestamps cannot reset it. With a locked YouTube
   video/audio format pair, a
@@ -846,7 +850,11 @@ scripts/uninstall-systemd.sh
   tracks only after YouTube confirms the broadcast ended, then checks that the
   required audio and video tracks are present and each keeps its saved duration.
   Unequal track durations are preserved without cutting off the longer track.
-  Incomplete inputs are kept for recovery and finalization is retried.
+  During merging the dashboard shows `finalizing`. Missing tracks or failed
+  validation produce `finalization_failed`, with the saved inputs kept for
+  recovery and excluded from fragment retention cleanup. Finalization retries
+  reconfirm the source end and resume after service restarts. A VOD redownload
+  can save a separate copy when the original recording cannot be completed.
   The dashboard also keeps each track's highest **reported** yt-dlp fragment
   index and count in `state/live-fragment-high-water/` across reconnects and
   service restarts. These counters are local to a yt-dlp run, so a high value

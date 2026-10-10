@@ -48,6 +48,9 @@ class OnlySaveMeVodsDaemon:
         stale_post_exit_records = self.state.list_streams_by_status(
             ["checking_after_exit"]
         )
+        failed_finalization_records = self.state.list_streams_by_status(
+            ["finalization_failed"]
+        )
         stalled_youtube_records = self.state.list_streams_by_status(["stalled"])
         self.state.mark_stale_watermarks_interrupted()
         sources = monitored_sources(self.config)
@@ -120,6 +123,7 @@ class OnlySaveMeVodsDaemon:
         if not monitored_sources(self.config):
             LOGGER.warning("No sources configured; edit config.toml to add channels or streamers")
         self.resume_stale_post_exit_checks(stale_post_exit_records)
+        self.resume_failed_finalizations(failed_finalization_records)
         self.resume_stalled_youtube_checks(stalled_youtube_records)
         if requeued_post_processing:
             LOGGER.warning(
@@ -175,7 +179,16 @@ class OnlySaveMeVodsDaemon:
                 record.segment_index,
             )
 
+    def resume_failed_finalizations(self, records: list[StreamRecord]) -> None:
+        for record in records:
+            self.downloads.resume_finalization_retry(
+                stream_from_record(record), record.segment_index
+            )
+
     async def poll_once(self) -> None:
+        self.resume_failed_finalizations(
+            self.state.list_streams_by_status(["finalization_failed"])
+        )
         self.downloads.resume_pending_post_processing_jobs()
         await self.cleanup_expired_fragments()
         for source in monitored_sources(self.config):

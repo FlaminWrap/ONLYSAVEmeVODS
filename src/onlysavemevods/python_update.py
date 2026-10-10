@@ -19,7 +19,7 @@ from .config import (
 )
 
 
-BUSY_STREAM_STATUSES = frozenset({"downloading", "checking_after_exit", "waiting_retry"})
+BUSY_STREAM_STATUSES = frozenset({"downloading", "checking_after_exit", "finalizing", "waiting_retry"})
 BUSY_JOB_STATUSES = frozenset({"queued", "running"})
 
 
@@ -101,7 +101,7 @@ def _busy_reasons_from_state_connection(conn: sqlite3.Connection) -> list[str]:
         """
         SELECT status, COUNT(*) AS count
         FROM streams
-        WHERE status IN ('downloading', 'checking_after_exit', 'waiting_retry')
+        WHERE status IN ('downloading', 'checking_after_exit', 'finalizing', 'waiting_retry')
         GROUP BY status
         """
     ).fetchall()

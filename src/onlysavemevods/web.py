@@ -350,11 +350,12 @@ SEGMENT_NAME_RE = re.compile(
 LIVE_CHAT_SUFFIX = ".live_chat.json"
 CHAT_RENDER_MEDIA_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov")
 CHAT_RENDER_OUTPUT_SUFFIX = " - chat.mp4"
-ATTENTION_STATUSES = {"checking_after_exit", "interrupted", "stalled", "waiting_retry"}
+ATTENTION_STATUSES = {"checking_after_exit", "finalization_failed", "interrupted", "stalled", "waiting_retry"}
 VOD_DOWNLOAD_BLOCKED_STATUSES = {
     "detected",
     "downloading",
     "checking_after_exit",
+    "finalizing",
     "stalled",
     "waiting_retry",
 }
@@ -362,6 +363,8 @@ SEGMENT_RECOVERY_BLOCKED_STATUSES = set(VOD_DOWNLOAD_BLOCKED_STATUSES)
 VOD_DOWNLOAD_PROGRESS_RE = re.compile(r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%")
 STATUS_LABELS = {
     "checking_after_exit": "checking after exit",
+    "finalizing": "finalizing",
+    "finalization_failed": "finalization failed",
     "detected": "detected",
     "downloading": "downloading",
     "ended": "ended",
@@ -4699,7 +4702,7 @@ def stream_status_from_record(
 
     file_scan_cache_ttl = (
         WEB_FILE_SCAN_ACTIVE_CACHE_SECONDS
-        if record.status in {"detected", "downloading", "checking_after_exit", "waiting_retry"}
+        if record.status in {"detected", "downloading", "checking_after_exit", "finalizing", "waiting_retry"}
         else WEB_FILE_SCAN_CACHE_SECONDS
     )
     step_started_at = time.perf_counter()
@@ -5506,6 +5509,8 @@ def resolve_download_file(
 FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
     "cleaning_fragments",
     "checking_after_exit",
+    "finalizing",
+    "finalization_failed",
     "deleting",
     "downloading",
     "stalled",
@@ -5514,6 +5519,7 @@ FRAGMENT_CLEANUP_BLOCKED_STATUSES = {
 STREAM_DELETE_BLOCKED_STATUSES = {
     "cleaning_fragments",
     "checking_after_exit",
+    "finalizing",
     "deleting",
     "downloading",
     "stalled",
@@ -5580,6 +5586,29 @@ def active_dashboard_job_kinds(config: BotConfig, video_id: str) -> list[str]:
     }
     kinds.update(durable_labels.get(job.kind, "Post-processing") for job in durable_jobs)
     return sorted(kinds)
+
+
+def claim_stream_finalization(
+    config: BotConfig,
+    video_id: str,
+    expected_status: str,
+) -> bool:
+    """Claim saved media after excluding dashboard jobs that use the same files."""
+
+    if expected_status not in {"checking_after_exit", "stalled", "finalization_failed", "detected", "ended"}:
+        return False
+    with STREAM_OPERATION_LOCK:
+        if active_dashboard_job_kinds(config, video_id):
+            return False
+        state = StateStore(config.db_path)
+        try:
+            return state.compare_and_set_stream_status(
+                video_id,
+                expected_status=expected_status,
+                new_status="finalizing",
+            )
+        finally:
+            state.close()
 
 
 def cleanup_stream_fragments(config: BotConfig, video_id: str) -> tuple[int, int]:
@@ -6136,7 +6165,8 @@ def queue_vod_download_job(
     output_template.parent.mkdir(parents=True, exist_ok=True)
     state = StateStore(config.db_path)
     try:
-        state.mark_vod_downloading(stream, message=queued_message)
+        if not state.mark_vod_downloading(stream, message=queued_message):
+            raise ConfigError("Stream status changed; VOD download was not started")
     finally:
         state.close()
 
@@ -6608,7 +6638,7 @@ def finish_failed_vod_download(
         message=message,
         progress=None,
     )
-    restore_status = previous_status if previous_status in {"ended", "interrupted"} else None
+    restore_status = previous_status if previous_status in {"ended", "interrupted", "finalization_failed"} else None
     state = StateStore(config.db_path)
     try:
         state.mark_vod_download_failed(
@@ -11968,7 +11998,7 @@ def render_status_html(snapshot: StatusSnapshot) -> str:
       background: var(--panel-strong);
     }}
     .badge.downloading, .badge.running, .badge.done {{ color: var(--active); border-color: color-mix(in srgb, var(--active), transparent 55%); }}
-    .badge.checking_after_exit, .badge.waiting_retry, .badge.interrupted, .badge.stalled, .badge.queued {{ color: var(--warn); }}
+    .badge.checking_after_exit, .badge.finalizing, .badge.finalization_failed, .badge.waiting_retry, .badge.interrupted, .badge.stalled, .badge.queued {{ color: var(--warn); }}
     .badge.failed {{ color: var(--bad); border-color: color-mix(in srgb, var(--bad), transparent 55%); }}
     .badge.ended {{ color: var(--muted); }}
     .signals {{
@@ -12696,6 +12726,8 @@ def dashboard_script() -> str:
   const tabs = ["tab-streamers", "tab-powerchat", "tab-jobs", "tab-logs", "tab-about", "tab-config"];
   const statusLabels = {
     checking_after_exit: "checking after exit",
+    finalizing: "finalizing",
+    finalization_failed: "finalization failed",
     detected: "detected",
     downloading: "downloading",
     ended: "ended",
@@ -12703,7 +12735,7 @@ def dashboard_script() -> str:
     stalled: "stalled",
     waiting_retry: "waiting retry",
   };
-  const attentionStatuses = new Set(["checking_after_exit", "interrupted", "stalled", "waiting_retry"]);
+  const attentionStatuses = new Set(["checking_after_exit", "finalization_failed", "interrupted", "stalled", "waiting_retry"]);
 
   const byId = (id) => document.getElementById(id);
   const setText = (id, value) => {
@@ -13627,6 +13659,8 @@ def dashboard_script() -> str:
     const signals = [];
     if (stream.has_mixed_formats) signals.push("conflicting format files");
     if (stream.status === "checking_after_exit") signals.push("post-exit checks running");
+    if (stream.status === "finalizing") signals.push("source ended; merging saved media");
+    if (stream.status === "finalization_failed") signals.push("source ended; saved media needs recovery");
     if (stream.status === "waiting_retry") signals.push("waiting for retry");
     if (stream.status === "interrupted") signals.push("interrupted before clean exit");
     if (stream.status === "stalled") signals.push("YouTube live edge is not advancing");
@@ -14342,7 +14376,7 @@ def dashboard_script() -> str:
   const renderCleanupFragmentsAction = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
     const count = Number(((stream && stream.file_kind_counts) || {}).fragment || 0);
-    const blockedStatuses = new Set(["checking_after_exit", "downloading", "stalled", "waiting_retry"]);
+    const blockedStatuses = new Set(["checking_after_exit", "finalizing", "finalization_failed", "downloading", "stalled", "waiting_retry"]);
     if (!videoId || count <= 0 || blockedStatuses.has(String(stream.status || ""))) {
       return "";
     }
@@ -14382,7 +14416,7 @@ def dashboard_script() -> str:
 
   const renderDeleteStreamAction = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
-    const blockedStatuses = new Set(["checking_after_exit", "detected", "downloading", "waiting_retry"]);
+    const blockedStatuses = new Set(["checking_after_exit", "finalizing", "detected", "downloading", "stalled", "waiting_retry"]);
     if (!videoId || blockedStatuses.has(String(stream.status || ""))) {
       return "";
     }
@@ -14496,7 +14530,7 @@ def dashboard_script() -> str:
 
   const renderStreamVodRedownloadForm = (stream) => {
     const videoId = String((stream && stream.video_id) || "");
-    const blockedStatuses = new Set(["detected", "downloading", "checking_after_exit", "stalled", "waiting_retry"]);
+    const blockedStatuses = new Set(["detected", "downloading", "checking_after_exit", "finalizing", "stalled", "waiting_retry"]);
     if (!videoId || blockedStatuses.has(String((stream && stream.status) || ""))) return "";
     const rawUrl = String((stream && stream.url) || "");
     const defaultUrl = rawUrl.startsWith("http://") || rawUrl.startsWith("https://") ? rawUrl : "";
@@ -18014,6 +18048,10 @@ def render_stream_signals(stream: StreamStatus) -> str:
         signals.append("conflicting format files")
     if stream.status == "checking_after_exit":
         signals.append("post-exit checks running")
+    if stream.status == "finalizing":
+        signals.append("source ended; merging saved media")
+    if stream.status == "finalization_failed":
+        signals.append("source ended; saved media needs recovery")
     if stream.status == "waiting_retry":
         signals.append("waiting for retry")
     if stream.status == "interrupted":

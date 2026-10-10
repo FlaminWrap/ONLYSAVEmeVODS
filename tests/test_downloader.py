@@ -3603,7 +3603,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 state.close()
 
-        self.assertEqual(status, "checking_after_exit")
+        self.assertEqual(status, "finalization_failed")
         self.assertTrue(
             any("preserving media tracks" in event.message for event in events)
         )
@@ -3755,7 +3755,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 state.close()
 
-        self.assertEqual(status, "checking_after_exit")
+        self.assertEqual(status, "finalization_failed")
         self.assertEqual(manager.finalize_ended_segment.await_count, 1)
         source_probe.assert_awaited_once_with(stream.url)
         edge_probe.assert_awaited_once_with(stream.url)
@@ -3775,6 +3775,8 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                 channel="Example Channel",
             )
             state = StateStore(config.db_path)
+            state.upsert_detected(stream)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
             order: list[str] = []
             manager.finalize_ended_segment = AsyncMock(return_value=True)  # type: ignore[method-assign]
@@ -3792,11 +3794,15 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=lambda *_args: order.append("process")
             )
 
+            def mark_ended(video_id: str) -> None:
+                order.append("ended")
+                StateStore.mark_ended(state, video_id)
+
             try:
                 with patch.object(
                     state,
                     "mark_ended",
-                    side_effect=lambda *_args: order.append("ended"),
+                    side_effect=mark_ended,
                 ):
                     await manager.finish_ended_stream(stream, 1, end_confirmed=True)
             finally:
@@ -3958,6 +3964,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             )
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
 
             try:
@@ -4001,6 +4008,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (directory / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
             repaired_file = directory / "Late Night Stream [twitch_Example].repaired.mp4"
 
@@ -4061,6 +4069,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
             transcribe = AsyncMock(return_value=True)
 
@@ -4099,6 +4108,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             clock = [datetime(2026, 8, 1, 0, 59, 30, tzinfo=timezone.utc)]
             sleep_calls: list[float] = []
             transcribe = AsyncMock(return_value=True)
@@ -4153,6 +4163,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (directory / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             sleep_started = asyncio.Event()
 
             async def wait_until_cancelled(_delay: float) -> None:
@@ -4368,6 +4379,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
             transcribe = AsyncMock(return_value=True)
 
@@ -4398,6 +4410,7 @@ class DownloadManagerTranscriptionTests(unittest.IsolatedAsyncioTestCase):
             (segment_dir / "segment-001.mp4").write_text("media", encoding="utf-8")
             state = StateStore(config.db_path)
             state.mark_downloading(stream, 1)
+            state.mark_exited(stream.video_id, 0)
             manager = DownloadManager(config, state, probe=None)  # type: ignore[arg-type]
             transcribe = AsyncMock(return_value=True)
 
