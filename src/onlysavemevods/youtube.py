@@ -237,17 +237,29 @@ class YoutubeProbe:
                 seen.add(live_stream.video_id)
 
         streams_url = channel_streams_url(channel)
-        playlist = self.runner.run_json(
-            [
-                "--dump-single-json",
-                "--flat-playlist",
-                "--playlist-end",
-                str(self.channel_scan_limit),
-                "--skip-download",
-                "--no-warnings",
-                streams_url,
-            ]
-        )
+        try:
+            playlist = self.runner.run_json(
+                [
+                    "--dump-single-json",
+                    "--flat-playlist",
+                    "--playlist-end",
+                    str(self.channel_scan_limit),
+                    "--skip-download",
+                    "--no-warnings",
+                    streams_url,
+                ]
+            )
+        except YtDlpError as exc:
+            if not live_streams:
+                raise
+            LOGGER.warning(
+                "Channel streams page check failed for %s; keeping %s confirmed "
+                "live stream(s) from the channel live URL: %s",
+                channel,
+                len(live_streams),
+                exc,
+            )
+            return live_streams
 
         video_ids = _candidate_video_ids(playlist)
         candidates: list[str] = []

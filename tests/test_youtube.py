@@ -557,7 +557,8 @@ segment.ts
         self.assertEqual(stream.channel, "Uploader")
 
     def test_discovers_multiple_live_streams(self) -> None:
-        probe = YoutubeProbe(FakeRunner(), channel_scan_limit=10)
+        runner = FakeRunner()
+        probe = YoutubeProbe(runner, channel_scan_limit=10)
 
         streams = probe.discover_channel_live_streams("@Example")
 
@@ -565,6 +566,42 @@ segment.ts
             [stream.video_id for stream in streams],
             ["youtube:LIVEVIDEO01", "youtube:LIVEVIDEO02"],
         )
+        self.assertEqual(runner.calls[0][-1], "https://www.youtube.com/@Example/live")
+        self.assertEqual(runner.calls[1][-1], "https://www.youtube.com/@Example/streams")
+        self.assertFalse(any(call[-1].endswith("v=LIVEVIDEO01") for call in runner.calls))
+
+    def test_streams_listing_error_preserves_confirmed_channel_live_stream(self) -> None:
+        runner = MagicMock()
+        runner.run_json.side_effect = [
+            {
+                "id": "LIVEVIDEO01",
+                "webpage_url": "https://www.youtube.com/watch?v=LIVEVIDEO01",
+                "live_status": "is_live",
+            },
+            YtDlpError("streams page unavailable"),
+        ]
+        probe = YoutubeProbe(runner)
+
+        with self.assertLogs("onlysavemevods.youtube", level="WARNING") as captured:
+            streams = probe.discover_channel_live_streams("@Example")
+
+        self.assertEqual([stream.video_id for stream in streams], ["youtube:LIVEVIDEO01"])
+        self.assertIn("keeping 1 confirmed live stream(s)", captured.output[0])
+        self.assertIn("streams page unavailable", captured.output[0])
+
+    def test_streams_listing_error_without_confirmed_live_stream_is_raised(self) -> None:
+        runner = MagicMock()
+        listing_error = YtDlpError("streams page unavailable")
+        runner.run_json.side_effect = [
+            {"id": "ENDEDVIDEO1", "live_status": "was_live"},
+            listing_error,
+        ]
+        probe = YoutubeProbe(runner)
+
+        with self.assertRaises(YtDlpError) as captured:
+            probe.discover_channel_live_streams("@Example")
+
+        self.assertIs(captured.exception, listing_error)
 
     def test_probe_channel_live_stream_uses_live_url_fast_path(self) -> None:
         runner = FakeRunner()

@@ -503,17 +503,32 @@ the pending request stays in the mailbox for the scheduled retry if needed.
 The privileged updater repairs its request watcher when it runs, including
 older path units that watched the persistent request instead of the temporary
 trigger. It preserves the root-owned updater service and its trusted policy.
-If an older installation leaves a force request queued, run this on the server:
+If an older installation leaves a force request queued or hits systemd's start
+limit, stop the watcher before clearing the failed state and running the update:
 
 ```bash
-sudo systemctl reset-failed onlysavemevods-app-update.service
+sudo systemctl stop onlysavemevods-app-update.path
+sudo systemctl reset-failed onlysavemevods-app-update.service onlysavemevods-app-update.path
 sudo systemctl start onlysavemevods-app-update.service
+```
+
+After that succeeds, run the updater once more. The newly installed script
+repairs and starts the watcher even when there is no pending update:
+
+```bash
+sudo systemctl start onlysavemevods-app-update.service
+```
+
+If either update run fails, inspect its log:
+
+```bash
 sudo journalctl -u onlysavemevods-app-update.service -n 60 --no-pager
 ```
 
 The queued force request stops and restarts the recording service itself.
-Versions predating watcher repair still need `scripts/install-systemd.sh` run
-once to refresh the path unit. App-only updates do not otherwise replace
+When installing a release that predates watcher repair, rerun
+`scripts/install-systemd.sh` once to refresh the path unit instead. App-only
+updates do not otherwise replace
 root-owned systemd units.
 
 The web process does not replace root-owned app files itself and its request
