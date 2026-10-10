@@ -167,6 +167,7 @@ class BotConfig:
     poll_interval_seconds: int = 60
     max_concurrent_downloads: int = 4
     live_from_start: bool = True
+    auto_redownload_failed_finalization: bool = False
     youtube_preferred_video_codec: str = "vp9"
     record_live_chat: bool = False
     render_live_chat_video: bool = False
@@ -327,6 +328,10 @@ def load_config_text(config_text: str, config_path: str | Path) -> BotConfig:
             raw.get("max_concurrent_downloads", 4), "max_concurrent_downloads"
         ),
         live_from_start=_as_bool(raw.get("live_from_start", True), "live_from_start"),
+        auto_redownload_failed_finalization=_as_bool(
+            raw.get("auto_redownload_failed_finalization", False),
+            "auto_redownload_failed_finalization",
+        ),
         youtube_preferred_video_codec=_as_choice(
             raw.get("youtube_preferred_video_codec", "vp9"),
             "youtube_preferred_video_codec",

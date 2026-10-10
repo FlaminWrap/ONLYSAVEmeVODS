@@ -4,6 +4,7 @@ from tempfile import TemporaryDirectory
 import unittest
 
 from onlysavemevods.config import (
+    BotConfig,
     DEFAULT_POST_EXIT_CHECK_SECONDS,
     DEFAULT_PROCESSING_QUIET_HOURS_END,
     DEFAULT_PROCESSING_QUIET_HOURS_START,
@@ -39,6 +40,32 @@ from onlysavemevods.config import (
 
 
 class ConfigTests(unittest.TestCase):
+    def test_auto_vod_redownload_is_disabled_by_default(self) -> None:
+        config = load_config_text("", Path("/tmp/config.toml"))
+
+        self.assertFalse(BotConfig().auto_redownload_failed_finalization)
+        self.assertFalse(config.auto_redownload_failed_finalization)
+
+    def test_auto_vod_redownload_loads_explicit_boolean(self) -> None:
+        for value in (True, False):
+            with self.subTest(value=value):
+                config = load_config_text(
+                    f"auto_redownload_failed_finalization = {str(value).lower()}\n",
+                    Path("/tmp/config.toml"),
+                )
+                self.assertIs(config.auto_redownload_failed_finalization, value)
+
+    def test_auto_vod_redownload_rejects_non_boolean_values(self) -> None:
+        for value in ('"true"', "1", "[]"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ConfigError,
+                "auto_redownload_failed_finalization must be true or false",
+            ):
+                load_config_text(
+                    f"auto_redownload_failed_finalization = {value}\n",
+                    Path("/tmp/config.toml"),
+                )
+
     def test_explicit_missing_config_is_rejected(self) -> None:
         with TemporaryDirectory() as tmp:
             missing = Path(tmp) / "missing.toml"

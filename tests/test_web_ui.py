@@ -510,6 +510,46 @@ class DashboardUiTests(unittest.TestCase):
         self.assertIn("Additional yt-dlp arguments", advanced)
         self.assertIn("Create subtitles automatically", advanced)
 
+    def test_automatic_vod_recovery_can_be_enabled_and_disabled_in_recording_settings(self) -> None:
+        setting = "auto_redownload_failed_finalization"
+        with TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.toml"
+            config_path.write_text(BASE_CONFIG, encoding="utf-8")
+            config = load_config(config_path)
+
+            initial = render_admin_page(
+                config, "settings", {"section": ["recording"]}
+            )
+            self.assertIn(
+                "Automatically redownload failed finalizations from VOD", initial
+            )
+            self.assertIn(f'name="{setting}" type="checkbox">', initial)
+            self.assertIn("Saved recording files are preserved", initial)
+
+            for enabled in (True, False):
+                with self.subTest(enabled=enabled):
+                    result = update_app_config_from_json(
+                        config,
+                        {
+                            "revision": config_file_revision(config),
+                            "values": {setting: enabled},
+                        },
+                    )
+                    self.assertTrue(result["ok"])
+                    self.assertEqual(result["restart_required"], [])
+                    self.assertIs(config.auto_redownload_failed_finalization, enabled)
+                    self.assertIs(
+                        load_config(config_path).auto_redownload_failed_finalization,
+                        enabled,
+                    )
+                    html = render_admin_page(
+                        config, "settings", {"section": ["recording"]}
+                    )
+                    checked = " checked" if enabled else ""
+                    self.assertIn(
+                        f'name="{setting}" type="checkbox"{checked}>', html
+                    )
+
     def test_after_stream_controls_are_per_streamer_and_inherit_defaults(self) -> None:
         with TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.toml"

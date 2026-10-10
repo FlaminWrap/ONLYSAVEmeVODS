@@ -127,6 +127,7 @@ def app_config_form_params(**overrides: str) -> dict[str, list[str]]:
         "discovery_probe_concurrency": "4",
         "max_concurrent_downloads": "4",
         "live_from_start": "true",
+        "auto_redownload_failed_finalization": "false",
         "youtube_preferred_video_codec": "vp9",
         "keep_fragments_for_resume": "true",
         "fragment_retention_hours": "0",

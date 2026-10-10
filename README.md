@@ -337,6 +337,22 @@ Manually add or redownload a VOD:
    VOD downloads too. When processing quiet hours are enabled, these automatic
    VOD jobs wait for the same window.
 
+Automatically recover recordings that fail finalization:
+
+1. Open **Settings → Recording → Download** and enable **Automatically redownload
+   failed finalizations from VOD** (`auto_redownload_failed_finalization = true`).
+   The setting is disabled by default and takes effect without restarting.
+2. After a confirmed stream end, a failed finalization triggers a separate VOD
+   download. The saved recording and its fragments are preserved for recovery.
+3. If the VOD is not available yet or the download fails, attempts are spaced
+   at least 5, 10, 20, 40, then 60 minutes apart. Pending recovery survives
+   service restarts; completed VOD copies are not downloaded again automatically.
+
+An archive removed or terminated by the platform cannot be recovered from its
+original URL. If a saved channel URL identifies a different broadcast, automatic
+recovery also waits. Use **Redownload from VOD** with the original broadcast's
+archive URL when another copy is available.
+
 Create a chat video:
 
 1. Enable `record_live_chat = true` for YouTube live chat capture.
@@ -855,6 +871,8 @@ scripts/uninstall-systemd.sh
   recovery and excluded from fragment retention cleanup. Finalization retries
   reconfirm the source end and resume after service restarts. A VOD redownload
   can save a separate copy when the original recording cannot be completed.
+  Enable `auto_redownload_failed_finalization` to queue that copy automatically
+  after finalization fails, with retries while the VOD is unavailable.
   The dashboard also keeps each track's highest **reported** yt-dlp fragment
   index and count in `state/live-fragment-high-water/` across reconnects and
   service restarts. These counters are local to a yt-dlp run, so a high value

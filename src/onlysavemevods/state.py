@@ -89,6 +89,17 @@ class PostProcessingJobRecord:
     updated_at: str
 
 
+@dataclass(frozen=True, slots=True)
+class AutomaticVodRecoveryRecord:
+    video_id: str
+    attempts: int
+    next_attempt_at: float
+    output_template: str
+    in_progress: bool
+    completed: bool
+    blocked: bool
+
+
 class StateStore:
     def __init__(self, db_path: Path) -> None:
         db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -187,6 +198,19 @@ class StateStore:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 UNIQUE (video_id, kind, segment_index, media_path)
+            )
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS automatic_vod_recovery (
+                video_id TEXT PRIMARY KEY,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL DEFAULT 0,
+                output_template TEXT NOT NULL DEFAULT '',
+                in_progress INTEGER NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -323,6 +347,32 @@ class StateStore:
 
     def reconcile_stale_downloads(self) -> None:
         now = utc_now()
+        recovery_rows = self.conn.execute(
+            """
+            SELECT streams.video_id, streams.segment_index
+            FROM streams JOIN automatic_vod_recovery USING (video_id)
+            WHERE streams.status = 'downloading'
+              AND automatic_vod_recovery.in_progress = 1
+            """
+        ).fetchall()
+        self.conn.execute(
+            """
+            UPDATE streams SET status = 'finalization_failed', updated_at = ?
+            WHERE status = 'downloading' AND video_id IN (
+                SELECT video_id FROM automatic_vod_recovery WHERE in_progress = 1
+            )
+            """,
+            (now,),
+        )
+        self.conn.execute("UPDATE automatic_vod_recovery SET in_progress = 0 WHERE in_progress = 1")
+        for row in recovery_rows:
+            self._insert_stream_event(
+                row["video_id"],
+                "Automatic VOD recovery interrupted by service restart; saved media preserved for retry",
+                level="warning",
+                segment_index=int(row["segment_index"]),
+                created_at=now,
+            )
         finalizing_rows = self.conn.execute(
             """
             SELECT video_id, segment_index
@@ -777,8 +827,104 @@ class StateStore:
         assert record is not None
         return record
 
-    def mark_vod_downloading(self, stream: LiveStream, *, message: str = "Started VOD download") -> bool:
+    def get_automatic_vod_recovery(self, video_id: str) -> AutomaticVodRecoveryRecord | None:
+        row = self.conn.execute(
+            "SELECT * FROM automatic_vod_recovery WHERE video_id = ?",
+            (video_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return AutomaticVodRecoveryRecord(
+            video_id=str(row["video_id"]),
+            attempts=int(row["attempts"]),
+            next_attempt_at=float(row["next_attempt_at"]),
+            output_template=str(row["output_template"]),
+            in_progress=bool(row["in_progress"]),
+            completed=bool(row["completed"]),
+            blocked=bool(row["blocked"]),
+        )
+
+    def begin_automatic_vod_recovery(
+        self,
+        video_id: str,
+        output_template: str,
+        *,
+        now: float,
+    ) -> AutomaticVodRecoveryRecord | None:
+        """Reserve a due attempt and its cooldown across polling and restarts."""
+
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            stream = self.get_stream(video_id)
+            if stream is None or stream.status != "finalization_failed":
+                return None
+            recovery = self.get_automatic_vod_recovery(video_id)
+            if recovery is not None and (
+                recovery.in_progress
+                or recovery.completed
+                or recovery.blocked
+                or recovery.next_attempt_at > now
+            ):
+                return None
+            attempts_before = recovery.attempts if recovery is not None else 0
+            delay = min(300 * 2 ** min(attempts_before, 4), 3600)
+            self.conn.execute(
+                """
+                INSERT INTO automatic_vod_recovery (
+                    video_id, attempts, next_attempt_at, output_template
+                ) VALUES (?, 1, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    attempts = automatic_vod_recovery.attempts + 1,
+                    next_attempt_at = excluded.next_attempt_at
+                """,
+                (video_id, now + delay, output_template),
+            )
+            return self.get_automatic_vod_recovery(video_id)
+
+    def block_automatic_vod_recovery(self, video_id: str) -> None:
+        self.conn.execute(
+            "UPDATE automatic_vod_recovery SET blocked = 1 WHERE video_id = ?",
+            (video_id,),
+        )
+        self.conn.commit()
+
+    def mark_vod_downloading(
+        self,
+        stream: LiveStream,
+        *,
+        message: str = "Started VOD download",
+        automatic: bool = False,
+    ) -> bool:
         now = utc_now()
+        if automatic:
+            with self.conn:
+                self.conn.execute("BEGIN IMMEDIATE")
+                existing = self.get_stream(stream.video_id)
+                recovery = self.get_automatic_vod_recovery(stream.video_id)
+                if (
+                    existing is None
+                    or existing.status != "finalization_failed"
+                    or recovery is None
+                    or recovery.in_progress
+                    or recovery.completed
+                    or recovery.blocked
+                ):
+                    return False
+                self.conn.execute(
+                    "UPDATE streams SET status = 'downloading', updated_at = ? WHERE video_id = ?",
+                    (now, stream.video_id),
+                )
+                self.conn.execute(
+                    "UPDATE automatic_vod_recovery SET in_progress = 1 WHERE video_id = ?",
+                    (stream.video_id,),
+                )
+                self._insert_stream_event(
+                    stream.video_id,
+                    message,
+                    segment_index=existing.segment_index,
+                    created_at=now,
+                )
+            return True
         existing = self.get_stream(stream.video_id)
         if existing is None:
             self.upsert_vod_stream(
@@ -852,6 +998,13 @@ class StateStore:
             """,
             (now, now, video_id),
         )
+        self.conn.execute(
+            """
+            UPDATE automatic_vod_recovery SET completed = 1, in_progress = 0
+            WHERE video_id = ? AND in_progress = 1
+            """,
+            (video_id,),
+        )
         self._insert_stream_event(
             video_id,
             message,
@@ -880,6 +1033,10 @@ class StateStore:
             WHERE video_id = ?
             """,
             (status, status, now, now, status, exit_code, video_id),
+        )
+        self.conn.execute(
+            "UPDATE automatic_vod_recovery SET in_progress = 0 WHERE video_id = ? AND in_progress = 1",
+            (video_id,),
         )
         self._insert_stream_event(
             video_id,
@@ -1437,6 +1594,10 @@ class StateStore:
             )
             self.conn.execute(
                 "DELETE FROM post_processing_jobs WHERE video_id = ?",
+                (video_id,),
+            )
+            self.conn.execute(
+                "DELETE FROM automatic_vod_recovery WHERE video_id = ?",
                 (video_id,),
             )
         self.conn.commit()

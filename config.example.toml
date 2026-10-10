@@ -217,6 +217,11 @@ app_update_github_token_env = "GITHUB_TOKEN"
 # format back into a resumable .part file without dropping fragments.
 keep_fragments_for_resume = true
 
+# If finalization fails after the platform confirms the stream has ended,
+# download a separate VOD copy. Original files are kept for recovery. The bot
+# retries later if the platform has not made the VOD available yet.
+auto_redownload_failed_finalization = false
+
 # Automatically remove saved fragments from streams that have been marked ended
 # for this many hours. Zero keeps them until they are cleaned manually.
 fragment_retention_hours = 0

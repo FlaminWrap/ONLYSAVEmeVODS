@@ -9,7 +9,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, RLock, Thread
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 from datetime import datetime, timedelta, timezone
@@ -45,6 +45,7 @@ from .chat_render import (
     chat_video_output_file,
     choose_chat_render_nvenc_device,
     detect_nvidia_devices,
+    ffprobe_path_for,
     render_chat_video_file,
 )
 from .chat_refresh import ChatRefreshResult, refresh_chat_sidecar
@@ -98,6 +99,7 @@ from .downloader import (
     is_yt_dlp_temporary_file,
     log_process_output,
     named_segment_file_stem,
+    probe_finalize_media_streams,
     recover_segment_from_fragments,
     recovered_segment_output_file,
     safe_filename_stem,
@@ -132,7 +134,13 @@ from .powerchat import (
 )
 from .sources import SourceError, live_stream_from_generic_info, resolve_source
 from .state import StateStore, StreamEventRecord, StreamRecord, WatermarkCopyRecord
-from .youtube import YtDlpError, YtDlpRunner, live_stream_from_info
+from .youtube import (
+    ConfirmedLiveTerminationError,
+    ConfirmedVideoRemovalError,
+    YtDlpError,
+    YtDlpRunner,
+    live_stream_from_info,
+)
 from .voice_match import (
     create_transcript_voice_sample,
     load_transcript_segments,
@@ -854,6 +862,7 @@ CONFIG_FORM_FIELDS: tuple[ConfigFormField, ...] = (
     ConfigFormField("discovery_probe_concurrency", "Discovery", "int", minimum=1),
     ConfigFormField("max_concurrent_downloads", "Discovery", "int", minimum=1),
     ConfigFormField("live_from_start", "Download", "bool"),
+    ConfigFormField("auto_redownload_failed_finalization", "Download", "bool"),
     ConfigFormField(
         "youtube_preferred_video_codec",
         "Download",
@@ -938,6 +947,7 @@ CONFIG_FIELD_HELP: dict[str, str] = {
     "discovery_probe_concurrency": "Number of source checks that may run at the same time.",
     "max_concurrent_downloads": "Maximum live recordings allowed to download simultaneously.",
     "live_from_start": "Ask supported platforms for the stream from its earliest available point.",
+    "auto_redownload_failed_finalization": "Automatically download a separate VOD copy after confirmed stream end if finalization fails. Saved recording files are preserved. Unavailable VODs are retried later.",
     "youtube_preferred_video_codec": "Preferred codec when locking a YouTube stream to one exact video format. The chosen format is retained for every reconnect.",
     "keep_fragments_for_resume": "Keep media fragments so interrupted or mixed-format downloads can resume safely.",
     "fragment_retention_hours": "Automatically remove fragments from ended streams after this many hours. Zero keeps them until you clean them manually.",
@@ -992,6 +1002,7 @@ CONFIG_FIELD_LABELS: dict[str, str] = {
     "discovery_probe_concurrency": "Concurrent source checks",
     "max_concurrent_downloads": "Concurrent recordings",
     "live_from_start": "Record from the available start",
+    "auto_redownload_failed_finalization": "Automatically redownload failed finalizations from VOD",
     "youtube_preferred_video_codec": "Preferred YouTube video codec",
     "keep_fragments_for_resume": "Keep fragments for recovery",
     "fragment_retention_hours": "Clear ended-stream fragments after",
@@ -3201,6 +3212,7 @@ def build_config_summary(config: BotConfig) -> dict[str, dict[str, Any]]:
         },
         "Download": {
             "live_from_start": config.live_from_start,
+            "auto_redownload_failed_finalization": config.auto_redownload_failed_finalization,
             "youtube_preferred_video_codec": config.youtube_preferred_video_codec,
             "keep_fragments_for_resume": config.keep_fragments_for_resume,
             "fragment_retention_hours": config.fragment_retention_hours,
@@ -5905,6 +5917,129 @@ def start_vod_redownload_job(
     return True, "VOD redownload queued"
 
 
+def start_automatic_vod_redownload_job(
+    config: BotConfig,
+    video_id: str,
+    *,
+    can_start: Callable[[], bool] | None = None,
+) -> bool:
+    """Start one persisted VOD replacement attempt for a failed live recording."""
+
+    def enabled() -> bool:
+        return config.auto_redownload_failed_finalization and (
+            can_start is None or can_start()
+        )
+
+    if not enabled():
+        return False
+    with STREAM_OPERATION_LOCK:
+        if active_dashboard_job_kinds(config, video_id):
+            return False
+        state = StateStore(config.db_path)
+        try:
+            record = state.get_stream(video_id)
+            if record is None or record.status != "finalization_failed":
+                return False
+            stream = stream_from_record(record, is_live=False)
+            recovery = state.begin_automatic_vod_recovery(
+                video_id,
+                str(vod_output_template_for(config, stream, force_copy=True)),
+                now=time.time(),
+            )
+        finally:
+            state.close()
+    if recovery is None:
+        return False
+
+    def defer(message: str, *, blocked: bool = False) -> bool:
+        state = StateStore(config.db_path)
+        try:
+            if state.get_stream(video_id) is None:
+                return False
+            if blocked:
+                state.block_automatic_vod_recovery(video_id)
+            state.add_stream_event(video_id, message, level="warning")
+        finally:
+            state.close()
+        LOGGER.warning("%s video_id=%s", message, video_id)
+        return False
+
+    # Probe outside the operation lock. The exact archived session must match;
+    # a channel URL may now refer to a different live broadcast.
+    try:
+        spec = resolve_source(record.url)
+        info = YtDlpRunner(config.yt_dlp_path).run_json(
+            [
+                *config.extra_yt_dlp_args,
+                "--dump-json", "--skip-download", "--no-playlist",
+                "--no-warnings", spec.url,
+            ],
+            timeout=30,
+        )
+        if spec.platform == "youtube":
+            archive = live_stream_from_info(info, fallback_url=spec.url)
+        else:
+            archive = live_stream_from_generic_info(
+                info, platform=spec.platform, fallback_url=spec.url, source=record.source
+            )
+    except (ConfirmedLiveTerminationError, ConfirmedVideoRemovalError):
+        return defer(
+            "Automatic VOD recovery unavailable: the source was removed or terminated; "
+            "saved recording files are kept. Use Redownload from VOD if another archive is available.",
+            blocked=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed probe must preserve the recording.
+        return defer(
+            f"Automatic VOD recovery deferred: archive metadata unavailable "
+            f"({exc.__class__.__name__}); will retry."
+        )
+    if archive.video_id != record.video_id:
+        return defer(
+            "Automatic VOD recovery deferred: the URL does not identify the original "
+            "recording; use Redownload from VOD with its archive URL."
+        )
+    if archive.is_live or archive.live_status in {"is_live", "is_upcoming", "post_live"}:
+        return defer(
+            "Automatic VOD recovery deferred: the broadcast is live or its archive "
+            "is still processing; will retry."
+        )
+    with STREAM_OPERATION_LOCK:
+        if not enabled() or active_dashboard_job_kinds(config, video_id):
+            return False
+        state = StateStore(config.db_path)
+        try:
+            latest = state.get_stream(video_id)
+        finally:
+            state.close()
+        if latest is None or latest.status != "finalization_failed":
+            return False
+        output_template = Path(recovery.output_template)
+        job_id = vod_download_job_id(video_id, record.url)
+        try:
+            queue_vod_download_job(
+                config, job_id, stream, record.url, output_template,
+                previous_status="finalization_failed",
+                queued_message="Started automatic VOD recovery after failed finalization; "
+                "saved recording files are kept",
+                item=output_template.name.replace("%(ext)s", "media"),
+                automatic=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - registration must release its claim.
+            state = StateStore(config.db_path)
+            try:
+                current = state.get_automatic_vod_recovery(video_id)
+                if current is not None and current.in_progress:
+                    finish_failed_vod_download(
+                        config, job_id, video_id,
+                        f"Unable to start automatic VOD recovery ({exc.__class__.__name__})",
+                        "finalization_failed",
+                    )
+            finally:
+                state.close()
+            return defer("Automatic VOD recovery could not start; saved files are kept and it will retry.")
+    return True
+
+
 @serialized_stream_operation
 def start_segment_recovery_job(
     config: BotConfig,
@@ -6161,11 +6296,12 @@ def queue_vod_download_job(
     previous_status: str | None,
     queued_message: str,
     item: str,
+    automatic: bool = False,
 ) -> None:
     output_template.parent.mkdir(parents=True, exist_ok=True)
     state = StateStore(config.db_path)
     try:
-        if not state.mark_vod_downloading(stream, message=queued_message):
+        if not state.mark_vod_downloading(stream, message=queued_message, automatic=automatic):
             raise ConfigError("Stream status changed; VOD download was not started")
     finally:
         state.close()
@@ -6181,7 +6317,7 @@ def queue_vod_download_job(
         progress=0.0,
     )
     thread = Thread(
-        target=run_vod_download_job,
+        target=run_automatic_vod_download_job if automatic else run_vod_download_job,
         args=(config, job_id, stream, vod_url, output_template, previous_status),
         name=f"onlysavemevods-vod-download-{stream.video_id}",
         daemon=True,
@@ -6195,6 +6331,28 @@ def queue_vod_download_job(
     )
 
 
+def run_automatic_vod_download_job(
+    config: BotConfig,
+    job_id: str,
+    stream: LiveStream,
+    vod_url: str,
+    output_template: Path,
+    previous_status: str | None = None,
+) -> None:
+    try:
+        run_vod_download_job(
+            config, job_id, stream, vod_url, output_template, previous_status,
+            automatic=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - background recovery must release its claim.
+        reason = str(exc) if isinstance(exc, ConfigError) else exc.__class__.__name__
+        message = f"Automatic VOD recovery failed: {reason}; saved recording files are kept"
+        finish_failed_vod_download(
+            config, job_id, stream.video_id, message, "finalization_failed"
+        )
+        LOGGER.warning("%s video_id=%s", message, stream.video_id)
+
+
 def run_vod_download_job(
     config: BotConfig,
     job_id: str,
@@ -6202,6 +6360,8 @@ def run_vod_download_job(
     vod_url: str,
     output_template: Path,
     previous_status: str | None = None,
+    *,
+    automatic: bool = False,
 ) -> None:
     command = build_vod_download_command(config, vod_url, output_template)
     update_tracked_job(
@@ -6231,22 +6391,37 @@ def run_vod_download_job(
         LOGGER.exception("Unable to start VOD download for %s", stream.video_id)
         return
 
-    if process.stdout is not None:
-        for line in process.stdout:
-            stripped = line.strip()
-            if stripped:
-                last_output = stripped
-            progress = vod_download_progress_from_line(stripped)
-            if progress is not None:
-                update_tracked_job(
-                    job_id,
-                    phase=f"Downloading {progress * 100:.1f}%",
-                    message=stripped,
-                    progress=min(0.98, max(0.02, progress)),
-                )
-            elif stripped:
-                update_tracked_job(job_id, message=stripped)
-    return_code = process.wait()
+    try:
+        if process.stdout is not None:
+            for line in process.stdout:
+                stripped = line.strip()
+                if stripped:
+                    last_output = stripped
+                progress = vod_download_progress_from_line(stripped)
+                if progress is not None:
+                    update_tracked_job(
+                        job_id,
+                        phase=f"Downloading {progress * 100:.1f}%",
+                        message=stripped,
+                        progress=min(0.98, max(0.02, progress)),
+                    )
+                elif stripped:
+                    update_tracked_job(job_id, message=stripped)
+        return_code = process.wait()
+    except Exception:
+        # Release the failed-copy claim only after its writer has stopped.
+        if automatic:
+            try:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=5)
+            except OSError:
+                LOGGER.warning("Unable to stop failed automatic VOD process video_id=%s", stream.video_id)
+        raise
     if return_code != 0:
         message = last_output or f"yt-dlp exited with code {return_code}"
         finish_failed_vod_download(
@@ -6264,6 +6439,16 @@ def run_vod_download_job(
             message,
         )
         return
+
+    if automatic:
+        media_file = vod_media_file_for_output_template(output_template)
+        if media_file is None:
+            raise ConfigError("VOD download produced no media file")
+        media_streams = probe_finalize_media_streams(
+            [media_file], ffprobe_path_for(config.ffmpeg_path)
+        )
+        if {"video", "audio"} - {track.codec_type for track in media_streams}:
+            raise ConfigError("VOD copy is missing its video or audio track")
 
     job_message = "VOD download completed"
     stream_message = f"VOD download completed from {vod_url}"

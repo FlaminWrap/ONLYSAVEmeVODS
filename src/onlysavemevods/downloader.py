@@ -3190,6 +3190,18 @@ class DownloadManager:
                 stream, segment_index, expected_status="finalization_failed"
             )
 
+    async def maybe_redownload_failed_finalization(self, stream: LiveStream) -> bool:
+        if self._stopping or not self.config.auto_redownload_failed_finalization:
+            return False
+        from .web import start_automatic_vod_redownload_job
+
+        return await asyncio.to_thread(
+            start_automatic_vod_redownload_job,
+            self.config,
+            stream.video_id,
+            can_start=lambda: not self._stopping,
+        )
+
     def _track_lifecycle_task(
         self,
         task: asyncio.Task[None],
@@ -3803,6 +3815,8 @@ class DownloadManager:
                 clear_download_progress(
                     stream.video_id, progress_file=self.download_progress_file
                 )
+                if await self.maybe_redownload_failed_finalization(stream):
+                    return
                 self._schedule_finalization_retry(
                     stream,
                     segment_index,
@@ -3856,6 +3870,9 @@ class DownloadManager:
             retry_status = expected_status
             delay = max(30, min(self.config.poll_interval_seconds, 300))
             while not self._stopping:
+                if retry_status == "finalization_failed":
+                    if await self.maybe_redownload_failed_finalization(stream):
+                        return
                 await self.sleep(delay)
                 if (
                     self._stopping
