@@ -1982,7 +1982,7 @@ def build_handler(
                 return
 
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", self._return_location("/#streamers"))
+            self.send_header("Location", self._return_location("/streamers"))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
@@ -11085,7 +11085,7 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
   <div class="section-stack">
     {render_stream_signals(stream)}
     <dl class="detail-list stream-detail-list"><dt>Directory</dt><dd>{escape(stream.directory)}</dd><dt>Video format</dt><dd>{escape(video_format)}</dd><dt>Files</dt><dd>{stream.file_count}</dd><dt>{storage_label}</dt><dd>{escape(format_bytes(stream.total_bytes))}</dd><dt>Started</dt><dd>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</dd><dt>Exited</dt><dd>{escape(format_optional_iso(stream.last_exit_at, timezone_name))}</dd><dt>Updated</dt><dd>{escape(format_optional_iso(stream.updated_at, timezone_name))}</dd></dl>
-    <div class="button-row">{render_segment_recovery_actions(stream)}{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}</div>
+    <div class="button-row">{render_segment_recovery_actions(stream)}{render_cleanup_fragments_action(stream)}{render_delete_stream_action(stream, use_dialog=True)}{render_stream_vod_redownload_form(stream, use_dialog=True)}</div>
     <details class="stream-subsection" data-details-key="stream:{details_key}:files" open><summary><strong>Files and actions</strong><span class="subsection-count">{stream.file_count}</span></summary><div class="stream-subsection-body"><div class="table-wrap"><table><thead><tr><th>File</th><th>Segment</th><th>Format</th><th>Kind</th><th>Modified</th><th>Size</th><th>Action</th></tr></thead><tbody>{files}</tbody></table></div>{file_diagnostics}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:events"><summary><strong>Content events</strong><span class="subsection-count">{stream.content_event_count}</span></summary><div class="stream-subsection-body">{render_content_events(stream.content_events)}</div></details>
     <details class="stream-subsection" data-details-key="stream:{details_key}:powerchat"><summary><strong>Powerchat</strong><span class="subsection-count">{stream.powerchat_event_count}</span></summary><div class="stream-subsection-body">{render_powerchat_events(stream, timezone_name)}</div></details>
@@ -17577,10 +17577,31 @@ def render_delete_stream_action(stream: StreamStatus, *, use_dialog: bool = Fals
     )
 
 
-def render_stream_vod_redownload_form(stream: StreamStatus) -> str:
+def render_stream_vod_redownload_form(stream: StreamStatus, *, use_dialog: bool = False) -> str:
     if stream.status in VOD_DOWNLOAD_BLOCKED_STATUSES:
         return ""
     default_url = stream.url if stream.url.startswith(("http://", "https://")) else ""
+    if use_dialog:
+        dialog_id = escape(f"vod-redownload-{stream.video_id}", quote=True)
+        return f"""<button class="download action-button" type="button" data-open-dialog="{dialog_id}">Redownload from VOD</button>
+<dialog id="{dialog_id}" aria-labelledby="{dialog_id}-title">
+  <div class="dialog-card">
+    <div class="card-header"><div><h2 id="{dialog_id}-title">Redownload from VOD</h2><p>Download a separate copy from the VOD. Existing recording files are kept.</p></div>
+      <button class="icon-button" type="button" data-close-dialog aria-label="Close">×</button>
+    </div>
+    <form class="section-stack" method="post" action="/vod-download">
+      <input type="hidden" name="action" value="redownload">
+      <input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">
+      <div class="form-field"><label for="{dialog_id}-url">VOD URL</label>
+        <input id="{dialog_id}-url" name="vod_url" value="{escape(default_url, quote=True)}" placeholder="Paste the VOD URL" required>
+      </div>
+      <div class="dialog-actions">
+        <button class="button secondary" type="button" data-close-dialog>Cancel</button>
+        <button class="button" type="submit">Download VOD Copy</button>
+      </div>
+    </form>
+  </div>
+</dialog>"""
     return f"""<details class="vod-download-box">
   <summary class="download action-button">Redownload from VOD</summary>
   <form class="vod-download-form" method="post" action="/vod-download">
