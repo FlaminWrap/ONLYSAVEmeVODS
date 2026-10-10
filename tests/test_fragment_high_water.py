@@ -172,6 +172,7 @@ class FragmentHighWaterTests(unittest.TestCase):
             status="downloading",
             recording_kind="live",
             platform="youtube",
+            jobs=[],
             download_progress=download_progress_for(video_id),
             download_progress_waiting_stale=False,
         )

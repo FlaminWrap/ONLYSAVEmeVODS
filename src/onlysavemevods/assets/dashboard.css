@@ -320,6 +320,7 @@ button, a, input, select, textarea, summary { outline: none; }
 .live-download-track.is-waiting progress { opacity: .55; }
 .stream-detail-header { margin-bottom: 0; }
 .stream-detail > .live-download-progress { margin-top: 12px; }
+.vod-download-progress { grid-template-columns: minmax(0, 1fr); }
 
 .streamer-list, .record-list { display: grid; gap: 10px; }
 .streamer-summary {

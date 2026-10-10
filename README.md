@@ -337,6 +337,11 @@ Manually add or redownload a VOD:
    VOD downloads too. When processing quiet hours are enabled, these automatic
    VOD jobs wait for the same window.
 
+VOD downloads show one **Overall** progress bar on the overview and streamer
+pages. It covers the selected video and audio downloads together, then shows
+the finishing phase. When the total size is unknown, the bar stays indeterminate
+until enough information is available. Live recordings keep their track progress.
+
 Automatically recover recordings that fail finalization:
 
 1. Open **Settings → Recording → Download** and enable **Automatically redownload

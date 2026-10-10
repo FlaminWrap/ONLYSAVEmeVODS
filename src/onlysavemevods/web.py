@@ -2898,6 +2898,16 @@ def expected_live_download_tracks(
     return ("media",)
 
 
+def active_vod_download_job(jobs: Sequence[JobStatus]) -> JobStatus | None:
+    return next(
+        (
+            job for job in jobs
+            if job.kind == "VOD download" and job.status in {"queued", "running"}
+        ),
+        None,
+    )
+
+
 def live_download_progress_waiting_stale(
     last_started_at: str | None,
     platform_name: str,
@@ -4758,6 +4768,7 @@ def stream_status_from_record(
 
     is_live_downloading = (
         record.status == "downloading" and record.recording_kind == "live"
+        and active_vod_download_job(job_records or []) is None
     )
     if is_live_downloading:
         resolved_download_progress = (
@@ -6368,10 +6379,11 @@ def run_vod_download_job(
         job_id,
         phase="Starting yt-dlp",
         message="Starting VOD download",
-        progress=0.02,
+        progress=None,
     )
     LOGGER.debug("yt-dlp VOD command for %s: %s", stream.video_id, command_for_log(command))
     last_output = ""
+    download_progress = VodDownloadProgress()
     try:
         process = subprocess.Popen(
             command,
@@ -6395,17 +6407,15 @@ def run_vod_download_job(
         if process.stdout is not None:
             for line in process.stdout:
                 stripped = line.strip()
-                if stripped:
-                    last_output = stripped
-                progress = vod_download_progress_from_line(stripped)
-                if progress is not None:
+                if download_progress.consume_line(stripped):
                     update_tracked_job(
                         job_id,
-                        phase=f"Downloading {progress * 100:.1f}%",
-                        message=stripped,
-                        progress=min(0.98, max(0.02, progress)),
+                        phase=download_progress.phase,
+                        message=download_progress.phase,
+                        progress=download_progress.progress,
                     )
                 elif stripped:
+                    last_output = stripped
                     update_tracked_job(job_id, message=stripped)
         return_code = process.wait()
     except Exception:
@@ -6440,6 +6450,12 @@ def run_vod_download_job(
         )
         return
 
+    update_tracked_job(
+        job_id,
+        phase="Finishing VOD download",
+        message="VOD media download completed",
+        progress=0.98,
+    )
     if automatic:
         media_file = vod_media_file_for_output_template(output_template)
         if media_file is None:
@@ -6788,11 +6804,11 @@ def run_kick_vod_chat_download_job(
     result = download_kick_vod_chat_replay(
         stream,
         output_template,
-        progress=lambda phase, value: update_tracked_job(
+        progress=lambda phase, _value: update_tracked_job(
             job_id,
             phase=phase,
             message=phase,
-            progress=0.99 if value is None else min(0.99, max(0.02, value)),
+            progress=0.99,
         ),
     )
     if not result.ok:
@@ -6850,6 +6866,23 @@ def build_vod_download_command(
         "--newline",
         "--progress-delta",
         "5",
+        "--print",
+        "before_dl:" + VOD_DOWNLOAD_PLAN_PREFIX + (
+            '{"format_id": %(format_id|null)j, "filesize": %(filesize|null)j, '
+            '"filesize_approx": %(filesize_approx|null)j, '
+            '"formats": %(requested_formats.:.{format_id,filesize,filesize_approx})j}'
+        ),
+        "--no-simulate",
+        "--no-quiet",
+        "--progress-template",
+        "download:" + VOD_DOWNLOAD_PROGRESS_PREFIX + (
+            '{"format_id": %(info.format_id|null)j, '
+            '"progress": %(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate})j}'
+        ),
+        "--progress-template",
+        "postprocess:" + VOD_DOWNLOAD_POSTPROCESS_PREFIX + (
+            "%(progress.{status,postprocessor})j"
+        ),
         "--no-playlist",
         "-o",
         str(output_template),
@@ -6901,6 +6934,103 @@ def vod_download_progress_from_line(line: str) -> float | None:
         return float(match.group("percent")) / 100.0
     except ValueError:
         return None
+
+
+VOD_DOWNLOAD_PLAN_PREFIX = "__ONLYSAVEMEVODS_VOD_PLAN__"
+VOD_DOWNLOAD_PROGRESS_PREFIX = "__ONLYSAVEMEVODS_VOD_PROGRESS__"
+VOD_DOWNLOAD_POSTPROCESS_PREFIX = "__ONLYSAVEMEVODS_VOD_POSTPROCESS__"
+
+
+@dataclass
+class VodDownloadProgress:
+    """Account for every selected media file before reporting one percentage."""
+
+    phase: str = "Downloading VOD"
+    progress: float | None = None
+    _sizes: dict[str, float | None] = field(default_factory=dict)
+    _downloaded: dict[str, float] = field(default_factory=dict)
+    _combined_format_id: str | None = None
+    _last_progress: float = 0.0
+
+    @staticmethod
+    def _bytes(value: object) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+            # Reject nonfinite values without accepting strings such as "NA".
+            number = float(value)
+            return number if number < float("inf") else None
+        return None
+
+    def consume_line(self, line: str) -> bool:
+        """Consume only our bounded JSON messages, never per-file percentages."""
+        prefixes = (
+            VOD_DOWNLOAD_PLAN_PREFIX,
+            VOD_DOWNLOAD_PROGRESS_PREFIX,
+            VOD_DOWNLOAD_POSTPROCESS_PREFIX,
+        )
+        prefix = next((value for value in prefixes if line.startswith(value)), None)
+        if prefix is None:
+            return False
+        try:
+            data = json.loads(line[len(prefix):])
+        except (ValueError, TypeError):
+            return True
+        if not isinstance(data, dict):
+            return True
+
+        if prefix == VOD_DOWNLOAD_PLAN_PREFIX:
+            formats = data.get("formats")
+            self._combined_format_id = str(data.get("format_id") or "")
+            selected = formats if isinstance(formats, list) and formats else [data]
+            self._sizes = {
+                str(fmt.get("format_id")): self._bytes(fmt.get("filesize"))
+                or self._bytes(fmt.get("filesize_approx"))
+                for fmt in selected
+                if isinstance(fmt, dict) and fmt.get("format_id") is not None
+            }
+            self._downloaded = {}
+            self.phase = "Downloading VOD"
+            self._report_progress()
+        elif prefix == VOD_DOWNLOAD_POSTPROCESS_PREFIX:
+            self.phase = "Merging VOD" if data.get("postprocessor") == "Merger" else "Processing VOD"
+        else:
+            current = data.get("progress")
+            if not isinstance(current, dict) or current.get("status") not in {"downloading", "finished"}:
+                return True
+            format_id = str(data.get("format_id") or "")
+            if format_id not in self._sizes:
+                if format_id != self._combined_format_id or not self._sizes:
+                    self.progress = None
+                    return True
+                # ffmpeg may download the selected formats together in one file.
+                sizes = list(self._sizes.values())
+                self._sizes = {format_id: sum(sizes) if all(value is not None for value in sizes) else None}
+                self._downloaded = {}
+            total = self._bytes(current.get("total_bytes")) or self._bytes(current.get("total_bytes_estimate"))
+            downloaded = self._bytes(current.get("downloaded_bytes")) or 0.0
+            if total is not None:
+                self._sizes[format_id] = total
+            if current.get("status") == "finished":
+                downloaded = downloaded or self._sizes.get(format_id) or 0.0
+                if downloaded:
+                    self._sizes[format_id] = downloaded
+            self._downloaded[format_id] = max(self._downloaded.get(format_id, 0.0), downloaded)
+            self.phase = "Downloading VOD"
+            self._report_progress()
+        return True
+
+    def _report_progress(self) -> None:
+        if not self._sizes or any(size is None for size in self._sizes.values()):
+            self.progress = None
+            return
+        total = sum(size for size in self._sizes.values() if size is not None)
+        downloaded = sum(
+            min(self._downloaded.get(format_id, 0.0), size)
+            for format_id, size in self._sizes.items()
+            if size is not None
+        )
+        # Merging, validation and chat still have to finish after media transfer.
+        self._last_progress = max(self._last_progress, min(0.98, downloaded / total))
+        self.progress = self._last_progress
 
 
 def vod_output_template_for(
@@ -10342,8 +10472,45 @@ def render_admin_setup_checklist(snapshot: StatusSnapshot) -> str:
     return f'<section class="notice info"><div class="card-header"><div><h2>{heading}</h2><p>{text}</p></div>{action}</div></section>'
 
 
+def render_stream_download_progress(stream: StreamStatus) -> str:
+    if stream.status != "downloading":
+        return (
+            f'<span data-download-progress-slot="{escape(stream.video_id, quote=True)}" hidden></span>'
+        )
+    vod_job = active_vod_download_job(stream.jobs)
+    if stream.recording_kind == "vod" or vod_job is not None:
+        return render_vod_download_progress(stream, vod_job)
+    return render_live_download_progress(stream)
+
+
+def render_vod_download_progress(stream: StreamStatus, job: JobStatus | None) -> str:
+    stream_label = stream.title or stream.video_id
+    phase = job.phase if job is not None and job.phase else "Waiting for download progress…"
+    progress = job.progress if job is not None else None
+    percent = round(max(0.0, min(1.0, progress)) * 100, 1) if progress is not None else None
+    value_attr = f' value="{percent:g}"' if percent is not None else ""
+    progress_label = f"{percent:g}%" if percent is not None else "Waiting for progress…"
+    waiting_class = " is-waiting" if percent is None else ""
+    return (
+        '<span class="live-download-progress vod-download-progress" role="group" '
+        f'data-download-progress="{escape(stream.video_id, quote=True)}" '
+        f'aria-label="{escape(f"VOD download progress for {stream_label}", quote=True)}">'
+        '<span class="live-download-progress-heading"><strong>VOD download</strong>'
+        f'<span>{escape(phase)}</span></span>'
+        f'<span class="live-download-track{waiting_class}">'
+        '<span class="live-download-track-label"><strong>Overall</strong>'
+        f'<span>{progress_label}</span></span>'
+        f'<progress max="100"{value_attr} '
+        f'aria-label="{escape(f"Overall VOD download progress for {stream_label}: {progress_label}", quote=True)}">'
+        f'{progress_label}</progress></span></span>'
+    )
+
+
 def render_live_download_progress(stream: StreamStatus) -> str:
-    if stream.status != "downloading" or stream.recording_kind != "live":
+    if (
+        stream.status != "downloading" or stream.recording_kind != "live"
+        or active_vod_download_job(stream.jobs) is not None
+    ):
         return ""
 
     progress_by_track = {item.track: item for item in stream.download_progress}
@@ -10481,6 +10648,7 @@ def render_live_download_progress(stream: StreamStatus) -> str:
 
     return (
         f'<span class="live-download-progress{wrapper_class}" role="group" '
+        f'data-download-progress="{escape(stream.video_id, quote=True)}" '
         f'data-live-download-progress="{escape(stream.video_id, quote=True)}" '
         f'aria-label="{escape(f"Live download progress for {stream_label}: {summary}", quote=True)}">'
         '<span class="live-download-progress-heading">'
@@ -10495,7 +10663,7 @@ def render_admin_stream_record(stream: StreamStatus, *, streamer_name: str = "")
     status_label = STATUS_LABELS.get(stream.status, stream.status.replace("_", " "))
     status_class = "warning" if stream_needs_attention(stream) else "good"
     stored_label = "Stored" if stream.file_size_totals_complete else "Relevant storage"
-    download_progress = render_live_download_progress(stream)
+    download_progress = render_stream_download_progress(stream)
     return f"""<article class="streamer-summary">
   <div>
     <h3>{escape(stream.title or stream.video_id)}</h3>
@@ -11260,7 +11428,7 @@ def render_admin_stream_detail(stream: StreamStatus, timezone_name: str) -> str:
     ) or '<tr><td colspan="7">No relevant files found</td></tr>'
     file_diagnostics = render_file_diagnostics_control(stream)
     storage_label = "Storage" if stream.file_size_totals_complete else "Relevant storage"
-    download_progress = render_live_download_progress(stream)
+    download_progress = render_stream_download_progress(stream)
     disclosure_label = stream.title or stream.video_id
     return f"""<article class="card stream-detail">
   <header class="card-header stream-detail-header"><div><h3>{escape(stream.title or stream.video_id)}</h3><div class="summary-meta">{render_platform_icon(platform, platform_label, platform_initial)}<span>{escape(format_optional_iso(stream.last_started_at, timezone_name))}</span><span class="muted">{escape(stream.video_id)}</span>{format_badge}</div></div><span class="status-badge {'warning' if stream_needs_attention(stream) else 'good'}">{escape(status_label)}</span></header>

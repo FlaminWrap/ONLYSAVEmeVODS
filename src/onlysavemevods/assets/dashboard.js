@@ -839,12 +839,14 @@
   const patchLiveDownloadProgress = (region, html) => {
     const template = document.createElement("template");
     template.innerHTML = html;
+    const selector = "[data-download-progress], [data-download-progress-slot]";
+    const progressKey = (progress) => progress.dataset.downloadProgress || progress.dataset.downloadProgressSlot;
     const incoming = new Map(
-      [...template.content.querySelectorAll("[data-live-download-progress]")]
-        .map((progress) => [progress.dataset.liveDownloadProgress, progress]),
+      [...template.content.querySelectorAll(selector)]
+        .map((progress) => [progressKey(progress), progress]),
     );
-    region.querySelectorAll("[data-live-download-progress]").forEach((progress) => {
-      const replacement = incoming.get(progress.dataset.liveDownloadProgress);
+    region.querySelectorAll(selector).forEach((progress) => {
+      const replacement = incoming.get(progressKey(progress));
       if (replacement) progress.replaceWith(replacement);
       else progress.remove();
     });
@@ -867,6 +869,7 @@
         if (revision) region.dataset.fragmentRevision = revision;
         return;
       }
+      patchLiveDownloadProgress(region, html);
       if (fragmentInteractionBlocksReplacement(region)) return;
       const detailsState = captureDetailsState(region);
       region.innerHTML = html;
