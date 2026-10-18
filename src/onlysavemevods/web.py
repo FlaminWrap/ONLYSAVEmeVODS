@@ -75,6 +75,7 @@ from .config import (
     monitored_sources,
     post_stream_config_for_channel,
     remove_streamer_config,
+    set_streamer_archived,
     streamer_display_name_for_channel,
     streamer_for_channel,
     update_channel_speaker_labels_config,
@@ -728,6 +729,7 @@ class StreamerStatus:
     stream_event_rules: list[dict[str, Any]]
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
     timezone: str = "UTC"
+    archived: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -764,6 +766,7 @@ class StreamerStatStatus:
     post_stream: dict[str, dict[str, Any]] = field(default_factory=dict)
     timezone: str = "UTC"
     file_size_totals_complete: bool = True
+    archived: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -2331,7 +2334,12 @@ def build_handler(
                 return
 
             streamer_name = first_query_value(params, "streamer_name").strip()
-            default_location = f"/streamers?selected={quote(streamer_name, safe='')}" if streamer_name else "/streamers"
+            default_location = (
+                "/streamers?view=archived"
+                if first_query_value(params, "action").strip().lower() == "archive"
+                else f"/streamers?selected={quote(streamer_name, safe='')}"
+                if streamer_name else "/streamers"
+            )
             self.send_response(HTTPStatus.SEE_OTHER)
             self.send_header("Location", safe_return_to(first_query_value(params, "return_to"), default_location))
             self.send_header("Cache-Control", "no-store")
@@ -3404,6 +3412,7 @@ def build_streamer_statuses(config: BotConfig) -> list[StreamerStatus]:
     return [
         StreamerStatus(
             name=name,
+            archived=streamer.archived,
             sources=list(streamer.sources),
             download_dir_name=streamer.download_dir_name,
             powerchat_enabled=streamer.powerchat_enabled,
@@ -3460,6 +3469,7 @@ def build_streamer_stats(
             streamer_stat_from_channel_status(
                 status,
                 configured=True,
+                archived=streamer.archived,
                 needs_grouping=False,
                 download_dir_name=streamer.download_dir_name or name,
                 powerchat_enabled=streamer.powerchat_enabled,
@@ -3561,6 +3571,7 @@ def streamer_stat_from_channel_status(
     stream_event_rules: list[dict[str, Any]],
     jobs: list[JobStatus],
     streams: list[StreamStatus],
+    archived: bool = False,
 ) -> StreamerStatStatus:
     latest_updated = iso_to_epoch(status.latest_updated_at)
     latest_file = status.latest_file_modified_at
@@ -3570,6 +3581,7 @@ def streamer_stat_from_channel_status(
     )
     return StreamerStatStatus(
         name=status.name,
+        archived=archived,
         sources=list(status.configured_sources),
         download_dir_name=download_dir_name,
         powerchat_enabled=powerchat_enabled,
@@ -8566,6 +8578,26 @@ def update_streamer_from_json(
     configured = config.streamers.get(streamer_name)
     if configured is None:
         raise ConfigError(f"streamer is not configured: {streamer_name}")
+    action = str(payload.get("action") or "save").strip().lower()
+    if action in {"archive", "restore"}:
+        with CONFIG_UPDATE_LOCK:
+            current_revision = config_file_revision(config)
+            expected_revision = str(payload.get("revision") or "")
+            if expected_revision and expected_revision != current_revision:
+                raise ConfigRevisionConflict(current_revision)
+            changed = set_streamer_archived(
+                config.config_path, streamer_name, action == "archive"
+            )
+            reload_running_config(config)
+            revision = config_file_revision(config)
+        return mutation_response(
+            ok=True,
+            message="Streamer archived" if action == "archive" else "Streamer restored",
+            revision=revision,
+            saved=["archived"] if changed else [],
+        )
+    if action != "save":
+        raise ConfigError("Unknown streamer action")
     values = payload.get("values")
     if not isinstance(values, dict) or not values:
         raise ConfigError("values must contain streamer settings")
@@ -8871,6 +8903,10 @@ def _update_streamer_from_form_locked(
 
     action = (first_query_value(params, "action") or "save").strip().lower()
     streamer_name = first_query_value(params, "streamer_name").strip()
+    if action in {"archive", "restore"}:
+        set_streamer_archived(config.config_path, streamer_name, action == "archive")
+        reload_running_config(config)
+        return
     if action == "migrate":
         selected_sources = [
             value.strip()
@@ -10268,6 +10304,7 @@ def render_admin_page(
             selected=selected,
             stream_page=stream_page,
             tab=streamer_tab,
+            archived=first_query_value(params, "view").strip().casefold() == "archived",
         )
         if not selected and snapshot_config_path(snapshot) != "-":
             actions = '<button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button>'
@@ -10331,6 +10368,7 @@ def render_admin_fragment_with_state(
         )
     elif page == "streamers":
         selected = first_query_value(params, "selected").strip()
+        archived = first_query_value(params, "view").strip().casefold() == "archived"
         base_stream_revision = stream_state_revision(snapshot.stream_revision)
         streamer: StreamerStatStatus | None = None
         tab = "overview"
@@ -10351,7 +10389,7 @@ def render_admin_fragment_with_state(
                 )
                 body = render_admin_streamer_streams(streamer, stream_page)
         else:
-            body = render_admin_streamer_list(snapshot)
+            body = render_admin_streamer_list(snapshot, archived=archived)
         revision = (
             streamer_powerchat_revision(snapshot.powerchat_stats, selected, streamer)
             if selected and tab == "powerchat" and streamer is not None
@@ -10376,6 +10414,9 @@ def render_admin_fragment_with_state(
                 else f"{base_stream_revision}:{snapshot.job_revision}"
             )
         )
+        if not selected:
+            revision = admin_streamer_list_revision(snapshot, archived=archived)
+            state_revision = revision
     elif page == "activity":
         view = first_query_value(params, "view").strip().lower() or "jobs"
         body = render_admin_activity_records(snapshot, view)
@@ -10742,32 +10783,58 @@ def render_admin_streamers(
     selected: str,
     stream_page: StreamerStreamPage | None = None,
     tab: str = "overview",
+    archived: bool = False,
 ) -> str:
     if selected:
         return render_admin_streamer_detail(snapshot, selected, stream_page, tab)
-    list_html = render_admin_streamer_list(snapshot)
-    revision = (
-        f"{stream_state_revision(snapshot.stream_revision)}:{snapshot.job_revision}"
-    )
+    list_html = render_admin_streamer_list(snapshot, archived=archived)
+    revision = admin_streamer_list_revision(snapshot, archived=archived)
+    fragment_url = "/streamers?fragment=list" + ("&view=archived" if archived else "")
     return f"""<div class="section-stack">
   <div class="search-bar"><label class="sr-only" for="streamer-search">Search streamers</label><input id="streamer-search" data-streamer-search type="search" placeholder="Search streamers or sources"></div>
-  <section data-fragment-url="/streamers?fragment=list" data-fragment-revision="{escape(revision, quote=True)}" data-fragment-state-revision="{escape(revision, quote=True)}">{list_html}</section>
+  <section data-fragment-url="{escape(fragment_url, quote=True)}" data-fragment-revision="{escape(revision, quote=True)}" data-fragment-state-revision="{escape(revision, quote=True)}">{list_html}</section>
   {render_admin_add_streamer_dialog(snapshot)}
   {render_admin_legacy_migration(snapshot)}
 </div>"""
 
 
-def render_admin_streamer_list(snapshot: StatusSnapshot) -> str:
-    if not snapshot.streamer_stats:
-        return '<section class="card empty-state"><h2>No streamers yet</h2><p>Add a streamer and one or more platform sources to start monitoring.</p><button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button></section>'
-    return '<div class="streamer-list">' + "".join(
-        render_admin_streamer_summary(streamer) for streamer in snapshot.streamer_stats
+def admin_streamer_list_revision(snapshot: StatusSnapshot, *, archived: bool) -> str:
+    identities = [
+        (streamer.name, streamer.sources, streamer.configured, streamer.archived)
+        for streamer in snapshot.streamer_stats
+    ]
+    digest = hashlib.sha1(json.dumps(identities).encode("utf-8")).hexdigest()[:16]
+    return (
+        f"{stream_state_revision(snapshot.stream_revision)}:{snapshot.job_revision}:"
+        f"streamers:{digest}:{int(archived)}"
+    )
+
+
+def render_admin_streamer_list(snapshot: StatusSnapshot, *, archived: bool = False) -> str:
+    archived_count = sum(streamer.archived for streamer in snapshot.streamer_stats)
+    active_count = len(snapshot.streamer_stats) - archived_count
+    tabs = (
+        '<nav class="tabs" aria-label="Streamer lists">'
+        f'<a href="/streamers" class="{"" if archived else "active"}"'
+        f'{"" if archived else " aria-current=\"page\""}>Active ({active_count})</a>'
+        f'<a href="/streamers?view=archived" class="{"active" if archived else ""}"'
+        f'{" aria-current=\"page\"" if archived else ""}>Archived ({archived_count})</a></nav>'
+    )
+    streamers = [streamer for streamer in snapshot.streamer_stats if streamer.archived == archived]
+    if not streamers:
+        if archived:
+            return tabs + '<section class="card empty-state"><h2>No archived streamers</h2><p>Archived streamers and their recordings will appear here.</p></section>'
+        if archived_count:
+            return tabs + '<section class="card empty-state"><h2>No active streamers</h2><p>Restore a streamer from Archived or add a streamer to start monitoring.</p></section>'
+        return tabs + '<section class="card empty-state"><h2>No streamers yet</h2><p>Add a streamer and one or more platform sources to start monitoring.</p><button class="button" type="button" data-open-dialog="add-streamer-dialog">Add streamer</button></section>'
+    return tabs + '<div class="streamer-list">' + "".join(
+        render_admin_streamer_summary(streamer) for streamer in streamers
     ) + "</div>"
 
 
 def render_admin_streamer_summary(streamer: StreamerStatStatus) -> str:
-    status_class = "warning" if streamer.needs_grouping or streamer.attention_count else "good"
-    status = "Needs grouping" if streamer.needs_grouping else ("Needs attention" if streamer.attention_count else "Configured")
+    status_class = "warning" if streamer.archived or streamer.needs_grouping or streamer.attention_count else "good"
+    status = "Archived" if streamer.archived else "Needs grouping" if streamer.needs_grouping else ("Needs attention" if streamer.attention_count else "Configured")
     search_text = " ".join([streamer.name, *streamer.sources]).lower()
     selected = quote(streamer.name, safe="")
     storage_label = (
@@ -10840,6 +10907,37 @@ def render_admin_streamer_detail(
     delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
       <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
     </form>"""
+    archive_form = ""
+    if streamer.configured and snapshot_config_path(snapshot) != "-":
+        action = "restore" if streamer.archived else "archive"
+        label = "Restore streamer" if streamer.archived else "Archive streamer"
+        return_to = (
+            f"/streamers?selected={quote(streamer.name, safe='')}"
+            if streamer.archived else "/streamers?view=archived"
+        )
+        confirmation = (
+            ""
+            if streamer.archived else
+            f' data-confirm="Archive {escape(streamer.name, quote=True)}? New monitoring will pause. '
+            'Recordings and settings will be kept, and current recordings will finish normally." '
+            'data-confirm-label="Archive streamer"'
+        )
+        archive_form = (
+            f'<form method="post" action="/streamers"{confirmation}>'
+            f'<input type="hidden" name="action" value="{action}">'
+            f'<input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}">'
+            f'<input type="hidden" name="return_to" value="{escape(return_to, quote=True)}">'
+            f'<button class="button small secondary" type="submit">{label}</button></form>'
+        )
+    archive_notice = (
+        '<div class="notice info"><strong>Archived — monitoring paused.</strong> '
+        'Recordings and settings are kept. Current recordings and processing jobs will finish normally. '
+        'Restore this streamer to resume monitoring.</div>'
+        if streamer.archived else ""
+    )
+    back_url = "/streamers?view=archived" if streamer.archived else "/streamers"
+    back_label = "Archived streamers" if streamer.archived else "All streamers"
+    badge_label = "Archived" if streamer.archived else "Needs attention" if streamer.attention_count else "Configured"
     tabs = render_admin_streamer_tabs(streamer.name, tab)
     basic_form = render_admin_streamer_basic_form(streamer, snapshot) if tab == "overview" else ""
     if tab == "settings":
@@ -10884,9 +10982,10 @@ def render_admin_streamer_detail(
     {render_admin_streamer_streams(streamer, stream_page)}
   </section>"""
     return f"""<div class="section-stack">
-  <div><a href="/streamers">← All streamers</a></div>
+  <div><a href="{escape(back_url, quote=True)}">← {back_label}</a></div>
   <section class="card streamer-detail-hero">
-    <div class="card-header"><div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div><div class="button-row"><span class="status-badge {'warning' if streamer.attention_count else 'good'}">{'Needs attention' if streamer.attention_count else 'Configured'}</span>{delete_form}</div></div>
+    <div class="card-header"><div><h2>{escape(streamer.name)}</h2>{render_source_chips(streamer.sources)}</div><div class="button-row"><span class="status-badge {'warning' if streamer.archived or streamer.attention_count else 'good'}">{badge_label}</span>{archive_form}{delete_form}</div></div>
+    {archive_notice}
     {basic_form}
   </section>
   {tabs}
@@ -15838,6 +15937,7 @@ def streamer_summary_for_config(config: BotConfig) -> dict[str, Any]:
     ]
     return {
         "count": len(config.streamers),
+        "archived_count": sum(streamer.archived for streamer in config.streamers.values()),
         "streamers": streamers,
         "shared_voice_detection": voice_detection,
         "shared_speaker_labels": speaker_labels,

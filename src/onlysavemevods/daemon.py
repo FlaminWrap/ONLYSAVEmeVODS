@@ -192,6 +192,8 @@ class OnlySaveMeVodsDaemon:
         self.downloads.resume_pending_post_processing_jobs()
         await self.cleanup_expired_fragments()
         for source in monitored_sources(self.config):
+            if not self._source_is_monitored(source):
+                continue
             LOGGER.info("Checking source %s", source)
             try:
                 streams = await asyncio.to_thread(
@@ -202,11 +204,15 @@ class OnlySaveMeVodsDaemon:
                 LOGGER.warning("Failed to check source %s: %s", source, exc)
                 continue
 
+            if not self._source_is_monitored(source):
+                continue
             if not streams:
                 LOGGER.info("No live streams detected for %s", source)
                 continue
 
             for stream in streams:
+                if not self._source_is_monitored(source):
+                    break
                 LOGGER.info(
                     "Live stream found for %s platform=%s video_id=%s title=%r",
                     source,
@@ -238,6 +244,13 @@ class OnlySaveMeVodsDaemon:
                             stream.video_id,
                             exc_info=True,
                         )
+
+    def _source_is_monitored(self, source: str) -> bool:
+        key = source.strip().rstrip("/").casefold()
+        return any(
+            candidate.strip().rstrip("/").casefold() == key
+            for candidate in monitored_sources(self.config)
+        )
 
     async def cleanup_expired_fragments(self) -> None:
         if self.config.fragment_retention_hours <= 0:

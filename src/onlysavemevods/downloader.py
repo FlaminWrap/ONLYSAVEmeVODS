@@ -52,6 +52,7 @@ from .config import (
     download_group_name_for_channel,
     post_stream_config_for_channel,
     streamer_for_channel,
+    streamer_for_source,
 )
 from .content_events import (
     ContentEventDetectorUnavailable,
@@ -759,12 +760,46 @@ class DownloadManager:
     def _remember_youtube_edge_progress(self, video_id: str) -> None:
         self._youtube_fragment_progress_at[video_id] = self.monotonic()
 
+    def _archived_streamer_blocks_start(self, stream: LiveStream) -> bool:
+        owner = streamer_for_source(
+            self.config, stream.source, default_platform=stream.platform
+        ) or streamer_for_source(
+            self.config, stream.url, default_platform=stream.platform
+        )
+        if owner is None and not stream.source:
+            owner = streamer_for_source(
+                self.config, stream.channel, default_platform=stream.platform
+            )
+        if owner is None or not owner[1].archived:
+            return False
+        record = self.state.get_stream(stream.video_id)
+        if (
+            record is not None
+            and record.last_started_at is not None
+            and record.status in {
+                "detected",
+                "downloading",
+                "checking_after_exit",
+                "stalled",
+                "waiting_retry",
+            }
+        ):
+            return False
+        self.logger.info(
+            "Skipping new recording %s because streamer %s is archived",
+            stream.video_id,
+            owner[0],
+        )
+        return True
+
     async def start_stream(
         self,
         stream: LiveStream,
         *,
         segment_index: int | None = None,
     ) -> bool:
+        if self._archived_streamer_blocks_start(stream):
+            return False
         if stream.video_id in self._starting_video_ids:
             self.logger.debug(
                 "Deferring %s while its downloader process is starting",
@@ -971,6 +1006,8 @@ class DownloadManager:
                 "Deferring %s because finalization began during startup",
                 stream.video_id,
             )
+            return False
+        if self._archived_streamer_blocks_start(stream):
             return False
         current_record = self.state.get_stream(stream.video_id)
         if (

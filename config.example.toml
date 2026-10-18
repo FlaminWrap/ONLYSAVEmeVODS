@@ -22,6 +22,7 @@ channels = []
 #   "kick:SomeStreamer",
 #   "https://rumble.com/user/SomeStreamer",
 # ]
+# archived = false # Pause new live recordings while keeping sources and recordings.
 # download_dir_name = "Some Streamer"
 # powerchat_enabled = true
 # powerchat_username = "SomeStreamer"

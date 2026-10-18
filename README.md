@@ -326,6 +326,17 @@ Add or remove a source for an existing streamer:
 4. The updated source list saves automatically. Source URLs are normalized to
    shorthand values when possible, such as `kick:oumb`.
 
+Archive or restore a streamer:
+
+1. Open **Streamers → Manage** and click **Archive streamer** beside **Remove**.
+2. Confirm to pause new source checks and recordings. Current recordings and
+   processing jobs finish normally. Sources, settings, and recordings are kept.
+3. Open **Streamers → Archived** to browse archived streamers and their history.
+   Select **Manage → Restore streamer** to resume monitoring.
+
+Archiving takes effect without restarting the service. The saved TOML setting
+is `archived = true` inside the streamer's table; it defaults to `false`.
+
 Manually add or redownload a VOD:
 
 1. Use the streamer's **Manual VOD** feature to add a new URL, or open a stream and use

@@ -10,7 +10,7 @@ import math
 import re
 import tomllib
 
-from .sources import SourceError, canonical_source, validate_source
+from .sources import SourceError, canonical_source, resolve_source, validate_source
 
 
 DEFAULT_POST_EXIT_CHECK_SECONDS = [
@@ -156,6 +156,7 @@ class StreamerConfig:
     voices: dict[str, VoiceProfileConfig] = field(default_factory=dict)
     stream_event_detection: StreamEventDetectionConfig | None = None
     stream_event_rules: list[StreamEventRuleConfig] = field(default_factory=list)
+    archived: bool = False
 
 
 @dataclass(slots=True)
@@ -589,9 +590,20 @@ def ensure_config_dirs(config: BotConfig) -> None:
 def monitored_sources(config: BotConfig) -> list[str]:
     sources: list[str] = []
     seen: set[str] = set()
+    archived_sources = {
+        _monitoring_source_key(source)
+        for streamer in config.streamers.values()
+        if streamer.archived
+        for source in streamer.sources
+        if source.strip()
+    }
     for source in [*config.channels, *streamer_sources(config)]:
         key = source.strip().rstrip("/").casefold()
-        if key and key not in seen:
+        if not key:
+            continue
+        if archived_sources and _monitoring_source_key(source) in archived_sources:
+            continue
+        if key not in seen:
             sources.append(source)
             seen.add(key)
     return sources
@@ -600,8 +612,40 @@ def monitored_sources(config: BotConfig) -> list[str]:
 def streamer_sources(config: BotConfig) -> list[str]:
     sources: list[str] = []
     for streamer in config.streamers.values():
-        sources.extend(streamer.sources)
+        if not streamer.archived:
+            sources.extend(streamer.sources)
     return sources
+
+
+def _monitoring_source_key(
+    source: str,
+    *,
+    default_platform: str | None = None,
+) -> tuple[str, str]:
+    spec = resolve_source(source, default_platform=default_platform)
+    normalized = canonical_source(spec.url).strip().rstrip("/").casefold()
+    if spec.platform == "youtube" and not normalized.startswith(("http://", "https://")):
+        normalized = normalized.lstrip("@")
+    return spec.platform, normalized
+
+
+def streamer_for_source(
+    config: BotConfig,
+    source: str,
+    *,
+    default_platform: str | None = None,
+) -> tuple[str, StreamerConfig] | None:
+    """Find a source owner without conflating usernames on different platforms."""
+    if not source.strip():
+        return None
+    try:
+        target = _monitoring_source_key(source, default_platform=default_platform)
+    except SourceError:
+        return None
+    for name, streamer in config.streamers.items():
+        if any(_monitoring_source_key(candidate) == target for candidate in streamer.sources):
+            return name, streamer
+    return None
 
 
 def streamer_for_channel(
@@ -935,6 +979,7 @@ def update_streamer_config(
     powerchat_enabled: bool = False,
     powerchat_username: str = "",
     timezone: str = "UTC",
+    archived: bool | None = None,
 ) -> bool:
     target = Path(config_path).expanduser()
     try:
@@ -969,9 +1014,15 @@ def update_streamer_config(
         timezone,
         f"streamers.{streamer_name}.timezone",
     )
+    if archived is None:
+        try:
+            current_streamers = tomllib.loads(current_text).get("streamers", {})
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"Invalid TOML in {target}: {exc}") from exc
+        current_streamer = current_streamers.get(streamer_name, {})
+        archived = current_streamer.get("archived", False)
+    normalized_archived = _as_bool(archived, f"streamers.{streamer_name}.archived")
 
-    table_name = f"streamers.{_toml_key(streamer_name)}"
-    pattern = re.compile(rf"(?ms)^\[{re.escape(table_name)}\]\n.*?(?=^\[|\Z)")
     block = _streamer_block(
         streamer_name,
         normalized_sources,
@@ -979,9 +1030,12 @@ def update_streamer_config(
         normalized_powerchat_enabled,
         normalized_powerchat_username,
         normalized_timezone,
+        normalized_archived,
     )
-    if pattern.search(current_text):
-        updated_text = pattern.sub(block + "\n", current_text, count=1)
+    table_span = _regular_table_span(current_text, ("streamers", streamer_name))
+    if table_span is not None:
+        start, end = table_span
+        updated_text = current_text[:start] + block + "\n\n" + current_text[end:]
     else:
         prefix = current_text.rstrip()
         updated_text = (prefix + "\n\n" if prefix else "") + block + "\n"
@@ -993,6 +1047,64 @@ def update_streamer_config(
     except OSError as exc:
         raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
     return updated_text != current_text
+
+
+def set_streamer_archived(
+    config_path: str | Path,
+    streamer_name: str,
+    archived: bool,
+) -> bool:
+    """Change monitoring state without changing sources or any saved settings."""
+    target = Path(config_path).expanduser()
+    try:
+        current_text = target.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise ConfigError(f"Config file does not exist: {target}") from exc
+    except OSError as exc:
+        raise ConfigError(f"Unable to read config file {target}: {exc}") from exc
+    streamer_name = streamer_name.strip()
+    if not streamer_name:
+        raise ConfigError("streamer name is required")
+    normalized = _as_bool(archived, f"streamers.{streamer_name}.archived")
+    _require_configured_streamer(current_text, streamer_name, target)
+    parsed = tomllib.loads(current_text)
+    streamers = _as_streamers(parsed.get("streamers", {}), "streamers")
+    if streamers[streamer_name].archived is normalized:
+        return False
+
+    table_span = _regular_table_span(current_text, ("streamers", streamer_name))
+    if table_span is None:
+        raise ConfigError("Archiving requires a separate streamer TOML table")
+    start, end = table_span
+    block = current_text[start:end]
+    assignment = re.compile(
+        r'(?m)^([ \t]*(?:archived|"archived"|\'archived\')[ \t]*=[ \t]*)'
+        r'(?:true|false)([ \t]*(?:#[^\n]*)?)$'
+    )
+    value = str(normalized).lower()
+    if "archived" in parsed["streamers"][streamer_name]:
+        for match in assignment.finditer(block):
+            try:
+                tomllib.loads(current_text[:start + match.start()])
+            except tomllib.TOMLDecodeError:
+                # An assignment-shaped line inside a multiline string is data.
+                continue
+            replacement = match.group(1) + value + match.group(2)
+            block = block[:match.start()] + replacement + block[match.end():]
+            break
+        else:
+            raise ConfigError("Unable to locate the streamer's archived setting")
+    else:
+        header, _, remainder = block.partition("\n")
+        block = header + "\n" + f"archived = {value}\n" + remainder
+    updated_text = current_text[:start] + block + current_text[end:]
+    _validate_generated_config(target, updated_text)
+    _validate_generated_streamers(target, updated_text)
+    try:
+        target.write_text(updated_text, encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
+    return True
 
 
 def update_streamer_post_stream_config(
@@ -1576,6 +1688,37 @@ def _require_configured_streamer(
         raise ConfigError(f"streamer is not configured: {streamer_name}")
 
 
+def _regular_table_span(
+    text: str,
+    table_path: tuple[str, ...],
+) -> tuple[int, int] | None:
+    headers = []
+    for header in re.finditer(
+        r"(?m)^[ \t]*\[[^\n]*\][ \t]*(?:#[^\n]*)?(?:\n|$)", text
+    ):
+        try:
+            tomllib.loads(text[:header.start()])
+        except tomllib.TOMLDecodeError:
+            # A header-shaped line inside a string or array belongs to its value.
+            continue
+        headers.append(header)
+    for index, header in enumerate(headers):
+        if header.group().lstrip().startswith("[["):
+            continue
+        try:
+            parsed = tomllib.loads(header.group())
+        except tomllib.TOMLDecodeError:
+            continue
+        path: list[str] = []
+        while isinstance(parsed, dict) and len(parsed) == 1:
+            key, parsed = next(iter(parsed.items()))
+            path.append(key)
+        if tuple(path) == table_path and parsed == {}:
+            end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+            return header.start(), end
+    return None
+
+
 def _streamer_block(
     streamer_name: str,
     sources: list[str],
@@ -1583,9 +1726,12 @@ def _streamer_block(
     powerchat_enabled: bool = False,
     powerchat_username: str = "",
     timezone: str = "UTC",
+    archived: bool = False,
 ) -> str:
     lines = [f"[streamers.{_toml_key(streamer_name)}]"]
     lines.append(f"sources = {_toml_value(sources, 'sources')}")
+    if archived:
+        lines.append("archived = true")
     if download_dir_name:
         lines.append(
             f"download_dir_name = {_toml_value(download_dir_name, 'download_dir_name')}"
@@ -1906,6 +2052,10 @@ def _as_streamers(value: Any, name: str) -> dict[str, StreamerConfig]:
 
         streamers[streamer_name] = StreamerConfig(
             sources=sources,
+            archived=_as_bool(
+                raw_config.get("archived", False),
+                f"{name}.{streamer_name}.archived",
+            ),
             download_dir_name=_as_optional_str(
                 raw_config.get("download_dir_name", ""),
                 f"{name}.{streamer_name}.download_dir_name",
