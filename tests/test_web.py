@@ -3524,6 +3524,7 @@ class WebStatusTests(unittest.TestCase):
                 *,
                 expected_status: str,
                 new_status: str,
+                commit: bool = True,
             ) -> bool:
                 nonlocal raced
                 if new_status == "deleting" and not raced:
@@ -3538,6 +3539,7 @@ class WebStatusTests(unittest.TestCase):
                     video_id,
                     expected_status=expected_status,
                     new_status=new_status,
+                    commit=commit,
                 )
 
             with patch.object(

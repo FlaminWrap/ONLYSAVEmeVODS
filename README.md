@@ -1,7 +1,7 @@
 # ONLYSAVEmeVODS
 
-ONLYSAVEmeVODS watches streamer sources and starts `yt-dlp` for every live
-stream it finds. YouTube keeps the existing fast channel discovery, while
+ONLYSAVEmeVODS watches streamer sources and starts recording when it finds a
+live broadcast. YouTube keeps the existing fast channel discovery, while
 Twitch, Kick, and Rumble are probed conservatively through yt-dlp and recorded
 only when the source is currently live. It supports multiple simultaneous
 streams from the same streamer and treats a `yt-dlp` exit as uncertain until the
@@ -328,7 +328,7 @@ Add or remove a source for an existing streamer:
 
 Archive or restore a streamer:
 
-1. Open **Streamers → Manage** and click **Archive streamer** beside **Remove**.
+1. Open **Streamers → Manage** and click **Archive streamer** beside **Remove streamer**.
 2. Confirm to pause new source checks and recordings. Current recordings and
    processing jobs finish normally. Sources, settings, and recordings are kept.
 3. Open **Streamers → Archived** to browse archived streamers and their history.
@@ -336,6 +336,11 @@ Archive or restore a streamer:
 
 Archiving takes effect without restarting the service. The saved TOML setting
 is `archived = true` inside the streamer's table; it defaults to `false`.
+
+To remove a streamer, open **Streamers → Manage → Remove streamer**. By default, removal
+keeps the stream history and downloaded files. Select the recording deletion
+option to also delete the streamer's tracked recordings, their associated files,
+and their history. Other streamers sharing the same download folder are kept.
 
 Manually add or redownload a VOD:
 
@@ -416,8 +421,9 @@ Delete or clean up a stream:
 1. Use **Clean fragments** on ended streams to remove saved `.part-Frag` files.
    To automate this, set `fragment_retention_hours` to the number of hours to
    retain fragments after a stream is marked ended; `0` keeps them indefinitely.
-2. Use **Delete stream** to remove the stream record and downloaded stream
-   folder. The UI asks for confirmation because this cannot be undone.
+2. Use **Delete stream** to remove the stream from history. Leave the recording
+   option unchecked to keep the files on disk, or select it to delete the
+   recording folder, including sidecars and fragments. Confirm your choice.
 3. Active/downloading streams cannot be deleted or cleaned up until they are no
    longer in a resume-sensitive state.
 
@@ -682,7 +688,14 @@ scripts/uninstall-systemd.sh
   finally marked ended, finalized segment files are renamed to the video title
   and ID, for example `Live Title [VIDEOID].mp4`. If a continuation file is
   needed, it uses `Live Title [VIDEOID] - part 002`.
-- Downloads use `--continue`, `--part`, `--keep-fragments`, and `--no-playlist`
+- New Kick recordings follow the broadcast's growing replay from its first
+  segment. The recorder aims for 60 seconds behind live at the selected source
+  quality. After an outage it resumes at the first uncommitted segment and
+  downloads in order as quickly as the connection allows. It drains the final
+  minute after Kick confirms the broadcast has ended. If the replay has not
+  appeared or a segment cannot be verified, the dashboard shows the wait or
+  retry. An unavailable replay or a permanent gap can leave an archive incomplete.
+- Other live downloads use `--continue`, `--part`, `--keep-fragments`, and `--no-playlist`
   by default. YouTube downloads also use `--live-from-start` when
   `live_from_start = true`; other platforms are left to yt-dlp's platform
   behavior. Keeping fragments costs extra disk space while a segment is active,

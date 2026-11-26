@@ -445,11 +445,29 @@
     input.closest("[data-source-manager]")?.querySelector("[data-add-source]")?.click();
   });
 
+  const updateRecordingRemoval = (form) => {
+    const deleting = form.elements.delete_recordings.checked;
+    form.querySelector("[data-removal-message]").textContent = deleting ? form.dataset.deleteMessage : form.dataset.keepMessage;
+    form.querySelector("[data-removal-submit]").textContent = deleting ? form.dataset.deleteLabel : form.dataset.keepLabel;
+  };
+  document.addEventListener("change", (event) => {
+    if (event.target.name === "delete_recordings" && event.target.form?.matches("[data-recording-removal]")) {
+      updateRecordingRemoval(event.target.form);
+    }
+  });
+
   document.addEventListener("click", (event) => {
     const openButton = event.target.closest("[data-open-dialog]");
     if (openButton) {
       const dialog = document.getElementById(openButton.dataset.openDialog);
-      if (dialog instanceof HTMLDialogElement && !dialog.open) dialog.showModal();
+      if (dialog instanceof HTMLDialogElement && !dialog.open) {
+        const removalForm = dialog.querySelector("[data-recording-removal]");
+        if (removalForm) {
+          removalForm.reset();
+          updateRecordingRemoval(removalForm);
+        }
+        dialog.showModal();
+      }
     }
     const closeButton = event.target.closest("[data-close-dialog]");
     if (closeButton) closeButton.closest("dialog")?.close();

@@ -12,7 +12,7 @@ from .config import (
     monitored_sources,
     post_stream_setting_enabled_anywhere,
 )
-from .downloader import DownloadManager
+from .downloader import DownloadManager, archive_capture_exists
 from .models import LiveStream
 from .sources import SourceMonitor
 from .state import StateStore, StreamRecord
@@ -42,6 +42,15 @@ class OnlySaveMeVodsDaemon:
 
     async def run(self) -> None:
         self.state.reconcile_stale_downloads()
+        # The checkpoint is persisted before claiming a recorder slot. Recover
+        # even a crash between writing it and marking the broadcast queued.
+        for record in self.state.list_streams_by_status(["detected"], limit=None):
+            if record.recording_kind == "live" and archive_capture_exists(
+                self.config, stream_from_record(record), record.segment_index
+            ):
+                self.state.compare_and_set_stream_status(
+                    record.video_id, expected_status="detected", new_status="checking_after_exit"
+                )
         requeued_post_processing = (
             self.state.requeue_incomplete_post_processing_jobs()
         )
@@ -280,7 +289,10 @@ class OnlySaveMeVodsDaemon:
             )
 
     async def _start_stream(self, stream: LiveStream) -> None:
-        self.state.upsert_detected(stream)
+        # A finished Kick archive owns its broadcast ID. Let the manager see
+        # the previous status before generic discovery can reopen it.
+        if stream.platform.casefold() != "kick" or self.state.get_stream(stream.video_id) is None:
+            self.state.upsert_detected(stream)
         await self.downloads.start_stream(stream)
 
 

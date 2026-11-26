@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable, Literal, Mapping, Protocol
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -15,6 +16,7 @@ import signal
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 from .chat_render import (
@@ -65,6 +67,7 @@ from .download_progress import (
     download_progress_path,
     record_download_progress,
 )
+from . import kick_archive
 from .job_tracker import finish_tracked_job, start_tracked_job, update_tracked_job
 from .models import LiveStream
 from .powerchat import (
@@ -792,12 +795,45 @@ class DownloadManager:
         )
         return True
 
+    def _defer_at_capacity(self, stream: LiveStream) -> None:
+        record = self.state.upsert_detected(stream)
+        if record.status != "detected":
+            return
+        archive = kick_capture_output(self.config, stream, record.segment_index)
+        if archive is None:
+            return
+        kick_archive.initialize_checkpoint(
+            archive, stream.video_id, started_at=kick_broadcast_start(stream)
+        )
+        if self.state.compare_and_set_stream_status(
+            stream.video_id, expected_status="detected", new_status="waiting_retry"
+        ):
+            self.state.add_stream_event(
+                stream.video_id, "Queued Kick broadcast archive until a recorder slot is free",
+                segment_index=record.segment_index,
+            )
+            self._ensure_spawn_retry(stream)
+
     async def start_stream(
         self,
         stream: LiveStream,
         *,
         segment_index: int | None = None,
     ) -> bool:
+        if stream.platform.casefold() == "kick":
+            previous_record = self.state.get_stream(stream.video_id)
+            if previous_record is not None and previous_record.recording_kind == "vod":
+                return False
+            if previous_record and archive_capture_exists(
+                self.config, stream, previous_record.segment_index
+            ) and (
+                previous_record.status in {"ended", "finalization_failed"}
+                or (previous_record.status == "checking_after_exit" and segment_index is None)
+            ):
+                # The archive supervisor resumes the original cursor, including when
+                # the channel's live status temporarily disagrees with its archive.
+                return False
+
         if self._archived_streamer_blocks_start(stream):
             return False
         if stream.video_id in self._starting_video_ids:
@@ -816,7 +852,7 @@ class DownloadManager:
                 stream.video_id,
                 stream.title,
             )
-            self.state.upsert_detected(stream)
+            self._defer_at_capacity(stream)
             return False
 
         self._starting_video_ids.add(stream.video_id)
@@ -871,7 +907,7 @@ class DownloadManager:
                 stream.video_id,
                 stream.title,
             )
-            self.state.upsert_detected(stream)
+            self._defer_at_capacity(stream)
             return False
 
         detected_record = self.state.upsert_detected(stream)
@@ -888,6 +924,10 @@ class DownloadManager:
                 detected_record.status,
             )
             return False
+        index = segment_index or detected_record.segment_index
+        archive_output = kick_capture_output(self.config, stream, index)
+        if archive_output is not None:
+            segment_index = index
         if segment_index is None:
             record = self.state.get_stream(stream.video_id)
             segment_index = record.segment_index if record else 1
@@ -975,13 +1015,35 @@ class DownloadManager:
         )
         output_template = output_template_for(self.config, stream, segment_index)
         output_template.parent.mkdir(parents=True, exist_ok=True)
-        command = build_download_command(
-            self.config,
-            stream,
-            segment_index,
-            youtube_video_format_selector=youtube_video_format_selector,
-            youtube_track_format_id=split_format_ids[0] if split_format_ids else "",
-        )
+        spawn_options = {}
+        if archive_output is not None:
+            started_at = kick_broadcast_start(stream)
+            kick_archive.initialize_checkpoint(archive_output, stream.video_id, started_at=started_at)
+            command = [
+                sys.executable, "-m", "onlysavemevods.kick_archive",
+                "--source", post_exit_probe_target(stream),
+                "--video-id", stream.video_id,
+                "--output", str(archive_output),
+                "--yt-dlp-path", self.config.yt_dlp_path,
+                "--ffmpeg-path", self.config.ffmpeg_path,
+                "--ffprobe-path", ffprobe_path_for(self.config.ffmpeg_path),
+            ]
+            # The daemon can run from an installed package or a source checkout.
+            # Inherit its working directory for configured paths to external tools.
+            source_root = str(Path(__file__).resolve().parents[1])
+            parent_path = os.environ.get("PYTHONPATH")
+            python_path = source_root + os.pathsep + parent_path if parent_path else source_root
+            spawn_options["env"] = dict(os.environ, PYTHONPATH=python_path)
+            if started_at:
+                command.extend(["--started-at", started_at])
+        else:
+            command = build_download_command(
+                self.config,
+                stream,
+                segment_index,
+                youtube_video_format_selector=youtube_video_format_selector,
+                youtube_track_format_id=split_format_ids[0] if split_format_ids else "",
+            )
         self.logger.debug(
             "Download output template for %s segment=%03d: %s",
             stream.video_id,
@@ -989,7 +1051,7 @@ class DownloadManager:
             output_template,
         )
         self.logger.debug(
-            "yt-dlp download command for %s segment=%03d: %s",
+            "Download command for %s segment=%03d: %s",
             stream.video_id,
             segment_index,
             command_for_log(command),
@@ -1012,7 +1074,10 @@ class DownloadManager:
         current_record = self.state.get_stream(stream.video_id)
         if (
             current_record is not None
-            and current_record.status in STREAM_FILE_OPERATION_STATUSES
+            and (
+                current_record.status in STREAM_FILE_OPERATION_STATUSES
+                or (archive_output is not None and current_record.recording_kind == "vod")
+            )
         ):
             self.logger.info(
                 "Deferring %s because dashboard file operation %s began during startup",
@@ -1053,6 +1118,7 @@ class DownloadManager:
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
+                **spawn_options,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
@@ -1112,7 +1178,7 @@ class DownloadManager:
             )
             output_task.add_done_callback(discard_task_exception)
         reconnect_task = None
-        if self.config.reconnect_interval_seconds > 0:
+        if archive_output is None and self.config.reconnect_interval_seconds > 0:
             reconnect_task = asyncio.create_task(
                 self._planned_reconnect_timer(
                     stream.video_id,
@@ -1122,7 +1188,7 @@ class DownloadManager:
             )
             reconnect_task.add_done_callback(discard_task_exception)
         mixed_segment_task = None
-        if split_format_ids is None:
+        if archive_output is None and split_format_ids is None:
             mixed_segment_task = asyncio.create_task(
                 self._mixed_segment_watchdog(stream, process, segment_index)
             )
@@ -2740,6 +2806,9 @@ class DownloadManager:
             record = None
         if planned_reconnect:
             self._planned_reconnects.discard(stream.video_id)
+        if exit_code and archive_capture_exists(self.config, stream, segment_index):
+            self._defer_post_exit_retry(stream, segment_index)
+            return
         if planned_reconnect and not (
             record is not None and record.status == "stalled"
         ):
@@ -3230,6 +3299,9 @@ class DownloadManager:
     async def maybe_redownload_failed_finalization(self, stream: LiveStream) -> bool:
         if self._stopping or not self.config.auto_redownload_failed_finalization:
             return False
+        record = self.state.get_stream(stream.video_id)
+        if record and archive_capture_exists(self.config, stream, record.segment_index):
+            return False
         from .web import start_automatic_vod_redownload_job
 
         return await asyncio.to_thread(
@@ -3426,6 +3498,18 @@ class DownloadManager:
         elapsed_since_exit_seconds: float = 0.0,
         expected_status: str | None = None,
     ) -> None:
+        if archive_capture_exists(self.config, stream, segment_index):
+            if not self._stream_status_matches(stream.video_id, expected_status) or self._stopping:
+                return
+            part = kick_archive_part(self.config, stream, segment_index)
+            if kick_archive_completed_bytes(part, stream.video_id, segment_index) is not None:
+                await self.finish_ended_stream(
+                    stream, segment_index, expected_status=expected_status, end_confirmed=True
+                )
+            elif not await self.start_stream(stream, segment_index=segment_index):
+                self._defer_post_exit_retry(stream, segment_index)
+            return
+
         record = self.state.get_stream(stream.video_id)
         if record is not None and record.youtube_stale_detected_at:
             if not self._stream_status_matches(stream.video_id, expected_status):
@@ -3919,7 +4003,12 @@ class DownloadManager:
                     return
                 explicit_end = False
                 try:
-                    latest = await self.probe_video(post_exit_probe_target(stream))
+                    # A sealed archive remains final even if the channel is
+                    # offline, unreachable, or already showing another broadcast.
+                    latest = (
+                        None if archive_capture_exists(self.config, stream, segment_index)
+                        else await self.probe_video(post_exit_probe_target(stream))
+                    )
                 except (
                     ConfirmedLiveEndError,
                     ConfirmedLiveTerminationError,
@@ -5297,6 +5386,17 @@ class DownloadManager:
     ) -> bool:
         failure_key = (video_id, segment_index)
         self._finalization_failure_reasons.pop(failure_key, None)
+        record = self.state.get_stream(video_id)
+        if record is not None and record.platform.casefold() == "kick":
+            stream = stream_from_state_record(record)
+            part = kick_archive_part(self.config, stream, segment_index)
+            if kick_archive.checkpoint_path(part).exists():
+                try:
+                    await self._publish_kick_archive(stream, segment_index, part)
+                except (OSError, ValueError, VideoProbeError) as exc:
+                    self._finalization_failure_reasons[failure_key] = str(exc)
+                    return False
+                return True
         try:
             plan = prepare_finalize_plan(self.config, video_id, segment_index, channel)
         except OSError:
@@ -5314,7 +5414,6 @@ class DownloadManager:
                 segment_index,
             )
             return True
-        record = self.state.get_stream(video_id)
         # The stream's selector can change after a segment rolls over. Format-
         # specific input names retain evidence that this segment used separate
         # tracks even when the current selector is now a muxed format.
@@ -5374,6 +5473,108 @@ class DownloadManager:
         if plan.failure_reason:
             self._finalization_failure_reasons[failure_key] = plan.failure_reason
         return False
+
+    async def _publish_kick_archive(self, stream: LiveStream, index: int, part: Path) -> None:
+        size = kick_archive_completed_bytes(part, stream.video_id, index)
+        if size is None:
+            raise ValueError("The Kick archive still has unconfirmed or missing segments")
+
+        final = part.parent / f"{segment_file_stem(index)}.mp4"
+        named = named_finalized_output_file(self.config, stream, index, ".mp4")
+        checkpoint = kick_archive.checkpoint_path(part)
+        ready = checkpoint.with_suffix(".ready.mp4")
+        receipt = checkpoint.with_suffix(".published")
+        if named.exists() and final.exists():
+            raise ValueError("Multiple files already use the Kick archive output names")
+        target = named if named.exists() else final
+        if part.exists():
+            if part.stat().st_size != size:
+                raise ValueError("Kick archive output size differs from its completed checkpoint")
+            if not ready.exists():
+                if target.exists():
+                    raise ValueError("A different recording already uses the archive output path")
+                await self._remux_kick_archive(part, ready)
+
+            metadata = json.loads(checkpoint.read_text(encoding="utf-8"))
+            try:
+                ffprobe = ffprobe_path_for(self.config.ffmpeg_path)
+                # A header duration can wrap after 26.5h in MPEG-TS. Count
+                # the packet timeline in bounded memory on both sides.
+                source_tracks = await asyncio.to_thread(kick_archive.measure_file, part, ffprobe)
+                measured = await asyncio.to_thread(
+                    kick_archive.measure_file, ready, ffprobe, input_format="mov"
+                )
+            except kick_archive.LocalStateError as exc:
+                raise VideoProbeError(str(exc)) from exc
+            for i, kind in enumerate(("video", "audio")):
+                codec, packets, duration = measured[kind]
+                source_codec, source_packets, source_duration = source_tracks[kind]
+                codecs = metadata.get("codecs")
+                if (
+                    not isinstance(codecs, list) or len(codecs) != 2
+                    or not codec == source_codec == codecs[i]
+                    or not packets == source_packets == metadata.get("packet_counts", {}).get(kind)
+                    or abs(duration - source_duration) > 0.25
+                ):
+                    if not target.exists():
+                        ready.unlink()
+                    raise VideoProbeError(
+                        f"Finalized MP4 {kind} codec, packet count, or duration differs from the Kick archive"
+                    )
+
+            # Publish the verified MP4 after both complete track scans,
+            # without overwriting another file. If interrupted, the hard link
+            # proves on retry that we published this particular output.
+            try:
+                os.link(ready, target)
+            except FileExistsError:
+                if not ready.samefile(target):
+                    raise ValueError("A different recording already uses the archive output path")
+            info = target.stat()
+            with receipt.open("w", encoding="ascii") as handle:
+                handle.write(f"{info.st_dev} {info.st_ino} {info.st_size}")
+                handle.flush()
+                os.fsync(handle.fileno())
+            directory_fd = os.open(part.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            part.unlink()
+        else:
+            info = target.stat()
+            if receipt.read_text(encoding="ascii") != f"{info.st_dev} {info.st_ino} {info.st_size}":
+                raise ValueError("The finalized MP4 does not match the Kick archive publication record")
+
+        if ready.exists():
+            if not ready.samefile(target):
+                raise ValueError("Published Kick archive differs from the validated MP4")
+            ready.unlink()
+
+    async def _remux_kick_archive(self, part: Path, ready: Path) -> None:
+        # Keep archive verification separate from the generic partial-recording
+        # muxer, whose duration probes use MPEG-TS header timestamps.
+        temp = ready.with_suffix(".muxing")
+        process = await asyncio.create_subprocess_exec(
+            self.config.ffmpeg_path, "-nostdin", "-v", "error", "-y", "-i", str(part),
+            "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mp4", str(temp),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.wait_for(process.wait(), timeout=FINALIZE_MUX_TIMEOUT_SECONDS)
+            if process.returncode:
+                raise VideoProbeError(f"Kick archive MP4 remux exited with code {process.returncode}")
+            with temp.open("rb") as handle:
+                os.fsync(handle.fileno())
+            temp.replace(ready)
+        finally:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            temp.unlink(missing_ok=True)
 
     async def _finalize_single_input(self, plan: FinalizePlan) -> bool:
         input_file = plan.input_files[0]
@@ -5577,6 +5778,12 @@ class DownloadManager:
             delay = self.config.retry_backoff_seconds[
                 min(failures, len(self.config.retry_backoff_seconds) - 1)
             ]
+            if stream.platform.casefold() == "kick":
+                queued = self.state.get_stream(stream.video_id)
+                if queued and queued.last_started_at is None and archive_capture_exists(
+                    self.config, stream, queued.segment_index
+                ):
+                    delay = min(delay, 5)
             self._spawn_failures[stream.video_id] = failures + 1
             self.logger.info("Retrying start for %s in %ss", stream.video_id, delay)
             await self.sleep(delay)
@@ -5587,6 +5794,10 @@ class DownloadManager:
             if record is None or record.status != "waiting_retry":
                 return
             segment_index = record.segment_index
+            if archive_capture_exists(self.config, stream, segment_index):
+                if await self.start_stream(stream, segment_index=segment_index):
+                    return
+                continue
             try:
                 latest = await self.probe_video(post_exit_probe_target(stream))
             except TerminalVideoUnavailableError as exc:
@@ -6009,6 +6220,63 @@ def chat_render_timeout_seconds(config: BotConfig) -> float | None:
 
 def yt_dlp_args_include_format(args: list[str]) -> bool:
     return any(arg.partition("=")[0] in FORMAT_OPTIONS for arg in args)
+
+
+def kick_archive_part(config: BotConfig, stream: LiveStream, segment_index: int) -> Path:
+    directory = segment_directory(config, stream.video_id, stream.channel)
+    return (directory / f"{segment_file_stem(segment_index)}.ts.part").resolve()
+
+
+def kick_broadcast_start(stream: LiveStream) -> str:
+    for key in ("release_timestamp", "actual_start_timestamp", "live_start_timestamp", "start_timestamp"):
+        value = stream.raw.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def kick_capture_output(config: BotConfig, stream: LiveStream, index: int) -> Path | None:
+    if stream.platform.casefold() != "kick":
+        return None
+    part = kick_archive_part(config, stream, index)
+    checkpoint = kick_archive.checkpoint_path(part)
+    if checkpoint.exists():
+        return part
+    if checkpoint.with_suffix(".lock").exists():
+        raise ValueError("Kick archive checkpoint is missing; preserving the recording")
+    # Previously recorded media belongs to the legacy recorder. Restarting
+    # that session from archive segment zero would duplicate its footage.
+    if stream.is_live and not any(
+        path.is_file() and normalize_part_file(path).suffix.lower() in FINALIZED_MEDIA_SUFFIXES
+        for path in part.parent.glob("*")
+    ):
+        return part
+    return None
+
+
+def archive_capture_exists(config: BotConfig, stream: LiveStream, segment_index: int) -> bool:
+    return stream.platform.casefold() == "kick" and kick_archive.checkpoint_path(
+        kick_archive_part(config, stream, segment_index)
+    ).exists()
+
+
+def kick_archive_completed_bytes(part: Path, video_id: str, segment_index: int) -> int | None:
+    try:
+        payload = json.loads(kick_archive.checkpoint_path(part).read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("video_id") != video_id
+        or payload.get("segment_index") != segment_index
+        or payload.get("complete") is not True
+        or type(payload.get("saved_segments")) is not int
+        or payload["saved_segments"] <= 0
+        or payload["saved_segments"] != payload.get("available_segments")
+    ):
+        return None
+    size = payload.get("bytes_written")
+    return size if type(size) is int and size > 0 else None
 
 
 def output_template_for(
@@ -7208,7 +7476,62 @@ def discard_task_exception(task: asyncio.Task[None]) -> None:
         return
 
 
+def _recording_location_file(config: BotConfig, video_id: str) -> Path:
+    key = hashlib.sha256(video_id.encode("utf-8")).hexdigest()
+    return config.state_dir / "recording-locations" / f"{key}.json"
+
+
+def remember_recording_directory(config: BotConfig, video_id: str, directory: Path) -> None:
+    relative = directory.relative_to(config.download_dir)
+    if len(relative.parts) not in (1, 2) or directory.name not in {
+        safe_path_component(video_id), stream_directory_component(video_id),
+    } or ".." in relative.parts:
+        raise ValueError("Invalid recording location")
+    if directory.is_symlink() or (len(relative.parts) == 2 and directory.parent.is_symlink()):
+        raise OSError("Cannot preserve a symlinked recording location")
+    identity = directory.stat()
+    hint = _recording_location_file(config, video_id)
+    hint.parent.mkdir(exist_ok=True, parents=True)
+    # Atomically replace the entry, so concurrent readers see a complete path.
+    with tempfile.NamedTemporaryFile(dir=hint.parent, mode="w", encoding="utf-8", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump([video_id, relative.as_posix(), identity.st_dev, identity.st_ino], output)
+            output.flush()
+            os.fsync(output.fileno())
+            os.replace(temporary, hint)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def forget_recording_directory(config: BotConfig, video_id: str) -> None:
+    _recording_location_file(config, video_id).unlink(missing_ok=True)
+
+
+def _retained_recording_directory(config: BotConfig, video_id: str) -> Path | None:
+    hint = _recording_location_file(config, video_id)
+    try:
+        saved_id, saved_path, device, inode = json.loads(hint.read_text(encoding="utf-8"))
+        relative = Path(saved_path)
+        if saved_id != video_id or relative.is_absolute() or ".." in relative.parts or len(relative.parts) not in (1, 2):
+            return None
+        if relative.name not in {safe_path_component(video_id), stream_directory_component(video_id)}:
+            return None
+        directory = config.download_dir / relative
+        if directory.is_symlink() or (len(relative.parts) == 2 and directory.parent.is_symlink()):
+            return None
+        identity = directory.stat()
+        if (identity.st_dev, identity.st_ino) == (device, inode) and directory.is_dir():
+            return directory
+    except (FileNotFoundError, NotADirectoryError, ValueError, TypeError):
+        pass
+    return None
+
+
 def segment_directory(config: BotConfig, video_id: str, channel: str = "") -> Path:
+    retained = _retained_recording_directory(config, video_id)
+    if retained is not None:
+        return retained
     legacy_directory = config.download_dir / safe_path_component(video_id)
     directory_component = stream_directory_component(video_id)
     group_name = download_group_name_for_channel(config, channel)

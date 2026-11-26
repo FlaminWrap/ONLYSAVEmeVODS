@@ -652,6 +652,7 @@ class StateStore:
         *,
         expected_status: str,
         new_status: str,
+        commit: bool = True,
     ) -> bool:
         """Atomically claim a stream lifecycle transition across DB connections."""
 
@@ -664,7 +665,8 @@ class StateStore:
             """,
             (new_status, now, video_id, expected_status),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return bool(cursor.rowcount)
 
     def mark_finalization_failed(self, video_id: str) -> bool:
@@ -1578,7 +1580,8 @@ class StateStore:
                 changed += 1
         return changed
 
-    def delete_stream(self, video_id: str) -> bool:
+    def delete_stream(self, video_id: str, *, commit: bool = True) -> bool:
+        """Remove the stream and its history; a bulk caller can own the transaction."""
         cursor = self.conn.execute(
             "DELETE FROM streams WHERE video_id = ?",
             (video_id,),
@@ -1600,7 +1603,8 @@ class StateStore:
                 "DELETE FROM automatic_vod_recovery WHERE video_id = ?",
                 (video_id,),
             )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
         return cursor.rowcount > 0
 
     def create_watermark_copy(

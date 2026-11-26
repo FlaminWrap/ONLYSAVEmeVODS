@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from bisect import insort
 from collections import OrderedDict
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache, wraps
 from html import escape
@@ -22,11 +23,14 @@ import ipaddress
 import io
 import json
 import logging
+import math
 import mimetypes
 import os
 import platform
 import re
 import shutil
+import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -69,6 +73,8 @@ from .config import (
     VoiceProfileConfig,
     add_voice_sample_to_profile,
     automatic_processing_window_wait_seconds,
+    _monitoring_source_key,
+    source_display_name,
     load_config,
     load_config_text,
     migrate_legacy_channels_to_streamer,
@@ -96,6 +102,7 @@ from .config import (
 from .downloader import (
     command_for_log,
     cleanup_files,
+    forget_recording_directory,
     is_live_chat_file,
     is_yt_dlp_temporary_file,
     log_process_output,
@@ -103,7 +110,9 @@ from .downloader import (
     probe_finalize_media_streams,
     recover_segment_from_fragments,
     recovered_segment_output_file,
+    remember_recording_directory,
     safe_filename_stem,
+    safe_path_component,
     segment_directory,
     segment_media_input_files,
 )
@@ -123,6 +132,7 @@ from .job_tracker import (
     start_tracked_job,
     update_tracked_job,
 )
+from .kick_archive import checkpoint_path as kick_archive_checkpoint_path
 from .kick_chat import download_kick_vod_chat_replay
 from .log_buffer import LogEntry, get_recent_log_snapshot
 from .models import LiveStream
@@ -626,6 +636,26 @@ class PowerchatEventStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class KickCaptureProgress:
+    phase: str
+    bytes_written: int | None = None
+    updated_at: float | None = None
+    reason: str = ""
+    report_state: str = "current"
+    saved_segments: int | None = None
+    available_segments: int | None = None
+    saved_seconds: float | None = None
+    available_seconds: float | None = None
+    delay_seconds: float | None = None
+    target_delay_seconds: float | None = None
+    complete: bool = False
+
+    @property
+    def needs_attention(self) -> bool:
+        return self.phase in {"needs_attention", "unreadable"} or self.report_state == "no_worker"
+
+
+@dataclass(frozen=True, slots=True)
 class StreamStatus:
     video_id: str
     title: str
@@ -673,6 +703,7 @@ class StreamStatus:
     recording_kind: str = "live"
     download_progress: list[DownloadTrackProgress] = field(default_factory=list)
     download_progress_waiting_stale: bool = False
+    kick_capture_progress: KickCaptureProgress | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1947,13 +1978,16 @@ def build_handler(
             if body is None:
                 return
             try:
-                params = parse_qs(body.decode("utf-8", "replace"))
+                params = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
             except UnicodeDecodeError:
                 self.send_error(HTTPStatus.BAD_REQUEST, "Invalid form body")
                 return
             video_id = first_query_value(params, "video_id")
             confirm_delete = first_query_value(params, "confirm_delete")
-            ok, message = delete_stream(config, video_id, confirm_delete)
+            ok, message = delete_stream(
+                config, video_id, confirm_delete,
+                delete_recordings=params.get("delete_recordings") == ["1"],
+            )
             if not ok:
                 self.send_error(HTTPStatus.BAD_REQUEST, message)
                 return
@@ -2567,6 +2601,10 @@ def build_status_snapshot(
         generated_at=generated_at,
         stream_revision=stream_revision_for_records(
             records,
+            kick_progress={
+                stream.video_id: stream.kick_capture_progress
+                for stream in streams if stream.kick_capture_progress
+            },
             progress_snapshot=progress_snapshot,
             current_time=generated_at,
         ),
@@ -2776,6 +2814,10 @@ def build_streamer_stream_page(
         streams=streams,
         revision=stream_revision_for_records(
             page_records,
+            kick_progress={
+                stream.video_id: stream.kick_capture_progress
+                for stream in streams if stream.kick_capture_progress
+            },
             progress_snapshot=progress_snapshot,
             current_time=generated_at,
         ),
@@ -2843,6 +2885,7 @@ def stream_platform_sort_key(platform: str) -> tuple[int, str]:
 def stream_revision_for_records(
     records: list[StreamRecord],
     *,
+    kick_progress: dict[str, KickCaptureProgress] | None = None,
     progress_snapshot: DownloadProgressSnapshot | None = None,
     current_time: float | None = None,
 ) -> str:
@@ -2853,6 +2896,11 @@ def stream_revision_for_records(
         f"{record.video_id}:{record.status}:{record.segment_index}:{record.updated_at}"
         for record in records
     )
+    capture_alerts = sorted(
+        video_id for video_id, item in (kick_progress or {}).items() if item.needs_attention
+    )
+    if capture_alerts:
+        statuses += "|attention:" + ",".join(capture_alerts)
     digest = hashlib.sha1(statuses.encode("utf-8")).hexdigest()[:16]
     active_records = [
         record
@@ -2870,7 +2918,7 @@ def stream_revision_for_records(
         for record in active_records
         if live_download_progress_waiting_stale(
             record.last_started_at,
-            record.platform,
+            stream_record_platform(record),
             download_progress_for(
                 record.video_id,
                 segment_index=record.segment_index,
@@ -2886,6 +2934,12 @@ def stream_revision_for_records(
                 + ";".join(waiting_stale_ids)
             ).encode("utf-8")
         ).hexdigest()[:16]
+    if kick_progress:
+        kick_digest = json.dumps(
+            {video_id: asdict(item) for video_id, item in kick_progress.items()},
+            sort_keys=True,
+        )
+        progress_revision = hashlib.sha1((progress_revision + kick_digest).encode()).hexdigest()[:16]
     progress_suffix = f"|progress:{progress_revision}" if progress_revision else ""
     return f"{latest}|{len(records)}|{digest}{progress_suffix}"
 
@@ -2916,6 +2970,134 @@ def active_vod_download_job(jobs: Sequence[JobStatus]) -> JobStatus | None:
     )
 
 
+# Kick metadata discovery can make three sequential 50-second requests.
+KICK_ARCHIVE_REPORT_GRACE_SECONDS = 180
+KICK_CHECKPOINT_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def kick_worker_report_state(
+    checkpoint: Path, updated_at: float | None, started_at: str | None, now: float
+) -> str:
+    claimed = iso_to_epoch(started_at) or 0.0
+    if now - max(updated_at or 0.0, claimed) < KICK_ARCHIVE_REPORT_GRACE_SECONDS:
+        return "current" if updated_at is not None and updated_at >= claimed else "awaiting_first_report"
+    # A remux may legitimately take minutes without writing a checkpoint. Only
+    # call the worker absent when its lifetime lock is available to another reader.
+    try:
+        import fcntl
+    except ImportError:
+        return "awaiting_update"
+    try:
+        fd = os.open(checkpoint.with_suffix(".lock"), KICK_CHECKPOINT_READ_FLAGS)
+        with os.fdopen(fd, "rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return "no_worker"
+    except FileNotFoundError:
+        return "no_worker"
+    except OSError:
+        return "awaiting_update"
+
+
+def kick_capture_for_record(
+    config: BotConfig,
+    record: StreamRecord,
+    tracks: Sequence[DownloadTrackProgress],
+    current_time: float,
+) -> KickCaptureProgress | None:
+    if record.recording_kind != "live" or stream_record_platform(record) != "kick":
+        return None
+    directory = segment_directory(config, record.video_id, record.channel)
+    stem = f"segment-{record.segment_index:03d}"
+    checkpoint = kick_archive_checkpoint_path(directory / f"{stem}.ts.part")
+    try:
+        fd = os.open(checkpoint, KICK_CHECKPOINT_READ_FLAGS)
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return KickCaptureProgress("unreadable")
+            data = handle.read(16_385)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return KickCaptureProgress("unreadable")
+    else:
+        try:
+            doc = json.loads(data) if len(data) <= 16_384 else None
+            if not isinstance(doc, dict) or (
+                doc.get("video_id") != record.video_id
+                or doc.get("segment_index") != record.segment_index
+            ):
+                return KickCaptureProgress("unreadable")
+            phase = doc["phase"]
+            if phase not in KICK_ARCHIVE_PHASES:
+                return KickCaptureProgress("unreadable")
+            metrics = {}
+            for key in ("saved_segments", "available_segments", "bytes_written"):
+                value = doc.get(key)
+                if value is not None and (type(value) is not int or value < 0):
+                    return KickCaptureProgress("unreadable")
+                metrics[key] = value
+            for key in ("saved_seconds", "available_seconds", "delay_seconds", "target_delay_seconds", "updated_at"):
+                value = doc.get(key)
+                if value is not None and (
+                    type(value) not in (int, float) or value < 0 or not math.isfinite(value)
+                ):
+                    return KickCaptureProgress("unreadable")
+                if key == "updated_at" and value is not None and value > 253402300799:
+                    return KickCaptureProgress("unreadable")
+                metrics[key] = value
+            complete = (
+                phase == "complete" and doc.get("complete") is True
+                and (metrics["bytes_written"] or 0) > 0
+                and (metrics["saved_segments"] or 0) > 0
+                and metrics["saved_segments"] == metrics["available_segments"]
+            )
+            reason = str(doc.get("reason") or "")[:120]
+            if record.status == "ended" and not complete:
+                phase, reason = "needs_attention", "archive_unverified"
+            report_state = "current"
+            if record.status == "downloading" and phase not in {"complete", "needs_attention"}:
+                report_state = kick_worker_report_state(
+                    checkpoint, metrics["updated_at"], record.last_started_at, current_time
+                )
+            return KickCaptureProgress(phase, reason=reason, complete=complete, report_state=report_state, **metrics)
+        except (ValueError, TypeError, KeyError, OverflowError, RecursionError):
+            return KickCaptureProgress("unreadable")
+
+    if record.status != "downloading" or tracks:
+        return None
+    # yt-dlp's FFmpeg downloader writes one combined output without fragment counters.
+    # Stat known media names directly so chat writes and earlier segments cannot mask inactivity.
+    latest = None
+    for suffix in (".mp4", ".ts", ".mkv", ".flv", ".webm"):
+        for file_suffix in (suffix + ".part", suffix):
+            try:
+                info = (directory / (stem + file_suffix)).stat()
+            except OSError:
+                continue
+            if latest is None or latest.st_mtime_ns < info.st_mtime_ns:
+                latest = info
+    if latest is None:
+        return KickCaptureProgress("file_waiting")
+    recent = latest.st_size > 0 and current_time - latest.st_mtime < DOWNLOAD_PROGRESS_STALE_SECONDS
+    return KickCaptureProgress(
+        "file_recent" if recent else "file_waiting",
+        bytes_written=latest.st_size,
+        updated_at=latest.st_mtime,
+    )
+
+
+KICK_ARCHIVE_PHASES = {
+    "waiting_archive": "Waiting for Kick to publish the archive",
+    "recording": "Recording available archive segments",
+    "waiting_delay": "Waiting for the target delay",
+    "waiting_snapshot": "Waiting for the next archive update",
+    "retrying": "Retrying archive capture",
+    "finalizing": "Verifying the archive",
+    "complete": "Archive capture finished",
+    "needs_attention": "Archive needs attention",
+}
+
+
 def live_download_progress_waiting_stale(
     last_started_at: str | None,
     platform_name: str,
@@ -2923,6 +3105,8 @@ def live_download_progress_waiting_stale(
     *,
     current_time: float,
 ) -> bool:
+    if platform_name.casefold() == "kick" and not progress:
+        return False
     expected_tracks = expected_live_download_tracks(platform_name, progress)
     observed = {item.track for item in progress}
     if all(track in observed for track in expected_tracks):
@@ -2975,12 +3159,26 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
     step_started_at = time.perf_counter()
     counts: dict[str, int] = {}
     attention_count = 0
+    jobs = build_job_statuses(watermark_records)
+    vod_downloads = {
+        job.video_id for job in jobs if job.kind == "VOD download" and job.status in {"queued", "running"}
+    }
+    kick_progress = {}
     for record in records:
         counts[record.status] = counts.get(record.status, 0) + 1
-        if record.status in ATTENTION_STATUSES:
+        capture = (
+            kick_capture_for_record(
+                config, record,
+                download_progress_for(record.video_id, segment_index=record.segment_index, snapshot=progress_snapshot),
+                generated_at,
+            )
+            if record.video_id not in vod_downloads else None
+        )
+        if capture is not None:
+            kick_progress[record.video_id] = capture
+        if record.status in ATTENTION_STATUSES or (capture and capture.needs_attention):
             attention_count += 1
 
-    jobs = build_job_statuses(watermark_records)
     perf_step(steps, "aggregate", step_started_at)
 
     recent_logs, log_revision = get_recent_log_snapshot(LOG_LIMIT)
@@ -2989,6 +3187,7 @@ def build_lite_status_payload(config: BotConfig) -> dict[str, Any]:
         "generated_at": generated_at,
         "stream_revision": stream_revision_for_records(
             records,
+            kick_progress=kick_progress,
             progress_snapshot=progress_snapshot,
             current_time=generated_at,
         ),
@@ -4793,7 +4992,7 @@ def stream_status_from_record(
         )
         waiting_stale = live_download_progress_waiting_stale(
             record.last_started_at,
-            record.platform,
+            stream_record_platform(record),
             resolved_download_progress,
             current_time=(
                 time.time()
@@ -4852,6 +5051,13 @@ def stream_status_from_record(
         recording_kind=record.recording_kind,
         download_progress=resolved_download_progress,
         download_progress_waiting_stale=waiting_stale,
+        kick_capture_progress=(
+            kick_capture_for_record(
+                config, record, resolved_download_progress,
+                time.time() if progress_current_time is None else progress_current_time,
+            )
+            if active_vod_download_job(job_records or []) is None else None
+        ),
     )
     log_perf(
         "stream-status",
@@ -5574,7 +5780,9 @@ def serialized_stream_operation(function: Any) -> Any:
     return wrapped
 
 
-def active_dashboard_job_kinds(config: BotConfig, video_id: str) -> list[str]:
+def active_dashboard_job_kinds(
+    config: BotConfig, video_id: str, *, state: StateStore | None = None,
+) -> list[str]:
     active_statuses = {"queued", "running"}
     kinds = {
         job.kind or "Dashboard job"
@@ -5605,14 +5813,17 @@ def active_dashboard_job_kinds(config: BotConfig, video_id: str) -> list[str]:
             for job in EVENT_DETECTION_JOBS.values()
         ):
             kinds.add("Content event detection")
-    state = StateStore(config.db_path)
+    owned_state = state is None
+    if state is None:
+        state = StateStore(config.db_path)
     try:
         durable_jobs = state.list_post_processing_jobs(
             video_id=video_id,
             statuses=["pending", "running"],
         )
     finally:
-        state.close()
+        if owned_state:
+            state.close()
     durable_labels = {
         "twitch_ad_repair": "Twitch ad repair",
         "transcription": "Transcription",
@@ -5807,6 +6018,8 @@ def delete_stream(
     config: BotConfig,
     video_id: str,
     confirm_delete: str = "",
+    *,
+    delete_recordings: bool = True,
 ) -> tuple[bool, str]:
     video_id = video_id.strip()
     if not video_id:
@@ -5814,74 +6027,64 @@ def delete_stream(
     if confirm_delete != STREAM_DELETE_CONFIRM_VALUE:
         return False, "Stream deletion was not confirmed"
 
-    active_job_kinds = active_dashboard_job_kinds(config, video_id)
-    if active_job_kinds:
-        return False, (
-            "Cannot delete a stream while dashboard jobs are still running: "
-            + ", ".join(active_job_kinds)
-        )
-
-    claimed_status = ""
-    state = StateStore(config.db_path)
+    state = None
+    files_removed = bytes_removed = 0
+    removed_directory = False
     try:
+        state = StateStore(config.db_path)
         record = state.get_stream(video_id)
         if record is None:
             return False, "Stream was not found"
         if record.status in STREAM_DELETE_BLOCKED_STATUSES:
             return False, "Cannot delete a stream while it may still be active or resume"
-        active_watermarks = state.list_watermark_copies(
-            video_id=video_id,
-            statuses=[WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING],
-            limit=1,
-        )
-        if active_watermarks:
-            return False, "Cannot delete a stream while watermark jobs are still running"
+        # This conditional UPDATE obtains the writer lock. Retain it through
+        # ownership checks, removal and metadata commit. A failure rolls the
+        # claim back, and another recorder cannot acquire the same directory.
+        state.conn.execute("BEGIN")
         if not state.compare_and_set_stream_status(
-            video_id,
-            expected_status=record.status,
-            new_status="deleting",
+            video_id, expected_status=record.status, new_status="deleting", commit=False,
         ):
             return False, "Stream status changed; no files were deleted"
-        claimed_status = record.status
+        active_job_kinds = active_dashboard_job_kinds(config, video_id, state=state)
+        if active_job_kinds:
+            return False, (
+                "Cannot delete a stream while dashboard jobs are still running: "
+                + ", ".join(active_job_kinds)
+            )
+        if state.list_watermark_copies(
+            video_id=video_id, statuses=[WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING], limit=1,
+        ):
+            return False, "Cannot delete a stream while watermark jobs are still running"
+        if delete_recordings:
+            # Channel metadata may have changed before the conditional update.
+            record = state.get_stream(video_id)
+            target = preflight_stream_recording_delete(config, record, state.list_streams(limit=None))
+            files_removed, bytes_removed, removed_directory = remove_stream_recordings(config, target)
+        if not state.delete_stream(video_id):
+            return False, "Stream was not found"
+    except sqlite3.Error as exc:
+        if removed_directory:
+            return False, (
+                f"Recording directory removed ({files_removed} file(s), {format_bytes(bytes_removed)}). "
+                f"Could not finish deleting stream history: {exc}"
+            )
+        return False, f"Could not delete stream history: {exc}"
+    except (OSError, ConfigError) as exc:
+        return False, f"Unable to delete stream files: {exc}"
     finally:
-        state.close()
+        # Closing also rolls back an uncommitted claim on every error/early return.
+        if state is not None:
+            state.close()
 
-    directory = segment_directory(config, record.video_id, record.channel)
-    bytes_removed = 0
-    files_removed = 0
-    removed_directory = False
-    if directory.exists():
-        try:
-            directory_path = safe_stream_directory_for_delete(config, directory)
-            files_removed, bytes_removed = directory_file_totals(directory_path)
-            shutil.rmtree(directory_path)
-            removed_directory = True
-        except OSError as exc:
-            restore_stream_operation_status(
-                config,
-                video_id,
-                claimed_status,
-                operation_status="deleting",
-            )
-            return False, f"Unable to delete stream files: {exc}"
-        except ConfigError as exc:
-            restore_stream_operation_status(
-                config,
-                video_id,
-                claimed_status,
-                operation_status="deleting",
-            )
-            return False, str(exc)
-
-    state = StateStore(config.db_path)
+    if removed_directory:
+        invalidate_file_scan_cache(target.directory)
     try:
-        deleted = state.delete_stream(video_id)
-    finally:
-        state.close()
-    if not deleted:
-        return False, "Stream was not found"
-
-    invalidate_file_scan_cache(directory)
+        forget_recording_directory(config, video_id)
+    except OSError as exc:
+        file_status = "Recording directory removed." if removed_directory else "No recording files were removed."
+        return False, (
+            f"Stream history deleted. {file_status} Could not clear its saved recording location: {exc}"
+        )
 
     LOGGER.info(
         "Deleted stream video_id=%s files=%s bytes=%s directory_removed=%s",
@@ -5890,6 +6093,8 @@ def delete_stream(
         bytes_removed,
         removed_directory,
     )
+    if not delete_recordings:
+        return True, "Stream deleted. Recording files kept."
     detail = f", removed {files_removed} file(s) / {format_bytes(bytes_removed)}" if removed_directory else ""
     return True, f"Stream deleted{detail}"
 
@@ -7115,22 +7320,142 @@ def safe_stream_directory(config: BotConfig, directory: Path) -> Path:
     return directory_path
 
 
-def safe_stream_directory_for_delete(config: BotConfig, directory: Path) -> Path:
-    return safe_stream_directory(config, directory)
+@dataclass(frozen=True)
+class StreamRecordingDeleteTarget:
+    directory: Path
+    identity: tuple[int, int] | None
 
 
-def directory_file_totals(directory: Path) -> tuple[int, int]:
-    file_count = 0
-    byte_count = 0
-    for path in directory.rglob("*"):
-        if path.is_symlink() or not path.is_file():
-            continue
-        file_count += 1
+_LINUX_MOUNTINFO = Path("/proc/self/mountinfo")
+
+
+def _reject_recording_mounts(leaf_fd: int) -> None:
+    # mountinfo includes file mounts and same-device bind mounts that ismount()
+    # cannot identify. The configured root and ancestors may be media mounts.
+    recording_path = os.readlink(os.fsencode(f"/proc/self/fd/{leaf_fd}"))
+    with _LINUX_MOUNTINFO.open("rb") as mountinfo:
+        for line in mountinfo:
+            mount_path = line.split(b" ", 5)[4]
+            mount_path = re.sub(rb"\\([0-7]{3})", lambda m: bytes([int(m[1], 8)]), mount_path)
+            if mount_path == recording_path or mount_path.startswith(recording_path + b"/"):
+                raise ConfigError("The recording directory includes a mount point")
+
+
+def _linux_mount_id(fd: int) -> bytes:
+    with open(f"/proc/self/fdinfo/{fd}", "rb") as fdinfo:
+        for line in fdinfo:
+            if line.startswith(b"mnt_id:"):
+                return line.split()[1]
+    raise ConfigError("Could not verify the recording filesystem")
+
+
+@contextmanager
+def _open_recording_for_delete(config: BotConfig, directory: Path):
+    """Pin each directory component so renamed parents and symlinks cannot redirect deletion."""
+    relative = directory.relative_to(config.download_dir)
+    if not relative.parts or ".." in relative.parts:
+        raise ConfigError("Invalid recording directory")
+    if not hasattr(os, "fwalk") or not hasattr(os, "O_NOFOLLOW"):
+        raise ConfigError("This filesystem platform does not support safe recording deletion")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    with ExitStack() as descriptors:
         try:
-            byte_count += path.stat().st_size
-        except OSError:
+            # The configured root can intentionally point to a media volume.
+            # Pin its destination once and forbid links at every level below it.
+            parent = os.open(config.download_dir, os.O_RDONLY | os.O_DIRECTORY)
+            descriptors.callback(os.close, parent)
+            for part in relative.parts[:-1]:
+                parent = os.open(part, flags, dir_fd=parent)
+                descriptors.callback(os.close, parent)
+            leaf = os.open(relative.name, flags, dir_fd=parent)
+            descriptors.callback(os.close, leaf)
+        except FileNotFoundError:
+            yield None
+            return
+        except NotADirectoryError as exc:
+            raise ConfigError("A recording directory is symlinked or is not a directory") from exc
+        if sys.platform == "linux":
+            _reject_recording_mounts(leaf)
+        yield parent, leaf
+
+
+def preflight_stream_recording_delete(
+    config: BotConfig, record: StreamRecord, records: Sequence[StreamRecord],
+) -> StreamRecordingDeleteTarget:
+    """Resolve legacy layouts and reject shared directories before removing anything."""
+    directory = segment_directory(config, record.video_id, record.channel)
+    with _open_recording_for_delete(config, directory) as opened:
+        if opened is None:
+            return StreamRecordingDeleteTarget(directory, None)
+        _, leaf = opened
+        identity = os.fstat(leaf)
+
+    if directory.parent == config.download_dir and any(
+        safe_path_component(streamer.download_dir_name or name) == directory.name
+        for name, streamer in config.streamers.items()
+    ):
+        raise ConfigError("The recording directory is a configured streamer folder")
+    real = directory.resolve(strict=True)
+    for other in records:
+        if other.video_id == record.video_id:
             continue
-    return file_count, byte_count
+        other_dir = segment_directory(config, other.video_id, other.channel).resolve()
+        if real.is_relative_to(other_dir) or other_dir.is_relative_to(real):
+            raise ConfigError("The recording directory overlaps another stream's storage")
+    return StreamRecordingDeleteTarget(directory, (identity.st_dev, identity.st_ino))
+
+
+def remove_stream_recordings(
+    config: BotConfig, target: StreamRecordingDeleteTarget,
+) -> tuple[int, int, bool]:
+    """Remove only the preflighted directory, never a later replacement."""
+    if target.identity is None:
+        return 0, 0, False
+    files = size = 0
+    with _open_recording_for_delete(config, target.directory) as opened:
+        if opened is None:
+            return 0, 0, False
+        parent, leaf = opened
+        original = os.fstat(leaf)
+        if (original.st_dev, original.st_ino) != target.identity:
+            raise ConfigError("The recording directory changed before deletion")
+
+        def raise_walk_error(error: OSError) -> None:
+            if not isinstance(error, FileNotFoundError):
+                raise error
+
+        mount_id = _linux_mount_id(leaf) if sys.platform == "linux" else None
+        # Traverse the preflighted inode, not a fresh lookup by its mutable
+        # filename. fwalk pins each child and never follows directory symlinks.
+        for _, subdirs, names, fd in os.fwalk(
+            ".", topdown=False, onerror=raise_walk_error, follow_symlinks=False, dir_fd=leaf,
+        ):
+            # A mount could also arrive after the mount-table check.
+            if mount_id is not None and _linux_mount_id(fd) != mount_id:
+                raise ConfigError("The recording directory includes a mount point")
+            for name in names:
+                try:
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    os.unlink(name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    files += 1
+                    size += info.st_size
+            for name in subdirs:
+                try:
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode):
+                        os.unlink(name, dir_fd=fd)
+                    else:
+                        os.rmdir(name, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+        current = os.stat(target.directory.name, dir_fd=parent, follow_symlinks=False)
+        if not os.path.samestat(original, current):
+            raise ConfigError("The recording directory changed before deletion")
+        os.rmdir(target.directory.name, dir_fd=parent)
+    return files, size, True
 
 
 def resolve_watermark_download_file(
@@ -8860,6 +9185,195 @@ def reload_running_config(config: BotConfig) -> None:
             continue
         setattr(config, name, getattr(loaded, name))
 
+
+def _recording_url_identifies_channel(url: str, platform: str) -> bool:
+    parts = urlsplit(url).path.strip("/").split("/")
+    first = parts[0].casefold()
+    if platform == "youtube":
+        return first.startswith("@") or (len(parts) >= 2 and first in {"channel", "user", "c"})
+    if platform == "rumble":
+        return len(parts) >= 2 and first in {"c", "user"}
+    if platform in {"kick", "twitch"}:
+        return bool(first) and first not in {"videos", "video", "clip", "clips", "directory", "category"}
+    return False
+
+
+def streamer_recordings_for_removal(
+    config: BotConfig, name: str, records: Sequence[StreamRecord],
+) -> list[StreamRecord]:
+    # Display grouping ignores punctuation and platform. Require stronger
+    # evidence before removing a recording.
+    owners: dict[tuple[str, str], set[str]] = {}
+    aliases: dict[tuple[str, str], set[str]] = {}
+    for owner, streamer in config.streamers.items():
+        for source in streamer.sources:
+            key = _monitoring_source_key(source)
+            owners.setdefault(key, set()).add(owner)
+            for alias in (source_display_name(key[1]), owner):
+                aliases.setdefault((key[0], alias.lstrip("@").casefold()), set()).add(owner)
+    for source in config.channels:
+        key = _monitoring_source_key(source)
+        if key not in owners:
+            # A standalone monitored channel may use a configured group's name.
+            # An empty group name denotes that independent source.
+            owners[key] = {""}
+            alias = source_display_name(key[1]).lstrip("@").casefold()
+            aliases.setdefault((key[0], alias), set()).add("")
+
+    selected = []
+    for record in records:
+        if record.recording_kind == "vod" and record.channel in config.streamers:
+            # The manual-VOD form assigns this exact group, even for a VOD
+            # uploaded by another account or on a different platform.
+            candidates = {record.channel}
+        else:
+            platform_name = stream_record_platform(record)
+            channel_owners = aliases.get((platform_name, record.channel.lstrip("@").casefold()), set())
+            source = record.source or record.url
+            try:
+                key = _monitoring_source_key(source, default_platform=platform_name)
+            except SourceError:
+                key = None
+            candidates = owners.get(key, set()) if key is not None else set()
+            if candidates and key[0] != platform_name and name in candidates:
+                raise ConfigError(f"Cannot determine the platform owner of recording {record.video_id}")
+            if not candidates:
+                if record.source or (key is not None and _recording_url_identifies_channel(source, key[0])):
+                    if name in channel_owners:
+                        raise ConfigError(
+                            f"Recording {record.video_id} has a different source and an overlapping channel name"
+                        )
+                    continue
+                candidates = channel_owners
+
+        if name in candidates:
+            if len(candidates) != 1:
+                raise ConfigError(f"Recording {record.video_id} matches multiple streamers or channels")
+            selected.append(record)
+    return selected
+
+
+def _check_streamer_recording_idle(config: BotConfig, state: StateStore, record: StreamRecord) -> None:
+    if record.status in STREAM_DELETE_BLOCKED_STATUSES | {"detected", "finalization_failed"}:
+        raise ConfigError(f"Recording {record.video_id} may still run or resume ({record.status})")
+    if active_dashboard_job_kinds(config, record.video_id, state=state) or state.list_watermark_copies(
+        video_id=record.video_id, statuses=[WATERMARK_STATUS_QUEUED, WATERMARK_STATUS_RUNNING], limit=1,
+    ):
+        raise ConfigError(f"Recording {record.video_id} still has queued or running jobs")
+
+
+def _remember_retained_recording_directories(config: BotConfig, name: str, records: Sequence[StreamRecord]) -> None:
+    after_removal = replace(config, streamers={key: value for key, value in config.streamers.items() if key != name})
+    for record in records:
+        current = segment_directory(config, record.video_id, record.channel)
+        if current.is_dir() and current != segment_directory(after_removal, record.video_id, record.channel):
+            remember_recording_directory(config, record.video_id, current)
+
+
+@serialized_stream_operation
+def _remove_streamer_keeping_recordings(config: BotConfig, name: str) -> None:
+    remove_streamer_config(config.config_path, name, validate_only=True)
+    if config.db_path.exists():
+        state = StateStore(config.db_path)
+        try:
+            with state.conn:
+                state.conn.execute("BEGIN IMMEDIATE")
+                _remember_retained_recording_directories(config, name, state.list_streams(None))
+                remove_streamer_config(config.config_path, name)
+        finally:
+            state.close()
+    else:
+        remove_streamer_config(config.config_path, name)
+    reload_running_config(config)
+
+
+@serialized_stream_operation
+def remove_streamer_with_recordings(config: BotConfig, name: str) -> None:
+    if config.config_path is None or name not in config.streamers:
+        raise ConfigError(f"streamer is not configured: {name}")
+    loaded = load_config(config.config_path)
+    if (loaded.streamers, loaded.channels, loaded.download_dir, loaded.db_path) != (
+        config.streamers, config.channels, config.download_dir, config.db_path,
+    ):
+        raise ConfigError("Streamer configuration on disk has changed; reload it before removing recordings")
+    remove_streamer_config(config.config_path, name, validate_only=True)
+    revision = config_file_revision(config)
+    configured = config.streamers[name]
+    # Suppress in-flight/new discovery while keeping the original ownership and
+    # storage mapping in place. Restore this in-memory flag on any failure.
+    config.streamers[name] = replace(configured, archived=True)
+    state = None
+    removed = 0
+    current_id = ""
+    current_files = ""
+    try:
+        state = StateStore(config.db_path)
+        with state.conn:
+            state.conn.execute("BEGIN IMMEDIATE")
+            all_records = state.list_streams(None)
+            records = streamer_recordings_for_removal(config, name, all_records)
+            targets = []
+            for record in records:
+                _check_streamer_recording_idle(config, state, record)
+                targets.append(preflight_stream_recording_delete(config, record, all_records))
+            removing = {record.video_id for record in records}
+            _remember_retained_recording_directories(
+                config, name, [record for record in all_records if record.video_id not in removing],
+            )
+
+        for record, target in zip(records, targets):
+            current_id = record.video_id
+            current_files = ""
+            with state.conn:
+                # Other recordings may have been discovered since the batch
+                # preflight. Recheck ownership of this path with writers excluded.
+                state.conn.execute("BEGIN IMMEDIATE")
+                remaining = state.list_streams(None)
+                current = state.get_stream(current_id)
+                if current is None or (current.channel, current.platform, current.source, current.url, current.recording_kind) != (
+                    record.channel, record.platform, record.source, record.url, record.recording_kind
+                ):
+                    raise ConfigError("Recording ownership changed during deletion")
+                _check_streamer_recording_idle(config, state, current)
+                if preflight_stream_recording_delete(config, current, remaining) != target:
+                    raise ConfigError("Recording storage changed during deletion")
+                current_files = "The current directory may have been partially removed. "
+                _, _, existed = remove_stream_recordings(config, target)
+                current_files = "The current directory was removed. " if existed else ""
+                forget_recording_directory(config, current_id)
+                state.delete_stream(current_id, commit=False)
+            removed += 1
+            invalidate_file_scan_cache(target.directory)
+
+        current_id = ""
+        current_files = ""
+        with state.conn:
+            state.conn.execute("BEGIN IMMEDIATE")
+            retained = state.list_streams(None)
+            if streamer_recordings_for_removal(config, name, retained):
+                raise ConfigError("Another recording appeared during removal; review it and retry")
+            if config_file_revision(config) != revision:
+                raise ConfigError("The streamer configuration changed during removal; review it and retry")
+            _remember_retained_recording_directories(config, name, retained)
+            remove_streamer_config(config.config_path, name)
+            reload_running_config(config)
+    except (OSError, ConfigError, sqlite3.Error) as exc:
+        if removed or current_id:
+            where = f" at recording {current_id}" if current_id else " while removing the streamer configuration"
+            raise ConfigError(
+                f"Removal stopped{where}. Removed {removed} recording(s). "
+                f"{current_files}Remaining records are retained for retry. {exc}"
+            ) from exc
+        raise ConfigError(str(exc)) from exc
+    finally:
+        try:
+            if state is not None:
+                state.close()
+        finally:
+            if name in config.streamers:
+                config.streamers[name] = configured
+
+
 def update_streamer_from_form(
     config: BotConfig,
     params: dict[str, list[str]],
@@ -8922,8 +9436,15 @@ def _update_streamer_from_form_locked(
         reload_running_config(config)
         return
     if action == "delete":
-        remove_streamer_config(config.config_path, streamer_name)
-        reload_running_config(config)
+        if "delete_recordings" in params:
+            if params["delete_recordings"] != ["1"] or params.get("confirm_delete") != ["delete_streamer_recordings"]:
+                raise ConfigError("Removing the streamer's recordings requires explicit confirmation")
+            remove_streamer_with_recordings(config, streamer_name)
+        else:
+            try:
+                _remove_streamer_keeping_recordings(config, streamer_name)
+            except (OSError, sqlite3.Error) as exc:
+                raise ConfigError(f"Unable to preserve the existing recording locations: {exc}") from exc
         return
     if action != "save":
         raise ConfigError("Unknown streamer action")
@@ -10177,6 +10698,8 @@ def file_details(name: str) -> tuple[str | None, str | None]:
 
 
 def file_kind(name: str) -> str:
+    if name.startswith(".kick-archive-"):
+        return "state"
     if ".part-Frag" in name:
         return "fragment"
     if name.endswith(".part"):
@@ -10514,6 +11037,8 @@ def render_admin_setup_checklist(snapshot: StatusSnapshot) -> str:
 
 
 def render_stream_download_progress(stream: StreamStatus) -> str:
+    if stream.kick_capture_progress and active_vod_download_job(stream.jobs) is None:
+        return render_kick_capture_progress(stream, stream.kick_capture_progress)
     if stream.status != "downloading":
         return (
             f'<span data-download-progress-slot="{escape(stream.video_id, quote=True)}" hidden></span>'
@@ -10522,6 +11047,74 @@ def render_stream_download_progress(stream: StreamStatus) -> str:
     if stream.recording_kind == "vod" or vod_job is not None:
         return render_vod_download_progress(stream, vod_job)
     return render_live_download_progress(stream)
+
+
+def render_kick_capture_progress(stream: StreamStatus, capture: KickCaptureProgress) -> str:
+    if capture.phase in {"file_waiting", "file_recent"}:
+        title = "Live recording"
+        summary = "Media file updated recently" if capture.phase == "file_recent" else "Waiting for media writes"
+        details = []
+        if capture.bytes_written is not None:
+            details.append(f"{format_bytes(capture.bytes_written)} on disk")
+        if capture.updated_at is not None:
+            details.append(f"Last media write {format_optional_epoch(capture.updated_at)}")
+        details.append("Live-edge delay unknown")
+    else:
+        title = "Kick archive"
+        summary = KICK_ARCHIVE_PHASES.get(capture.phase, "Archive checkpoint unreadable · needs attention")
+        if capture.phase == "recording" and (
+            capture.delay_seconds is not None and capture.target_delay_seconds is not None
+            and capture.delay_seconds > capture.target_delay_seconds
+        ):
+            summary = "Catching up to the target delay"
+        if capture.phase == "retrying":
+            if capture.reason in {"missing_segment", "archive_origin_missing"}:
+                summary = "Retrying an archive gap"
+            elif capture.reason in {"truncated_segment", "invalid_segment", "incomplete_media"}:
+                summary = "Retrying an incomplete archive segment"
+            elif capture.reason in {"archive_changed", "snapshot_regressed"}:
+                summary = "Archive changed · retrying from the last verified segment"
+        if capture.phase == "needs_attention":
+            if capture.reason == "local_media_error":
+                summary = "Archive needs attention · local media verification failed"
+            elif capture.reason == "archive_unverified":
+                summary = "Archive needs attention · recording ended without a verified archive"
+        if capture.phase == "complete":
+            if not capture.complete:
+                summary = "Archive verification pending"
+            elif stream.status != "ended":
+                summary = "Archive segments verified · awaiting recording finalization"
+        if capture.report_state == "no_worker":
+            summary = "No active archive worker · last report was " + summary.lower()
+        elif capture.report_state == "awaiting_first_report":
+            summary = "Waiting for this worker’s first report"
+        elif capture.report_state == "awaiting_update":
+            summary = "Waiting for a fresh worker report · last report was " + summary.lower()
+        elif stream.status != "downloading" and capture.phase not in {"complete", "needs_attention", "unreadable"}:
+            summary = "Last worker report · " + summary
+        details = []
+        if capture.saved_segments is not None:
+            count = f"{capture.saved_segments:,}"
+            if capture.available_segments is not None:
+                count += f" of {capture.available_segments:,} published"
+            details.append(f"{count} segments verified")
+        if capture.target_delay_seconds is not None:
+            details.append(f"Target delay {format_duration(round(capture.target_delay_seconds))}")
+        if capture.delay_seconds is None:
+            details.append("Live-edge delay unknown")
+        else:
+            details.append(f"Estimated live-edge delay {format_duration(round(capture.delay_seconds))}")
+        if capture.updated_at is not None:
+            details.append(f"Last report {format_optional_epoch(capture.updated_at)}")
+    classes = " is-stale" if capture.needs_attention else ""
+    return (
+        f'<span class="live-download-progress{classes}" role="group" '
+        f'data-download-progress="{escape(stream.video_id, quote=True)}" '
+        f'data-live-download-progress="{escape(stream.video_id, quote=True)}" '
+        f'aria-label="{escape(title + " for " + (stream.title or stream.video_id), quote=True)}">'
+        f'<span class="live-download-progress-heading"><strong>{title}</strong><span>{escape(summary)}</span></span>'
+        f'<span class="live-download-track"><span>{escape(" · ".join(details))}</span></span></span>'
+    )
 
 
 def render_vod_download_progress(stream: StreamStatus, job: JobStatus | None) -> str:
@@ -10904,9 +11497,10 @@ def render_admin_streamer_detail(
         f"{snapshot.job_revision}:{streamer.timezone}"
     )
     state_revision = revision
-    delete_form = f"""<form method="post" action="/streamers" data-confirm="Remove {escape(streamer.name, quote=True)} from monitoring? Existing downloaded files and stream history will be kept." data-confirm-label="Remove streamer">
-      <input type="hidden" name="action" value="delete"><input type="hidden" name="streamer_name" value="{escape(streamer.name, quote=True)}"><input type="hidden" name="return_to" value="/streamers"><button class="button small danger" type="submit">Remove</button>
-    </form>"""
+    delete_form = (
+        render_recording_removal("streamer", streamer.name, use_dialog=True)
+        if streamer.configured and snapshot_config_path(snapshot) != "-" else ""
+    )
     archive_form = ""
     if streamer.configured and snapshot_config_path(snapshot) != "-":
         action = "restore" if streamer.archived else "archive"
@@ -14866,17 +15460,12 @@ def dashboard_script() -> str:
     }
   });
 
+  const removalForms = /*RECORDING_REMOVAL_FORMS*/null;
+  const renderRemoval = (kind, target) => removalForms[kind].replaceAll("__removal_target__", () => escapeAttr(target));
   const renderDeleteStreamAction = (stream) => {
-    const videoId = String((stream && stream.video_id) || "");
-    const blockedStatuses = new Set(["checking_after_exit", "finalizing", "detected", "downloading", "stalled", "waiting_retry"]);
-    if (!videoId || blockedStatuses.has(String(stream.status || ""))) {
-      return "";
-    }
-    return `<form class="inline-form stream-delete-form" method="post" action="/delete-stream" onsubmit="return confirm('Delete this stream and all downloaded files? This cannot be undone.');">
-      <input type="hidden" name="video_id" value="${escapeAttr(videoId)}">
-      <input type="hidden" name="confirm_delete" value="delete_stream">
-      <button class="download action-button danger-action" type="submit" title="Delete this stream record and its downloaded files">Delete stream</button>
-    </form>`;
+    const videoId = String(stream?.video_id || "");
+    if (!videoId || removalForms.blocked.includes(stream.status)) return "";
+    return renderRemoval(stream.status === "detected" ? "detected" : "stream", videoId);
   };
 
   const jobDetailElapsed = (job) => {
@@ -15138,9 +15727,7 @@ def dashboard_script() -> str:
     const powerchatEnabled = Boolean(streamer && streamer.powerchat_enabled);
     const powerchatUsername = isExisting ? String(streamer.powerchat_username || "") : "";
     const readonly = isExisting ? " readonly" : "";
-    const deleteButton = isExisting
-      ? '<button class="download action-button" name="action" value="delete" type="submit">Delete</button>'
-      : "";
+    const removeForm = isExisting ? renderRemoval("streamer", name) : "";
     const saveLabel = isExisting ? "Save Streamer" : "Add Streamer";
     const meta = isExisting
       ? `<span class="streamer-meta">Voice ${escapeHtml(streamer.voice_detection || "default")}; labels ${escapeHtml(streamer.speaker_label_count || 0)}</span>`
@@ -15162,9 +15749,8 @@ def dashboard_script() -> str:
   <div class="settings-field wide"><span>Sources</span>${renderSourceBuilder(sources)}</div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">${saveLabel}</button>
-    ${deleteButton}
   </div>
-</form>`;
+</form>${removeForm}`;
   };
 
   const renderSelect = (name, selected, options) => `<select name="${escapeAttr(name)}">${options.map((option) => `<option value="${escapeAttr(option)}"${String(option) === String(selected) ? " selected" : ""}>${escapeHtml(option)}</option>`).join("")}</select>`;
@@ -15735,7 +16321,12 @@ def dashboard_script() -> str:
   renderPowerchatDashboard(latestPowerchatStats);
   window.setInterval(refreshStatus, 15000);
 })();
-</script>"""
+</script>""".replace("/*RECORDING_REMOVAL_FORMS*/null", json_script_payload({
+        "stream": render_recording_removal("stream", "__removal_target__"),
+        "detected": render_recording_removal("stream", "__removal_target__", detected=True),
+        "streamer": render_recording_removal("streamer", "__removal_target__"),
+        "blocked": sorted(STREAM_DELETE_BLOCKED_STATUSES),
+    }))
 
 
 def render_about_panel(snapshot: StatusSnapshot) -> str:
@@ -16837,11 +17428,7 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
     voice_detection = streamer.voice_detection if streamer is not None else "default"
     speaker_label_count = streamer.speaker_label_count if streamer is not None else 0
     readonly = " readonly" if is_existing else ""
-    delete_button = (
-        '<button class="download action-button" name="action" value="delete" type="submit">Delete</button>'
-        if is_existing
-        else ""
-    )
+    remove_form = render_recording_removal("streamer", name) if is_existing else ""
     save_label = "Save Streamer" if is_existing else "Add Streamer"
     meta = (
         f'<span class="streamer-meta">Voice {escape(voice_detection)}; '
@@ -16866,9 +17453,8 @@ def render_streamer_group_form(streamer: StreamerStatus | StreamerStatStatus | N
   <div class="settings-field wide"><span>Sources</span>{render_source_editor(streamer.sources if streamer is not None else [])}</div>
   <div class="settings-actions">
     <button class="download action-button" name="action" value="save" type="submit">{save_label}</button>
-    {delete_button}
   </div>
-</form>"""
+</form>{remove_form}"""
 
 
 def render_app_config_form(snapshot: StatusSnapshot) -> str:
@@ -18009,25 +18595,73 @@ def render_segment_recovery_actions(stream: StreamStatus) -> str:
 def render_delete_stream_action(stream: StreamStatus, *, use_dialog: bool = False) -> str:
     if stream.status in STREAM_DELETE_BLOCKED_STATUSES:
         return ""
-    confirmation = (
-        "Delete this detected stream record? If the source is still live, it may be detected again."
-        if stream.status == "detected"
-        else "Delete this stream and all downloaded files? This cannot be undone."
+    return render_recording_removal(
+        "stream", stream.video_id, use_dialog=use_dialog, detected=stream.status == "detected"
     )
-    confirmation_attr = (
-        f'data-confirm="{escape(confirmation, quote=True)}" data-confirm-label="Delete stream"'
-        if use_dialog
-        else f'onsubmit="return confirm(\'{escape(confirmation, quote=True)}\');"'
+
+
+def render_recording_removal(
+    scope: str, target: str, *, use_dialog: bool = False, detected: bool = False
+) -> str:
+    if scope == "streamer":
+        action = "/streamers"
+        target_name = "streamer_name"
+        token = "delete_streamer_recordings"
+        trigger = "Remove streamer"
+        keep_label = trigger
+        delete_label = "Remove streamer and delete recordings"
+        keep_message = f"Remove {target} from monitoring? Existing recordings and stream history will be kept."
+        delete_message = (
+            f"Remove {target} from monitoring and permanently delete the recordings still listed for this streamer, "
+            "including their files and history? This cannot be undone."
+        )
+        checkbox_label = "Also permanently delete recordings still listed for this streamer, including their files and history"
+        extra = '<input type="hidden" name="action" value="delete"><input type="hidden" name="return_to" value="/streamers">'
+    else:
+        action = "/delete-stream"
+        target_name = "video_id"
+        token = STREAM_DELETE_CONFIRM_VALUE
+        trigger = "Delete stream"
+        keep_label = "Delete stream record"
+        delete_label = "Delete record and files"
+        keep_message = "Delete this stream record from the dashboard? Its downloaded files will be kept on disk."
+        delete_message = "Permanently delete this stream record and all files in its recording directory? This cannot be undone."
+        if detected:
+            note = " If the source is still live, it may be detected again."
+            keep_message += note
+            delete_message += note
+        checkbox_label = "Also permanently delete this stream’s downloaded recording and related files"
+        extra = ""
+
+    fields = (
+        f'<input type="hidden" name="{target_name}" value="{escape(target, quote=True)}">'
+        f'<input type="hidden" name="confirm_delete" value="{token}">{extra}'
     )
-    return (
-        '<form class="inline-form stream-delete-form" method="post" action="/delete-stream" '
-        f'{confirmation_attr}>'
-        f'<input type="hidden" name="video_id" value="{escape(stream.video_id, quote=True)}">'
-        f'<input type="hidden" name="confirm_delete" value="{STREAM_DELETE_CONFIRM_VALUE}">'
-        '<button class="download action-button danger-action" type="submit" '
-        'title="Delete this stream record and its downloaded files">Delete stream</button>'
-        '</form>'
+    option = f'<label><input type="checkbox" name="delete_recordings" value="1"> {checkbox_label}</label>'
+    messages = (
+        f'data-keep-message="{escape(keep_message, quote=True)}" '
+        f'data-delete-message="{escape(delete_message, quote=True)}"'
     )
+    if not use_dialog:
+        return (
+            f'<form method="post" action="{action}" class="inline-form recording-removal" {messages} '
+            'onsubmit="return confirm(this.elements.delete_recordings.checked ? this.dataset.deleteMessage : this.dataset.keepMessage)">'
+            f'{fields}{option} <button class="download action-button danger-action" type="submit">{trigger}</button></form>'
+        )
+
+    dialog_id = f'remove-{scope}-' + hashlib.sha256(target.encode()).hexdigest()[:20]
+    return f"""<button class="button small danger" type="button" data-open-dialog="{dialog_id}">{trigger}</button>
+<dialog id="{dialog_id}" aria-labelledby="{dialog_id}-title">
+  <form class="dialog-card section-stack" method="post" action="{action}" data-recording-removal {messages}
+        data-keep-label="{keep_label}" data-delete-label="{delete_label}">
+    <h2 id="{dialog_id}-title">{trigger}</h2>
+    {fields}
+    <p data-removal-message aria-live="polite">{escape(keep_message)}</p>
+    {option}
+    <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>Cancel</button>
+      <button class="button danger" type="submit" data-removal-submit>{keep_label}</button></div>
+  </form>
+</dialog>"""
 
 
 def render_stream_vod_redownload_form(stream: StreamStatus, *, use_dialog: bool = False) -> str:
@@ -18154,6 +18788,7 @@ def render_stream_card(stream: StreamStatus, streamer: StreamerStatStatus | None
   </div>
   <div class="stream-body">
     {signals}
+    {render_stream_download_progress(stream)}
     <div class="meta">
       <div>Segment: {stream.segment_index:03d}</div>
       <div>Files: {stream.file_count}</div>
@@ -18540,7 +19175,11 @@ def render_stream_signals(stream: StreamStatus) -> str:
 
 
 def stream_needs_attention(stream: StreamStatus) -> bool:
-    return stream.status in ATTENTION_STATUSES or stream.has_mixed_formats
+    return (
+        stream.status in ATTENTION_STATUSES
+        or stream.has_mixed_formats
+        or bool(stream.kick_capture_progress and stream.kick_capture_progress.needs_attention)
+    )
 
 
 def format_optional_int(value: int | None) -> str:

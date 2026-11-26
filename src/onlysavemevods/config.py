@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import json
 import math
+import os
 import re
 import tomllib
 
@@ -1276,6 +1277,8 @@ def _toml_collection_depth(value: str) -> int:
 def remove_streamer_config(
     config_path: str | Path,
     streamer_name: str,
+    *,
+    validate_only: bool = False,
 ) -> bool:
     target = Path(config_path).expanduser()
     try:
@@ -1290,17 +1293,45 @@ def remove_streamer_config(
         raise ConfigError("streamer name is required")
     _require_configured_streamer(current_text, streamer_name, target)
 
-    table_key = re.escape(_toml_key(streamer_name))
-    pattern = re.compile(rf"(?ms)^\[\[?streamers\.{table_key}(?:\.[^\]]+)?\]\]?\n.*?(?=^\[|\Z)")
-    updated_text, count = pattern.subn("", current_text)
-    updated_text = re.sub(r"\n{3,}", "\n\n", updated_text).rstrip() + "\n"
-    if count == 0:
-        return False
-
-    _validate_generated_config(target, updated_text)
-    _validate_generated_streamers(target, updated_text)
+    # Use the parsed table name for quoted, unquoted and nested tables. A
+    # header-like line inside a multiline string must be retained verbatim.
+    headers = _table_headers(current_text)
+    updated_text = current_text
+    for index in range(len(headers) - 1, -1, -1):
+        header = headers[index]
+        section = tomllib.loads(header.group()).get("streamers")
+        if isinstance(section, dict) and streamer_name in section:
+            end = headers[index + 1].start() if index + 1 < len(headers) else len(current_text)
+            updated_text = updated_text[:header.start()] + updated_text[end:]
+    original = tomllib.loads(current_text)
+    del original["streamers"][streamer_name]
+    remaining = tomllib.loads(updated_text)
+    if not original["streamers"] and "streamers" not in remaining:
+        del original["streamers"]
+    if original != remaining:
+        raise ConfigError("Removing a streamer requires separate streamer TOML tables")
+    load_config_text(updated_text, target)
     try:
-        target.write_text(updated_text, encoding="utf-8")
+        # systemd may permit writing only config.toml, so use its existing
+        # inode. Verify write access without truncating when preflighting.
+        with target.open("r+", encoding="utf-8") as config_file:
+            if config_file.read() != current_text:
+                raise ConfigError("Configuration changed during streamer removal")
+            if validate_only:
+                return True
+            try:
+                config_file.seek(0)
+                config_file.write(updated_text)
+                config_file.truncate()
+                config_file.flush()
+                os.fsync(config_file.fileno())
+            except OSError:
+                config_file.seek(0)
+                config_file.write(current_text)
+                config_file.truncate()
+                config_file.flush()
+                os.fsync(config_file.fileno())
+                raise
     except OSError as exc:
         raise ConfigError(f"Unable to update config file {target}: {exc}") from exc
     return updated_text != current_text
@@ -1688,10 +1719,7 @@ def _require_configured_streamer(
         raise ConfigError(f"streamer is not configured: {streamer_name}")
 
 
-def _regular_table_span(
-    text: str,
-    table_path: tuple[str, ...],
-) -> tuple[int, int] | None:
+def _table_headers(text: str) -> list[re.Match[str]]:
     headers = []
     for header in re.finditer(
         r"(?m)^[ \t]*\[[^\n]*\][ \t]*(?:#[^\n]*)?(?:\n|$)", text
@@ -1702,6 +1730,14 @@ def _regular_table_span(
             # A header-shaped line inside a string or array belongs to its value.
             continue
         headers.append(header)
+    return headers
+
+
+def _regular_table_span(
+    text: str,
+    table_path: tuple[str, ...],
+) -> tuple[int, int] | None:
+    headers = _table_headers(text)
     for index, header in enumerate(headers):
         if header.group().lstrip().startswith("[["):
             continue
